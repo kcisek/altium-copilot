@@ -53,3 +53,11 @@ def test_get_component_includes_sheet(sample_netlist, default_vs):
 def test_get_component_sheet_u1(sample_netlist, default_vs):
     result = json.loads(_get_component_impl(sample_netlist, default_vs, "U1"))
     assert result["sheet"] == "MCU"
+
+
+def test_get_component_empty_components_returns_no_components_loaded(default_vs):
+    netlist = {"nets": {"N": [("U1", "1")]}, "pin_to_net": {"U1": {"1": "N"}}, "components": {},
+               "sheet_errors": [{"sheet": "Power", "path": "p", "error": "file not found"}]}
+    result = json.loads(_get_component_impl(netlist, default_vs, "U1"))
+    assert result["error"] == "no_components_loaded"
+    assert result["sheet_errors"][0]["sheet"] == "Power"

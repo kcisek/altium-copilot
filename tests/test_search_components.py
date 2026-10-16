@@ -58,3 +58,22 @@ def test_search_mixed_values_null(sample_netlist):
     result = json.loads(_search_components_impl(sample_netlist, "RES 10K OHM", "description"))
     group = next(g for g in result["results"] if g["mpn"] == "RC0402FR-0710KL")
     assert group["value"] is None
+
+
+def test_search_empty_components_returns_no_components_loaded():
+    """Issue #6: nets loaded but no components must not report 'matched all 0'."""
+    netlist = {"nets": {"N": [("U1", "1")]}, "pin_to_net": {"U1": {"1": "N"}}, "components": {}}
+    raw = _search_components_impl(netlist, "STM32", "description")
+    assert "matched all 0" not in raw
+    assert json.loads(raw)["error"] == "no_components_loaded"
+
+
+def test_search_missing_components_key_returns_no_components_loaded():
+    netlist = {"nets": {"N": [("U1", "1")]}, "pin_to_net": {"U1": {"1": "N"}}}
+    result = json.loads(_search_components_impl(netlist, "STM32", "description"))
+    assert result["error"] == "no_components_loaded"
+
+
+def test_search_no_match_returns_empty_results(sample_netlist):
+    result = json.loads(_search_components_impl(sample_netlist, "ZZZ_NOPE", "description"))
+    assert result == {"results": [], "match_count": 0}

@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 try:
-    from altium import AltiumClient
+    from altium import AltiumClient, is_netlist_fresh, netlist_sources
     from parsers.prj_pcb import parse_prj_pcb, VariantState
     from services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
     from services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
@@ -29,7 +29,7 @@ try:
     from services.pcb_index import PcbIndex
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
-    from server.altium import AltiumClient
+    from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
     from server.parsers.prj_pcb import parse_prj_pcb, VariantState
     from server.parsers.pcb_doc import parse_pcb_doc
     from server.services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
@@ -216,6 +216,11 @@ otherwise your data may be stale.
 
 ## Error Recovery
 
+- no_components_loaded (from set_project_dir, refresh_netlist or any component tool) → nets
+  loaded but no schematic component metadata did. Tell the user, name any sheet_errors, and do
+  not answer component questions from the nets alone or retry search_components in a loop
+- sheet_errors in set_project_dir/refresh_netlist → those sheets failed to parse; their
+  components are missing. Name the failing sheets and errors to the user
 - Component not found → call search_components with a regex to locate it
 - Net not found → use query_net with a keyword pattern to discover the real name
   (e.g. query_net('MISO') or query_net('CAN')). Never guess net names or
@@ -243,6 +248,56 @@ def _require_project():
     if _project is None or _altium._netlist is None or _variant_state is None:
         raise ValueError("No project loaded. Call set_project_dir first.")
     return _project, _altium._netlist, _variant_state
+
+
+def _no_components_error(netlist: dict) -> dict | None:
+    """Structured error when the netlist has no schematic component metadata, else None."""
+    if netlist.get("components"):
+        return None
+    error = {
+        "error": "no_components_loaded",
+        "message": (
+            f"The netlist has {len(netlist.get('nets') or {})} nets but no component metadata "
+            "was loaded from the schematic sheets. Component, sheet and BOM answers are not "
+            "available. Check sheet_errors, fix or re-save the failing sheets, then call "
+            "refresh_netlist or set_project_dir again."
+        ),
+    }
+    if netlist.get("sheet_errors"):
+        error["sheet_errors"] = netlist["sheet_errors"]
+    return error
+
+
+def _load_diagnostics(netlist: dict) -> dict:
+    """Component count, per-sheet parse errors and coverage warnings for load responses."""
+    components = netlist.get("components") or {}
+    diagnostics: dict = {"component_count": len(components)}
+    if netlist.get("sheet_errors"):
+        diagnostics["sheet_errors"] = netlist["sheet_errors"]
+    if not components and netlist.get("pin_to_net"):
+        error = _no_components_error(netlist)
+        diagnostics["warning"] = error["error"]
+        diagnostics["message"] = error["message"]
+    elif components:
+        missing = sorted(set(netlist.get("pin_to_net") or {}) - set(components))
+        if missing:
+            diagnostics["refdes_without_metadata"] = len(missing)
+            diagnostics["refdes_without_metadata_sample"] = missing[:10]
+            diagnostics["refdes_without_metadata_hint"] = (
+                "These refdes are in the netlist but on no sheet listed in the saved .PrjPcb "
+                "(or on a sheet in sheet_errors). If sheets were added in Altium, save the "
+                "project, then call refresh_netlist."
+            )
+    return diagnostics
+
+
+def _resolve_dnp_uids(variant_state: VariantState, netlist: dict | None) -> None:
+    uid_map = {
+        comp.get("unique_id"): refdes
+        for refdes, comp in (netlist or {}).get("components", {}).items()
+        if comp.get("unique_id")
+    }
+    variant_state.resolve_dnp_uid(uid_map)
 
 
 class PcbSession:
@@ -379,6 +434,9 @@ def set_project_dir(project_dir: str) -> str:
 
     # Cache shortcut — if registry has a validated netlist mtime and the .NET file matches,
     # load from disk without requiring Altium to be running or on a schematic sheet.
+    # The .NET must also be at least as new as every sheet listed in the .PrjPcb (wherever
+    # it lives in the tree) and the .PrjPcb itself — otherwise fall through and regenerate.
+    _stale_cache = False
     _registry = read_registry()
     for _entry in _registry.get("projects", []):
         if Path(_entry.get("dir", "")).resolve() == Path(project_dir).resolve():
@@ -392,14 +450,18 @@ def set_project_dir(project_dir: str) -> str:
                     try:
                         if abs(_net_matches[0].stat().st_mtime - _stored_mtime) < 0.01:
                             prj_data = parse_prj_pcb(prj_pcb_path)
-                            if prj_data.sheet_paths:
+                            _fresh = bool(prj_data.sheet_paths) and is_netlist_fresh(
+                                _net_matches[0], netlist_sources(prj_pcb_path, prj_data.sheet_paths)
+                            )
+                            _stale_cache = bool(prj_data.sheet_paths) and not _fresh
+                            if _fresh:
                                 sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
                                 _project = None
                                 _variant_state = None
                                 _altium._netlist = None
                                 _netlist_last_updated = None
                                 _pcb_session.__init__()
-                                _altium.load_netlist_from_file(str(_net_matches[0]), project_dir)
+                                _altium.load_netlist_from_file(str(_net_matches[0]), prj_data.sheet_paths)
                                 _project = {
                                     "name": project_name,
                                     "root_dir": project_dir,
@@ -408,12 +470,7 @@ def set_project_dir(project_dir: str) -> str:
                                     "pcb_doc_paths": prj_data.pcb_doc_paths,
                                 }
                                 _variant_state = VariantState(prj_data.variants)
-                                _uid_map = {
-                                    comp.get("unique_id"): refdes
-                                    for refdes, comp in (_altium._netlist or {}).get("components", {}).items()
-                                    if comp.get("unique_id")
-                                }
-                                _variant_state.resolve_dnp_uid(_uid_map)
+                                _resolve_dnp_uids(_variant_state, _altium._netlist)
                                 _netlist_last_updated = datetime.now(timezone.utc).isoformat()
                                 upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
                                 response = {
@@ -424,6 +481,7 @@ def set_project_dir(project_dir: str) -> str:
                                     "variants": [v.name for v in prj_data.variants],
                                     "variant_count": len(prj_data.variants),
                                     "netlist_updated_utc": _netlist_last_updated,
+                                    **_load_diagnostics(_altium._netlist or {}),
                                 }
                                 _claude_md = (
                                     list(Path(project_dir).glob("CLAUDE.md")) +
@@ -439,10 +497,17 @@ def set_project_dir(project_dir: str) -> str:
     # Full Altium flow — required when cache is absent or stale.
     status = _altium.get_status()
     if not status.get("running"):
-        return json.dumps({
+        response = {
             "error": "altium_not_running",
             "message": "Altium Designer is not running. Open Altium with your project before loading.",
-        })
+        }
+        if _stale_cache:
+            response["netlist_stale"] = True
+            response["message"] += (
+                " The project or its schematic sheets were saved after the cached netlist "
+                "was generated, so it must be regenerated in Altium."
+            )
+        return json.dumps(response)
     if status.get("warning") == "no_sheet_open":
         return json.dumps({
             "error": "no_sheet_open",
@@ -491,8 +556,8 @@ def set_project_dir(project_dir: str) -> str:
     sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
 
     try:
-        _altium.generate_netlist(prj_pcb_path)
-    except RuntimeError as e:
+        _altium.generate_netlist(prj_pcb_path, sheet_paths=prj_data.sheet_paths)
+    except (RuntimeError, OSError) as e:
         return json.dumps({
             "error": "netlist_generation_failed",
             "message": str(e),
@@ -506,12 +571,7 @@ def set_project_dir(project_dir: str) -> str:
         "pcb_doc_paths": prj_data.pcb_doc_paths,
     }
     _variant_state = VariantState(prj_data.variants)
-    _uid_map = {
-        comp.get("unique_id"): refdes
-        for refdes, comp in (_altium._netlist or {}).get("components", {}).items()
-        if comp.get("unique_id")
-    }
-    _variant_state.resolve_dnp_uid(_uid_map)
+    _resolve_dnp_uids(_variant_state, _altium._netlist)
     _netlist_last_updated = datetime.now(timezone.utc).isoformat()
 
     _net_matches = (
@@ -529,6 +589,7 @@ def set_project_dir(project_dir: str) -> str:
         "variants": [v.name for v in prj_data.variants],
         "variant_count": len(prj_data.variants),
         "netlist_updated_utc": _netlist_last_updated,
+        **_load_diagnostics(_altium._netlist or {}),
     }
 
     claude_md_files = (
@@ -550,15 +611,34 @@ def refresh_netlist() -> str:
     Do not call speculatively — only when the user confirms they have saved."""
     global _netlist_last_updated
     try:
-        project, _, _ = _require_project()
+        project, _, variant_state = _require_project()
     except ValueError as e:
         return json.dumps({"error": "no_project", "message": str(e)})
+    # Re-read the sheet list so sheets added, moved or removed since load are picked up
+    # and the sheet names stay in step with the components' sheet attribution.
+    prj_data = None
+    sheet_paths = [s["path"] for s in project.get("sheets", [])]
     try:
-        regenerated = _altium.generate_netlist(project["prj_pcb_path"])
+        prj_data = parse_prj_pcb(project["prj_pcb_path"])
+        sheet_paths = prj_data.sheet_paths
+    except Exception as e:
+        logging.warning("Could not re-read .PrjPcb, using the sheet list from load: %s", e)
+    try:
+        regenerated = _altium.generate_netlist(project["prj_pcb_path"], sheet_paths=sheet_paths)
     except Exception as e:
         return json.dumps({"error": "generate_failed", "message": str(e)})
+    if prj_data is not None:
+        project["sheets"] = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
+        project["pcb_doc_paths"] = prj_data.pcb_doc_paths
+    _resolve_dnp_uids(variant_state, _altium._netlist)
+    diagnostics = _load_diagnostics(_altium._netlist or {})
     if not regenerated:
-        return "Netlist is already up to date. If you expected changes, save in Altium and try refresh again."
+        message = "Netlist is already up to date. If you expected changes, save in Altium and try refresh again."
+        if diagnostics.get("warning"):
+            message += f"\nWarning ({diagnostics['warning']}): {diagnostics['message']}"
+        for err in diagnostics.get("sheet_errors", []):
+            message += f"\nSheet '{err['sheet']}' failed to load: {err['error']}"
+        return message
     _pcb_session.invalidate()
     _netlist_last_updated = datetime.now(timezone.utc).isoformat()
     _rn_name = Path(project["prj_pcb_path"]).stem
@@ -572,7 +652,11 @@ def refresh_netlist() -> str:
         _rn_dir,
         netlist_mtime=_rn_net[0].stat().st_mtime if _rn_net else None,
     )
-    return json.dumps({"refreshed": True, "netlist_updated_utc": _netlist_last_updated})
+    return json.dumps({
+        "refreshed": True,
+        "netlist_updated_utc": _netlist_last_updated,
+        **diagnostics,
+    })
 
 
 # ---------- query_net ----------
@@ -651,6 +735,9 @@ def query_net(pattern: str) -> str:
 # ---------- get_component ----------
 
 def _get_component_impl(netlist: dict, variant_state: VariantState, refdes: str) -> str:
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
     components = netlist.get("components", {})
     matched = next((k for k in components if k.lower() == refdes.lower()), None)
     if matched is None:
@@ -695,6 +782,10 @@ def _search_components_impl(netlist: dict, pattern: str, search_by: str) -> str:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         return json.dumps({"error": "invalid_pattern", "message": f"Invalid regex: {e}"})
+
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
 
     components = netlist.get("components", {})
     matches: dict = {}
@@ -794,7 +885,18 @@ def _get_sheet_context_impl(project: dict, netlist: dict, variant_state: Variant
             })
         sheet_name = matched
 
-    return build_sheet_context(netlist, sheet_name, variant_state, offset)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    context = build_sheet_context(netlist, sheet_name, variant_state, offset)
+    sheet_error = next((e for e in netlist.get("sheet_errors") or []
+                        if e.get("sheet", "").lower() == sheet_name.lower()), None)
+    if sheet_error:
+        context = (
+            f"warning: sheet_load_failed — '{sheet_name}' could not be parsed "
+            f"({sheet_error['error']}); its components are missing below.\n" + context
+        )
+    return context
 
 
 @mcp.tool(title="Get Sheet Context", annotations=ToolAnnotations(readOnlyHint=True),
@@ -1572,11 +1674,20 @@ def _package_for_xfn_impl(
     variant_state,
     version: str,
 ) -> str:
+    # Never ship a hollow snapshot: nets present but no component metadata.
+    no_components = netlist.get("pin_to_net") and _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
     try:
         db_path = export_project(project, netlist, variant_state, version)
     except Exception as e:
         return json.dumps({"error": "export_failed", "message": str(e)})
     prj_pcb_name = Path(project["prj_pcb_path"]).name
+    incomplete_warning = "".join(
+        f"\nWarning: sheet '{err['sheet']}' failed to load ({err['error']}); "
+        "its components are missing from this snapshot."
+        for err in netlist.get("sheet_errors") or []
+    )
     registry_warning = ""
     try:
         mark_xfn_exported(prj_pcb_name)
@@ -1593,6 +1704,7 @@ def _package_for_xfn_impl(
         f"Exported to: {db_path}\n"
         "Share this file with your cross-functional team via Slack or a shared drive.\n"
         "Do not commit it to Git — it is a binary snapshot and will cause repository bloat."
+        f"{incomplete_warning}"
         f"{registry_warning}"
     )
 

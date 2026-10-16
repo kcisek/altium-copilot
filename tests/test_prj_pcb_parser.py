@@ -195,3 +195,31 @@ VariantKind=3
         assert "U7" in debug.dnp_refdes
     finally:
         os.unlink(tmp)
+
+
+def test_sheet_paths_resolve_subfolder_and_parent_paths(tmp_path):
+    """DocumentPath may point into a subfolder (source\\) or outside the project (..\\)."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    prj = proj / "Board.PrjPcb"
+    prj.write_text(
+        "[Document1]\nDocumentPath=source\\Main.SchDoc\n"
+        "[Document2]\nDocumentPath=..\\common\\Shared.SchDoc\n",
+        encoding="utf-8",
+    )
+    assert parse_prj_pcb(str(prj)).sheet_paths == [
+        str((proj / "source" / "Main.SchDoc").resolve()),
+        str((tmp_path / "common" / "Shared.SchDoc").resolve()),
+    ]
+
+
+def test_unresolved_dnp_uid_kept_for_later_resolution():
+    """A UID the schematics did not cover (e.g. its sheet failed to parse) must survive,
+    so a later refresh can still resolve it instead of silently dropping the DNP."""
+    state = VariantState([VariantDefinition(name="Prod", dnp_uid=["AAAA", "BBBB"])])
+    state.resolve_dnp_uid({"AAAA": "R1"})
+    assert state.is_dnp("R1")
+    assert not state.is_dnp("R2")
+    state.resolve_dnp_uid({"BBBB": "R2"})
+    assert state.is_dnp("R1")
+    assert state.is_dnp("R2")

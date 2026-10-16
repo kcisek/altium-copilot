@@ -150,16 +150,21 @@ class VariantState:
 
     def resolve_dnp_uid(self, uid_to_refdes: dict[str, str]) -> None:
         """Resolve stale DNP UniqueIds to real refdes using the schematic uid map.
-        Call once after schematics are parsed. Safe to call multiple times."""
+        Call after schematics are parsed. Safe to call multiple times."""
         for variant in self._variants:
             if not variant.dnp_uid:
                 continue
             resolved = set(variant.dnp_refdes)
+            unresolved: list[str] = []
             for uid in variant.dnp_uid:
                 if uid in uid_to_refdes:
                     resolved.add(uid_to_refdes[uid])
+                else:
+                    unresolved.append(uid)
             variant.dnp_refdes = list(resolved)
-            variant.dnp_uid = []
+            # Keep UIDs the schematics did not cover (e.g. a sheet failed to parse) so a
+            # later refresh_netlist can still resolve them.
+            variant.dnp_uid = unresolved
 
     @property
     def active(self) -> VariantDefinition:
