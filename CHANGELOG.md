@@ -3,6 +3,31 @@
 All notable changes to this project will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
+## [Unreleased]
+
+### Fixed
+- Projects that keep their `.SchDoc` files in a subfolder (e.g. `source\`) or outside
+  the project folder (`..\common\`) now load components. Sheets come from the `.PrjPcb`
+  document list instead of a top-level `*.SchDoc` glob, for both enrichment and netlist
+  freshness ([ee-in-a-box/altium-copilot#6](https://github.com/ee-in-a-box/altium-copilot/issues/6))
+- Saving a sheet in a subfolder now makes `refresh_netlist` regenerate, and
+  `set_project_dir` no longer serves a cached netlist older than the sheets or `.PrjPcb`
+  (offline load returns `altium_not_running` with `netlist_stale: true`)
+- A sheet that fails to parse no longer discards every other sheet's components; the
+  failure is returned as `sheet_errors` (sheet, path, error)
+- Nets loaded with zero components now report `no_components_loaded` from
+  `set_project_dir`, `refresh_netlist`, `search_components`, `get_component`,
+  `get_sheet_context` and `package_for_xfn` instead of "Pattern matched all 0 components"
+- A failed regeneration (e.g. Altium closed) restores the previous `.NET` instead of
+  leaving the project without a netlist
+- Stale-designator DNP UniqueIds that could not be resolved at load are kept and
+  resolved by the next `refresh_netlist`
+
+### Added
+- `set_project_dir` / `refresh_netlist` responses include `component_count`, and
+  `refdes_without_metadata` when netlist refdes are missing from every parsed sheet
+- `package_for_xfn` warns when the snapshot is missing components from failed sheets
+
 ## [0.3.0] - 2026-07-19
 
 ### Added

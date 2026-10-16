@@ -17,6 +17,11 @@ try:
 except ImportError:
     from server.parsers.sch_doc import ComponentMeta, parse_sch_doc
 
+try:
+    from parsers.prj_pcb import parse_prj_pcb
+except ImportError:
+    from server.parsers.prj_pcb import parse_prj_pcb
+
 # When bundled with PyInstaller (--onefile), data files are extracted to sys._MEIPASS.
 # In normal Python execution, scripts live next to this file.
 if getattr(sys, "frozen", False):
@@ -65,6 +70,52 @@ def enrich_netlist(netlist: dict, components: dict[str, "ComponentMeta"],
 
     netlist["components"] = result
     return netlist
+
+
+def is_netlist_fresh(net_path: str | Path, sources: list[str | Path]) -> bool:
+    """True when the .NET is at least as new as every source file on disk.
+
+    Sources that cannot be stat'ed (listed in the .PrjPcb but missing) are skipped —
+    Altium could not have compiled them either, and enrichment reports them as sheet
+    errors. With no readable source at all the cache is not trusted.
+    """
+    net_mtime = Path(net_path).stat().st_mtime
+    src_mtimes = []
+    for src in sources:
+        try:
+            src_mtimes.append(Path(src).stat().st_mtime)
+        except OSError:
+            continue
+    return bool(src_mtimes) and net_mtime >= max(src_mtimes)
+
+
+def netlist_sources(project_path: str, sheet_paths: list[str]) -> list[Path]:
+    """Files whose saves make the .NET stale: the .PrjPcb, the sheets it lists, and any
+    other .SchDoc in those folders.
+
+    The extra sheets cover a sheet added in Altium and saved before the project itself
+    was saved — it is compiled into the .NET but not yet listed in the .PrjPcb on disk.
+    They only drive freshness, never enrichment.
+    """
+    sources = [Path(project_path), *(Path(p) for p in sheet_paths)]
+    folders = dict.fromkeys(p.parent for p in sources)
+    for folder in folders:
+        try:
+            sources.extend(folder.glob("*.[Ss][Cc][Hh][Dd][Oo][Cc]"))
+        except OSError:
+            continue
+    return sources
+
+
+def _sheet_paths_for(project_path: str) -> list[str]:
+    """Schematic sheets listed in the .PrjPcb, wherever they live in the project tree."""
+    if not Path(project_path).exists():
+        return []
+    try:
+        return parse_prj_pcb(project_path).sheet_paths
+    except Exception as e:
+        logging.warning("Could not read sheet list from %s: %s", project_path, e)
+        return []
 
 
 def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
@@ -170,17 +221,44 @@ class AltiumClient:
     def __init__(self):
         self._netlist: dict | None = None
 
-    def _enrich_from_schdocs(self, project_dir: Path, netlist: dict) -> None:
+    def _enrich_from_schdocs(self, sheet_paths: list[str], netlist: dict) -> None:
+        """Parse each .PrjPcb-listed sheet and merge its components into the netlist.
+
+        A sheet that fails to parse is recorded in netlist["sheet_errors"] and skipped,
+        so one bad sheet never discards the components of the others.
+        """
         components: dict = {}
         refdes_to_sheet: dict[str, str] = {}
-        for sch_path in project_dir.glob("*.SchDoc"):
+        sheet_errors: list[dict] = []
+        for sch_path in sheet_paths:
             sheet_name = Path(sch_path).stem
-            sheet_comps = parse_sch_doc(str(sch_path))
-            for r in sheet_comps:
-                refdes_to_sheet[r] = sheet_name
-            components.update(sheet_comps)
+            if not Path(sch_path).is_file():
+                error = "file not found"
+            else:
+                try:
+                    sheet_comps = parse_sch_doc(str(sch_path))
+                except Exception as e:
+                    error = f"{type(e).__name__}: {e}"
+                else:
+                    for r in sheet_comps:
+                        refdes_to_sheet[r] = sheet_name
+                    components.update(sheet_comps)
+                    continue
+            logging.warning("SchDoc enrichment failed for %s: %s", sch_path, error)
+            sheet_errors.append({"sheet": sheet_name, "path": str(sch_path), "error": error})
         enrich_netlist(netlist, components, refdes_to_sheet)
-        netlist["components"] = netlist.get("components", {})
+        netlist["sheet_errors"] = sheet_errors
+
+    def _load_enriched(self, net_path: str | Path, sheet_paths: list[str]) -> dict:
+        """Parse a .NET file and enrich it from the given sheets. Always returns a new dict."""
+        netlist = parse_protel_netlist(str(net_path))
+        try:
+            self._enrich_from_schdocs(sheet_paths, netlist)
+        except Exception as e:
+            logging.warning("SchDoc enrichment failed: %s", e)
+            netlist["components"] = {}
+            netlist["sheet_errors"] = [{"sheet": "*", "path": "", "error": f"{type(e).__name__}: {e}"}]
+        return netlist
 
     def get_status(self) -> dict:
         result = json.loads(_run_ps("get_altium_status.ps1"))
@@ -194,18 +272,20 @@ class AltiumClient:
             result["warning"] = "no_sheet_open"
         return result
 
-    def load_netlist_from_file(self, net_path: str, project_dir: str) -> None:
+    def load_netlist_from_file(self, net_path: str, sheet_paths: list[str]) -> None:
         """Load netlist from an existing .NET file without triggering Altium automation."""
-        netlist = parse_protel_netlist(net_path)
-        try:
-            self._enrich_from_schdocs(Path(project_dir), netlist)
-        except Exception as e:
-            logging.warning("SchDoc enrichment failed: %s", e)
-        self._netlist = netlist
+        self._netlist = self._load_enriched(net_path, sheet_paths)
 
-    def generate_netlist(self, project_path: str) -> bool:
+    def generate_netlist(self, project_path: str, sheet_paths: list[str] | None = None) -> bool:
+        """Load the project netlist, regenerating it through Altium when it is stale.
+
+        sheet_paths defaults to the sheets listed in the .PrjPcb. Returns True when
+        Altium regenerated the .NET, False when the existing file was fresh.
+        """
         project_dir = Path(project_path).parent
         project_name = Path(project_path).stem
+        if sheet_paths is None:
+            sheet_paths = _sheet_paths_for(project_path)
 
         def _find_net_file() -> Path | None:
             matches = list(project_dir.rglob(f"{project_name}.NET"))
@@ -218,29 +298,45 @@ class AltiumClient:
         # Cache check — skip GUI automation if .NET is newer than all source files.
         if netlist_path is not None and netlist_path.exists():
             try:
-                net_mtime = netlist_path.stat().st_mtime
-                source_files = list(project_dir.glob("*.SchDoc"))
-                prj_pcb = Path(project_path)
-                if prj_pcb.exists():
-                    source_files.append(prj_pcb)
-                if source_files:
-                    max_src_mtime = max(f.stat().st_mtime for f in source_files)
-                    if net_mtime >= max_src_mtime:
-                        logging.info("Netlist cache is fresh — skipping generation")
-                        netlist = parse_protel_netlist(str(netlist_path))
-                        try:
-                            self._enrich_from_schdocs(project_dir, netlist)
-                        except Exception as e:
-                            logging.warning("SchDoc enrichment failed: %s", e)
-                        self._netlist = netlist
-                        return False  # cache hit — nothing regenerated
-            except Exception as e:
+                fresh = is_netlist_fresh(netlist_path, netlist_sources(project_path, sheet_paths))
+            except OSError as e:
                 logging.warning("Cache check failed, regenerating: %s", e)
+                fresh = False
+            if fresh:
+                logging.info("Netlist cache is fresh — skipping generation")
+                try:
+                    self._netlist = self._load_enriched(netlist_path, sheet_paths)
+                    return False  # cache hit — nothing regenerated
+                except Exception as e:
+                    logging.warning("Cached netlist unreadable, regenerating: %s", e)
 
-        # Remove stale netlist so we can detect when Altium writes a fresh one
+        # Move the stale netlist aside so we can detect when Altium writes a fresh one.
+        # It is restored if regeneration fails, so a closed or unresponsive Altium never
+        # costs the user their only netlist.
+        backup: Path | None = None
         if netlist_path is not None and netlist_path.exists():
-            netlist_path.unlink()
+            backup = netlist_path.with_name(netlist_path.name + ".bak")
+            netlist_path.replace(backup)
 
+        # Backup housekeeping is best-effort: a sync client or AV holding the .bak must
+        # neither turn a successful regeneration into an error nor mask the real failure.
+        try:
+            regenerated = self._regenerate(sheet_paths, _find_net_file)
+        except BaseException:
+            if backup is not None and backup.exists() and _find_net_file() is None:
+                try:
+                    backup.replace(netlist_path)
+                except OSError as e:
+                    logging.warning("Could not restore %s: %s", backup, e)
+            raise
+        if backup is not None:
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError as e:
+                logging.warning("Could not remove %s: %s", backup, e)
+        return regenerated
+
+    def _regenerate(self, sheet_paths: list[str], _find_net_file) -> bool:
         max_attempts = 3
         per_attempt_timeout = 15  # seconds per attempt
 
@@ -261,12 +357,7 @@ class AltiumClient:
             while time.time() - start_time < per_attempt_timeout:
                 found = _find_net_file()
                 if found is not None and found.exists():
-                    netlist = parse_protel_netlist(str(found))
-                    try:
-                        self._enrich_from_schdocs(project_dir, netlist)
-                    except Exception as e:
-                        logging.warning("SchDoc enrichment failed: %s", e)
-                    self._netlist = netlist
+                    self._netlist = self._load_enriched(found, sheet_paths)
                     return True  # PowerShell ran, netlist regenerated
                 time.sleep(1)
 

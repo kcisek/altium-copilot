@@ -107,15 +107,19 @@ def test_generate_netlist_regenerates_when_schdoc_is_newer(tmp_path):
     net_file = outputs_dir / "myproj.NET"
     net_file.write_text("(\nOLD_NET\nR1-1\n)\n", encoding="utf-8")
 
-    # .SchDoc is newer than the .NET
+    # The .PrjPcb lists top.SchDoc and is older than the .NET ...
+    prj = proj_dir / "myproj.PrjPcb"
+    prj.write_text("[Document1]\nDocumentPath=top.SchDoc\n", encoding="utf-8")
+    past = net_file.stat().st_mtime - 100
+    os.utime(prj, (past, past))
+
+    # ... but the listed .SchDoc is newer than the .NET
     sch = proj_dir / "top.SchDoc"
     sch.write_text("", encoding="utf-8")
     future = net_file.stat().st_mtime + 100
     os.utime(sch, (future, future))
 
-    proj_dir / "myproj.PrjPcb"  # doesn't exist, that's fine
-
-    project_path = str(proj_dir / "myproj.PrjPcb")
+    project_path = str(prj)
     client = AltiumClient()
 
     def fake_run_ps(script, **kwargs):
