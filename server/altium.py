@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 try:
     from netlist_parser import parse_protel_netlist
@@ -151,6 +151,54 @@ def _run_ps(script: str, **params: str) -> str:
     return result.stdout.strip()
 
 
+# Altium Designer 17 and older (DXP.exe) lead the title bar with the product, then the
+# focused document's full path, then the project:
+#   "Altium Designer (14.3) - C:\Work\Board\Power.SchDoc - Board.PrjPcb. Licensed to ..."
+# The document group is greedy, so " - " inside a folder name stays part of the path.
+_LEGACY_TITLE = re.compile(
+    r"^Altium Designer[^-]*?\s-\s(?:(?P<document>.*)\s-\s)?"
+    r"(?:.*?[\\/])?(?P<project>[^\\/]+?\.PrjPcb)(?=$|[\s.])",
+    re.IGNORECASE,
+)
+
+
+def _parse_legacy_title(title: str) -> tuple[str, str]:
+    """(project_file, document_path) from a DXP.exe title bar; ("", "") if it has no project."""
+    m = _LEGACY_TITLE.match(title)
+    if not m:
+        return "", ""
+    # "*" is not valid in a Windows file name, so a trailing " *" is an unsaved-changes marker.
+    return m["project"], (m["document"] or "").rstrip(" *").strip()
+
+
+def _find_project_near(document: str, project_file: str) -> str:
+    """Path of project_file in the document's folder or the nearest parent folder holding it."""
+    doc = Path(document)
+    if not doc.is_absolute():
+        return ""
+    for folder in doc.parents:
+        candidate = folder / project_file
+        if os.path.isfile(candidate):
+            return str(candidate)
+    return ""
+
+
+def _apply_legacy_title(status: dict, title: str) -> None:
+    """Fill project_file, project_path and active_tab for Altium Designer 17 and older.
+
+    get_altium_status.ps1 leaves the title of a DXP.exe window unparsed because its layout
+    differs from X2.exe. The project is looked up from the focused document's folder
+    instead of the X2 search under Public Documents\\Altium.
+    """
+    project_file, document = _parse_legacy_title(title)
+    if not project_file:
+        return
+    status["project_file"] = project_file
+    if document and PureWindowsPath(document).suffix:
+        status["active_tab"] = PureWindowsPath(document).name
+        status["project_path"] = _find_project_near(document, project_file)
+
+
 def _classify_tab(tab: str) -> str:
     lower = tab.lower()
     if lower.endswith(".schdoc"):
@@ -264,6 +312,9 @@ class AltiumClient:
         result = json.loads(_run_ps("get_altium_status.ps1"))
         if not result.get("running"):
             return result
+        title = result.pop("window_title", "")
+        if (result.get("process") or "").upper() == "DXP":
+            _apply_legacy_title(result, title)
         result["tab_type"] = _classify_tab(result.get("active_tab", ""))
         if not result.get("project_file"):
             # Can't tell from the title bar whether no project is loaded or a project

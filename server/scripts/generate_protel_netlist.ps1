@@ -21,6 +21,7 @@ using System.Text;
 public class AltiumNetlistGenerator {
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
     [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr hWnd, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
@@ -38,20 +39,32 @@ public class AltiumNetlistGenerator {
 
     private static IntPtr _hwnd = IntPtr.Zero;
 
-    public static bool FindAndActivate() {
+    // pids: the running X2/DXP processes. Only their windows are candidates, so a browser
+    // tab titled "Altium Designer ..." never receives the keystrokes. The TDocumentForm
+    // main window is preferred; older DXP builds fall back to any visible window titled
+    // "Altium Designer" except the VCL TApplication window.
+    public static bool FindAndActivate(int[] pids) {
         _hwnd = IntPtr.Zero;
+        IntPtr fallback = IntPtr.Zero;
         EnumWindows((hwnd, lp) => {
-            if (IsWindowVisible(hwnd)) {
-                var sb = new StringBuilder(512);
-                GetWindowText(hwnd, sb, 512);
-                if (sb.ToString().Contains("Altium Designer")) {
-                    _hwnd = hwnd;
-                    return false;
-                }
+            uint pid;
+            GetWindowThreadProcessId(hwnd, out pid);
+            if (Array.IndexOf(pids, (int)pid) < 0 || !IsWindowVisible(hwnd)) return true;
+            var sb = new StringBuilder(512);
+            GetWindowText(hwnd, sb, 512);
+            if (!sb.ToString().Contains("Altium Designer")) return true;
+            var cls = new StringBuilder(256);
+            GetClassName(hwnd, cls, 256);
+            if (cls.ToString() == "TDocumentForm") {
+                _hwnd = hwnd;
+                return false;
             }
+            if (fallback == IntPtr.Zero && cls.ToString() != "TApplication")
+                fallback = hwnd;
             return true;
         }, IntPtr.Zero);
 
+        if (_hwnd == IntPtr.Zero) _hwnd = fallback;
         if (_hwnd == IntPtr.Zero) return false;
 
         if (IsIconic(_hwnd))
@@ -76,7 +89,9 @@ public class AltiumNetlistGenerator {
 }
 '@
 
-if (-not [AltiumNetlistGenerator]::FindAndActivate()) {
+# Altium Designer 18+ runs as X2.exe; Altium Designer 17 and older run as DXP.exe.
+$altiumPids = [int[]]@(Get-Process -Name "X2", "DXP" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+if (-not [AltiumNetlistGenerator]::FindAndActivate($altiumPids)) {
     @{ success = $false; error = "Altium Designer window not found. Is it running?" } |
         ConvertTo-Json -Compress | Write-Output
     exit 1
