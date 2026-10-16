@@ -22,8 +22,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   leaving the project without a netlist
 - Stale-designator DNP UniqueIds that could not be resolved at load are kept and
   resolved by the next `refresh_netlist`
+- Netlist generation only activates a window owned by Altium. Before, the first visible
+  window with "Altium Designer" in its title got the keystrokes, which could be a
+  browser tab
 
 ### Added
+- Altium Designer 17 and older, which run as `DXP.exe` (e.g. 14.3), are now detected
+  alongside `X2.exe` (AD 18+). Their title bar (`Altium Designer (14.3) - <sheet path> -
+  <project>.PrjPcb. Licensed to …`) gives the project, active sheet and project path. The
+  project path is found in the sheet's folder or a parent folder
+  ([ee-in-a-box/altium-copilot#5](https://github.com/ee-in-a-box/altium-copilot/issues/5))
 - `set_project_dir` / `refresh_netlist` responses include `component_count`, and
   `refdes_without_metadata` when netlist refdes are missing from every parsed sheet
 - `package_for_xfn` warns when the snapshot is missing components from failed sheets
