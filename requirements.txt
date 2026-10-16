@@ -1,5 +1,9 @@
 # MCP server framework (official SDK — FastMCP class is included)
-mcp>=1.0.0
+# Pinned <2: mcp 2.x removed mcp.server.fastmcp, which server/main.py imports.
+mcp>=1.0.0,<2
+
+# HTTP client for the release auto-update check (server/main.py imports it directly)
+httpx
 
 # Altium .SchDoc parser — OLE2 compound document format
 olefile>=0.47
