@@ -1,4 +1,5 @@
-"""Designer-added information for the loaded project, rendered as compact text.
+"""Designer-added information for the loaded project, rendered as compact text and as
+rows for the package_for_xfn snapshot.
 
 Sources: project parameters (.PrjPcb), per-sheet annotations (.SchDoc notes, text
 frames, labels, pictures, directives, title block) and Draftsman documents (.PCBDwf).
@@ -91,27 +92,38 @@ def _split_plus(expression: str) -> list[str]:
     return parts + [current]
 
 
+def _unset(value: str) -> bool:
+    return value in ("", "*")  # "*" is Altium's placeholder for a parameter not filled in
+
+
 def resolve_special_string(text: str, *parameter_sets: dict[str, str], depth: int = 0) -> str | None:
     """The value Altium shows for a special string, or None if it cannot be worked out.
 
     A special string is "=Name" or a "+" expression of names and quoted literals
     ("=PrjName + '-v' + Revision"). Names are matched case-insensitively against the
-    parameter sets in order (the sheet's own before the project's), and a value that is
-    itself a special string ("Revision" = "=SCH_Rev") is followed. None when the text is
-    not a special string or uses a name none of the sets has.
+    parameter sets in order (the sheet's own before the project's); a set whose value is
+    "*" or empty does not count, so the next one is used. A value that is itself a
+    special string ("Revision" = "=SCH_Rev") is followed. A name that only has unset
+    values shows as nothing. None when the text is not a special string or uses a name
+    no set has.
     """
     if not text.startswith("=") or depth > 5:
         return None
     lookup: dict[str, str] = {}
-    for params in reversed(parameter_sets):  # earlier sets win
-        lookup.update({k.lower(): v for k, v in params.items()})
+    for params in parameter_sets:
+        for key, value in params.items():
+            if not _unset(value):
+                lookup.setdefault(key.lower(), value)
+    known = {key.lower() for params in parameter_sets for key in params}
     out = []
     for part in (p.strip() for p in _split_plus(text[1:])):
         if len(part) >= 2 and part[0] == part[-1] and part[0] in "'\"":
             out.append(part[1:-1])
             continue
         value = lookup.get(part.lower())
-        if value is not None and value.startswith("="):
+        if value is None and part.lower() in known:
+            value = ""  # defined, but nowhere filled in
+        elif value is not None and value.startswith("="):
             value = resolve_special_string(value, *parameter_sets, depth=depth + 1)
         if value is None:
             return None
@@ -119,30 +131,54 @@ def resolve_special_string(text: str, *parameter_sets: dict[str, str], depth: in
     return "".join(out)
 
 
-def render_sheet_notes(name: str, notes: SheetAnnotations,
-                       project_parameters: dict[str, str] | None = None) -> str:
+# Sheet parameters Altium computes when it draws them; the stored record is not the value.
+_COMPUTED_PARAMETERS = {
+    "currenttime", "currentdate", "time", "date", "documentfullpathandname", "documentname",
+    "modifieddate", "application_buildnumber", "projectname",
+}
+
+
+def resolved_sheet(notes: SheetAnnotations, project: dict, sheet_path: str) -> SheetAnnotations:
+    """The sheet's notes with special strings ("=Revision", "=A + '-' + B") replaced by
+    what Altium displays: label, text-frame and note text, and title-block values.
+
+    Names resolve against the sheet's parameters, then the project's, then the values
+    Altium computes itself that are known here (ProjectName, DocumentName). A text that
+    resolves to nothing is dropped, as nothing is drawn on the sheet; one that cannot be
+    resolved is kept as typed.
+    """
+    sheet = {k: v for k, v in notes.sheet_parameters.items() if k.lower() not in _COMPUTED_PARAMETERS}
+    built_in = {"DocumentName": Path(sheet_path).name}
+    if project.get("prj_pcb_path"):
+        built_in["ProjectName"] = Path(project["prj_pcb_path"]).name
+    sets = (sheet, project.get("parameters") or {}, built_in)
+
     def shown(text: str) -> str:
-        """Special strings ("=Revision", "=A + '-' + B") as Altium displays them."""
-        resolved = resolve_special_string(text, notes.sheet_parameters, project_parameters or {})
+        resolved = resolve_special_string(text, *sets)
         return text if resolved is None else resolved
 
     items = []
     for item in notes.items:
         if item.kind != "image" and item.text.startswith("="):
             text = shown(item.text)
-            if text in ("", "*"):
-                continue  # an empty parameter: nothing is shown on the sheet
+            if not text.strip():
+                continue
             item = replace(item, text=text)
         items.append(item)
+    return replace(notes, items=items,
+                   title_block={k: shown(v) for k, v in notes.title_block.items()})
+
+
+def render_sheet_notes(name: str, notes: SheetAnnotations) -> str:
+    """One sheet's notes as text; pass them through resolved_sheet first."""
+    items = notes.items
     texts = [i for i in items if i.kind != "image"]
     images = [i for i in items if i.kind == "image"]
     lines = [
         f"sheet:{name} notes:{len(texts)} images:{len(images)} directives:{len(notes.directives)}"
     ]
     if notes.title_block:
-        lines.append("  title_block: " + "; ".join(
-            f"{k}={shown(v)}" for k, v in notes.title_block.items()
-        ))
+        lines.append("  title_block: " + "; ".join(f"{k}={v}" for k, v in notes.title_block.items()))
     if notes.template:
         lines.append(f"  template: {PureWindowsPath(notes.template).name}")
     for item in items:
@@ -255,23 +291,132 @@ def render_draftsman(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str])
                 lines.append(f"    [view] {item.view}{side}{layer}{title}")
     if doc.drill_table:
         lines.append("  drill_table (cached from the board at last_update):")
-        for row in doc.drill_table:
-            size = f"{row['size_mm']:.3f}" if row["size_mm"] is not None else "?"
-            line = (
-                f"    {size} mm {'plated' if row['plated'] else 'non-plated'} "
-                f"{row['type']} {row['span']} x{row['count']}"
-            )
-            if row.get("slot_length_mm"):
-                line += f" slot {row['slot_length_mm']:.3f} mm"
-            if row.get("backdrill"):
-                line += " backdrill"
-            lines.append(line)
+        lines.extend("    " + _drill_text(row) for row in doc.drill_table)
     if doc.layer_notes:
         lines.append("  layer_stack_notes:")
         for layer in doc.layer_notes:
-            details = "; ".join(f"{k}={v}" for k, v in layer.items() if k != "layer")
-            lines.append(f"    {layer['layer']}: {details}")
+            lines.append(f"    {layer['layer']}: {_layer_note_text(layer)}")
     return "\n".join(lines)
+
+
+def _drill_text(row: dict) -> str:
+    size = f"{row['size_mm']:.3f}" if row["size_mm"] is not None else "?"
+    text = (
+        f"{size} mm {'plated' if row['plated'] else 'non-plated'} "
+        f"{row['type']} {row['span']} x{row['count']}"
+    )
+    if row.get("slot_length_mm"):
+        text += f" slot {row['slot_length_mm']:.3f} mm"
+    if row.get("backdrill"):
+        text += " backdrill"
+    return text
+
+
+def _layer_note_text(layer: dict) -> str:
+    return "; ".join(f"{k}={v}" for k, v in layer.items() if k != "layer")
+
+
+def _note_row(document_kind: str, document: str, kind: str, *, text: str | None = "",
+              title: str | None = None, page: int | None = None, author: str | None = None,
+              near: list[str] | None = None, data: dict | None = None) -> dict:
+    return {
+        "document_kind": document_kind, "document": document, "kind": kind, "page": page,
+        "title": title, "text": text or "", "author": author,
+        "near_refdes": list(near or []), "data": data or {},
+    }
+
+
+def _sheet_rows(name: str, notes: SheetAnnotations) -> list[dict]:
+    rows = []
+    for item in notes.items:
+        data = {"x_mil": item.x_mil, "y_mil": item.y_mil,
+                "width_mil": item.width_mil, "height_mil": item.height_mil}
+        if item.kind == "image":
+            data.update(file_name=item.file_name, embedded=item.embedded,
+                        image_index=item.image_index, captions=item.captions)
+            rows.append(_note_row("sheet", name, "image", title=item.file_name,
+                                  text="\n".join(item.captions), near=item.near, data=data))
+            continue
+        if item.kind == "note":
+            data["collapsed"] = item.collapsed
+        rows.append(_note_row("sheet", name, item.kind, text=item.text, author=item.author,
+                              near=item.near, data=data))
+    for directive in notes.directives:
+        rows.append(_note_row(
+            "sheet", name, "directive", title=directive.name,
+            text=", ".join(f"{k}={v}" for k, v in directive.parameters.items()),
+            data={"parameters": directive.parameters,
+                  "x_mil": directive.x_mil, "y_mil": directive.y_mil},
+        ))
+    rows += [_note_row("sheet", name, "title_block", title=k, text=v)
+             for k, v in notes.title_block.items()]
+    if notes.template:
+        rows.append(_note_row("sheet", name, "template", text=PureWindowsPath(notes.template).name,
+                              data={"path": notes.template}))
+    return rows
+
+
+def _draftsman_rows(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str]) -> list[dict]:
+    rows = [_note_row("draftsman", name, "drawing", text=doc.source_pcb, data={
+        "source_pcb": doc.source_pcb,
+        "matches_project_pcb": bool(doc.source_pcb) and any(
+            _same_path(doc.source_pcb, p) for p in project_pcb_paths),
+        "last_update": doc.last_update,
+        "pages": doc.pages,
+    })]
+    rows += [_note_row("draftsman", name, "parameter", title=k, text=v)
+             for k, v in doc.parameters.items()]
+    for item in doc.items:
+        data = {"from_template": item.from_template}
+        if item.kind == "note":
+            data["lines"] = item.lines
+            text = "\n".join(f"{n}. {line}" for n, line in enumerate(item.lines, start=1))
+        elif item.kind == "table":
+            data["rows"] = item.rows
+            text = "\n".join(" | ".join(row) for row in item.rows)
+        elif item.kind == "picture":
+            data.update(picture_index=item.picture_index,
+                        width_mm=item.width_mm, height_mm=item.height_mm)
+            text = ""
+        elif item.kind == "view":
+            data.update(view=item.view, side=item.side, layer=item.layer)
+            text = item.view + (f", {item.side} side" if item.side else "")
+        else:
+            text = item.text
+        rows.append(_note_row("draftsman", name, item.kind, title=item.title, text=text,
+                              page=item.page, data=data))
+    rows += [_note_row("draftsman", name, "drill", text=_drill_text(row), data=row)
+             for row in doc.drill_table]
+    rows += [_note_row("draftsman", name, "layer_note", title=layer["layer"],
+                       text=_layer_note_text(layer), data=layer)
+             for layer in doc.layer_notes]
+    return rows
+
+
+def note_rows(cache: DesignNotesCache, project: dict) -> tuple[list[dict], list[dict]]:
+    """The package_for_xfn notes table: what get_design_notes reports, one row per item.
+
+    Pictures are described (file name, size, index) without their image data.
+    Returns (rows, errors); errors list [{document_kind, document, error}] for documents
+    that could not be read, so the export can go ahead without them.
+    """
+    rows = [_note_row("project", project["name"], "parameter", title=k, text=v)
+            for k, v in (project.get("parameters") or {}).items()]
+    errors = []
+    documents = [("sheet", s) for s in project.get("sheets") or []]
+    documents += [("draftsman", d) for d in draftsman_documents(project)]
+    for kind, doc in documents:
+        try:
+            if kind == "sheet":
+                rows += _sheet_rows(doc["name"],
+                                    resolved_sheet(cache.sheet(doc["path"]), project, doc["path"]))
+            else:
+                rows += _draftsman_rows(doc["name"], cache.draftsman(doc["path"]),
+                                        project.get("pcb_doc_paths") or [])
+        except Exception as e:
+            errors.append({"document_kind": kind, "document": doc["name"],
+                           "error": f"{type(e).__name__}: {e}"})
+    return rows, errors
 
 
 def render_project_parameters(project: dict) -> str | None:
@@ -284,8 +429,8 @@ def render_project_parameters(project: dict) -> str | None:
 def _section(cache: DesignNotesCache, project: dict, kind: str, doc: dict) -> str:
     try:
         if kind == "sheet":
-            return render_sheet_notes(doc["name"], cache.sheet(doc["path"]),
-                                      project.get("parameters") or {})
+            return render_sheet_notes(doc["name"],
+                                      resolved_sheet(cache.sheet(doc["path"]), project, doc["path"]))
         return render_draftsman(doc["name"], cache.draftsman(doc["path"]),
                                 project.get("pcb_doc_paths") or [])
     except Exception as e:

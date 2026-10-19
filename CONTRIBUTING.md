@@ -20,7 +20,7 @@ build and publish workflow. Contributors cannot ship a release.
 
 ## DB Schema Changes
 
-`server/export.py` defines `SCHEMA_VERSION = 1`. Any PR that changes the SQLite
+`server/export.py` defines `SCHEMA_VERSION` (currently 2). Any PR that changes the SQLite
 schema in `_create_schema()` **must** also:
 
 1. Bump `SCHEMA_VERSION` in `server/export.py`

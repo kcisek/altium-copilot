@@ -135,9 +135,25 @@ def _jpeg(width: int, height: int) -> bytes:
     (bmp_to_png(_bmp(3, 2, PICTURE)), (3, 2)),
     (b"GIF89a" + struct.pack("<HH", 640, 480) + b"\0" * 10, (640, 480)),
     (_jpeg(1024, 768), (1024, 768)),
-    (b"RIFF\0\0\0\0WEBPVP8 ", None),  # not read: no WebP pictures in Altium files seen
+    (b"RIFF\0\0\0\0WEBPVP8 ", None),  # too short to hold a size
     (b"\xff\xd8\xff\xe0\x00", None),   # truncated JPEG
     (b"%PDF-1.7", None),
 ])
 def test_image_size(data, expected):
+    assert image_size(data) == expected
+
+
+def test_jpeg_size_skips_fill_bytes_and_standalone_markers():
+    sof = b"\xff\xff\xff\xc2" + struct.pack(">HBHHB", 17, 8, 40, 9000, 3) + b"\0" * 9  # progressive, after fill
+    assert image_size(b"\xff\xd8" + b"\xff\xd0" + sof) == (9000, 40)
+
+
+@pytest.mark.parametrize("chunk,payload,expected", [
+    # payload = chunk size (4 bytes), then the chunk's own header
+    (b"VP8X", b"\0" * 4 + b"\0" * 4 + (8999).to_bytes(3, "little") + (99).to_bytes(3, "little"), (9000, 100)),
+    (b"VP8 ", b"\0" * 4 + b"\0" * 3 + b"\x9d\x01\x2a" + struct.pack("<HH", 9000, 0x4000 | 300), (9000, 300)),
+    (b"VP8L", b"\0" * 4 + b"\x2f" + ((8999) | (499 << 14)).to_bytes(4, "little"), (9000, 500)),
+])
+def test_webp_size(chunk, payload, expected):
+    data = b"RIFF\0\0\0\0WEBP" + chunk + payload + b"\0" * 8
     assert image_size(data) == expected

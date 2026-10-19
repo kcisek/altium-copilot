@@ -9,6 +9,7 @@ import pytest
 from mcp.server.fastmcp import Image
 
 import main
+import parsers.pcb_dwf as pcb_dwf
 import services.design_notes as design_notes
 from parsers.prj_pcb import PrjPcbData, VariantDefinition, VariantState, parse_prj_pcb
 from parsers.sch_doc import SheetAnnotation, SheetAnnotations
@@ -123,23 +124,52 @@ def test_resolve_special_string_stops_on_a_cycle():
     assert design_notes.resolve_special_string("=A", {"A": "=B", "B": "=A"}) is None
 
 
-def test_sheet_notes_show_special_strings_as_displayed():
-    notes = SheetAnnotations(
+def _sheet_with_specials() -> SheetAnnotations:
+    return SheetAnnotations(
         items=[
             SheetAnnotation(kind="label", text="=PrjMPN + '-v' + PrjVersion"),
             SheetAnnotation(kind="text_frame", text="=Unset"),
             SheetAnnotation(kind="label", text="=Unknown + 'x'"),
+            SheetAnnotation(kind="label", text="=ProjectName + ' ' + DocumentName"),
+            SheetAnnotation(kind="label", text="='Drawn by ' + DrawnBy"),
+            SheetAnnotation(kind="label", text="='Printed ' + CurrentDate"),
         ],
         title_block={"Revision": "=SCH_Revision", "Title": "Main"},
-        sheet_parameters={"Unset": "*", "Revision": "=SCH_Revision", "Title": "Main"},
+        sheet_parameters={
+            "Unset": "*", "Revision": "=SCH_Revision", "Title": "Main",
+            # Stored placeholders and computed values Altium does not draw as stored:
+            "ProjectName": "*", "DrawnBy": "*", "CurrentDate": "Not shown in title block",
+        },
     )
-    text = design_notes.render_sheet_notes(
-        "S", notes, {"PrjMPN": "E002", "PrjVersion": "6.0", "SCH_Revision": "B"})
+
+
+def test_sheet_notes_show_special_strings_as_displayed():
+    project = {"prj_pcb_path": "C:/Boards/BMS.PrjPcb",
+               "parameters": {"PrjMPN": "E002", "PrjVersion": "6.0", "SCH_Revision": "B", "DrawnBy": "KPC"}}
+    notes = design_notes.resolved_sheet(_sheet_with_specials(), project, "C:/Boards/Power.SchDoc")
+    text = design_notes.render_sheet_notes("S", notes)
     assert "[label] E002-v6.0" in text
-    assert "=Unset" not in text  # an empty parameter shows nothing on the sheet
-    assert "[label] =Unknown + 'x'" in text  # unresolved: shown as typed
+    assert "=Unset" not in text  # set nowhere: nothing is drawn on the sheet
+    assert "[label] =Unknown + 'x'" in text  # unknown name: shown as typed
+    assert "[label] BMS.PrjPcb Power.SchDoc" in text  # built in, not the stored "*"
+    assert "[label] Drawn by KPC" in text  # the sheet's "*" falls through to the project
+    assert "[label] ='Printed ' + CurrentDate" in text  # computed when printed: left as typed
     assert "title_block: Revision=B; Title=Main" in text
-    assert text.startswith("sheet:S notes:2 ")
+    assert text.startswith("sheet:S notes:5 ")
+
+
+def test_project_parameters_reach_sheet_notes_and_snapshot_rows(project, cache):
+    notes = SheetAnnotations(items=[SheetAnnotation(kind="label", text="=PrjName + '-x'")],
+                             title_block={"Rev": "=PrjPCBRev"})
+    with patch.object(cache, "sheet", return_value=notes):
+        text = build_design_notes(cache, project, "sheet1")
+        context = sheet_notes_for_context(cache, project, "sheet1")
+        rows, _ = design_notes.note_rows(cache, project)
+    for shown in (text, context):
+        assert "[label] BMS_11-x" in shown and "title_block: Rev=1" in shown
+    sheet_rows = {r["kind"]: r for r in rows if r["document"] == "sheet1"}
+    assert sheet_rows["label"]["text"] == "BMS_11-x"
+    assert sheet_rows["title_block"]["text"] == "1"
 
 
 def test_pagination(project, cache, monkeypatch):
@@ -268,11 +298,12 @@ def test_draftsman_picture(project, cache):
 
 
 def test_draftsman_pictures_come_from_the_cached_parse(project, cache):
-    with patch.object(design_notes, "parse_pcb_dwf", wraps=design_notes.parse_pcb_dwf) as parse:
+    # The file is decoded once for the notes; pictures, and bad indexes, reuse that parse.
+    with patch.object(pcb_dwf, "_decode", wraps=pcb_dwf._decode) as decode:
         build_design_notes(cache, project, "Fab")
-        main._get_design_image_impl(project, cache, "Fab", 0)
-        main._get_design_image_impl(project, cache, "Fab", 7)
-    assert parse.call_count == 1
+        assert isinstance(main._get_design_image_impl(project, cache, "Fab", 0), Image)
+        assert main._get_design_image_impl(project, cache, "Fab", 7)["error"] == "image_not_found"
+    assert decode.call_count == 1
 
 
 def test_embedded_schematic_picture_becomes_png(project, cache):

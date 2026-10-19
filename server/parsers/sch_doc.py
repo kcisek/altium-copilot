@@ -430,9 +430,12 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
         result.items.append(item)
 
     components = [(designators[pos], box) for pos, box in part_boxes.items() if designators.get(pos)]
-    texts = [(i.text, rects[id(i)]) for i in result.items if i.kind != "image"]
+    # A special string ("=A + '-' + B") is drawn as its value, whose extent is unknown
+    # here, so it is not related to nearby parts or pictures.
+    texts = [(i.text, rects[id(i)]) for i in result.items
+             if i.kind != "image" and not i.text.startswith("=")]
     for item in result.items:
-        if item.kind != "image":
+        if item.kind != "image" and not item.text.startswith("="):
             item.near = _closest(rects[id(item)], components, NEAR_COMPONENT_MIL, _MAX_NEAR)
         elif item.kind == "image":
             item.captions = _closest(rects[id(item)], texts, CAPTION_MIL, 3)

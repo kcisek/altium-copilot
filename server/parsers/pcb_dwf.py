@@ -12,6 +12,7 @@ view titles, pictures, and the drill table and layer stack data the drawing cach
 the board at its last update.
 """
 import base64
+import binascii
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -156,16 +157,25 @@ def _decode(data: bytes) -> bytearray:
 
 
 def _without_board_copy(xml: bytearray) -> bytes:
-    """The XML with the _SKIPPED_SUBTREES cut out (self-closing ones are left alone)."""
+    """The XML with the first element of each _SKIPPED_SUBTREES tag cut out.
+
+    An element is left in place when it is self-closing (Draftsman writes empty ones as
+    <Tag i:nil="true"/>), has no closing tag, or holds another element of the same name.
+    """
     cuts = []
     for tag in _SKIPPED_SUBTREES:
-        start = xml.find(b"<" + tag)
-        if start < 0 or xml[start + 1 + len(tag) : start + 2 + len(tag)] not in (b" ", b">"):
+        opening = b"<" + tag
+        start = xml.find(opening)
+        if start < 0 or xml[start + len(opening) : start + len(opening) + 1] not in (b" ", b">"):
+            continue
+        start_end = xml.find(b">", start)
+        if start_end < 0 or xml[start_end - 1 : start_end] == b"/":
             continue
         close = b"</" + tag + b">"
-        end = xml.find(close, start)
-        if end >= 0:
-            cuts.append((start, end + len(close)))
+        end = xml.find(close, start_end)
+        if end < 0 or xml.find(opening, start_end, end) >= 0:
+            continue
+        cuts.append((start, end + len(close)))
     kept, pos = [], 0
     for start, end in sorted(cuts):
         if start >= pos:
@@ -213,7 +223,11 @@ def _item_title(item: ET.Element) -> str | None:
 
 
 def _picture_bytes(item: ET.Element) -> bytes:
-    return base64.b64decode(_text(item, "Bitmap") or _text(item, "Bitmap2"))
+    """The picture's image file, or b"" when it cannot be decoded (only that picture fails)."""
+    try:
+        return base64.b64decode(_text(item, "Bitmap") or _text(item, "Bitmap2"))
+    except (binascii.Error, ValueError):
+        return b""
 
 
 def _parse_item(item: ET.Element, page: int, layers: dict[str, str],
@@ -253,12 +267,18 @@ def _parse_item(item: ET.Element, page: int, layers: dict[str, str],
         parsed.kind = "view"
         parsed.view = VIEW_KINDS[kind]
         parsed.side = _text(item, "ViewSide") or None
-        parsed.layer = layers.get(_text(item, "LayerV7Id")) if kind == "BoardFabricationViewData" else None
+        if kind == "BoardFabricationViewData":
+            layer_id = _text(item, "LayerV7Id")
+            parsed.layer = layers.get(layer_id) or _default_layer_name(layer_id)
         title = _item_title(item) or ""
         if parsed.side:
             title = title.replace("=ViewSide", parsed.side)
         if parsed.layer:
             title = title.replace("=ViewLayerName", parsed.layer)
+        scale = _child(item, "Scale")
+        if scale is not None and _text(item, "UseCustomScale") != "true" and \
+                _text(scale, "Numenator") and _text(scale, "Denominator"):
+            title = title.replace("=ViewScale", f"{_text(scale, 'Numenator')}:{_text(scale, 'Denominator')}")
         parsed.title = resolve(title) or None
     else:
         return None
@@ -341,8 +361,28 @@ def _cached_values(root: ET.Element) -> dict[str, str]:
     return values
 
 
+def _default_layer_name(layer_id: str) -> str | None:
+    """Altium's default name for a V7 layer id, for drawings without a cached stack."""
+    try:
+        n = int(layer_id)
+    except ValueError:
+        return None
+    if n == 1:
+        return "Top Layer"
+    if n == 32:
+        return "Bottom Layer"
+    if 2 <= n <= 31:
+        return f"Mid-Layer {n - 1}"
+    if 39 <= n <= 54:
+        return f"Internal Plane {n - 38}"
+    return None
+
+
 def _parse_root(xml: bytearray) -> ET.Element:
-    root = ET.fromstring(_without_board_copy(xml))
+    try:
+        root = ET.fromstring(_without_board_copy(xml))
+    except ET.ParseError:  # the cut went wrong on an unusual file: parse all of it
+        root = ET.fromstring(bytes(xml))
     if _local(root.tag) != "Document" or "PcbDrawing" not in root.tag:
         raise ValueError("not an Altium Draftsman document")
     return root

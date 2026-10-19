@@ -59,8 +59,9 @@ def drawing_xml() -> str:
         '<Document xmlns="http://schemas.datacontract.org/2004/07/Altium.Designer.PcbDrawing.DataSerialization.V1"'
         ' xmlns:i="http://www.w3.org/2001/XMLSchema-instance">'
         "<Id>0</Id><BillOfMaterialsInformation i:nil=\"true\"/>"
-        # The drawing's copy of the board: cut out before parsing.
-        "<BoardAssemblyInformation><Components><Text>board copy</Text></Components></BoardAssemblyInformation>"
+        # The drawing's copy of the board: cut out before parsing. The undeclared "q:"
+        # prefix makes the document unparseable unless the cut happens.
+        "<BoardAssemblyInformation><Components><q:Part>board copy</q:Part></Components></BoardAssemblyInformation>"
         "<DocumentId>ABCDEFGH</DocumentId>"
         f"<DrillTableInformation><Id>0</Id><Holes/><HolesV2>{holes}</HolesV2></DrillTableInformation>"
         "<FormatVersion>24</FormatVersion><LastUpdate>2026-10-01T12:00:00.0000000Z</LastUpdate>"
@@ -93,13 +94,16 @@ def drawing_xml() -> str:
         f"<Bitmap>{TINY_PNG}</Bitmap><Bitmap2/><MaintainAspectRatio>true</MaintainAspectRatio>"
         f"<Rect><Height>{25 * _MM}</Height><Width>{50 * _MM}</Width><X>0</X><Y>0</Y></Rect></Item>"
         '<Item i:type="BoardFabricationViewData"><Id>7</Id><OriginatedFromTemplate>false</OriginatedFromTemplate>'
-        "<LayerV7Id>1</LayerV7Id><ShowTitle>true</ShowTitle><Title>=ViewLayerName (Scale =ViewScale)</Title>"
-        "<ViewSide>Top</ViewSide></Item>"
+        "<LayerV7Id>1</LayerV7Id><Scale><Denominator>1</Denominator><Numenator>3</Numenator></Scale>"
+        "<ShowTitle>true</ShowTitle><Title>=ViewLayerName (Scale =ViewScale)</Title>"
+        "<UseCustomScale>true</UseCustomScale><ViewSide>Top</ViewSide></Item>"
         '<Item i:type="Line"><Id>8</Id></Item>'
         "</Items><StandardSizeName>A4</StandardSizeName><TemplateFileName/></Page>"
         "<Page><Id>9</Id><Items>"
         '<Item i:type="BoardAssemblyViewData"><Id>10</Id><OriginatedFromTemplate>false</OriginatedFromTemplate>'
-        "<Title>View from =ViewSide side (Scale =ViewScale)</Title><ViewSide>Bottom</ViewSide></Item>"
+        "<Scale><Denominator>1</Denominator><Numenator>2</Numenator></Scale>"
+        "<Title>View from =ViewSide side (Scale =ViewScale)</Title><UseCustomScale>false</UseCustomScale>"
+        "<ViewSide>Bottom</ViewSide></Item>"
         '<Item i:type="LayerStackLegendView"><Id>11</Id>'
         f"{_title('Layer Stack Legend')}</Item>"
         "</Items><StandardSizeName>A3</StandardSizeName></Page>"

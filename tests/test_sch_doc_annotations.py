@@ -156,6 +156,17 @@ def test_label_extent_reaches_nearby_component():
     assert notes.items[0].width_mil == pytest.approx(30 * 10 * 0.646 * 1000 / 72 * 0.5)
 
 
+def test_special_string_labels_are_not_related_to_parts_or_pictures():
+    # Drawn as its value, whose size is not known here: no "near", not a caption.
+    notes = _annotations(
+        "|RECORD=4|Location.X=150|Location.Y=100|Text==PrjMPN + '-v' + Version",
+        "|RECORD=30|Location.X=150|Location.Y=110|Corner.X=200|Corner.Y=150|EmbedImage=T|FileName=p",
+    )
+    label = next(i for i in notes.items if i.kind == "label")
+    image = next(i for i in notes.items if i.kind == "image")
+    assert label.near == [] and image.captions == []
+
+
 def test_rotated_label_box_turns_about_its_anchor():
     # Orientation=1 (90 deg), Justification=2 (bottom right): the text runs upward and
     # ends at the anchor, so after turning it lies left of and below the anchor.

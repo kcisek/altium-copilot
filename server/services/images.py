@@ -29,7 +29,7 @@ def image_format(data: bytes) -> str | None:
 
 
 def image_size(data: bytes) -> tuple[int, int] | None:
-    """(width, height) from a PNG, GIF or JPEG header, or None if it cannot be read."""
+    """(width, height) from a PNG, GIF, JPEG or WebP header, or None if it cannot be read."""
     fmt = image_format(data)
     try:
         if fmt == "png":
@@ -37,16 +37,37 @@ def image_size(data: bytes) -> tuple[int, int] | None:
         if fmt == "gif":
             return struct.unpack_from("<HH", data, 6)
         if fmt == "jpeg":
-            pos = 2
-            while pos + 9 <= len(data) and data[pos] == 0xFF:
-                marker = data[pos + 1]
-                # SOFn frame headers (C0-CF except DHT C4, JPG C8, DAC CC): height, width
-                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
-                    height, width = struct.unpack_from(">HH", data, pos + 5)
-                    return width, height
-                pos += 2 + struct.unpack_from(">H", data, pos + 2)[0]
+            return _jpeg_size(data)
+        if fmt == "webp" and len(data) >= 30:
+            chunk = data[12:16]
+            if chunk == b"VP8X":  # extended: 24-bit width-1 and height-1
+                return (1 + int.from_bytes(data[24:27], "little"),
+                        1 + int.from_bytes(data[27:30], "little"))
+            if chunk == b"VP8 ":  # lossy: 14-bit sizes after the frame start code
+                width, height = struct.unpack_from("<HH", data, 26)
+                return width & 0x3FFF, height & 0x3FFF
+            if chunk == b"VP8L":  # lossless: 14-bit width-1 and height-1, bit-packed
+                bits = int.from_bytes(data[21:25], "little")
+                return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
     except struct.error:
         return None
+    return None
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int] | None:
+    pos = 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        while pos + 1 < len(data) and data[pos + 1] == 0xFF:  # fill bytes before a marker
+            pos += 1
+        marker = data[pos + 1]
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:  # standalone markers carry no length
+            pos += 2
+            continue
+        # SOFn frame headers (C0-CF except DHT C4, JPG C8, DAC CC): height, then width
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height, width = struct.unpack_from(">HH", data, pos + 5)
+            return width, height
+        pos += 2 + struct.unpack_from(">H", data, pos + 2)[0]
     return None
 
 

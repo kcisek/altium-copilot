@@ -30,7 +30,7 @@ try:
     from services.pcb_index import PcbIndex
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
-        draftsman_documents, resolve_document, sheet_notes_for_context,
+        draftsman_documents, note_rows, resolve_document, sheet_notes_for_context,
     )
     from services.images import (
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
@@ -46,7 +46,7 @@ except ImportError:
     from server.services.pcb_index import PcbIndex
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
-        draftsman_documents, resolve_document, sheet_notes_for_context,
+        draftsman_documents, note_rows, resolve_document, sheet_notes_for_context,
     )
     from server.services.images import (
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
@@ -1871,13 +1871,15 @@ def _package_for_xfn_impl(
     netlist: dict,
     variant_state,
     version: str,
+    notes_cache: DesignNotesCache | None = None,
 ) -> str:
     # Never ship a hollow snapshot: nets present but no component metadata.
     no_components = netlist.get("pin_to_net") and _no_components_error(netlist)
     if no_components:
         return json.dumps(no_components)
+    notes, notes_errors = note_rows(notes_cache, project) if notes_cache is not None else ([], [])
     try:
-        db_path = export_project(project, netlist, variant_state, version)
+        db_path = export_project(project, netlist, variant_state, version, notes)
     except Exception as e:
         return json.dumps({"error": "export_failed", "message": str(e)})
     prj_pcb_name = Path(project["prj_pcb_path"]).name
@@ -1885,6 +1887,11 @@ def _package_for_xfn_impl(
         f"\nWarning: sheet '{err['sheet']}' failed to load ({err['error']}); "
         "its components are missing from this snapshot."
         for err in netlist.get("sheet_errors") or []
+    )
+    incomplete_warning += "".join(
+        f"\nWarning: the notes of {err['document_kind']} '{err['document']}' could not be read "
+        f"({err['error']}); they are missing from this snapshot."
+        for err in notes_errors
     )
     registry_warning = ""
     try:
@@ -1923,7 +1930,7 @@ def package_for_xfn() -> str:
             "error": "no_project",
             "message": "No project loaded. Ask the user to open a project in Altium first.",
         })
-    return _package_for_xfn_impl(project, netlist, variant_state, _read_version())
+    return _package_for_xfn_impl(project, netlist, variant_state, _read_version(), _design_notes)
 
 
 if __name__ == "__main__":
