@@ -419,3 +419,20 @@ def test_a_fan_out_never_takes_a_part_filed_under_its_own_name():
     })["components"]
     assert comps["TP1V8"]["unique_ids"] == ["B"]
     assert comps["TP1"]["pins"] == {}
+
+
+def test_an_unconnected_compiled_part_keeps_its_own_name():
+    """TP1 has no nets; TP1A is another compiled part whose sheet was not read."""
+    netlist = _netlist("R1")
+    netlist["parts"] = {name: {"footprint": "", "comment": ""} for name in ("R1", "TP1", "TP1A")}
+    tp1 = ComponentMeta(refdes="TP1", unique_id="U", unique_ids=["U"])
+    comps = enrich_netlist(netlist, {"R1": _meta("R1"), "TP1": tp1})["components"]
+    assert "TP1" in comps and "TP1A" not in comps
+
+
+def test_parts_keep_their_sheet_order():
+    netlist = _netlist("R2")
+    comps = enrich_netlist(
+        netlist, {"R1": _meta("R1"), "R2": _meta("R2"), "R3": _meta("R3")}
+    )["components"]
+    assert list(comps) == ["R1", "R2", "R3"]

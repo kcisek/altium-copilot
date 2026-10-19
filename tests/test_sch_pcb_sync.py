@@ -509,13 +509,123 @@ def test_new_net_behind_a_footprint_change():
 
 def test_part_without_sheet_metadata():
     netlist = _netlist()
-    del netlist["components"]["C1"]  # e.g. its sheet failed to parse
+    del netlist["components"]["C1"]  # its sheet failed to parse
+    netlist["sheet_errors"] = [{"sheet": "Caps", "path": "", "error": "boom"}]
     pcb = _pcb(extra_pads=[(GND, 3, "3")])  # C1 pad 3 tied to GND by hand
     result = _check(pcb=pcb, netlist=netlist)
     (link,) = [f for f in result["findings"] if f["check"] == "component_link"]
-    assert "no sheet gave the schematic part's unique ID" in link["issue"]
+    assert "no sheet gave the schematic part's unique ID (see sheet_errors)" in link["issue"]
     (pad,) = [f for f in result["findings"] if f["check"] == "pad_net"]
     assert pad["severity"] == "warning" and "pin list was not read" in pad["issue"]
+    # Without sheet errors (e.g. a sheet missing from the saved .PrjPcb) no pointer.
+    del netlist["sheet_errors"]
+    (link,) = [
+        f for f in _check(pcb=pcb, netlist=netlist)["findings"] if f["check"] == "component_link"
+    ]
+    assert "sheet missing from the saved .PrjPcb" in link["issue"]
+
+
+def test_a_pinless_symbol_with_a_tied_pad():
+    """The sheet was read and the symbol has no pins: the pad has no schematic pin."""
+    pcb = _pcb(
+        extra_components=[_component(6, "MH9", "UMH9", "HOLE")],
+        extra_pads=[(GND, 6, "1")],
+    )
+    netlist = _netlist()
+    _add_part(netlist, "MH9", "HOLE", "UMH9", {})
+    (pad,) = _problems(_check(pcb=pcb, netlist=netlist))
+    assert pad["severity"] == "warning" and "has no such pin" in pad["issue"]
+
+
+def test_a_hand_tied_shield_pad_is_not_a_single_pin_net():
+    """Shield pad J1-S1 on CHASSIS with two PCB-only holes; J1's symbol has pins 1, 2."""
+    pcb = _pcb(
+        extra_components=[
+            _component(6, "J1", "UJ1", "USB"),
+            _component(7, "MH1A", kind=1),
+            _component(8, "MH2A", kind=1),
+        ],
+        extra_pads=[(VIN, 6, "1"), (GND, 6, "2"), (OUT, 6, "S1"), (OUT, 7, "1"),
+                    (OUT, 8, "1")],
+    )
+    netlist = _netlist()
+    _add_part(netlist, "J1", "USB", "UJ1", {"1": "VIN", "2": "GND"})
+    _add_pin(netlist, "U1", "1", "OUT_SCH")  # U1-1 sits on OUT on the PCB too
+    result = _check(pcb=pcb, netlist=netlist)
+    pads = {f["pin"]: f for f in result["findings"] if f["check"] == "pad_net"}
+    assert pads["J1-S1"]["severity"] == "warning" and "no such pin" in pads["J1-S1"]["issue"]
+    assert result["in_sync"] is False
+
+
+def test_rebuilt_net_reads_as_one_finding():
+    """Name matching off: both FB copies unmatched; a pad on FB on both sides is info."""
+    netlist = _netlist()
+    _remove_pin(netlist, "U1", "2")
+    _add_pin(netlist, "U1", "2", "VIN")
+    result = _check(netlist=netlist, net_matching={**DEFAULT_NET_MATCHING, "name_matching": False})
+    rebuilt = {f["pin"]: f for f in result["findings"] if f.get("net_rebuilt")}
+    assert set(rebuilt) == {"R1-2", "R2-1"}
+    assert rebuilt["R1-2"]["severity"] == "info"
+    assert "name matching is off" in rebuilt["R1-2"]["issue"]
+
+
+def test_path_link_prefers_the_placement_showing_the_designator():
+    """C1 pasted again as C99 before the original, both with C1's path and footprint."""
+    pcb = _pcb()
+    pcb.components.insert(0, _component(0, "C99", "UC1", "C0402"))
+    for index, component in enumerate(pcb.components):
+        component.index = index
+    for primitive in pcb.primitives:
+        primitive.component += 1
+    netlist = _netlist()
+    netlist["components"]["C1"]["unique_paths"] = ["\\TOP\\UC1"]
+    result = _check(pcb=pcb, netlist=netlist)
+    assert [(f["check"], f["pcb"]) for f in _problems(result)] == [("extra_on_pcb", "C99")]
+
+
+def test_stale_annotation_paths_follow_a_renamed_sheet_symbol():
+    """The .Annotation file still names sheet symbol OLD; the PCB has NEW."""
+    pcb = _pcb(extra_components=[
+        _component(6, "R5A", "CH", "R0603", path="\\NEW\\SA\\CH"),
+        _component(7, "R5B", "CH", "R0603", path="\\NEW\\SB\\CH"),
+        _component(8, "R9", "U9", "R0603", path="\\NEW\\U9"),
+    ], extra_pads=[(VIN, 6, "1"), (GND, 6, "2"), (FB, 7, "1"), (GND, 7, "2")])
+    netlist = _netlist()
+    # Re-annotated: channel A's copy is now R5B and B's is R5A.
+    _add_part(netlist, "R5B", "R0603", "CH", {"1": "VIN", "2": "GND"},
+              unique_paths=["\\OLD\\SA\\CH"])
+    _add_part(netlist, "R5A", "R0603", "CH", {"1": "FB", "2": "GND"},
+              unique_paths=["\\OLD\\SB\\CH"])
+    _add_part(netlist, "R9", "R0603", "U9", {}, unique_paths=["\\OLD\\U9"])
+    result = _check(pcb=pcb, netlist=netlist)
+    assert [(f["check"], f["schematic"], f["pcb"]) for f in _problems(result)] == [
+        ("designator", "R5A", "R5B"), ("designator", "R5B", "R5A"),
+    ]
+    assert not any("match no PCB part" in note for note in result["notes"])
+    # Without R9 to show the rename, no path matches and the note says so.
+    netlist["components"]["R9"]["unique_paths"] = ["\\GONE\\XX"]
+    result = _check(pcb=pcb, netlist=netlist)
+    assert any(note.startswith("3 unique ID paths") for note in result["notes"])
+
+
+def test_tied_copies_pair_by_their_comment():
+    """Same rails, per-channel values: C5_1 is 100n, C5_2 is 1u."""
+    pcb = _pcb(
+        extra_components=[
+            _component(6, "C5A", "CH", "C0402", "100n", path="\\SA\\CH"),
+            _component(7, "C5B", "CH", "C0402", "1u", path="\\SB\\CH"),
+        ],
+        extra_pads=[(VIN, 6, "1"), (GND, 6, "2"), (VIN, 7, "1"), (GND, 7, "2")],
+    )
+    netlist = _netlist()
+    _add_part(netlist, "C5_2", "C0402", "CH", {"1": "VIN", "2": "GND"})
+    _add_part(netlist, "C5_1", "C0402", "CH", {"1": "VIN", "2": "GND"})
+    netlist["parts"]["C5_1"]["comment"] = "100n"
+    netlist["parts"]["C5_2"]["comment"] = "1u"
+    problems = _problems(_check(pcb=pcb, netlist=netlist))
+    assert [(f["check"], f["schematic"], f["pcb"]) for f in problems] == [
+        ("designator", "C5_1", "C5A"), ("designator", "C5_2", "C5B"),
+    ]
 
 
 def test_in_sync_covers_every_check():
@@ -664,6 +774,26 @@ def test_check_sch_pcb_sync_context(sync_project, monkeypatch):
     assert result["note"] == "Project lists 2 PcbDocs; compared with 'Board.PcbDoc'."
     (missing,) = [f for f in result["findings"] if f["check"] == "missing_from_pcb"]
     assert (missing["schematic"], missing["dnp"]) == ("R3", True)
+
+
+def test_netlist_stale_covers_the_project_and_annotation_files(sync_project):
+    """Board Level Annotate saved only the .Annotation file after the netlist."""
+    tmp_path = sync_project["tmp_path"]
+    prj = tmp_path / "Demo.PrjPcb"
+    prj.write_text(
+        "[Document1]\nDocumentPath=Main.SchDoc\n\n[Document2]\nDocumentPath=Board.PcbDoc\n\n"
+        "[Document3]\nDocumentPath=Demo.Annotation\n",
+        encoding="utf-8",
+    )
+    annotation = tmp_path / "Demo.Annotation"
+    annotation.write_text("[DesignatorManager]\n", encoding="utf-8")
+    os.utime(prj, (1_000_000, 1_000_000))
+    os.utime(annotation, (4_000_000, 4_000_000))
+    sync_project["netlist"]["net_file_mtime"] = 3_500_000  # after every sheet
+    result = json.loads(main_mod.check_sch_pcb_sync())
+    assert result["netlist_stale"] is True
+    assert result["other_files_saved_after_netlist"] == ["Demo.Annotation"]
+    assert "sheets_saved_after_netlist" not in result
 
 
 def test_check_sch_pcb_sync_errors(sync_project, monkeypatch):

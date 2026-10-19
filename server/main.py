@@ -2646,6 +2646,37 @@ def _sheets_saved_after(project: dict, saved: float) -> list[str]:
     return newer
 
 
+def _saved_after_netlist(project: dict, compiled: float) -> tuple[list[str], list[str]]:
+    """Files saved after the netlist was compiled, as refresh_netlist judges them (the
+    .PrjPcb, its sheets and .Annotation files, other sheets in those folders): sheet
+    names, and the other file names."""
+    prj_path = project.get("prj_pcb_path")
+    try:
+        prj = parse_prj_pcb(prj_path)
+        sources = netlist_sources(prj_path, prj.sheet_paths, prj.annotation_paths)
+    except Exception:
+        sources = [Path(sheet["path"]) for sheet in project.get("sheets", [])]
+    sheets: list[str] = []
+    others: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        source = Path(source)
+        key = os.path.normcase(str(source.resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if source.stat().st_mtime <= compiled:
+                continue
+        except OSError:
+            continue
+        if source.suffix.lower() == ".schdoc":
+            sheets.append(source.stem)
+        else:
+            others.append(source.name)
+    return sheets, others
+
+
 def _utc(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
@@ -2679,7 +2710,7 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
     pcb_saved = pcb_path.stat().st_mtime
     newer = _sheets_saved_after(project, pcb_saved)
     compiled = netlist.get("net_file_mtime")
-    stale = _sheets_saved_after(project, compiled) if compiled else []
+    stale, stale_others = _saved_after_netlist(project, compiled) if compiled else ([], [])
     options = net_matching_options(project.get("prj_pcb_path"))
     for limit in (100, 30, 10):
         result = run_sync_check(
@@ -2701,11 +2732,14 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
         }
         if compiled:
             context["netlist_compiled_utc"] = _utc(compiled)
-        if stale:
+        if stale or stale_others:
             context["netlist_stale"] = True
-            context["sheets_saved_after_netlist"] = stale
+            if stale:
+                context["sheets_saved_after_netlist"] = stale
+            if stale_others:
+                context["other_files_saved_after_netlist"] = stale_others
             context["hint"] = (
-                "These sheets were saved after the netlist was compiled: their changes "
+                "These files were saved after the netlist was compiled: their changes "
                 "are not compared. Call refresh_netlist, then check again."
             )
         context["sheets_saved_after_pcb"] = newer

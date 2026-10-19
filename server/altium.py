@@ -94,20 +94,18 @@ def enrich_netlist_sheets(
                 _file_entry(result, name, entry)
 
     claimed = set(result)
-    # Exact names first, so a channel fan-out never takes the name of a part that
-    # is filed under it.
-    fan_out: list[tuple[str, str, ComponentMeta]] = []
+    compiled = set(names)
+    # A channel fan-out never takes a name some sheet part carries itself, whichever
+    # comes first; parts are filed in sheet order.
+    taken = claimed | {refdes for _, refdes, _ in unannotated}
     for sheet, refdes, meta in unannotated:
         # Direct match (most components, and already-suffixed subsheet refs)
-        if refdes in pin_to_net and refdes not in claimed:
-            entry = _make_enriched(meta, pin_to_net[refdes])
+        if refdes in compiled and refdes not in claimed:
+            entry = _make_enriched(meta, pin_to_net.get(refdes, {}))
             entry["sheet"] = sheet
             _file_entry(result, refdes, entry)
             continue
-        fan_out.append((sheet, refdes, meta))
-    taken = set(result) | {refdes for _, refdes, _ in fan_out}
 
-    for sheet, refdes, meta in fan_out:
         # Subsheet fan-out: look for refdesA, refdesB, ... among the compiled names
         suffixed = [
             r for r in names
