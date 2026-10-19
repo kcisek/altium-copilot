@@ -23,6 +23,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   no longer ends up in its last value, and a non-numeric `OwnerIndex` is skipped instead
   of failing the sheet. On the 84 example sheets 1537 of 1581 parts load (was 98); the
   others share a designator with another part on the same sheet
+- Parts of a multi-part component that each have their own UniqueId, as on most of
+  Altium's AD25 examples, are merged by designator. `parse_sch_doc` merged parts only
+  when they shared a UniqueId and kept one entry per designator, so the last part placed
+  replaced the others: 44 parts of 37 components on the examples, 399 pin names among
+  them. Parts with the same designator, different part ids and the same part count now
+  merge (pins united, first non-empty description and value, best MPN), so all 1581
+  example parts load. The component keeps the UniqueId of its highest part, the one the
+  PcbDoc's `SOURCEUNIQUEID` names (29 of 29 on the examples; the last part placed
+  matched 28). Parts placed from different library references are merged and logged.
+  Two different components with one designator on a sheet are logged and, as before,
+  the later one is kept
 - PCB tools name components by the designator printed on the board (decoded from
   `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
   name and differs on multi-channel and board-annotated designs (57 of 73 parts on

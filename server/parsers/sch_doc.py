@@ -1,3 +1,4 @@
+import logging
 import re
 import struct
 import zlib
@@ -21,15 +22,17 @@ class ComponentMeta:
 def parse_sch_doc(path: str) -> dict[str, ComponentMeta]:
     """Parse an Altium .SchDoc OLE file and return component metadata keyed by refdes."""
     with olefile.OleFileIO(path) as f:
-        return components_from_stream(f.openstream("FileHeader").read())
+        return components_from_stream(f.openstream("FileHeader").read(), source=path)
 
 
-def components_from_stream(data: bytes) -> dict[str, ComponentMeta]:
+def components_from_stream(data: bytes, source: str = "") -> dict[str, ComponentMeta]:
     """parse_sch_doc for the bytes of a FileHeader stream.
 
     The OwnerIndex field in child records (pins, designators, parameters) refers to
     the 0-based sequential record number of the parent RECORD=1 minus 1, i.e. the
     record immediately preceding the component record in the file stream.
+
+    source names the sheet in logged warnings.
     """
     # Parsing state
     # Key: owner_key = record_num - 1 for the RECORD=1 entry
@@ -38,6 +41,7 @@ def components_from_stream(data: bytes) -> dict[str, ComponentMeta]:
     canonical_owner: dict[int, int] = {}   # any owner_key -> canonical owner_key
     uid_seen: dict[str, int] = {}          # UniqueID -> canonical owner_key
     best_mpn_priority: dict[int, int] = {} # canonical owner_key -> lowest suffix seen (0 = best)
+    parts: dict[int, _Part] = {}           # canonical owner_key -> which part it is
 
     for record_num, props in enumerate(_read_records(data)):
         record_type = props.get("record")
@@ -45,7 +49,7 @@ def components_from_stream(data: bytes) -> dict[str, ComponentMeta]:
         # matching the OwnerIndex used by child records.
         if record_type == "1":
             _handle_component(
-                props, record_num, components_by_owner, canonical_owner, uid_seen
+                props, record_num, components_by_owner, canonical_owner, uid_seen, parts
             )
         elif record_type == "34":
             _handle_designator(props, components_by_owner, canonical_owner)
@@ -57,7 +61,89 @@ def components_from_stream(data: bytes) -> dict[str, ComponentMeta]:
             )
         # RECORD=17 (power ports) intentionally skipped
 
-    return {comp.refdes: comp for comp in components_by_owner.values() if comp.refdes}
+    return _merge_parts(components_by_owner, parts, best_mpn_priority, source)
+
+
+@dataclass
+class _Part:
+    lib_reference: str  # LibReference, the library symbol it was placed from
+    part_id: str        # CurrentPartId: 1 = part A, 2 = part B, ...
+    part_count: str     # PartCount: number of parts + 1
+
+
+def _part_number(part_id: str) -> int:
+    return int(part_id) if part_id.isdigit() else 0
+
+
+class _Component:
+    """A component being assembled from its parts, see _merge_parts."""
+
+    def __init__(self, meta: ComponentMeta, part: _Part, mpn_priority: int):
+        self.meta = meta
+        self.first = part
+        self.part_ids = {part.part_id}
+        self.top_part = _part_number(part.part_id)  # the part whose UniqueID meta carries
+        self.mpn_priority = mpn_priority
+
+    def can_take(self, part: _Part) -> bool:
+        return part.part_id not in self.part_ids and part.part_count == self.first.part_count
+
+    def add(self, meta: ComponentMeta, part: _Part, mpn_priority: int) -> None:
+        self.part_ids.add(part.part_id)
+        for pin, name in meta.pins.items():
+            self.meta.pins.setdefault(pin, name)
+        self.meta.description = self.meta.description or meta.description
+        self.meta.value = self.meta.value or meta.value
+        if meta.mpn and (not self.meta.mpn or mpn_priority < self.mpn_priority):
+            self.meta.mpn, self.mpn_priority = meta.mpn, mpn_priority
+        if _part_number(part.part_id) > self.top_part:
+            self.meta.unique_id, self.top_part = meta.unique_id, _part_number(part.part_id)
+
+
+def _merge_parts(
+    components_by_owner: dict[int, ComponentMeta],
+    parts: dict[int, _Part],
+    best_mpn_priority: dict[int, int],
+    source: str,
+) -> dict[str, ComponentMeta]:
+    """One ComponentMeta per designator, the parts of a multi-part component merged.
+
+    Each part of a multi-part component is its own record. In older sheets the parts
+    share a UniqueID and are merged while reading; in newer ones (most of Altium's AD25
+    examples) each part has its own, and only the designator ties them together.
+    Parts with the same designator, different part ids and the same part count merge:
+    pins are united, the first non-empty description and value and the best MPN are
+    kept, and unique_id is the highest part's, the one Altium gives the component on
+    the PCB (SOURCEUNIQUEID). A difference in LibReference is logged but merged, since
+    parts of one component can be placed from different libraries. A part that cannot
+    belong to the component holding its designator (a part id seen before, or another
+    part count) is another component with the same designator: it replaces the earlier
+    one, as before, and the clash is logged. Unannotated parts (U?) share a designator
+    and are neither merged nor logged.
+    """
+    components: dict[str, _Component] = {}
+    for key, meta in components_by_owner.items():
+        refdes, part = meta.refdes, parts[key]
+        if not refdes:
+            continue
+        held = components.get(refdes)
+        if held and "?" not in refdes:
+            if held.can_take(part):
+                if part.lib_reference != held.first.lib_reference:
+                    logging.warning(
+                        "%s: the parts of %s come from different library references "
+                        "(%s and %s); merged as one component", source or "SchDoc", refdes,
+                        held.first.lib_reference, part.lib_reference,
+                    )
+                held.add(meta, part, best_mpn_priority.get(key, 999))
+                continue
+            logging.warning(
+                "%s: %s is the designator of two different components (%s and %s); "
+                "using the later one", source or "SchDoc", refdes,
+                held.first.lib_reference, part.lib_reference,
+            )
+        components[refdes] = _Component(meta, part, best_mpn_priority.get(key, 999))
+    return {refdes: held.meta for refdes, held in components.items()}
 
 
 def _parse_props(text: str) -> dict[str, str]:
@@ -124,6 +210,7 @@ def _handle_component(
     components_by_owner: dict[int, ComponentMeta],
     canonical_owner: dict[int, int],
     uid_seen: dict[str, int],
+    parts: dict[int, _Part],
 ) -> None:
     # The owner_key used by child records equals record_num - 1
     owner_key = record_num - 1
@@ -137,6 +224,11 @@ def _handle_component(
         comp = ComponentMeta(description=desc, unique_id=uid)
         components_by_owner[owner_key] = comp
         canonical_owner[owner_key] = owner_key
+        parts[owner_key] = _Part(
+            lib_reference=props.get("libreference", ""),
+            part_id=props.get("currentpartid", ""),
+            part_count=props.get("partcount", ""),
+        )
         if uid:
             uid_seen[uid] = owner_key
 

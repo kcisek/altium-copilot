@@ -1,3 +1,4 @@
+import logging
 import re
 import struct
 from pathlib import Path
@@ -185,3 +186,116 @@ def test_non_numeric_owner_index_is_ignored():
         "|RECORD=41|OWNERINDEX=x|NAME=Value|TEXT=10k",
     ))
     assert result["R7"].value is None
+
+
+# ---------- parts of a multi-part component ----------
+# Newer sheets (most of Altium's AD25 examples) give each part of a multi-part component
+# its own UniqueID; only the designator ties the parts together.
+
+def _part(refdes: str, uid: str, part_id: str, lib: str = "LM339", part_count: str = "5",
+          pins: dict[str, str] | None = None, params: dict[str, str] | None = None,
+          description: str = "") -> list[str]:
+    """Records of one placed part; _parts_stream fills in the children's OwnerIndex."""
+    records = [f"|RECORD=1|LibReference={lib}|ComponentDescription={description}"
+               f"|UniqueID={uid}|CurrentPartId={part_id}|PartCount={part_count}"]
+    records += [f"|RECORD=2|OwnerIndex={{owner}}|Designator={number}|Name={name}"
+                for number, name in (pins or {}).items()]
+    records.append(f"|RECORD=34|OwnerIndex={{owner}}|Name=Designator|Text={refdes}")
+    records += [f"|RECORD=41|OwnerIndex={{owner}}|Name={name}|Text={text}"
+                for name, text in (params or {}).items()]
+    return records
+
+
+def _parts_stream(*parts: list[str], upper: bool = False) -> bytes:
+    records: list[str] = []
+    for part in parts:
+        owner = len(records)  # the part's RECORD=1 lands at position owner + 1
+        records += [record.format(owner=owner) for record in part]
+    return _stream(*(_upper_keys(r) if upper else r for r in records))
+
+
+@pytest.mark.parametrize("upper", [False, True], ids=["mixed", "upper"])
+def test_parts_with_own_unique_ids_merge(upper):
+    result = components_from_stream(_parts_stream(
+        _part("U5", "AAAA0001", "1", pins={"1": "OUT1", "3": "VCC"}),
+        _part("U5", "AAAA0002", "2", pins={"2": "OUT2", "3": "VCC"},
+              params={"Value": "LM339"}, description="Quad comparator"),
+        _part("U5", "AAAA0003", "3", pins={"14": "OUT3"},
+              params={"Manufacturer Part Number": "LM339DR"}),
+        _part("R1", "BBBB0001", "1", lib="RES", part_count="2"),
+        upper=upper,
+    ))
+    assert set(result) == {"U5", "R1"}
+    u5 = result["U5"]
+    assert u5.pins == {"1": "OUT1", "3": "VCC", "2": "OUT2", "14": "OUT3"}
+    assert u5.unique_id == "AAAA0003"  # the highest part's, as on the PCB
+    assert u5.description == "Quad comparator"  # first non-empty, from part 2
+    assert u5.value == "LM339"
+    assert u5.mpn == "LM339DR"
+
+
+def test_unique_id_is_the_highest_parts_wherever_it_is_placed():
+    # The PcbDoc's SOURCEUNIQUEID names the highest part, not the first or last in the file
+    result = components_from_stream(_parts_stream(
+        _part("U5", "AAAA0004", "4"),
+        _part("U5", "AAAA0001", "1"),
+        _part("U5", "AAAA0002", "2"),
+    ))
+    assert result["U5"].unique_id == "AAAA0004"
+
+
+def test_merged_mpn_prefers_manufacturer_part_number():
+    result = components_from_stream(_parts_stream(
+        _part("U5", "AAAA0001", "1", params={"Comment": "LM339"}),
+        _part("U5", "AAAA0002", "2", params={"Manufacturer Part Number 1": "LM339DR"}),
+        _part("U5", "AAAA0003", "3", params={"Manufacturer Part Number 2": "LM339ADR"}),
+    ))
+    assert result["U5"].mpn == "LM339DR"
+
+
+def test_parts_from_different_libraries_merge_and_are_logged(caplog):
+    with caplog.at_level(logging.WARNING):
+        result = components_from_stream(_parts_stream(
+            _part("U5", "AAAA0001", "1", lib="LM339", pins={"1": "OUT1"}),
+            _part("U5", "AAAA0002", "2", lib="CMP-0001", pins={"2": "OUT2"}),
+        ), source="Comparators.SchDoc")
+    assert result["U5"].pins == {"1": "OUT1", "2": "OUT2"}
+    assert "Comparators.SchDoc" in caplog.text
+    assert "LM339" in caplog.text and "CMP-0001" in caplog.text
+
+
+@pytest.mark.parametrize("second", [
+    {"part_id": "1"},                                     # part A placed twice
+    {"part_id": "2", "lib": "OPA2", "part_count": "3"},  # another component's part B
+], ids=["same-part-id", "other-part-count"])
+def test_different_components_with_one_designator_are_not_merged(caplog, second):
+    with caplog.at_level(logging.WARNING):
+        result = components_from_stream(_parts_stream(
+            _part("U5", "AAAA0001", "1", pins={"1": "OUT1"}, params={"Value": "LM339"}),
+            _part("U5", "BBBB0001", pins={"1": "IN", "2": "OUT"},
+                  params={"Value": "OPA2"}, **second),
+        ))
+    u5 = result["U5"]  # the later component, as before
+    assert (u5.unique_id, u5.pins, u5.value) == ("BBBB0001", {"1": "IN", "2": "OUT"}, "OPA2")
+    assert "two different components" in caplog.text
+
+
+def test_parts_after_a_designator_clash_merge_into_the_later_component():
+    result = components_from_stream(_parts_stream(
+        _part("U5", "AAAA0001", "1", lib="LDO", part_count="2", pins={"1": "VIN"}),
+        _part("U5", "BBBB0001", "1", pins={"1": "OUT1"}),
+        _part("U5", "BBBB0002", "2", pins={"7": "OUT2"}),
+    ))
+    assert result["U5"].pins == {"1": "OUT1", "7": "OUT2"}
+    assert result["U5"].unique_id == "BBBB0002"
+
+
+def test_unannotated_parts_are_not_merged_or_logged(caplog):
+    with caplog.at_level(logging.WARNING):
+        result = components_from_stream(_parts_stream(
+            _part("U?", "AAAA0001", "1", pins={"1": "OUT1"}),
+            _part("U?", "AAAA0002", "2", pins={"7": "OUT2"}),
+            _part("U?", "BBBB0001", "1", lib="RES", part_count="2", pins={"1": "A"}),
+        ))
+    assert result["U?"].pins == {"1": "A"}
+    assert not caplog.records
