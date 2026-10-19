@@ -3,9 +3,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-# IMPORTANT: Bump this — and SUPPORTED_SCHEMA_VERSION in pcb-copilot — whenever the DB
-# schema changes. See CONTRIBUTING.md.
-SCHEMA_VERSION = 2
+# IMPORTANT: Bump this — and SUPPORTED_SCHEMA_VERSION in pcb-copilot — when an existing
+# table or column changes or goes away. A new table that older readers can ignore (like
+# `notes`) does not need a bump: pcb-copilot refuses any version it does not know.
+# See CONTRIBUTING.md.
+SCHEMA_VERSION = 1
 
 HIGH_FANOUT_THRESHOLD = 25
 

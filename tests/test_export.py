@@ -14,8 +14,10 @@ from tests.draftsman_fixture import TINY_PNG
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def test_schema_version_is_2():
-    assert SCHEMA_VERSION == 2
+def test_schema_version_stays_readable_by_released_pcb_copilot():
+    # The notes table is new but no existing table changed, so released pcb-copilot
+    # (SUPPORTED_SCHEMA_VERSION = 1) can still open the snapshot. See CONTRIBUTING.md.
+    assert SCHEMA_VERSION == 1
 
 
 def test_create_schema_tables(tmp_path):
@@ -361,16 +363,21 @@ def test_export_notes_draftsman(notes_project):
         by_kind.setdefault(r["kind"], []).append(r)
 
     drawing = by_kind["drawing"][0]
-    assert drawing["text"] == "C:\\Projects\\Demo\\Demo.PcbDoc"
+    assert drawing["text"] == "Demo.PcbDoc"  # file name only: the snapshot is shared
+    assert drawing["data"]["source_pcb"] == "Demo.PcbDoc"
     assert drawing["data"]["matches_project_pcb"] is False
+    assert drawing["data"]["source_warning"].startswith("(not this project's PcbDoc")
     assert drawing["data"]["pages"] == ["A4", "A3", "custom"]
     assert drawing["data"]["last_update"].startswith("2026-10-01T12:00:00")
     assert [(r["title"], r["text"]) for r in by_kind["parameter"]] == [("Revision", "B")]
 
     note = by_kind["note"][0]
     assert (note["page"], note["title"]) == (1, "Notes:")
-    assert note["text"] == "1. Board material FR-4, Tg 150 or higher\n2. Surface finish ENIG"
-    assert note["data"]["lines"] == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
+    assert note["text"] == (
+        "1. Board material FR-4, Tg 150 or higher\n2. Surface finish ENIG\n"
+        "3. Final thickness 1.6mm, part DEMO-v3, =Unknown_Param kept"
+    )
+    assert note["data"]["lines"][:2] == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
 
     texts = {r["text"]: r["data"]["from_template"] for r in by_kind["text"]}
     assert texts == {"Do not scale this drawing": False, "Drawn by: J. Doe": True}
@@ -380,12 +387,12 @@ def test_export_notes_draftsman(notes_project):
     assert table["text"] == "Layer | Impedance\nL1 | 50 ohm"
     assert table["data"]["rows"] == [["Layer", "Impedance"], ["L1", "50 ohm"]]
 
-    assert [(r["page"], r["text"], r["data"]["side"]) for r in by_kind["view"]] == [
-        (1, "fabrication view, Top side", "Top"),
-        (2, "assembly view, Bottom side", "Bottom"),
-        (2, "layer stack legend", None),
+    assert [(r["page"], r["text"], r["data"]["side"], r["data"]["layer"]) for r in by_kind["view"]] == [
+        (1, "fabrication view, Top side", "Top", "Top Layer"),
+        (2, "assembly view, Bottom side", "Bottom", None),
+        (2, "layer stack legend", None, None),
     ]
-    assert by_kind["view"][1]["title"] == "View from Bottom side (Scale =ViewScale)"
+    assert by_kind["view"][1]["title"] == "View from Bottom side (Scale 2:1)"
 
     assert [r["text"] for r in by_kind["drill"]] == [
         "0.300 mm plated Via Top Layer - Bottom Layer x3",
@@ -461,10 +468,28 @@ def test_export_notes_sheet_note_and_image(tmp_path):
     }
     assert (directive["title"], directive["text"]) == ("DiffPair", "DifferentialPair=USB")
     assert (template["kind"], template["text"]) == ("template", "A3.SchDot")
-    assert template["data"] == {"path": "C:\\Templates\\A3.SchDot"}
+    assert template["data"] == {}
 
 
-def test_unreadable_document_is_reported_and_skipped(notes_project, tmp_path):
+def test_snapshot_keeps_file_names_not_local_folders(tmp_path):
+    sheet = SheetAnnotations(
+        items=[SheetAnnotation(kind="image", file_name="C:\\Users\\jdoe\\Pictures\\block.png",
+                               image_index=0),
+               SheetAnnotation(kind="image", file_name="ClipboardPicture03/06/2025 14:30:46",
+                               embedded=True, image_index=1)],
+        template="C:\\Users\\jdoe\\Documents\\Altium\\A3.SchDot",
+    )
+    project = {"name": "TestBoard", "root_dir": str(tmp_path),
+               "sheets": [{"name": "MCU", "path": "MCU.SchDoc"}]}
+    db_path, _ = _export_notes(project, _StubNotesCache(sheet))
+    linked, pasted, template = _notes(db_path)
+    assert (linked["title"], linked["data"]["file_name"]) == ("block.png", "block.png")
+    assert pasted["title"] == "ClipboardPicture03/06/2025 14:30:46"  # a name, not a path
+    assert template["text"] == "A3.SchDot"
+    assert b"jdoe" not in Path(db_path).read_bytes()
+
+
+def test_unreadable_document_is_reported_and_marked(notes_project, tmp_path):
     (tmp_path / "sheet2.SchDoc").write_bytes(b"not an OLE file")
     Path(notes_project["pcb_dwf_paths"][0]).unlink()
     db_path, errors = _export_notes(notes_project)
@@ -472,4 +497,12 @@ def test_unreadable_document_is_reported_and_skipped(notes_project, tmp_path):
         ("sheet", "sheet2"), ("draftsman", "Fab.PCBDwf"),
     ]
     assert "FileNotFoundError" in errors[1]["error"]
-    assert {r["document"] for r in _notes(db_path)} == {"TestBoard", "sheet1"}
+    assert {r["document"] for r in _notes(db_path)} == {"TestBoard", "sheet1", "sheet2", "Fab.PCBDwf"}
+    # One marker row per unreadable document, so it is not mistaken for "no notes";
+    # the reason names the file, not its folder.
+    marks = {r["document"]: r for r in _notes(db_path, "kind='unreadable'")}
+    assert set(marks) == {"sheet2", "Fab.PCBDwf"}
+    assert marks["sheet2"]["sheet_id"] is not None
+    assert marks["Fab.PCBDwf"]["text"].startswith("FileNotFoundError: ")
+    assert str(tmp_path) not in marks["Fab.PCBDwf"]["text"]
+    assert all(r["kind"] == "unreadable" for r in _notes(db_path, "document IN ('sheet2', 'Fab.PCBDwf')"))
