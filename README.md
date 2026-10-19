@@ -33,6 +33,9 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths |
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
 | *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |
+| *"What did we note about the power input?"* | Schematic notes, text frames and labels, with the parts they sit next to |
+| *"What are the fabrication notes?"* | Draftsman notes, tables, drill table and title-block data |
+| *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images |
 
 ---
 
@@ -53,6 +56,17 @@ Altium Copilot now reads your `.PcbDoc` directly. Ask where nets
 route, what's near what (crosstalk), your full stackup, and where components sit.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
+
+---
+
+## Design notes
+
+Claude also reads what you wrote into the project besides the circuit: notes (with
+author and collapsed state), text frames, free text, pictures, directives and title
+blocks on every schematic sheet, project parameters, and the notes, tables, view titles,
+drill table and layer stack notes in your Draftsman (`.PCBDwf`) drawings. Pictures can be
+shown to Claude as images. Review comments made in Altium 365 are stored in your cloud
+workspace, not in the project files, so they are not available.
 
 ---
 

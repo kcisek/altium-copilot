@@ -15,6 +15,8 @@ class PrjPcbData:
     sheet_paths: list[str]
     variants: list[VariantDefinition]
     pcb_doc_paths: list[str] = field(default_factory=list)
+    pcb_dwf_paths: list[str] = field(default_factory=list)  # Draftsman documents
+    parameters: dict[str, str] = field(default_factory=dict)  # project parameters
 
 
 def parse_prj_pcb(path: str) -> PrjPcbData:
@@ -28,6 +30,8 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
         sheet_paths=sheet_paths,
         variants=variants,
         pcb_doc_paths=pcb_doc_paths,
+        pcb_dwf_paths=_extract_documents(sections, project_dir, ".pcbdwf"),
+        parameters=_extract_parameters(sections),
     )
 
 
@@ -83,6 +87,18 @@ def _extract_documents(
             continue
         paths.append(str((project_dir / normalized).resolve()))
     return paths
+
+
+def _extract_parameters(sections: list[tuple[str, list[str]]]) -> dict[str, str]:
+    """Project parameters ([ParameterN] Name/Value), e.g. a revision or project title."""
+    params: dict[str, str] = {}
+    for header, lines in sections:
+        if not re.match(r"^Parameter\d+$", header, re.IGNORECASE):
+            continue
+        name, value = _get_field(lines, "Name"), _get_field(lines, "Value")
+        if name and value:
+            params[name] = value
+    return params
 
 
 def _extract_sheets(sections: list[tuple[str, list[str]]], project_dir: Path) -> list[str]:
