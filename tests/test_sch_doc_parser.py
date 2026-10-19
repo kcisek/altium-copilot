@@ -2,8 +2,9 @@ import logging
 import re
 import struct
 from pathlib import Path
+from unittest.mock import patch
 import pytest
-from server.parsers.sch_doc import components_from_stream, parse_sch_doc
+from server.parsers.sch_doc import DesignatorClash, components_from_stream, parse_sch_doc
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -269,33 +270,76 @@ def test_parts_from_different_libraries_merge_and_are_logged(caplog):
     {"part_id": "2", "lib": "OPA2", "part_count": "3"},  # another component's part B
 ], ids=["same-part-id", "other-part-count"])
 def test_different_components_with_one_designator_are_not_merged(caplog, second):
+    clashes: list[DesignatorClash] = []
     with caplog.at_level(logging.WARNING):
         result = components_from_stream(_parts_stream(
             _part("U5", "AAAA0001", "1", pins={"1": "OUT1"}, params={"Value": "LM339"}),
             _part("U5", "BBBB0001", pins={"1": "IN", "2": "OUT"},
                   params={"Value": "OPA2"}, **second),
-        ))
+        ), clashes=clashes)
     u5 = result["U5"]  # the later component, as before
     assert (u5.unique_id, u5.pins, u5.value) == ("BBBB0001", {"1": "IN", "2": "OUT"}, "OPA2")
     assert "two different components" in caplog.text
+    assert clashes == [DesignatorClash("U5", ["LM339", second.get("lib", "LM339")])]
+
+
+def test_designator_of_three_components_is_one_clash():
+    clashes: list[DesignatorClash] = []
+    result = components_from_stream(_parts_stream(
+        _part("R1", "AAAA0001", "1", lib="RES", part_count="2"),
+        _part("U5", "BBBB0001", "1", lib="LDO", part_count="2"),
+        _part("U5", "CCCC0001", "1", lib="LM339"),
+        _part("U5", "DDDD0001", "1", lib="OPA2", part_count="3"),
+        _part("C1", "EEEE0001", "1", lib="CAP", part_count="2"),
+        _part("C1", "FFFF0001", "1", lib="CAP", part_count="2"),
+    ), clashes=clashes)
+    assert set(result) == {"R1", "U5", "C1"}
+    assert clashes == [DesignatorClash("U5", ["LDO", "LM339", "OPA2"]),
+                       DesignatorClash("C1", ["CAP", "CAP"])]
 
 
 def test_parts_after_a_designator_clash_merge_into_the_later_component():
+    clashes: list[DesignatorClash] = []
     result = components_from_stream(_parts_stream(
         _part("U5", "AAAA0001", "1", lib="LDO", part_count="2", pins={"1": "VIN"}),
         _part("U5", "BBBB0001", "1", pins={"1": "OUT1"}),
         _part("U5", "BBBB0002", "2", pins={"7": "OUT2"}),
-    ))
+    ), clashes=clashes)
     assert result["U5"].pins == {"1": "OUT1", "7": "OUT2"}
     assert result["U5"].unique_id == "BBBB0002"
+    assert clashes == [DesignatorClash("U5", ["LDO", "LM339"])]
+
+
+def test_merged_parts_are_no_clash():
+    clashes: list[DesignatorClash] = []
+    components_from_stream(_parts_stream(
+        _part("U5", "AAAA0001", "1", lib="LM339"),
+        _part("U5", "AAAA0002", "2", lib="CMP-0001"),
+    ), clashes=clashes)
+    assert clashes == []
 
 
 def test_unannotated_parts_are_not_merged_or_logged(caplog):
+    clashes: list[DesignatorClash] = []
     with caplog.at_level(logging.WARNING):
         result = components_from_stream(_parts_stream(
             _part("U?", "AAAA0001", "1", pins={"1": "OUT1"}),
             _part("U?", "AAAA0002", "2", pins={"7": "OUT2"}),
             _part("U?", "BBBB0001", "1", lib="RES", part_count="2", pins={"1": "A"}),
-        ))
+        ), clashes=clashes)
     assert result["U?"].pins == {"1": "A"}
     assert not caplog.records
+    assert clashes == []
+
+
+def test_parse_sch_doc_reports_clashes():
+    stream = _parts_stream(
+        _part("U5", "AAAA0001", "1", lib="LDO", part_count="2"),
+        _part("U5", "BBBB0001", "1"),
+    )
+    clashes: list[DesignatorClash] = []
+    with patch("server.parsers.sch_doc.olefile.OleFileIO") as ole:
+        ole.return_value.__enter__.return_value.openstream.return_value.read.return_value = stream
+        result = parse_sch_doc("Power.SchDoc", clashes)
+    assert result["U5"].unique_id == "BBBB0001"
+    assert clashes == [DesignatorClash("U5", ["LDO", "LM339"])]

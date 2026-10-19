@@ -13,9 +13,9 @@ except ImportError:
     from server.netlist_parser import parse_protel_netlist
 
 try:
-    from parsers.sch_doc import ComponentMeta, parse_sch_doc
+    from parsers.sch_doc import ComponentMeta, DesignatorClash, parse_sch_doc
 except ImportError:
-    from server.parsers.sch_doc import ComponentMeta, parse_sch_doc
+    from server.parsers.sch_doc import ComponentMeta, DesignatorClash, parse_sch_doc
 
 try:
     from parsers.prj_pcb import parse_prj_pcb
@@ -372,19 +372,28 @@ class AltiumClient:
         """Parse each .PrjPcb-listed sheet and merge its components into the netlist.
 
         A sheet that fails to parse is recorded in netlist["sheet_errors"] and skipped,
-        so one bad sheet never discards the components of the others. The project's
-        .Annotation files map sheet designators to the netlist's physical ones; one that
-        cannot be read is recorded in netlist["annotation_errors"].
+        so one bad sheet never discards the components of the others. A sheet designator
+        shared by different components, of which only the last one is kept, is recorded in
+        netlist["designator_clashes"]. The project's .Annotation files map sheet
+        designators to the netlist's physical ones; one that cannot be read is recorded in
+        netlist["annotation_errors"].
         """
         sheets: list[tuple[str, dict]] = []
         sheet_errors: list[dict] = []
+        designator_clashes: list[dict] = []
         for sch_path in sheet_paths:
             sheet_name = Path(sch_path).stem
             if not Path(sch_path).is_file():
                 error = "file not found"
             else:
                 try:
-                    sheets.append((sheet_name, parse_sch_doc(str(sch_path))))
+                    clashes: list[DesignatorClash] = []
+                    sheets.append((sheet_name, parse_sch_doc(str(sch_path), clashes)))
+                    designator_clashes += [
+                        {"sheet": sheet_name, "refdes": c.refdes,
+                         "lib_references": c.lib_references}
+                        for c in clashes
+                    ]
                     continue
                 except Exception as e:
                     error = f"{type(e).__name__}: {e}"
@@ -393,6 +402,8 @@ class AltiumClient:
         annotation, annotation_errors = _read_annotation(annotation_paths or [])
         enrich_netlist_sheets(netlist, sheets, annotation)
         netlist["sheet_errors"] = sheet_errors
+        if designator_clashes:
+            netlist["designator_clashes"] = designator_clashes
         if annotation_errors:
             netlist["annotation_errors"] = annotation_errors
 
