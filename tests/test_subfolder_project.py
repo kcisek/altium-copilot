@@ -129,6 +129,63 @@ def test_regenerates_when_sheet_outside_project_dir_is_newer(subfolder_project):
     assert client._netlist["components"]["U3"]["sheet"] == "shared"
 
 
+# A managed device sheet, as Altium lists it in the .PrjPcb ([DeviceSheetN], not [DocumentN]).
+DEVICE_SHEET = "Managed\\Sheets\\2C007D27-9DB2-40E7-9A59-B05D1E0767B6\\sheet2.SchDoc"
+
+
+@pytest.fixture
+def device_sheet_project(subfolder_project):
+    """subfolder_project with sheet2 placed as a managed device sheet."""
+    root, prj, net = subfolder_project
+    device = root / DEVICE_SHEET.replace("\\", "/")
+    device.parent.mkdir(parents=True)
+    (root / "source" / "sheet2.SchDoc").replace(device)
+    prj.write_text(
+        _prj_text("source\\sheet1.SchDoc", extra=f"[DeviceSheet1]\nDocumentPath={DEVICE_SHEET}\n"),
+        encoding="utf-8",
+    )
+    _make_net_fresh(root, net)
+    return root, prj, net, device
+
+
+def test_device_sheet_components_are_enriched(device_sheet_project):
+    _, prj, _, _ = device_sheet_project
+    client = AltiumClient()
+    with patch("altium._run_ps") as mock_ps:
+        assert client.generate_netlist(str(prj)) is False
+        mock_ps.assert_not_called()
+
+    comps = client._netlist["components"]
+    assert len(comps) == TOTAL_COUNT
+    assert comps["U3"]["sheet"] == "sheet2"
+    assert comps["U3"]["pins"]["1"] == {"name": "V+", "net": "VCC"}
+    assert client._netlist["sheet_errors"] == []
+
+
+def test_regenerates_when_device_sheet_is_newer(device_sheet_project):
+    _, prj, net, device = device_sheet_project
+    _make_stale(device, net)
+    client = AltiumClient()
+    with patch("altium._run_ps", side_effect=_fake_ps_writing(net)) as mock_ps:
+        assert client.generate_netlist(str(prj)) is True
+        mock_ps.assert_called_once()
+    assert client._netlist["components"]["U3"]["sheet"] == "sheet2"
+
+
+def test_missing_device_sheet_is_a_sheet_error(device_sheet_project):
+    _, prj, _, device = device_sheet_project
+    device.unlink()
+    client = AltiumClient()
+    with patch("altium._run_ps") as mock_ps:
+        assert client.generate_netlist(str(prj)) is False
+        mock_ps.assert_not_called()
+
+    assert len(client._netlist["components"]) == SHEET1_COUNT
+    assert client._netlist["sheet_errors"] == [
+        {"sheet": "sheet2", "path": str(device.resolve()), "error": "file not found"},
+    ]
+
+
 def test_unlisted_schdoc_drives_freshness_but_not_enrichment(subfolder_project):
     """A sheet added in Altium and saved before the project is compiled into the .NET but
     not yet listed in the .PrjPcb: it must trigger regeneration, yet only listed sheets

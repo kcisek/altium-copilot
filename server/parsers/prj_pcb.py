@@ -1,3 +1,4 @@
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +13,7 @@ class VariantDefinition:
 
 @dataclass
 class PrjPcbData:
-    sheet_paths: list[str]
+    sheet_paths: list[str]  # project sheets and device sheets
     variants: list[VariantDefinition]
     pcb_doc_paths: list[str] = field(default_factory=list)
     pcb_dwf_paths: list[str] = field(default_factory=list)  # Draftsman documents
@@ -77,10 +78,11 @@ def _extract_documents(
     sections: list[tuple[str, list[str]]],
     project_dir: Path,
     suffix: str,
+    section: str = "Document",
 ) -> list[str]:
     paths: list[str] = []
     for header, lines in sections:
-        if not re.match(r"^Document\d+$", header, re.IGNORECASE):
+        if not re.match(rf"^(?:{section})\d+$", header, re.IGNORECASE):
             continue
         raw = _get_field(lines, "DocumentPath")
         if not raw:
@@ -105,7 +107,12 @@ def _extract_parameters(sections: list[tuple[str, list[str]]]) -> dict[str, str]
 
 
 def _extract_sheets(sections: list[tuple[str, list[str]]], project_dir: Path) -> list[str]:
-    return _extract_documents(sections, project_dir, ".schdoc")
+    """The project's own sheets ([DocumentN]) and its device sheets ([DeviceSheetN], e.g.
+    Managed\\Sheets\\<GUID>\\Name.SchDoc for a managed one), in file order, each listed once."""
+    paths: dict[str, str] = {}
+    for path in _extract_documents(sections, project_dir, ".schdoc", "Document|DeviceSheet"):
+        paths.setdefault(os.path.normcase(path), path)
+    return list(paths.values())
 
 
 def _extract_variants(sections: list[tuple[str, list[str]]]) -> list[VariantDefinition]:
