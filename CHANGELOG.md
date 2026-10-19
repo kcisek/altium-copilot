@@ -55,6 +55,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 - `set_project_dir` / `refresh_netlist` responses include `component_count`, and
   `refdes_without_metadata` when netlist refdes are missing from every parsed sheet
 - `package_for_xfn` warns when the snapshot is missing components from failed sheets
+- `package_for_xfn` snapshots include the design notes in a new `notes` table: project
+  parameters; per sheet the notes, text frames, labels, pictures, directives, title-block
+  parameters and template; per Draftsman document its source board, parameters, notes,
+  text, tables, pictures, view titles, drill table and layer stack notes. One row per item
+  with `document_kind`, `document`, `sheet_id`, `page`, `kind`, `title`, `text`, `author`,
+  `near_refdes` (JSON) and kind-specific `data` (JSON). Pictures are stored as metadata
+  only (name, size, position, index), never their image data. A document whose notes
+  cannot be read is left out with a warning instead of failing the export
+
+### Changed
+- Snapshot `SCHEMA_VERSION` is now 2 (new `notes` table). pcb-copilot must accept schema
+  2 (`SUPPORTED_SCHEMA_VERSION`) to open snapshots written by this version
 
 ## [0.3.0] - 2026-07-19
 

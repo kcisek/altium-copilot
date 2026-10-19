@@ -5,7 +5,7 @@ from pathlib import Path
 
 # IMPORTANT: Bump this — and SUPPORTED_SCHEMA_VERSION in pcb-copilot — whenever the DB
 # schema changes. See CONTRIBUTING.md.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 HIGH_FANOUT_THRESHOLD = 25
 
@@ -52,9 +52,29 @@ def _create_schema(conn: sqlite3.Connection) -> None:
           pin_name     TEXT NOT NULL,
           net_name     TEXT REFERENCES nets(name)
         );
+        -- Designer-added information, as get_design_notes reports it. Pictures are
+        -- described in data (file name, size, index), their image bytes are not stored.
+        --   project:   parameter
+        --   sheet:     note, text_frame, label, image, directive, title_block, template
+        --   draftsman: drawing (source PcbDoc, pages), parameter, note, text, table,
+        --              picture, view, drill, layer_note
+        CREATE TABLE notes (
+          id            INTEGER PRIMARY KEY,
+          document_kind TEXT NOT NULL,             -- 'project' | 'sheet' | 'draftsman'
+          document      TEXT NOT NULL,             -- project, sheet or Draftsman file name
+          sheet_id      INTEGER REFERENCES sheets(id),
+          page          INTEGER,                   -- Draftsman page, 1-based
+          kind          TEXT NOT NULL,
+          title         TEXT,                      -- note/table/view title, parameter name
+          text          TEXT NOT NULL DEFAULT '',
+          author        TEXT,
+          near_refdes   TEXT NOT NULL DEFAULT '[]',  -- components drawn next to it
+          data          TEXT NOT NULL DEFAULT '{}'   -- kind-specific fields, JSON
+        );
         CREATE INDEX idx_pins_net_name       ON pins(net_name);
         CREATE INDEX idx_pins_component_id   ON pins(component_id);
         CREATE INDEX idx_components_sheet_id ON components(sheet_id);
+        CREATE INDEX idx_notes_sheet_id      ON notes(sheet_id);
     """)
 
 
@@ -63,9 +83,12 @@ def export_project(
     netlist: dict,
     variant_state,
     version: str,
+    notes: list[dict] | None = None,
 ) -> str:
     """Write in-memory project to a pcb-copilot .db file next to the .PrjPcb.
 
+    notes are rows for the notes table (services.design_notes.note_rows); sheet notes
+    are linked to their sheet by name.
     Returns the absolute path to the written file.
     Raises ValueError if a duplicate refdes is detected during INSERT.
     Always overwrites any existing file at the same path.
@@ -148,6 +171,28 @@ def export_project(
                     " VALUES (?,?,?,?)",
                     (comp_id, pin_num, pin_name, net_name),
                 )
+
+        for note in notes or []:
+            sheet_id = (
+                sheet_id_map.get(note["document"].lower())
+                if note["document_kind"] == "sheet" else None
+            )
+            conn.execute(
+                "INSERT INTO notes (document_kind, document, sheet_id, page, kind, title,"
+                " text, author, near_refdes, data) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    note["document_kind"],
+                    note["document"],
+                    sheet_id,
+                    note.get("page"),
+                    note["kind"],
+                    note.get("title"),
+                    note.get("text") or "",
+                    note.get("author"),
+                    json.dumps(note.get("near_refdes") or []),
+                    json.dumps(note.get("data") or {}),
+                ),
+            )
 
         conn.commit()
         _committed = True

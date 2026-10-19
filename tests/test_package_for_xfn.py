@@ -1,7 +1,13 @@
 import json
+import shutil
+import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 from main import _package_for_xfn_impl
+from services.design_notes import DesignNotesCache
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class _FakeVariant:
@@ -80,6 +86,29 @@ def test_registry_mark_failure_does_not_hide_successful_export(tmp_path):
     assert "Exported to:" in result
     assert "Warning:" in result
     assert "registry locked" in result
+
+
+def test_design_notes_are_exported_and_unreadable_ones_reported(tmp_path):
+    project = _project(tmp_path)
+    shutil.copy(FIXTURES / "sheet1.SchDoc", tmp_path / "MCU.SchDoc")
+    project["sheets"] = [
+        {"name": "MCU", "path": str(tmp_path / "MCU.SchDoc")},
+        {"name": "Power", "path": str(tmp_path / "Power.SchDoc")},  # not on disk
+    ]
+    project["parameters"] = {"PrjPCBRev": "3"}
+    with patch("main.mark_xfn_exported"):
+        result = _package_for_xfn_impl(project, _netlist(), _FakeVS(), "0.1.0", DesignNotesCache())
+
+    assert "Exported to:" in result
+    assert "Warning: the notes of sheet 'Power' could not be read (FileNotFoundError" in result
+    conn = sqlite3.connect(str(tmp_path / "MotorController-pcb-copilot.db"))
+    counts = dict(conn.execute(
+        "SELECT document, COUNT(*) FROM notes GROUP BY document"
+    ).fetchall())
+    conn.close()
+    assert counts["MotorController"] == 1
+    assert counts["MCU"] > 15
+    assert "Power" not in counts
 
 
 def test_duplicate_refdes_returns_error_json(tmp_path):
