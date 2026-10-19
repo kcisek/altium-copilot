@@ -258,9 +258,12 @@ component locations, distances):
     of rules and copper against each chip's layout guide. For one net use
     get_rules_for_net; for circuit correctness schematic_review.
 
-Lengths are the copper path from pad centre to pad centre plus the via barrel over the
-layers it traverses (multi-pad nets: routed copper plus barrels). Pin/package length is not
-included, so a result within a few mil of a limit is inconclusive. The checks read the saved
+Lengths are measured like Altium's Signal Length: the copper path from pad centre to pad
+centre plus the via barrel over the layers it traverses plus the pin/package length stored
+on the end pads (xSignals: legs through series parts, pin/package length at the end pins).
+Nets without exactly 2 pads use routed copper plus barrels and no pin/package length, like
+Altium's Routed Length. A pair's group length is the P/N average. Results marked marginal
+are too close to a limit to call. The checks read the saved
 rules and copper, not Altium's DRC report; checked_by_batch_drc false means the designer's
 own batch DRC does not check that kind — say so before calling it a problem.
 
@@ -1966,17 +1969,43 @@ def _net_or_pair_not_found(index, name: str) -> dict:
     }
 
 
+# Rule kinds that apply to a whole xSignal (its routed legs through series
+# parts); every other kind applies to its member nets.
+XSIGNAL_RULE_KINDS = ("Length", "MatchedLengths")
+
+
+def _xsignal_classes_of(index, name: str) -> list[str]:
+    key = name.lower()
+    return [
+        pcb_class.name
+        for pcb_class in index.pcb.classes
+        if pcb_class.kind == "xsignal"
+        and not pcb_class.superclass
+        and key in {member.lower() for member in pcb_class.members}
+    ]
+
+
 def _get_rules_for_net_impl(index, net, kinds) -> dict:
     target = index.rule_target(net)
     if target is None:
-        return _net_or_pair_not_found(index, net)
-    also_pair = (
-        target.kind == "net" and net.lower() in index.rule_context.pairs
-    )
+        missing = _net_or_pair_not_found(index, net)
+        missing["message"] = (
+            f"No PCB net, differential pair or xSignal named '{net}'."
+        )
+        missing["suggestions"] += [
+            xsignal.name
+            for xsignal in index.pcb.xsignals
+            if net.lower() in xsignal.name.lower()
+        ][:5]
+        return missing
+    ctx = index.rule_context
+    also_pair = target.kind == "net" and net.lower() in ctx.pairs
+    also_xsignal = target.kind != "xsignal" and net.lower() in ctx.xsignals
     by_kind: dict[str, list] = {}
     for rule in index.pcb.rules:
         if rule.kind != ROOM_KIND:
             by_kind.setdefault(rule.kind, []).append(rule)
+    not_for_xsignal: list[str] = []
     if kinds:
         lookup = {kind.lower(): kind for kind in by_kind}
         wanted = (
@@ -1994,6 +2023,11 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
                 "message": f"No rules of kind {unknown} on this board.",
                 "available_kinds": sorted(by_kind),
             }
+        if target.kind == "xsignal":
+            not_for_xsignal = [
+                kind for kind in wanted if kind not in XSIGNAL_RULE_KINDS
+            ]
+            wanted = [kind for kind in wanted if kind in XSIGNAL_RULE_KINDS]
     else:
         wanted = [kind for kind in NET_RULE_KINDS if kind in by_kind]
         if target.kind == "diff_pair":
@@ -2001,6 +2035,8 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
                 kind for kind in ("DiffPairsRouting", "MatchedLengths")
                 if kind in by_kind
             ]
+        elif target.kind == "xsignal":
+            wanted = [kind for kind in XSIGNAL_RULE_KINDS if kind in by_kind]
 
     def describe(rule):
         return _rule_detail(index, rule)
@@ -2041,8 +2077,8 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
         pairs = index.diff_pairs_of(target.name)
         if pairs:
             result["diff_pairs"] = pairs
-    else:
-        _, positive, negative = index.rule_context.pairs[target.name.lower()]
+    elif target.kind == "diff_pair":
+        _, positive, negative = ctx.pairs[target.name.lower()]
         result["positive_net"] = positive
         result["negative_net"] = negative
         result["pair_classes"] = index.pair_classes_of(target.name)
@@ -2051,13 +2087,40 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
             "via and length rules apply to the member nets: call "
             "get_rules_for_net on each net."
         )
+    elif target.kind == "xsignal":
+        key = target.name.lower()
+        result["nets"] = sorted(
+            ctx.net_names.get(member, member) for member in ctx.xsignals.get(key, ())
+        )
+        xsignal = index.xsignals.get(key)
+        if xsignal is not None:
+            result["pins"] = list(xsignal.pins)
+        classes = _xsignal_classes_of(index, target.name)
+        if classes:
+            result["xsignal_classes"] = classes
+        if not_for_xsignal:
+            result["kinds_not_resolved"] = not_for_xsignal
+        result["hint"] = (
+            "An xSignal is checked by Length and MatchedLengths rules (listed in "
+            "rules; check_lengths(target=...) measures it). Width, clearance, "
+            "via and layer rules apply to its member nets: call "
+            "get_rules_for_net on each net."
+        )
     result["rules"] = results
+    notes = []
     if also_pair:
-        result["note"] = (
+        notes.append(
             f"'{net}' is also a differential pair name; its pair rules are "
             "listed under DiffPairsRouting when the net belongs to it, or call "
             "list_diff_pairs."
         )
+    if also_xsignal:
+        notes.append(
+            f"'{net}' is also an xSignal name; call check_lengths(target=...) "
+            "for the xSignal's length rules."
+        )
+    if notes:
+        result["note"] = " ".join(notes)
     return result
 
 
@@ -2079,7 +2142,8 @@ def get_rules_for_net(
     Clearance list candidates in priority order, since the winner depends on the other
     object; each lists orientations (which side of the rule the net is on, and what the
     other object must be). Diff-pair routing rules are resolved for the pairs the net
-    belongs to; a pair net's track width comes from them, not from Width.
+    belongs to; a pair net's track width comes from them, not from Width. An xSignal
+    name gets its Length and MatchedLengths rules and its member nets.
     kinds narrows the kinds (default: routing-related kinds; ['all'] for every kind).
     Lengths use units (default: board display unit)."""
     index, error = _pcb_index_or_error()
@@ -2288,8 +2352,9 @@ def _list_diff_pairs_impl(index, pattern, offset) -> dict:
         "diff_pairs": rendered,
         "note": (
             "length_mil is the copper path pad centre to pad centre plus the via "
-            "barrel over the layers it traverses (multi-pad legs: routed copper "
-            "plus barrels); pin/package length is not included. routed_length_mil "
+            "barrel over the layers it traverses plus the end pads' pin/package "
+            "length, like Altium's Signal Length (multi-pad legs: routed copper "
+            "plus barrels, no pin/package length). routed_length_mil "
             "is all track and arc copper of each leg, including stubs. Use "
             "check_diff_pairs for skew against the in-pair rule and "
             "get_rules_for_net for the routing rule's gap and widths."
@@ -2331,6 +2396,20 @@ def _split_names(value: str | None) -> list[str] | None:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+COMPLIANCE_GROUP_LIMIT = 50
+
+
+def _trim_violation_groups(result: dict, offset: int, limit: int) -> None:
+    """Cut every kind's violation groups to limit, keeping paging consistent."""
+    for entry in result.get("kinds", []):
+        groups = entry.get("violations")
+        if not isinstance(groups, list) or len(groups) <= limit:
+            continue
+        entry["violations"] = groups[:limit]
+        entry["has_more"] = True
+        entry["next_offset"] = offset + limit
+
+
 @mcp.tool(
     title="Check Rule Compliance",
     annotations=ToolAnnotations(readOnlyHint=True),
@@ -2340,6 +2419,7 @@ def check_rule_compliance(
     net: str | None = None,
     kinds: list[str] | None = None,
     clearance_spot_check: bool = False,
+    offset: int = 0,
     units: PcbUnits | None = None,
 ) -> str:
     """Check the saved copper against the design rules: track widths per layer (pair
@@ -2349,27 +2429,47 @@ def check_rule_compliance(
 
     net is a net or diff-pair name (comma-separated for several); omit for the whole
     board. kinds narrows to Width, DiffPairsRouting, RoutingVias, HoleSize,
-    MinimumAnnularRing, RoutingLayers, Length, Clearance. clearance_spot_check adds an
-    approximate clearance check for up to 10 nets. Violations are grouped with one
-    example location; checked_by_batch_drc says whether the board's own batch DRC
-    checks that kind. Lengths use units (default: board display unit). This reads the
-    saved file, not Altium's DRC report."""
+    MinimumAnnularRing, RoutingLayers, Length, Clearance. Diff-pair nets' track widths
+    are checked under DiffPairsRouting, not Width (widths only; uncoupled length is not
+    checked). clearance_spot_check adds an approximate clearance check for up to 10
+    nets. Violations are grouped with one example location, worst first, up to 50
+    groups per kind; if a kind has has_more true, call again with kinds=[that kind]
+    and offset=next_offset (offset skips that many groups of every kind).
+    checked_by_batch_drc says whether the board's own batch DRC checks that kind.
+    Lengths use units (default: board display unit). This reads the saved file, not
+    Altium's DRC report."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)
     to_mm, _, units_error = _pcb_units_or_error(index, units)
     if units_error:
         return json.dumps(units_error)
+    offset = max(0, offset)
     result = check_compliance(
         index,
         _split_names(net),
         kinds,
         length_of=lambda name: net_length(index, name),
         clearance=clearance_spot_check,
+        limit=COMPLIANCE_GROUP_LIMIT,
+        offset=offset,
     )
     if "error" in result:
         return json.dumps(result)
-    return json.dumps(_convert_units(result, to_mm), indent=2)
+    # A board-wide call with many failing kinds: list fewer groups per kind
+    # until the answer fits; counts and summaries stay complete.
+    rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    for limit in (20, 10, 3, 1):
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+        _trim_violation_groups(result, offset, limit)
+        result["violations_per_kind_limited_to"] = limit
+        result["hint"] = (
+            "Response trimmed to fit: call check_rule_compliance(kinds=[<kind>], "
+            "offset=<next_offset>) to page one kind's violation groups."
+        )
+        rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    return rendered
 
 
 @mcp.tool(
@@ -2386,14 +2486,17 @@ def check_lengths(
     """Evaluate Length and MatchedLengths rules on the saved copper, as Altium does:
     Length windows per object; matched-length groups (xSignals, pairs or nets) against
     the longest member or the target source; within-pair skew. Lengths are the copper
-    path pad to pad plus the via barrel over the layers traversed (xSignals through
-    series parts).
+    path pad to pad plus the via barrel over the layers traversed plus the end pads'
+    pin/package length (xSignals through series parts, pin/package length at the end
+    pins); nets without exactly 2 pads use routed copper plus barrels. A pair's group
+    length is the P/N average.
 
     rule picks one rule; target (net, pair, xSignal or xSignal class) shows the rules
-    covering it; with neither, every rule is listed with its problems first. Stale
-    scopes, conditional members and approximations are reported. Paginated per rule:
-    pass offset from members_page.next_offset. Lengths use units (default: board
-    display unit)."""
+    covering it; with neither, every rule is listed but only members whose status is
+    not ok are shown (summaries count all members). Stale scopes,
+    conditional members and approximations are reported. Paginated per rule: pass
+    offset from members_page.next_offset. Lengths use units (default: board display
+    unit)."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)
@@ -2433,8 +2536,10 @@ def get_signal_length(
     """Measure one signal on the saved copper: a net (2 pads: pad-to-pad path; more:
     routed copper plus via barrels), a differential pair (both legs and skew) or an
     xSignal (legs through series parts). With to_pin, name is a pin like 'U1-5' and the
-    path between the two pins is measured. Via barrels are included, pin/package length
-    is not. Lengths use units (default: board display unit)."""
+    path between the two pins is measured. Via barrels are included. Pin/package length
+    stored on the end pads is added to pad-to-pad paths and at an xSignal's end pins,
+    like Altium's Signal Length; routed copper of multi-pad nets has none, like Routed
+    Length. Lengths use units (default: board display unit)."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)

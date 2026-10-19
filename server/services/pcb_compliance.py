@@ -94,9 +94,44 @@ _NOT_CHECKED = (
     },
     {
         "kind": "MatchedLengths",
-        "reason": "Group/skew matching: see check_length_rules.",
+        "reason": "Group/skew matching: see check_lengths.",
     },
 )
+
+# Hints in the output name the MCP tool that exposes this check
+# (server/main.py check_rule_compliance) and its parameters.
+_TOOL = "check_rule_compliance"
+_CLEARANCE_HINT = (
+    f"call {_TOOL}(net='A,B', clearance_spot_check=True) with at most "
+    f"{CLEARANCE_MAX_NETS} nets"
+)
+_UNCOUPLED_NOT_CHECKED = {
+    "kind": "DiffPairsRouting (max uncoupled length)",
+    "reason": (
+        "Only the per-layer min/max widths of pair-member tracks and arcs are "
+        "checked. Altium's batch DRC for this kind also measures each pair's "
+        "uncoupled length (copper where the pair's gap is outside the rule's gap "
+        "range) against Max Uncoupled Length; that is not checked here."
+    ),
+}
+_PAIRS_ADDED = (
+    "Width does not cover diff-pair member tracks and arcs: their widths are "
+    "checked by their DiffPairsRouting rule, so DiffPairsRouting was added."
+)
+
+# Scope terms that ask which footprint owns an object. At net level they are
+# decided from the pads the net connects to, which says nothing about a via or
+# track that a footprint owns, so scopes using them are decided per object
+# ("incomponent" also covers InComponentClass).
+_OWNERSHIP_TERMS = (
+    "incomponent", "inanycomponent", "hasfootprint", "haspad", "inpadclass",
+    "comppincount",
+)
+
+
+def _per_object_scope(scope: str | None) -> bool:
+    text = (scope or "").lower()
+    return any(term in text for term in _OWNERSHIP_TERMS)
 
 
 # ---------- three-valued helpers ----------
@@ -187,6 +222,33 @@ def resolve_clearance_rule(rules, target_a, target_b, ctx) -> tuple:
     return _resolve_binary(ordered, targets, ctx, side)
 
 
+def _undecided_entry(rule, side: dict) -> dict:
+    entry = {"rule": rule.name, "conditions": side.get("conditions", [])}
+    if side.get("parse_error"):
+        entry["parse_error"] = side["parse_error"]
+    return entry
+
+
+class _Resolver(ObjectResolver):
+    """ObjectResolver that decides more scopes on each object.
+
+    Net-level verdicts are reused for every object only when object facts
+    cannot change them: scopes are decided per object for a target without
+    nets (no-net vias, whose scope facts are the object's alone) and, for a
+    net, when they ask which footprint owns the object (_OWNERSHIP_TERMS).
+    """
+
+    def __init__(self, rules: list, target: RuleTarget, ctx):
+        super().__init__(rules, target, ctx)
+        self.net_level = [
+            "conditional"
+            if not target.nets
+            or (target.kind == "net" and _per_object_scope(rule.scope1))
+            else verdict
+            for rule, verdict in zip(self.rules, self.net_level)
+        ]
+
+
 # ---------- per-kind report ----------
 
 
@@ -259,7 +321,7 @@ class _KindReport:
     def extra_count(self, name: str, amount: int = 1) -> None:
         self.extra[name] = self.extra.get(name, 0) + amount
 
-    def render(self, checked_by_batch_drc, limit: int) -> dict:
+    def render(self, checked_by_batch_drc, limit: int, offset: int = 0) -> dict:
         groups = sorted(
             self.groups.values(),
             key=lambda group: (
@@ -289,10 +351,14 @@ class _KindReport:
                 },
                 "violation_count": self.violations,
                 "violation_groups": len(groups),
-                "violations": groups[:limit],
-                "has_more": len(groups) > limit,
+                "violations": groups[offset : offset + limit],
+                "has_more": offset + limit < len(groups),
             }
         )
+        if offset:
+            result["offset"] = offset
+        if result["has_more"]:
+            result["next_offset"] = offset + limit
         if self.approximate:
             result["approximate"] = True
         result.update(self.extra)
@@ -336,6 +402,8 @@ class _Checker:
         self._targets: dict = {}
         self._resolvers: dict = {}
         self._pairs: dict = {}
+        # No-net objects (free vias): a target without nets, whose scopes the
+        # resolver decides on each object.
         self._free = RuleTarget(kind="net", name="", nets=set(), pairs=set())
 
     # --- lookups ---
@@ -354,9 +422,9 @@ class _Checker:
             return self._free
         key = net.lower()
         if key not in self._targets:
-            self._targets[key] = (
-                self.index.rule_target(net, kind="net") or self._free
-            )
+            self._targets[key] = self.index.rule_target(
+                net, kind="net"
+            ) or RuleTarget(kind="net", name=key, nets={key}, pairs=set())
         return self._targets[key]
 
     def pair_of(self, net: str) -> str | None:
@@ -378,7 +446,7 @@ class _Checker:
                 )
             else:
                 target = self.target(net)
-            self._resolvers[key] = ObjectResolver(
+            self._resolvers[key] = _Resolver(
                 self.rules.get(kind, []), target, self.ctx
             )
         return self._resolvers[key]
@@ -528,13 +596,17 @@ class _Checker:
             rule, undecided = self.resolver(
                 "DiffPairsRouting", net, pair
             ).resolve(facts)
+            # A pair net's tracks belong to DiffPairsRouting (check_compliance
+            # adds that kind whenever Width is asked for pair nets); those with
+            # no pair rule are its no-rule objects.
             if undecided:
                 if pairs is not None:
                     pairs.not_decided(net, undecided)
                 return
+            if pairs is not None:
+                pairs.checked(rule)
             if rule is not None:
                 if pairs is not None:
-                    pairs.checked(rule)
                     self.check_width(
                         pairs, rule, row, net, layer_name, x, y, diff_pair=pair
                     )
@@ -708,10 +780,10 @@ class _Checker:
                 if matches["matches"] == "yes":
                     rule = candidate
                     break
-                if matches["matches"] == "conditional":
-                    undecided.append(
-                        {"rule": candidate.name, "conditions": matches["conditions"]}
-                    )
+                if matches["matches"] != "no":
+                    # Conditional, or a scope that cannot be parsed: Altium
+                    # may apply this rule, so a lower one is not certain.
+                    undecided.append(_undecided_entry(candidate, matches))
             if rule is None and not undecided:
                 continue  # nets without a Length rule are not counted
             if undecided:
@@ -769,27 +841,21 @@ class _Checker:
             ]
         )
         net_ids = [index.net_id(net) for net in nets]
-        objects = self._rows(
+        rows = self._rows(
             "SELECT p.*, n.name AS net_name FROM prims p "
             "JOIN nets n ON n.id = p.net_id "
             "WHERE p.kind IN ('track','arc','via','pad') AND p.pour_id IS NULL",
             [],
             [net_id for net_id in net_ids if net_id is not None],
         )
-        if len(objects) > CLEARANCE_MAX_OBJECTS:
-            report.extra["truncated_objects"] = len(objects) - CLEARANCE_MAX_OBJECTS
-            objects = objects[:CLEARANCE_MAX_OBJECTS]
-        facts_cache: dict[int, object] = {}
-        verdicts: dict[tuple, str] = {}
-        net_level: dict[tuple, str] = {}
+        # An arc (all its chords) is one object, as for Width.
+        chords_of: dict[tuple, list] = {}
+        for row in rows:
+            chords_of.setdefault(_object_id(row), []).append(row)
+        if len(chords_of) > CLEARANCE_MAX_OBJECTS:
+            report.extra["truncated_objects"] = len(chords_of) - CLEARANCE_MAX_OBJECTS
+            chords_of = dict(list(chords_of.items())[:CLEARANCE_MAX_OBJECTS])
         layer_cache: dict[int, frozenset] = {}
-        seen: set = set()
-
-        def facts_of(row):
-            key = row["id"]
-            if key not in facts_cache:
-                facts_cache[key] = index.object_facts(row)
-            return facts_cache[key]
 
         def layers_of(row):
             key = row["id"]
@@ -797,123 +863,171 @@ class _Checker:
                 layer_cache[key] = frozenset(index._primitive_layers(row))
             return layer_cache[key]
 
-        for row in objects:
-            layers = layers_of(row)
-            for candidate in self._clearance_candidates(row, reach):
-                pair_key = (min(row["id"], candidate["id"]), max(row["id"], candidate["id"]))
-                if pair_key in seen:
-                    continue
-                seen.add(pair_key)
-                shared = layers & layers_of(candidate)
-                if not shared:
-                    continue
-                distance = index._primitive_distance(row, candidate)
-                if distance >= reach:
-                    continue
-                ends = (row, candidate)
-                targets = (
-                    self.target(row["net_name"]),
-                    self.target(candidate["net_name"]),
-                )
+        # Pass 1: the closest chord pair of every object pair that shares a
+        # layer within the search distance (ends keep the first orientation).
+        closest: dict[tuple, list] = {}
+        seen: set = set()
+        for chords in chords_of.values():
+            for row in chords:
+                layers = layers_of(row)
+                for candidate in self._clearance_candidates(row, reach):
+                    chord_key = (
+                        min(row["id"], candidate["id"]),
+                        max(row["id"], candidate["id"]),
+                    )
+                    if chord_key in seen:
+                        continue
+                    seen.add(chord_key)
+                    shared = layers & layers_of(candidate)
+                    if not shared:
+                        continue
+                    distance = index._primitive_distance(row, candidate)
+                    if distance >= reach:
+                        continue
+                    ids = (_object_id(row), _object_id(candidate))
+                    pair_key = tuple(sorted(ids))
+                    best = closest.get(pair_key)
+                    if best is None:
+                        closest[pair_key] = [distance, row, candidate, shared, ids]
+                    elif distance < best[0]:
+                        ends = (row, candidate) if ids[0] == best[4][0] else (
+                            candidate, row
+                        )
+                        best[:4] = [distance, *ends, shared]
 
-                def side(position, which, endpoint, ends=ends, targets=targets):
-                    rule = rules[position]
-                    scope = rule.scope1 if which == 1 else rule.scope2
+        # Pass 2: one rule resolution and one check per object pair.
+        facts_cache: dict[tuple, object] = {}
+        verdicts: dict[tuple, str] = {}
+        net_level: dict[tuple, str] = {}
+        per_object = [
+            (_per_object_scope(rule.scope1), _per_object_scope(rule.scope2))
+            for rule in rules
+        ]
+
+        def facts_of(row):
+            # Scope facts of an arc come from its middle chord, as for Width.
+            key = _object_id(row)
+            if key not in facts_cache:
+                chords = chords_of.get(key) or self._arc_chords(row)
+                facts_cache[key] = index.object_facts(chords[len(chords) // 2])
+            return facts_cache[key]
+
+        for distance, row, candidate, shared, _ids in closest.values():
+            ends = (row, candidate)
+            targets = (
+                self.target(row["net_name"]),
+                self.target(candidate["net_name"]),
+            )
+
+            def side(position, which, endpoint, ends=ends, targets=targets):
+                rule = rules[position]
+                scope = rule.scope1 if which == 1 else rule.scope2
+                if not per_object[position][which - 1]:
                     net_key = (position, which, ends[endpoint]["net_id"])
                     if net_key not in net_level:
                         net_level[net_key] = evaluate_scope(
                             scope, targets[endpoint], self.ctx
                         )["matches"]
-                    if net_level[net_key] != "conditional":
+                    if net_level[net_key] in ("yes", "no"):
                         return net_level[net_key]
-                    object_key = (position, which, ends[endpoint]["id"])
-                    if object_key not in verdicts:
-                        verdicts[object_key] = evaluate_scope(
-                            scope,
-                            replace(targets[endpoint], obj=facts_of(ends[endpoint])),
-                            self.ctx,
-                        )["matches"]
-                    return verdicts[object_key]
+                object_key = (position, which, _object_id(ends[endpoint]))
+                if object_key not in verdicts:
+                    verdicts[object_key] = evaluate_scope(
+                        scope,
+                        replace(targets[endpoint], obj=facts_of(ends[endpoint])),
+                        self.ctx,
+                    )["matches"]
+                return verdicts[object_key]
 
-                rule, undecided = _resolve_binary(
-                    rules,
-                    (
-                        replace(targets[0], obj=facts_of(row)),
-                        replace(targets[1], obj=facts_of(candidate)),
-                    ),
-                    self.ctx,
-                    side,
-                )
-                if undecided:
-                    report.objects += 1
-                    report.undecided += 1
-                    if len(report.undecided_examples) < UNDECIDED_EXAMPLES:
-                        report.undecided_examples.append(
-                            {
-                                "net": row["net_name"],
-                                "other_net": candidate["net_name"],
-                                "rules": undecided,
-                            }
-                        )
-                    continue
-                report.checked(rule)
-                if rule is None:
-                    continue
-                value = values[rules.index(rule)]
-                if (
-                    value.get("ignore_pad_to_pad_in_footprint")
-                    and row["kind"] == "pad"
-                    and candidate["kind"] == "pad"
-                    and row["component"] is not None
-                    and row["component"] == candidate["component"]
-                ):
-                    report.extra_count("pad_pairs_in_footprint_ignored")
-                    continue
-                kinds = (_clearance_kind(row), _clearance_kind(candidate))
-                matrix = value.get("object_clearances_mil", {})
-                required = matrix.get(
-                    f"{kinds[0]}-{kinds[1]}",
-                    matrix.get(f"{kinds[1]}-{kinds[0]}", value.get("clearance_mil")),
-                )
-                if required is None or distance >= required - CLEARANCE_TOLERANCE_MIL:
-                    continue
-                layer_name = (
-                    self.layer_label(next(iter(shared)))
-                    if len(shared) == 1
-                    else "Multi-Layer"
-                )
-                record = {
-                    "net": row["net_name"],
-                    "other_net": candidate["net_name"],
-                    "rule": rule.name,
-                    "objects": "-".join(kinds),
-                    "layer": layer_name,
-                    "actual_mil": round(distance, 4),
-                    "required_mil": _round(required),
-                }
-                _margin_fields(record, required - distance)
-                anchor = facts_of(row).points
-                record["x_mil"] = round(
-                    sum(point[0] for point in anchor) / len(anchor), 3
-                )
-                record["y_mil"] = round(
-                    sum(point[1] for point in anchor) / len(anchor), 3
-                )
-                key = (
-                    row["net_name"],
-                    candidate["net_name"],
-                    rule.name,
-                    layer_name,
-                    tuple(sorted(kinds)),
-                )
-                report.violation(
-                    rule,
-                    key,
-                    record,
-                    worst=lambda old, new: new["actual_mil"] < old["actual_mil"],
-                )
-        report.extra["target_objects"] = len(objects)
+            rule, undecided = _resolve_binary(
+                rules,
+                (
+                    replace(targets[0], obj=facts_of(row)),
+                    replace(targets[1], obj=facts_of(candidate)),
+                ),
+                self.ctx,
+                side,
+            )
+            if undecided:
+                report.objects += 1
+                report.undecided += 1
+                if len(report.undecided_examples) < UNDECIDED_EXAMPLES:
+                    report.undecided_examples.append(
+                        {
+                            "net": row["net_name"],
+                            "other_net": candidate["net_name"],
+                            "rules": undecided,
+                        }
+                    )
+                continue
+            report.checked(rule)
+            if rule is None:
+                continue
+            value = values[rules.index(rule)]
+            if (
+                value.get("ignore_pad_to_pad_in_footprint")
+                and row["kind"] == "pad"
+                and candidate["kind"] == "pad"
+                and row["component"] is not None
+                and row["component"] == candidate["component"]
+            ):
+                report.extra_count("pad_pairs_in_footprint_ignored")
+                continue
+            kinds = (_clearance_kind(row), _clearance_kind(candidate))
+            matrix = value.get("object_clearances_mil", {})
+            required = matrix.get(
+                f"{kinds[0]}-{kinds[1]}",
+                matrix.get(f"{kinds[1]}-{kinds[0]}", value.get("clearance_mil")),
+            )
+            if required is None or distance >= required - CLEARANCE_TOLERANCE_MIL:
+                continue
+            layer_name = (
+                self.layer_label(next(iter(shared)))
+                if len(shared) == 1
+                else "Multi-Layer"
+            )
+            record = {
+                "net": row["net_name"],
+                "other_net": candidate["net_name"],
+                "rule": rule.name,
+                "objects": "-".join(kinds),
+                "layer": layer_name,
+                "actual_mil": round(distance, 4),
+                "required_mil": _round(required),
+            }
+            _margin_fields(record, required - distance)
+            # Located at the closest chord (or the via / pad centre).
+            x, y = _anchor(row)
+            record["x_mil"] = round(x, 3)
+            record["y_mil"] = round(y, 3)
+            key = (
+                row["net_name"],
+                candidate["net_name"],
+                rule.name,
+                layer_name,
+                tuple(sorted(kinds)),
+            )
+            report.violation(
+                rule,
+                key,
+                record,
+                worst=lambda old, new: new["actual_mil"] < old["actual_mil"],
+            )
+        report.extra["target_objects"] = len(chords_of)
         report.extra["search_distance_mil"] = round(reach, 4)
+
+    def _arc_chords(self, row) -> list:
+        """Every chord of the arc a chord row belongs to, in id order."""
+        if row["kind"] != "arc" or row["source_id"] is None:
+            return [row]
+        return self.index.db.execute(
+            "SELECT p.*, n.name AS net_name FROM prims p "
+            "LEFT JOIN nets n ON n.id = p.net_id "
+            "WHERE p.net_id = ? AND p.kind = 'arc' AND p.source_id = ? "
+            "AND p.pour_id IS NULL "
+            "ORDER BY p.id",
+            (row["net_id"], row["source_id"]),
+        ).fetchall() or [row]
 
     def _clearance_candidates(self, row, reach: float):
         index = self.index
@@ -941,6 +1055,21 @@ class _Checker:
                 "AND p.maxx >= ? AND p.minx <= ? AND p.maxy >= ? AND p.miny <= ?"
             )
         return index.db.execute(sql, (row["net_id"], *box)).fetchall()
+
+
+def _object_id(row) -> tuple:
+    """Identity of the copper object a prims row belongs to: an arc's chords
+    share their source_id (tagged so it cannot clash with a primitive id)."""
+    if row["kind"] == "arc" and row["source_id"] is not None:
+        return ("arc", row["source_id"])
+    return ("prim", row["id"])
+
+
+def _anchor(row) -> tuple:
+    """Location of a row: a via or pad centre, a track or chord midpoint."""
+    if row["kind"] in ("via", "pad"):
+        return row["x1"], row["y1"]
+    return (row["x1"] + row["x2"]) / 2.0, (row["y1"] + row["y2"]) / 2.0
 
 
 def _clearance_kind(row) -> str:
@@ -1012,6 +1141,12 @@ def _default_length(index):
     return measure
 
 
+def _selects_pair_nets(index, checker: _Checker, names) -> bool:
+    if names is None:
+        return bool(index.rule_context.pairs)
+    return any(checker.pair_of(net) is not None for net in names)
+
+
 def check_compliance(
     index,
     nets: list[str] | None = None,
@@ -1019,22 +1154,29 @@ def check_compliance(
     length_of=None,
     clearance: bool = False,
     limit: int = 50,
+    offset: int = 0,
 ) -> dict:
     """Check the copper of the selected nets against the board's rules.
 
     nets: net or differential-pair names (a pair checks both nets); None
     checks every net. kinds: subset of SUPPORTED_KINDS (case-insensitive);
     None runs every supported kind the board has an enabled rule for
-    (Clearance only with clearance=True). length_of(net) -> {"length_mil",
-    "status" ("ok" when measured), "measure"} measures a net for Length rules;
-    by default the net's routed track/arc length. clearance=True (or
-    kinds=['Clearance']) runs an object-pair clearance spot-check for at most
-    CLEARANCE_MAX_NETS nets. limit caps the violation groups per kind.
+    (Clearance only with clearance=True). Width never covers diff-pair member
+    tracks: when Width is asked for pair nets, DiffPairsRouting is added
+    (kinds_added). length_of(net) -> {"length_mil", "status" ("ok" when
+    measured), "measure"} measures a net for Length rules; by default the
+    net's routed track/arc length. clearance=True (or kinds=['Clearance'])
+    runs an object-pair clearance spot-check for at most CLEARANCE_MAX_NETS
+    nets. limit and offset page the violation groups of every kind (has_more,
+    next_offset per kind).
 
     Returns {"nets", "kinds": [per-kind report], "violation_count",
     "not_checked", "approximations", ...} or {"error", "message", ...}.
+    Hints in the output name the MCP tool check_rule_compliance and its
+    parameters (net, kinds, clearance_spot_check, offset).
     """
     checker = _Checker(index, max(1, limit))
+    offset = max(0, offset)
     selected_kinds, without_rules, error = _select_kinds(checker, kinds, clearance)
     if error:
         return error
@@ -1042,7 +1184,7 @@ def check_compliance(
     if nets is not None and not nets:
         return {
             "error": "net_not_found",
-            "message": "No nets given; pass nets=None to check every net.",
+            "message": "No net names given; omit net to check every net.",
         }
     if nets is not None and not names:
         suggestions = [
@@ -1054,6 +1196,15 @@ def check_compliance(
             "message": f"No PCB net or differential pair named {unknown}.",
             "suggestions": suggestions,
         }
+    kinds_added: list[dict] = []
+    if (
+        "Width" in selected_kinds
+        and "DiffPairsRouting" not in selected_kinds
+        and checker.enabled("DiffPairsRouting")
+        and _selects_pair_nets(index, checker, names)
+    ):
+        selected_kinds.insert(selected_kinds.index("Width") + 1, "DiffPairsRouting")
+        kinds_added.append({"kind": "DiffPairsRouting", "reason": _PAIRS_ADDED})
     run_clearance = "Clearance" in selected_kinds
     net_ids = (
         None
@@ -1061,6 +1212,8 @@ def check_compliance(
         else [net_id for net_id in (index.net_id(net) for net in names) if net_id is not None]
     )
     reports = {kind: _KindReport(kind) for kind in selected_kinds}
+    if "DiffPairsRouting" in reports:
+        reports["DiffPairsRouting"].extra["checks"] = ["width"]
 
     routed = {kind: reports[kind] for kind in _TRACK_KINDS if kind in reports}
     if routed:
@@ -1075,21 +1228,20 @@ def check_compliance(
             length_of or _default_length(index),
         )
     not_checked = [dict(entry) for entry in _NOT_CHECKED]
+    if "DiffPairsRouting" in reports:
+        not_checked.append(dict(_UNCOUPLED_NOT_CHECKED))
     if run_clearance:
         report = reports["Clearance"]
         if names is None or len(names) > CLEARANCE_MAX_NETS:
             report.skipped = (
-                f"The clearance spot-check runs on at most {CLEARANCE_MAX_NETS} "
-                "nets; pass nets=[...]."
+                "The clearance spot-check needs a small net selection: "
+                f"{_CLEARANCE_HINT}."
             )
         else:
             checker.run_clearance(report, names)
     else:
         not_checked.append(
-            {
-                "kind": "Clearance",
-                "reason": "Opt-in spot-check: pass clearance=True with a few nets.",
-            }
+            {"kind": "Clearance", "reason": f"Opt-in spot-check: {_CLEARANCE_HINT}."}
         )
     if names is None and routed:
         no_net = _no_net_routing(index, checker.signal)
@@ -1107,7 +1259,7 @@ def check_compliance(
             )
 
     rendered = [
-        reports[kind].render(checker.batch_drc(kind), checker.limit)
+        reports[kind].render(checker.batch_drc(kind), checker.limit, offset)
         for kind in selected_kinds
     ]
     result: dict = {"nets": "all" if names is None else names}
@@ -1119,8 +1271,16 @@ def check_compliance(
         entry.get("violation_count", 0) for entry in rendered
     )
     result["kinds"] = rendered
+    if kinds_added:
+        result["kinds_added"] = kinds_added
     if without_rules:
         result["kinds_without_rules"] = without_rules
+    if any(entry.get("has_more") for entry in rendered):
+        result["next_page"] = (
+            "Kinds with has_more true have more violation groups: repeat the "
+            f"{_TOOL} call with kinds=[<kind>] and offset=<that kind's "
+            "next_offset>."
+        )
     result["not_checked"] = not_checked
     result["approximations"] = _approximations(
         checker, selected_kinds, reports, length_of is None
@@ -1203,12 +1363,14 @@ def _approximations(
         )
     if "Length" in kinds:
         notes.append(
-            "Length is approximate: pin/package lengths are not included"
-            + (
-                "; the measure is the net's routed track and arc length "
-                "without via barrels."
+            (
+                "Length is approximate: the measure is the net's routed track and "
+                "arc length, without via barrels or pin/package length."
                 if default_length
-                else "."
+                else "Length is approximate: two-pad nets use the pad-to-pad copper "
+                "path plus via barrels and pin/package length (Altium's Signal "
+                "Length); other nets use routed copper plus via barrels (Altium's "
+                "Routed Length, no pin/package term)."
             )
         )
     if "Clearance" in kinds:

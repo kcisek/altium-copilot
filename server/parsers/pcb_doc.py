@@ -112,6 +112,9 @@ class Primitive:
     # True copper length of an arc chord (r * sweep / steps); the chord itself
     # is shorter. None for other primitives: their length is the segment's.
     length: float | None = None
+    # Pad Pin/Package Length (pad to die, mil): 0.0 when unset, None when the
+    # pad record is too short to carry it (and for non-pad primitives).
+    pin_package: float | None = None
 
 
 def iter_binary_records(data: bytes):
@@ -312,6 +315,12 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
 _PAD_SUBRECORD_COUNT = 5
 _PAD_MAIN_INDEX = 3
 _PAD_MAIN_MIN_LENGTH = 60
+# Pin/Package Length: int32 in internal units (1e-4 mil) at this offset of
+# the main subrecord. Seen set only in 194- and 202-byte records (whole-mm
+# values on user boards; on the MiniPC example it is what closes the tuned
+# groups at the FPGA); 171-, 185- and 186-byte records hold 0 there throughout
+# the corpus.
+_PAD_PIN_PACKAGE_OFFSET = 158
 
 
 def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
@@ -373,6 +382,13 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
         if size_x <= 0 or size_y <= 0 or hole < 0:
             skipped += 1
             continue
+        pin_package = None
+        if len(main) >= _PAD_PIN_PACKAGE_OFFSET + 4:
+            (raw_pin_package,) = struct.unpack_from(
+                "<i", main, _PAD_PIN_PACKAGE_OFFSET
+            )
+            if raw_pin_package >= 0:
+                pin_package = _units_to_mil(raw_pin_package)
         x_mil = _units_to_mil(x)
         y_mil = _units_to_mil(y)
         primitives.append(
@@ -391,6 +407,7 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                 shape=shape,
                 hole=_units_to_mil(hole),
                 pad_name=pad_name,
+                pin_package=pin_package,
             )
         )
     return primitives, skipped

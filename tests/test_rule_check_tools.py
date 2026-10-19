@@ -1,5 +1,6 @@
 """MCP tools for rule compliance, lengths, diff-pair checks and the constraints review."""
 
+import asyncio
 import json
 
 import pytest
@@ -122,3 +123,94 @@ def test_check_lengths_trims_members_to_fit(rules_pcb, monkeypatch):
     result = json.loads(main_mod.check_lengths())
     assert result["members_per_rule_limited_to"] == 1
     assert "check_lengths(rule=" in result["hint"]
+
+
+def _fake_compliance(seen: dict, total: int = 120):
+    def fake(index, nets, kinds, length_of=None, clearance=False, limit=50, offset=0):
+        seen.update(limit=limit, offset=offset, kinds=kinds)
+        groups = [
+            {"net": f"N{i}", "layer": "Top Layer", "count": 1, "margin_mil": 1.0,
+             "example": {"x_mil": 1.0, "y_mil": 2.0}}
+            for i in range(total)
+        ]
+        page = groups[offset:offset + limit]
+        entry = {
+            "kind": "Width", "violation_count": total, "violation_groups": total,
+            "violations": page, "has_more": offset + limit < total,
+        }
+        if entry["has_more"]:
+            entry["next_offset"] = offset + limit
+        return {"nets": "all", "violation_count": total, "kinds": [entry],
+                "not_checked": [], "approximations": []}
+    return fake
+
+
+def test_check_rule_compliance_pages_with_offset(rules_pcb, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(main_mod, "check_compliance", _fake_compliance(seen))
+    result = json.loads(main_mod.check_rule_compliance(kinds=["Width"], offset=60))
+    assert seen == {"limit": 50, "offset": 60, "kinds": ["Width"]}
+    width = result["kinds"][0]
+    assert [group["net"] for group in width["violations"]][:2] == ["N60", "N61"]
+    assert len(width["violations"]) == 50
+    assert width["next_offset"] == 110
+    assert "violations_per_kind_limited_to" not in result
+    json.loads(main_mod.check_rule_compliance(offset=-5))
+    assert seen["offset"] == 0
+
+
+def test_check_rule_compliance_trims_groups_to_fit(rules_pcb, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(main_mod, "check_compliance", _fake_compliance(seen))
+    monkeypatch.setattr(main_mod, "QUERY_NET_MAX_RESULT_SIZE_CHARS", 2500)
+    text = main_mod.check_rule_compliance(kinds=["Width"], offset=10)
+    assert len(text) <= 2500
+    result = json.loads(text)
+    width = result["kinds"][0]
+    shown = len(width["violations"])
+    assert result["violations_per_kind_limited_to"] == shown < 50
+    assert width["violations"][0]["net"] == "N10"
+    # Paging stays consistent: the next call starts after the last shown group.
+    assert width["has_more"] is True and width["next_offset"] == 10 + shown
+    assert width["violation_count"] == 120
+    assert "offset=" in result["hint"]
+
+
+def test_check_rule_compliance_exposes_offset_parameter():
+    tools = {tool.name: tool for tool in asyncio.run(main_mod.mcp.list_tools())}
+    schema = tools["check_rule_compliance"].inputSchema["properties"]
+    assert "offset" in schema
+    assert "next_offset" in tools["check_rule_compliance"].description
+
+
+def test_check_rule_compliance_real_offset(rules_pcb):
+    first = json.loads(main_mod.check_rule_compliance())
+    later = json.loads(main_mod.check_rule_compliance(offset=1000))
+    for entry in later["kinds"]:
+        assert entry.get("violations", []) == []
+    assert later["violation_count"] == first["violation_count"]
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_length_wording_includes_pin_package_length(rules_pcb):
+    # The length engine adds the end pads' pin/package length (Altium Signal
+    # Length); nothing may say it is excluded or bound its effect to a few mil.
+    instructions = _flat(main_mod.SERVER_INSTRUCTIONS)
+    assert "plus the pin/package length stored on the end pads" in instructions
+    assert "like Altium's Routed Length" in instructions
+    assert "group length is the P/N average" in instructions
+    tools = {tool.name: tool for tool in asyncio.run(main_mod.mcp.list_tools())}
+    pair_note = json.loads(main_mod.list_diff_pairs())["note"]
+    assert "pin/package length" in pair_note
+    texts = [instructions, _flat(pair_note)]
+    for name in ("get_signal_length", "check_lengths"):
+        description = _flat(tools[name].description)
+        assert "pin/package length" in description.lower()
+        texts.append(description)
+    for text in texts:
+        assert "few mil" not in text
+        assert "pin/package length is not" not in text.lower()
+        assert "length is not included" not in text.lower()

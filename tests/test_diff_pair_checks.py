@@ -212,10 +212,21 @@ def test_polarity_tokens_letter_rules():
         ("10uH", 1e-5),
         ("0,1uF", 1e-7),
         ("100nF,16V", 1e-7),
+        # A space between number and prefix, upper-case prefixes before a unit.
+        ("100 nF", 1e-7),
+        ("100 pF", 1e-10),
+        ("0.1 uF", 1e-7),
+        ("10 kΩ", 1e4),
+        ("4.7 k", 4700.0),
+        ("100 nF 16V", 1e-7),
+        ("100NF", 1e-7),
+        ("10UF", 1e-5),
+        ("100 NF", 1e-7),
+        ("22 R", 22.0),
     ],
 )
 def test_parse_value(raw, expected):
-    assert parse_value(raw) == pytest.approx(expected)
+    assert parse_value(raw) == pytest.approx(expected, rel=1e-9, abs=0)
 
 
 @pytest.mark.parametrize("raw", ["GRM155R71C104KA88D", "", None, "CAP", "0402B104K160NT"])
@@ -253,6 +264,20 @@ def test_name_classes():
         # "clock" in a description does not make the pair a clock.
         (["X_P", "X_N"], ["TXP", "TXN"], "PCIe switch with clock buffer", "PCI Express", True),
         (["X_P", "X_N"], ["XP", "XN"], "", None, None),
+        # SGMII / SerDes lanes of an Ethernet PHY are not MDI.
+        (["X_P", "X_N"], ["S_IN+", "S_IN-"], "88E1111 Gigabit Ethernet Transceiver",
+         "SGMII / 1000BASE-X / SerDes", None),
+        (["SGMII_TX_P", "SGMII_TX_N", "SGMII_TX"], ["S_OUTN", "S_OUTP"],
+         "Integrated 10/100/1000 Mbps Ethernet Transceiver", "SGMII / 1000BASE-X / SerDes", None),
+        (["QSGMII_RXN", "QSGMII_RXP"], ["P1", "P2"], "Ethernet switch",
+         "SGMII / 1000BASE-X / SerDes", None),
+        (["X_P", "X_N"], ["XP", "XN"], "1000BASE-X SFP transceiver",
+         "SGMII / 1000BASE-X / SerDes", None),
+        # LAN8720-style 10/100 PHY: TXP/TXN on an Ethernet part are MDI pins.
+        (["X_P", "X_N"], ["TXP", "TXN"], "Ethernet PHY", "Ethernet MDI", True),
+        # MDI pins named by port and pair letter on a gigabit switch module.
+        (["ETX_P", "ETX_N"], ["P0A_N", "P0A_P"], "4 port 1G Ethernet switch module",
+         "Ethernet MDI", True),
     ],
 )
 def test_interface_hint(names, pins, description, interface, tolerated):
@@ -326,6 +351,29 @@ def test_naming_flags_pcb_pair_conventions():
     assert summary["nets_in_multiple_pairs"] == 1
     # The B_N / A_P candidate conflicts with pair A; A_P/A_N is declared.
     assert all(f["issue"] != "undeclared_pair" or "B_N" not in str(f) for f in result["findings"])
+
+
+def test_naming_rail_pairs_are_suppressed():
+    # VP / VN with 20 pads per leg: analog rails, not an undeclared pair.
+    parts = [(f"C{index}", "0402", {"1": "VP", "2": "VN"}) for index in range(1, 21)]
+    parts.append(("U1", "QFN", {"1": "MOD_P", "2": "MOD_N"}))
+    result = check_diff_pairs(PcbIndex(_build(parts), None), None, checks=["naming"])
+    summary = result["summary"]["naming"]
+    assert summary["suppressed_rail"] == 1
+    assert _issues(result) == [("warning", "undeclared_pair", None)]
+    assert result["findings"][0]["details"]["positive_net"] == "MOD_P"
+
+
+@pytest.mark.parametrize("positive, negative", [
+    ("MOTOR_A_P", "MOTOR_A_N"), ("SPK_P", "SPK_N"), ("LED1_P", "LED1_N"),
+    ("HEATER_P", "HEATER_N"), ("TEC_P", "TEC_N"),
+])
+def test_naming_load_pairs_are_info(positive, negative):
+    parts = [("U1", "QFN", {"1": positive, "2": negative}),
+             ("J1", "HDR", {"1": positive, "2": negative})]
+    result = check_diff_pairs(PcbIndex(_build(parts), None), None, checks=["naming"])
+    assert _issues(result) == [("info", "undeclared_pair", None)]
+    assert result["findings"][0]["details"]["load_or_actuator"] is True
 
 
 def test_naming_pattern_limits_pairs_and_candidates():
@@ -429,6 +477,86 @@ def test_polarity_without_pin_names_is_not_checked():
     result = check_diff_pairs(index, None, checks=["polarity"])
     assert "polarity" not in result["summary"]
     assert [entry["check"] for entry in result["not_checked"]] == ["polarity"]
+
+
+def _usb_polarity(extra_parts, info=None, pairs=(("USB", "USB_DP", "USB_DM"),)):
+    """USB pair from U1 (USB_DP / USB_DM pins) to J1, plus extra parts
+    [(designator, {pad: (pin name, net)})]."""
+    netlist_parts = [
+        ("U1", {"1": ("USB_DP", "USB_DP"), "2": ("USB_DM", "USB_DM")}),
+        ("J1", {"3": ("D+", "USB_DP"), "2": ("D-", "USB_DM"), "1": ("VBUS", "VBUS")}),
+        *extra_parts,
+    ]
+    parts = [
+        (designator, "FP", {pad: net for pad, (_, net) in pins.items()})
+        for designator, pins in netlist_parts
+    ]
+    netlist = _netlist(netlist_parts, info)
+    return PcbIndex(_build(parts, pairs), netlist), netlist
+
+
+def test_polarity_shunt_esd_part_is_not_judged():
+    # A 2-channel USB ESD array wired D+ to pin 'D-': a shunt to ground, so
+    # its pin order does not change link polarity.
+    esd = ("U5", {"1": ("D+", "USB_DM"), "2": ("D-", "USB_DP"), "3": ("GND", "GND")})
+    index, netlist = _usb_polarity(
+        [esd], {"U5": {"description": "2-channel ESD protection for USB 2.0"}}
+    )
+    result = check_diff_pairs(index, netlist, checks=["polarity"])
+    assert result["findings"] == []
+    summary = result["summary"]["polarity"]
+    assert summary["unjudged_shunt"] == 1
+    assert summary["swapped"] == 0
+    # A D-prefixed diode array is a shunt without a description too.
+    diode = ("D7", {"1": ("IO+", "USB_DM"), "2": ("IO-", "USB_DP"), "3": ("GND", "GND")})
+    index, netlist = _usb_polarity([diode])
+    assert check_diff_pairs(index, netlist, checks=["polarity"])["findings"] == []
+
+
+def _mux(common, side):
+    """USB 2.0 mux U3: common pins D+ / D- and switched pins 1D+ / 1D-."""
+    return ("U3", {
+        "1": ("D+", common[0]), "2": ("D-", common[1]),
+        "3": ("1D+", side[0]), "4": ("1D-", side[1]), "5": ("GND", "GND"),
+    })
+
+
+def test_polarity_pass_through_mux_consistent_swap_is_harmless():
+    mux = _mux(("USB_DM", "USB_DP"), ("USB1_DM", "USB1_DP"))  # swapped on both sides
+    pairs = (("USB", "USB_DP", "USB_DM"), ("USB1", "USB1_DP", "USB1_DM"))
+    index, netlist = _usb_polarity(
+        [mux], {"U3": {"description": "USB 2.0 analog switch multiplexer"}}, pairs
+    )
+    result = check_diff_pairs(index, netlist, checks=["polarity"])
+    assert result["findings"] == []
+    assert result["summary"]["polarity"]["pass_through_consistent"] == 2  # seen from both pairs
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_polarity_pass_through_mux_crossing_warns_once(declared):
+    mux = _mux(("USB_DM", "USB_DP"), ("USB1_DP", "USB1_DM"))  # swapped on one side only
+    pairs = (("USB", "USB_DP", "USB_DM"),)
+    if declared:
+        pairs += (("USB1", "USB1_DP", "USB1_DM"),)
+    index, netlist = _usb_polarity(
+        [mux], {"U3": {"description": "USB 2.0 analog switch multiplexer"}}, pairs
+    )
+    result = check_diff_pairs(index, netlist, checks=["polarity"])
+    assert _issues(result) == [("warning", "crossed_through_part", "USB")]
+    details = result["findings"][0]["details"]
+    assert details["other_side"]["positive_pin"]["net"] == "USB1_DP"
+    assert details["interface"] == "USB 2.0"
+
+
+def test_polarity_sgmii_swap_on_ethernet_phy_warns():
+    index, netlist = _polarity_case(
+        {"A1": ("S_OUTN", "X_P"), "A2": ("S_OUTP", "X_N")},
+        info={"U1": {"description": "Integrated 10/100/1000 Mbps Ethernet Transceiver"}},
+    )
+    finding = check_diff_pairs(index, netlist, checks=["polarity"])["findings"][0]
+    assert finding["severity"] == "warning"
+    assert finding["details"]["interface"] == "SGMII / 1000BASE-X / SerDes"
+    assert finding["details"]["inversion_tolerated"] is None
 
 
 def test_polarity_counts_pcb_only_parts_as_unjudged():
@@ -586,6 +714,196 @@ def test_series_ignores_supply_far_nets_and_rails():
     assert result["findings"] == []
 
 
+def _series_board(parts, pairs, info=None, dnp=None, lengths=None):
+    """check_diff_pairs(series) on parts [(designator, {pad: net})] with
+    numeric pin names; info {refdes: {"value": ...}}."""
+    data = _build([(designator, "0402", pads) for designator, pads in parts], pairs,
+                  lengths=lengths)
+    netlist = _netlist(
+        [(designator, {pad: (pad, net) for pad, net in pads.items()}) for designator, pads in parts],
+        info,
+    )
+    return check_diff_pairs(PcbIndex(data, netlist), netlist, is_dnp=dnp, checks=["series"])
+
+
+@pytest.mark.parametrize("driver", [
+    # Transistor-switched 1.5k pull-up (USB soft connect).
+    [("Q1", {"3": "NetQ1_3", "2": "3V3", "1": "USB_PU_EN"})],
+    # GPIO-driven pull-up from the MCU.
+    [("U2", {"7": "USB_PU", "8": "GND", "9": "SDA"})],
+])
+def test_series_usb_soft_connect_pull_up_is_a_shunt(driver):
+    far = driver[0][1].get("3") or driver[0][1]["7"]
+    parts = [
+        ("U1", {"1": "USB_DP", "2": "USB_DM", "3": "GND"}),
+        ("J1", {"3": "USB_DP", "2": "USB_DM", "1": "VBUS", "4": "GND"}),
+        ("R5", {"1": "USB_DP", "2": far}),
+        *driver,
+    ]
+    result = _series_board(parts, [("USB", "USB_DP", "USB_DM")], {"R5": {"value": "1k5"}})
+    assert _issues(result) == [("info", "shunt_part_one_leg", "USB")]
+    assert result["findings"][0]["details"]["part"]["refdes"] == "R5"
+    summary = result["summary"]["series"]
+    assert summary["shunt_parts"] == 1
+    assert summary["pairs_with_series"] == 0
+    assert summary["asymmetric_pairs"] == 0
+
+
+def test_series_isolated_rs485_bias_is_a_shunt():
+    # A pulled up to VISO (not a supply name the regex knows), B to GND_ISO.
+    parts = [
+        ("U1", {"12": "RS485_A", "13": "RS485_B", "16": "VISO", "9": "GND_ISO"}),
+        ("J1", {"1": "RS485_A", "2": "RS485_B", "3": "GND_ISO"}),
+        ("R1", {"1": "RS485_A", "2": "VISO"}),
+        ("R2", {"1": "RS485_B", "2": "GND_ISO"}),
+        ("C1", {"1": "VISO", "2": "GND_ISO"}),
+        ("C2", {"1": "VISO", "2": "GND_ISO"}),
+    ]
+    result = _series_board(parts, [("RS485", "RS485_A", "RS485_B")], {"R1": {"value": "680"}})
+    assert [f["severity"] for f in result["findings"]] == ["info"]
+    assert _issues(result) == [("info", "shunt_part_one_leg", "RS485")]
+
+
+def test_series_extra_pull_up_does_not_make_a_count_mismatch():
+    # 22R series resistors on both legs, a 1k5 pull-up on D+ only.
+    parts = [
+        ("U1", {"1": "USB_DP", "2": "USB_DM", "3": "GND"}),
+        ("J1", {"3": "USB_DP_C", "2": "USB_DM_C", "1": "VBUS", "4": "GND"}),
+        ("R1", {"1": "USB_DP_C", "2": "USB_DP"}),
+        ("R2", {"1": "USB_DM_C", "2": "USB_DM"}),
+        ("R5", {"1": "USB_DP_C", "2": "NetQ1_3"}),
+        ("Q1", {"3": "NetQ1_3", "2": "3V3", "1": "USB_PU_EN"}),
+    ]
+    info = {"R1": {"value": "22R"}, "R2": {"value": "22R"}, "R5": {"value": "1k5"}}
+    result = _series_board(
+        parts, [("USB", "USB_DP", "USB_DM"), ("USB_C", "USB_DP_C", "USB_DM_C")], info
+    )
+    assert _issues(result) == [("info", "shunt_part_one_leg", "USB_C")]
+    assert result["summary"]["series"]["far_pair_ok"] == 2
+
+
+def test_series_one_leg_cap_still_warns_when_partner_reaches_the_connector():
+    # TX_N runs straight to J1; TX_P goes through C1: a real asymmetry.
+    parts = [
+        ("U1", {"1": "TX_P", "2": "TX_N", "3": "GND"}),
+        ("C1", {"1": "TX_P", "2": "NetC1_2"}),
+        ("J1", {"1": "NetC1_2", "2": "TX_N", "3": "GND"}),
+    ]
+    result = _series_board(parts, [("TX", "TX_P", "TX_N")], {"C1": {"value": "100nF"}})
+    assert _issues(result) == [("warning", "ac_coupling_asymmetric", "TX")]
+
+
+@pytest.mark.parametrize("value, dnp, severity", [
+    ("10k", False, "info"),   # a bias resistor, not a series part
+    ("0R", True, "info"),     # DNP in the active variant
+    ("0R", False, "warning"),
+])
+def test_series_one_leg_part_downgrades(value, dnp, severity):
+    parts = [
+        ("U1", {"1": "TX_P", "2": "TX_N", "3": "GND"}),
+        ("R1", {"1": "TX_P", "2": "NetR1_2"}),
+        ("J1", {"1": "NetR1_2", "2": "TX_N", "3": "GND"}),
+    ]
+    result = _series_board(parts, [("TX", "TX_P", "TX_N")], {"R1": {"value": value}},
+                           dnp=lambda refdes: dnp and refdes == "R1")
+    assert _issues(result) == [(severity, "series_part_one_leg_only", "TX")]
+    details = result["findings"][0]["details"]
+    assert ("likely_not_series" in details) is (severity == "info")
+
+
+def test_series_far_side_is_checked_despite_an_extra_dnp_part():
+    # C3 is a DNP alternate of C1; the crossed coupled side is still reported.
+    parts = [
+        ("U1", {"1": "X_P", "2": "X_N", "3": "GND"}),
+        ("C1", {"1": "X_P", "2": "X_C_N"}),
+        ("C3", {"1": "X_P", "2": "X_C_N"}),
+        ("C2", {"1": "X_N", "2": "X_C_P"}),
+        ("J1", {"1": "X_C_P", "2": "X_C_N", "3": "GND"}),
+    ]
+    info = {name: {"value": "100nF"} for name in ("C1", "C2", "C3")}
+    result = _series_board(parts, [("X", "X_P", "X_N"), ("X_C", "X_C_P", "X_C_N")], info,
+                           dnp=lambda refdes: refdes == "C3")
+    issues = _issues(result)
+    assert ("warning", "coupled_side_inverted", "X") in issues
+    assert ("info", "series_count_mismatch", "X") in issues
+    assert not [issue for issue in issues if issue[0] == "warning" and issue[1] != "coupled_side_inverted"]
+
+
+@pytest.mark.parametrize("values, expected", [
+    (("100 nF", "100 pF"), [("warning", "series_value_mismatch", "X")]),
+    (("100 nF", "100nF"), []),
+    (("100nF", "100NF"), []),
+    (("0.1 uF", "100n"), []),
+    (("CAP 0402", "CAP0402"), []),
+])
+def test_series_values_with_spaces_and_upper_case(values, expected):
+    index, netlist = _series_case(
+        [("C1", "0402", values[0], "X_C_P")], [("C2", "0402", values[1], "X_C_N")]
+    )
+    assert _issues(check_diff_pairs(index, netlist, checks=["series"])) == expected
+
+
+def _crossed_board(far_positive, far_negative, pairs, extra=()):
+    parts = [
+        ("U1", {"1": pairs[0][1], "2": pairs[0][2], "3": "GND"}),
+        ("C1", {"1": pairs[0][1], "2": far_positive}),
+        ("C2", {"1": pairs[0][2], "2": far_negative}),
+        ("J1", {"1": far_positive, "2": far_negative, "3": "GND"}),
+        *extra,
+    ]
+    info = {"C1": {"value": "100nF"}, "C2": {"value": "100nF"}}
+    return _series_board(parts, pairs, info, lengths={far_positive: 800, far_negative: 800})
+
+
+@pytest.mark.parametrize("pair, far", [
+    (("TX", "TX_P", "TX_N"), ("TX_C_N", "TX_C_P")),
+    (("A", "A+", "A-"), ("B-", "B+")),
+])
+def test_series_crossed_undeclared_coupled_side_warns(pair, far):
+    result = _crossed_board(*far, [pair])
+    assert _issues(result) == [("warning", "coupled_side_crossed_by_name", pair[0])]
+    finding = result["findings"][0]
+    assert "crossed" in finding["message"]
+    assert result["summary"]["series"]["coupled_side_crossed_by_name"] == 1
+
+
+def _double_swap(declare_far):
+    parts = [
+        ("U1", {"1": "TX0_P", "2": "TX0_N", "3": "TX1_P", "4": "TX1_N", "5": "GND"}),
+        ("C1", {"1": "TX0_P", "2": "TX0_C_P"}), ("C2", {"1": "TX0_N", "2": "TX1_C_N"}),
+        ("C3", {"1": "TX1_P", "2": "TX1_C_P"}), ("C4", {"1": "TX1_N", "2": "TX0_C_N"}),
+        ("J1", {"1": "TX0_C_P", "2": "TX0_C_N", "3": "TX1_C_P", "4": "TX1_C_N", "5": "GND"}),
+    ]
+    pairs = [("TX0", "TX0_P", "TX0_N"), ("TX1", "TX1_P", "TX1_N")]
+    if declare_far:
+        pairs += [("TX0_C", "TX0_C_P", "TX0_C_N"), ("TX1_C", "TX1_C_P", "TX1_C_N")]
+    info = {name: {"value": "100nF"} for name in ("C1", "C2", "C3", "C4")}
+    return _series_board(parts, pairs, info)
+
+
+def test_series_cross_pair_miswire_with_declared_far_pairs_warns():
+    result = _double_swap(declare_far=True)
+    issues = _issues(result)
+    assert {issue[0] for issue in issues} == {"warning"}
+    assert sorted(issue[2] for issue in issues if issue[1] == "coupled_side_cross_pair") == [
+        "TX0", "TX0_C", "TX1", "TX1_C"
+    ]
+    tx0 = next(f for f in result["findings"] if f["pair"] == "TX0")
+    assert "the negative leg of pair TX1_C" in tx0["message"]
+    assert "not a PCB differential pair" not in tx0["message"]
+    assert result["summary"]["series"]["coupled_side_not_pair"] == 0
+
+
+def test_series_cross_pair_miswire_with_undeclared_far_nets_warns():
+    result = _double_swap(declare_far=False)
+    assert _issues(result) == [
+        ("warning", "coupled_side_cross_pair", "TX0"),
+        ("warning", "coupled_side_cross_pair", "TX1"),
+    ]
+    tx0 = result["findings"][0]
+    assert "TX0_C_N" in tx0["message"]  # the name TX0_C_P is paired with
+
+
 def test_series_part_across_the_pair_is_counted_not_flagged():
     index, netlist = _series_case(
         [], [], far_pairs=(), extra_parts=[("R5", "0402", {"1": "X_P", "2": "X_N"})],
@@ -598,11 +916,12 @@ def test_series_part_across_the_pair_is_counted_not_flagged():
 # ---------- skew ----------
 
 
-def _skew_case(rules, positive=100.0, negative=107.0, classes=(), xsignals=(),
-               pairs=(("X", "X_P", "X_N"),), extra_nets=()):
+def _skew_case(rules, positive=100.0, negative=112.0, classes=(), xsignals=(),
+               pairs=(("X", "X_P", "X_N"),), extra_nets=(), extra_parts=()):
     parts = [
         ("U1", "QFN", {"A1": "X_P", "A2": "X_N"}),
         ("J1", "HDR", {"1": "X_P", "2": "X_N"}),
+        *extra_parts,
     ]
     data = _build(
         parts, pairs, lengths={"X_P": positive, "X_N": negative}, rules=rules,
@@ -622,17 +941,17 @@ def test_skew_pair_scoped_rule_over_tolerance_warns():
     assert _issues(result) == [("warning", "in_pair_skew_exceeds_tolerance", "X")]
     finding = result["findings"][0]
     assert finding["positive_mil"] == 100.0
-    assert finding["negative_mil"] == 107.0
-    assert finding["skew_mil"] == 7.0
+    assert finding["negative_mil"] == 112.0
+    assert finding["skew_mil"] == 12.0
     assert finding["tolerance_mil"] == 5.0
-    assert finding["excess_mil"] == 2.0
+    assert finding["excess_mil"] == 7.0
     assert finding["details"]["rule_scope"] == "pair"
     summary = result["summary"]["skew"]
     assert summary["with_in_pair_rule"] == 1
     assert summary["pair_scoped"] == 1
     assert summary["over_tolerance"] == 1
     assert summary["in_pair_rules"][0]["scope_kind"] == "pair"
-    assert summary["in_pair_rules"][0]["max_skew_mil"] == 7.0
+    assert summary["in_pair_rules"][0]["max_skew_mil"] == 12.0
 
 
 def test_skew_within_tolerance_has_no_finding():
@@ -642,16 +961,56 @@ def test_skew_within_tolerance_has_no_finding():
     assert result["summary"]["skew"]["within_tolerance"] == 1
 
 
-def test_skew_net_scoped_rule_is_info_with_note():
+def test_skew_net_scoped_rule_warns_with_note():
+    # Same verdict as check_lengths (a violation), with a note on the scope.
     index = _skew_case(
         [_in_pair_rule("InNetClass('HS')")], classes=[_class("HS", "net", ["X_P", "X_N"])],
     )
     result = check_diff_pairs(index, None, checks=["skew"])
-    assert _issues(result) == [("info", "in_pair_skew_exceeds_tolerance", "X")]
+    assert _issues(result) == [("warning", "in_pair_skew_exceeds_tolerance", "X")]
     details = result["findings"][0]["details"]
     assert details["rule_scope"] == "net"
     assert "InDifferentialPair" in details["note"]
-    assert result["summary"]["skew"]["net_scoped_only"] == 1
+    summary = result["summary"]["skew"]
+    assert summary["net_scoped_only"] == 1
+    assert summary["net_scoped_violations"] == 1
+    assert summary["over_tolerance"] == 1
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        "InDifferentialPair('X') or InNetClass('HS')",
+        "InDifferentialPairClass('PAIRS') or InNetClass('HS')",
+        "IsDifferentialPair or InNetClass('HS')",
+        "InNetClass('HS') or (ObjectKind = 'Differential Pair')",
+    ],
+)
+def test_skew_pair_term_or_net_term_is_pair_scoped(scope):
+    index = _skew_case(
+        [_in_pair_rule(scope)],
+        classes=[_class("HS", "net", ["X_P", "X_N"]), _class("PAIRS", "diff_pair", ["X"])],
+    )
+    result = check_diff_pairs(index, None, checks=["skew"])
+    assert _issues(result) == [("warning", "in_pair_skew_exceeds_tolerance", "X")]
+    details = result["findings"][0]["details"]
+    assert details["rule_scope"] == "pair"
+    assert "note" not in details
+    assert result["summary"]["skew"]["pair_scoped"] == 1
+
+
+def test_skew_pair_term_that_misses_the_pair_stays_net_scoped():
+    # Y is not selected by its pair term; only the net class selects it.
+    index = _skew_case(
+        [_in_pair_rule("InDifferentialPair('X') or InNetClass('HS')")],
+        pairs=(("X", "X_P", "X_N"), ("Y", "Y_P", "Y_N")),
+        classes=[_class("HS", "net", ["X_P", "X_N", "Y_P", "Y_N"])],
+        extra_parts=[("U2", "QFN", {"1": "Y_P", "2": "Y_N"}),
+                     ("J2", "HDR", {"1": "Y_P", "2": "Y_N"})],
+    )
+    result = check_diff_pairs(index, None, checks=["skew"], pattern="^Y")
+    rule = result["summary"]["skew"]["in_pair_rules"][0]
+    assert rule["scope_kind"] == "net"
 
 
 def test_skew_all_scoped_rule_counts_as_pair_scoped():
@@ -696,6 +1055,65 @@ def test_skew_unrouted_pair_without_rule_is_info():
     assert _issues(result) == [("info", "pair_unrouted", "X")]
 
 
+def _measured(positive, negative):
+    """A pair_lengths callable returning these per-leg dicts."""
+    def pair_lengths(name):
+        return {"positive": dict(positive), "negative": dict(negative), "skew_mil": None}
+    return pair_lengths
+
+
+def test_skew_single_pad_legs_have_nothing_to_route():
+    single = {"length_mil": 0.0, "status": "ok", "pad_count": 1, "copper_mil": 0.0}
+    index = _skew_case([_in_pair_rule("InDifferentialPair('X')")])
+    result = check_diff_pairs(index, None, checks=["skew"],
+                              pair_lengths=_measured(single, single))
+    assert result["findings"] == []
+    summary = result["summary"]["skew"]
+    assert summary["single_pad_pairs"] == 1
+    assert summary["unrouted"] == 0
+
+
+def test_skew_one_single_pad_leg_is_info_not_unrouted():
+    routed = {"length_mil": 210.0, "status": "ok", "pad_count": 2, "copper_mil": 210.0}
+    single = {"length_mil": 0.0, "status": "ok", "pad_count": 1, "copper_mil": 0.0}
+    index = _skew_case([_in_pair_rule("InDifferentialPair('X')")])
+    result = check_diff_pairs(index, None, checks=["skew"],
+                              pair_lengths=_measured(routed, single))
+    assert _issues(result) == [("info", "leg_single_pad", "X")]
+    assert result["findings"][0]["details"]["single_pad_net"] == "X_N"
+    summary = result["summary"]["skew"]
+    assert summary["single_pad_legs"] == 1
+    assert summary["no_verdict_unrouted"] == 1
+
+
+def test_skew_single_pad_legs_on_routed_length_fallback():
+    data = _build([("U1", "QFN", {"1": "X_P", "2": "X_N"})], [("X", "X_P", "X_N")])
+    result = check_diff_pairs(PcbIndex(data, None), None, checks=["skew"])
+    assert result["findings"] == []
+    assert result["summary"]["skew"]["single_pad_pairs"] == 1
+
+
+def test_skew_incomplete_legs_with_copper_are_not_called_unrouted():
+    note = "The net has polygon pours, which are not part of the copper graph."
+    legs = [
+        {"length_mil": 1932.0, "status": "incomplete", "pad_count": 3,
+         "copper_mil": 1932.0, "pad_islands": 3, "note": note},
+        {"length_mil": 1992.0, "status": "incomplete", "pad_count": 3,
+         "copper_mil": 1992.0, "pad_islands": 3},
+    ]
+    index = _skew_case([])
+    result = check_diff_pairs(index, None, checks=["skew"], pair_lengths=_measured(*legs))
+    assert _issues(result) == [("info", "pair_unrouted", "X")]
+    finding = result["findings"][0]
+    assert "is completely routed" in finding["message"]
+    assert not finding["message"].endswith("is routed.")
+    assert "1932" in finding["message"] and "1992" in finding["message"]
+    details = finding["details"]
+    assert details["note"] == note
+    assert [leg["pad_islands"] for leg in details["legs"]] == [3, 3]
+    assert [leg["pad_count"] for leg in details["legs"]] == [3, 3]
+
+
 def test_skew_xsignal_scoped_rule_is_conditional():
     index = _skew_case(
         [_in_pair_rule("InxSignal('XS1')")],
@@ -719,7 +1137,7 @@ def test_skew_ignores_group_rules_and_lists_disabled_in_pair_rules():
     summary = result["summary"]["skew"]
     assert summary["in_pair_rules"] == []
     assert summary["disabled_in_pair_rules"] == ["OFF"]
-    assert summary["largest_skew_without_rule"] == {"pair": "X", "skew_mil": 7.0}
+    assert summary["largest_skew_without_rule"] == {"pair": "X", "skew_mil": 12.0}
 
 
 def test_skew_delay_rule_is_not_evaluated():
@@ -798,7 +1216,8 @@ def test_findings_are_sorted_and_paginated():
     index = _skew_case(
         [_in_pair_rule("InDifferentialPair('X')")],
         pairs=(("X", "X_P", "X_N"), ("CLK", "CLK_A", "CLK_B")),
-        extra_nets=["CLK_A", "CLK_B"],
+        extra_parts=[("U2", "QFN", {"1": "CLK_A", "2": "CLK_B"}),
+                     ("J2", "HDR", {"1": "CLK_A", "2": "CLK_B"})],
     )
     full = check_diff_pairs(index, None, checks=["naming", "skew"])
     severities = [finding["severity"] for finding in full["findings"]]
@@ -880,8 +1299,13 @@ def minipc():
 
 
 def test_example_minipc(minipc):
+    from server.services.pcb_length import check_length_rules, pair_lengths
+
     index, netlist = minipc
-    result = check_diff_pairs(index, netlist, limit=1000)
+    # The runtime path: leg lengths from the length engine, as check_lengths.
+    result = check_diff_pairs(
+        index, netlist, limit=1000, pair_lengths=lambda name: pair_lengths(index, name)
+    )
     summary = result["summary"]
     assert result["pairs_total"] == 96
     assert summary["naming"]["undeclared_warning"] == 0
@@ -891,21 +1315,41 @@ def test_example_minipc(minipc):
     assert summary["polarity"]["swapped"] == 0
     assert summary["series"]["capacitor_coupled"] == 44
     assert summary["series"]["asymmetric_pairs"] == 0
+    assert summary["series"]["shunt_parts"] == 0
     assert summary["series"]["common_node_pairs"] == 8
     assert summary["series"]["coupled_side_not_pair"] == 0
+    assert summary["skew"]["unrouted"] == 0
     rules = {rule["rule"]: rule for rule in summary["skew"]["in_pair_rules"]}
     assert rules["MatchedLengths_PCIE_RX_TX_TX_C_CLK"]["scope_kind"] == "net"
     assert rules["MatchedLengths_SFP"]["scope_kind"] == "pair"
     assert rules["MatchedLengths_DDR4_DIFF"]["stale_references"]
+    # The only warnings: the stale rule, and in-pair skew violations, which
+    # are exactly the pairs check_lengths reports over the same rule.
     warnings = [f for f in result["findings"] if f["severity"] == "warning"]
-    assert [(f["issue"], f["details"]["rule"]) for f in warnings] == [
-        ("in_pair_rule_stale", "MatchedLengths_DDR4_DIFF")
+    assert {f["issue"] for f in warnings} <= {
+        "in_pair_rule_stale", "in_pair_skew_exceeds_tolerance"
+    }
+    assert [f["details"]["rule"] for f in warnings if f["issue"] == "in_pair_rule_stale"] == [
+        "MatchedLengths_DDR4_DIFF"
     ]
     over = {
-        f["pair"] for f in result["findings"]
+        (f["details"]["rule"], f["pair"]) for f in result["findings"]
         if f["issue"] == "in_pair_skew_exceeds_tolerance"
     }
-    assert over == {"PCIE_TX5", "PCIE_TX0", "PCIE_RX4", "PCIE_RX3", "PCIE_REFCLK_QR0"}
+    exceeded = {}
+    for name in ("MatchedLengths_PCIE_RX_TX_TX_C_CLK", "MatchedLengths_SFP"):
+        checked = check_length_rules(index, rule=name, limit=1000)["rules"][0]
+        exceeded.update({
+            (name, row["object"]): bool(row.get("marginal"))
+            for row in checked["pairs"] if row["status"] == "skew_exceeded"
+        })
+    assert over == set(exceeded)
+    # Same verdict: a warning, or info when check_lengths marks it marginal.
+    for finding in result["findings"]:
+        if finding["issue"] == "in_pair_skew_exceeds_tolerance":
+            marginal = exceeded[(finding["details"]["rule"], finding["pair"])]
+            assert finding["severity"] == ("info" if marginal else "warning")
+            assert bool(finding["details"].get("marginal")) is marginal
 
 
 def test_example_sodimm():
@@ -932,18 +1376,28 @@ def test_result_is_json_and_converts_to_mm():
     finding = next(
         f for f in converted["findings"] if f["issue"] == "in_pair_skew_exceeds_tolerance"
     )
-    assert finding["skew_mm"] == pytest.approx(7.0 * 0.0254)
+    assert finding["skew_mm"] == pytest.approx(12.0 * 0.0254)
     assert finding["tolerance_mm"] == pytest.approx(5.0 * 0.0254)
     assert converted["summary"]["skew"]["in_pair_rules"][0]["tolerance_mm"] == pytest.approx(0.127)
 
 
-def test_skew_borderline_excess_is_info():
+def test_skew_marginal_excess_is_inconclusive_info():
+    # As check_lengths: within MARGINAL_MIL of the tolerance a violation is
+    # marked marginal (inconclusive); beyond it, a warning.
+    from server.services.pcb_length import MARGINAL_MIL
+
     index = _skew_case([_in_pair_rule("InDifferentialPair('X')")], negative=105.6)
     result = check_diff_pairs(index, None, checks=["skew"])
     assert _issues(result) == [("info", "in_pair_skew_exceeds_tolerance", "X")]
     finding = result["findings"][0]
     assert finding["excess_mil"] == pytest.approx(0.6)
-    assert finding["details"]["borderline"] is True
+    assert finding["details"]["marginal"] is True
     summary = result["summary"]["skew"]
     assert summary["over_tolerance"] == 1
-    assert summary["borderline"] == 1
+    assert summary["marginal"] == 1
+    negative = 105.0 + MARGINAL_MIL + 1.0
+    index = _skew_case([_in_pair_rule("InDifferentialPair('X')")], negative=negative)
+    finding = check_diff_pairs(index, None, checks=["skew"])["findings"][0]
+    assert finding["severity"] == "warning"
+    assert finding["excess_mil"] == pytest.approx(MARGINAL_MIL + 1.0)
+    assert "marginal" not in finding["details"]

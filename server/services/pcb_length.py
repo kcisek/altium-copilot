@@ -9,8 +9,9 @@ barrel edges as long as the stackup z distance between those layers.
 
 A pad-to-pad length is the shortest path between the two pad centres: in-pad
 wandering does not count, straight fanout copper does, and a via counts the
-barrel over the layers actually traversed. That reproduces the example boards'
-tuned groups (Altium's Signal Length) far better than whole-net routed length.
+barrel over the layers actually traversed. The end pads' Pin/Package Length
+(pad to die) is added, as Altium adds it to Signal Length. That reproduces the
+example boards' tuned groups far better than whole-net routed length.
 
 Graphs are built lazily and cached on the PcbIndex instance; everything else
 is pure functions over the index. Lengths are float mils under *_mil keys.
@@ -46,9 +47,11 @@ except ImportError:
 
 LENGTH_RULE_KINDS = ("Length", "MatchedLengths")
 DEFAULT_LIMIT = 50
-# The measurement reproduces tuned groups to a few mil (pin/package length,
-# pad entry and series parts are approximated), so violations this close to
-# a band edge are flagged marginal rather than certain.
+# With pin/package length included, tuned groups come out within a few mil of
+# Altium's DRC figures; paths run to pad centres (copper wandering inside pads
+# or off the path is left out) and via barrels follow the stackup, so
+# violations this close to a band edge are flagged marginal rather than
+# certain.
 MARGINAL_MIL = 5.0
 _CONDITIONAL_LIMIT = 20
 _MST_ISLAND_LIMIT = 16
@@ -56,31 +59,39 @@ _MST_ISLAND_LIMIT = 16
 MEASURE = (
     "Signal path: shortest copper path from pad centre to pad centre "
     "(tracks, true arc lengths, attach to pad and via centres) plus via barrel "
-    "over the stackup span actually traversed. An xSignal sums its routed "
-    "legs; a series part between legs counts 0. A net with exactly 2 pads uses "
-    "its signal path (like Altium's Signal Length); other nets use routed "
-    "copper plus each via's barrel over the layers its copper connects (like "
-    "Altium's Routed Length)."
+    "over the stackup span actually traversed plus both end pads' Pin/Package "
+    "Length (pin_package_mil). An xSignal sums its routed legs plus the "
+    "Pin/Package Length of its first and last pins and of any pin only one "
+    "routed leg reaches (not of fly-by pins the route passes through); a "
+    "series part between legs counts 0. A net with exactly 2 pads uses its "
+    "signal path (like Altium's Signal Length); other nets use routed copper "
+    "plus each via's barrel over the layers its copper connects, without "
+    "Pin/Package Length (like Altium's Routed Length). A differential pair's "
+    "length is the P/N average (as Altium's DRC reports it); max_mil is the "
+    "longer leg."
 )
 
 APPROXIMATIONS = [
-    "Pin/package length is not included (the pad property is not decoded).",
+    "Pin/package length is included where Altium includes it (2-pad signal "
+    "paths and pair legs, pad-to-pad paths, xSignal end pins) and not on "
+    "multi-pad nets; it is read from one pad-record field, and pad records "
+    "too old to carry it count 0.",
     "A series part between xSignal legs counts 0 length.",
     "Polygon pours, fills and regions are not part of the copper graph; a "
     "connection made only through them is reported incomplete.",
     "Pad shapes are approximated: round/oblong as capsules, every other shape "
-    "as its rotated rectangle; paths run to the pad or via centre.",
-    "Differential-pair group length is max(P, N) (current Altium docs); avg_mil "
-    "gives the older pair-average convention.",
+    "as its rotated rectangle; paths run to the pad or via centre, so copper "
+    "wandering inside a pad and stubs off the path are not counted (Altium's "
+    "track total may be longer).",
     "Nets without exactly 2 pads use routed copper plus via barrels; Altium "
     "shows no Signal Length for them (use xSignals).",
     f"Violations within {MARGINAL_MIL:g} mil of the band are marked marginal: "
-    "the measurement reproduces tuned groups only to a few mil.",
+    "pad entry and via barrel conventions can differ from Altium's; on Altium's MiniPC example the Length-rule nets come out 6-13 mil from their windows.",
 ]
 
 _GRAPH_SQL = (
     "SELECT id, kind, layer, layer_to, component, x1, y1, x2, y2, width, "
-    "height, rotation, shape, hole, pad_name, length FROM prims "
+    "height, rotation, shape, hole, pad_name, length, pin_package FROM prims "
     "WHERE net_id = ? AND kind IN ('track', 'arc', 'via', 'pad') "
     "AND pour_id IS NULL ORDER BY id"
 )
@@ -112,6 +123,14 @@ def _parse_mil(raw) -> float | None:
 
 def _cache(index) -> dict:
     return index.__dict__.setdefault("_length_cache", {})
+
+
+def _column(row, key: str):
+    """row[key], or None when the row (sqlite3.Row or dict) lacks the column."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 # ---------- stackup ----------
@@ -231,6 +250,7 @@ class PathResult:
     vias: int = 0
     layers: dict[int, float] = field(default_factory=dict)
     gap: float | None = None  # unrouted Manhattan distance when no_path
+    end_pads: tuple[int, int] | None = None  # (source, target) pad ids when ok
 
 
 class NetGraph:
@@ -257,7 +277,11 @@ class NetGraph:
         self.routed_by_layer: dict[int, float] = defaultdict(float)
         self.segment_count = 0
         self._attached: dict[tuple[int, int], float] = {}
+        # Track ends lying inside another track's round end cap (overlapping
+        # copper that the endpoint merge leaves apart): node pair -> distance.
+        self._cap_links: dict[tuple[int, int], float] = {}
         self._islands: list[int] | None = None
+        self._node_pads: dict[int, int] | None = None
         self._build(rows)
 
     # -- construction --
@@ -293,13 +317,27 @@ class NetGraph:
         layer, layer_to = row["layer"], row["layer_to"]
         if layer in self.order_pos and layer_to in self.order_pos:
             low, high = sorted((self.order_pos[layer], self.order_pos[layer_to]))
-            return self.order[low : high + 1]
+            span = self.order[low : high + 1]
+            if self.order and span[0] == self.order[0] and span[-1] == self.order[-1]:
+                # A through via also reaches copper on layers missing from the
+                # stack table (their barrel length is unknown).
+                span = span + self.unstacked
+            return span
         return list(dict.fromkeys(item for item in (layer, layer_to) if item is not None))
 
     def _build(self, rows) -> None:
         segments: list[tuple] = []  # x1, y1, x2, y2, layer, half width, planar, true
         vias: list[dict] = []
         pads: list[dict] = []
+        # Signal layers carrying tracks but absent from the stack table: through
+        # vias and multi-layer pads still connect them (barrel unknown).
+        self.unstacked = sorted({
+            row["layer"]
+            for row in rows
+            if row["kind"] in ("track", "arc")
+            and row["layer"] not in self.order_pos
+            and 1 <= row["layer"] <= 32
+        }) if self.order else []
         for row in rows:
             kind = row["kind"]
             if kind in ("track", "arc"):
@@ -327,8 +365,9 @@ class NetGraph:
                     "h": row["height"] or width, "rot": row["rotation"] or 0.0,
                     "shape": row["shape"], "component": row["component"],
                     "name": row["pad_name"],
+                    "ppl": _column(row, "pin_package") or 0.0,
                     "layers": (
-                        list(self.order)
+                        list(self.order) + self.unstacked
                         if row["layer"] == MULTI_LAYER and self.order
                         else [row["layer"]]
                     ),
@@ -394,6 +433,33 @@ class NetGraph:
                 root_nodes[root] = node
             node_of_end[end] = node
 
+        # An endpoint inside another track's round end cap (a neck-down that
+        # does not snap) overlaps it without merging, since the merge keeps to
+        # the narrower half-width so meanders get no shortcuts: link the two
+        # ends with an edge as long as their distance.
+        for end in range(count):
+            gx = math.floor(end_x[end] / end_cell)
+            gy = math.floor(end_y[end] / end_cell)
+            for cx in (gx - 1, gx, gx + 1):
+                for cy in (gy - 1, gy, gy + 1):
+                    for other in end_grid.get((cx, cy), ()):
+                        if (
+                            other <= end
+                            or other // 2 == end // 2
+                            or end_layer[other] != end_layer[end]
+                        ):
+                            continue
+                        node_a, node_b = node_of_end[end], node_of_end[other]
+                        if node_a == node_b:
+                            continue
+                        distance = math.hypot(
+                            end_x[other] - end_x[end], end_y[other] - end_y[end]
+                        )
+                        if distance <= max(end_half[end], end_half[other]):
+                            key = (min(node_a, node_b), max(node_a, node_b))
+                            if distance < self._cap_links.get(key, math.inf):
+                                self._cap_links[key] = distance
+
         # Segments in a grid (cells along their length, with neighbours) so a
         # point's own cell lists every segment whose copper can reach it.
         seg_cell = max(10.0, 2.0 * max_half)
@@ -416,7 +482,10 @@ class NetGraph:
                 (layer, math.floor(x / seg_cell), math.floor(y / seg_cell)), []
             )
 
-        # T-junctions: an endpoint on another segment's body splits it.
+        # T-junctions: an endpoint on another segment's body splits it. The
+        # copper overlaps when the endpoint lies within the host's half-width
+        # or, for a wider track ending on a narrow one, the host's centreline
+        # lies within the end's round cap.
         splits: dict[int, list[tuple[float, int]]] = defaultdict(list)
         for end in range(count):
             node = node_of_end[end]
@@ -425,7 +494,7 @@ class NetGraph:
                 if host == own or node in (node_of_end[2 * host], node_of_end[2 * host + 1]):
                     continue
                 hit = _project(segments[host], end_x[end], end_y[end])
-                if hit is not None and hit[3] <= segments[host][5]:
+                if hit is not None and hit[3] <= max(segments[host][5], end_half[end]):
                     splits[host].append((hit[0], node))
 
         def ends_near(x: float, y: float, reach: float):
@@ -541,6 +610,11 @@ class NetGraph:
                 end_node, owner_node, distance,
                 ("attach", self.pos[owner_node][2], None, None, True),
             )
+        for (node_a, node_b), distance in self._cap_links.items():
+            self._edge(
+                node_a, node_b, distance,
+                ("seg", self.pos[node_a][2], None, None, True),
+            )
 
         # Barrels between the per-layer nodes of each via / through-hole pad.
         for pid, nodes in self.via_nodes.items():
@@ -574,6 +648,19 @@ class NetGraph:
     def nodes_of(self, pad_ids) -> list[int]:
         return [node for pid in pad_ids for node in self.pad_nodes.get(pid, {}).values()]
 
+    def pad_of_node(self, node: int) -> int | None:
+        if self._node_pads is None:
+            self._node_pads = {
+                pad_node: pid
+                for pid, nodes in self.pad_nodes.items()
+                for pad_node in nodes.values()
+            }
+        return self._node_pads.get(node)
+
+    def pin_package(self, pad_ids) -> float:
+        """Sum of the pads' Pin/Package Length (mil)."""
+        return sum(self.pads[pid]["ppl"] for pid in pad_ids if pid in self.pads)
+
     def shortest(self, pad_ids_a, pad_ids_b) -> PathResult:
         sources = self.nodes_of(pad_ids_a)
         targets = set(self.nodes_of(pad_ids_b))
@@ -588,11 +675,14 @@ class NetGraph:
             if distance > dist.get(node, math.inf):
                 continue
             if node in targets:
+                target_pad = self.pad_of_node(node)
                 path_edges = []
                 while node in previous:
                     node, edge = previous[node]
                     path_edges.append(edge)
-                return self._summarise(path_edges)
+                result = self._summarise(path_edges)
+                result.end_pads = (self.pad_of_node(node), target_pad)
+                return result
             for neighbour, weight, edge in self.adj[node]:
                 candidate = distance + weight
                 if candidate < dist.get(neighbour, math.inf):
@@ -716,6 +806,20 @@ def _pin_map(index) -> dict[str, list[tuple[int, int, int | None]]]:
     return cache["pins"]
 
 
+def _pad_pin_package(index) -> dict[int, float]:
+    """prim id -> Pin/Package Length (mil) of every pad that has one."""
+    cache = _cache(index)
+    if "pin_package" not in cache:
+        cache["pin_package"] = {
+            row["id"]: row["pin_package"]
+            for row in index.db.execute(
+                "SELECT id, pin_package FROM prims "
+                "WHERE kind = 'pad' AND pin_package > 0"
+            )
+        }
+    return cache["pin_package"]
+
+
 def _layer_names(index, layers: dict[int, float]) -> dict[str, float]:
     """{layer display name: mil} in stack order."""
     cache = _cache(index)
@@ -749,13 +853,20 @@ def _net_name(index, net_id: int | None) -> str | None:
     return index.pcb.nets[net_id]
 
 
-def _path_fields(index, result: PathResult) -> dict:
+def _path_fields(index, result: PathResult, pin_package: float | None = None) -> dict:
+    """Output fields of a path; pin_package (mil), when given, is added to the
+    length and reported as pin_package_mil."""
+    length = result.length
+    if length is not None and pin_package is not None:
+        length += pin_package
     fields: dict = {
-        "length_mil": _r(result.length),
+        "length_mil": _r(length),
         "copper_mil": _r(result.copper),
         "via_barrel_mil": _r(result.barrel),
-        "vias": result.vias,
     }
+    if pin_package is not None:
+        fields["pin_package_mil"] = _r(pin_package)
+    fields["vias"] = result.vias
     if result.status == "ok":
         fields["layers_mil"] = _layer_names(index, result.layers)
     if result.gap is not None:
@@ -791,12 +902,14 @@ def pad_to_pad(index, net: str | None, pin_a: str, pin_b: str) -> dict:
                 "error": "pin_not_on_net",
                 "message": f"Pad '{pin}' is not on net '{_net_name(index, net_id)}'.",
             }
-    result = net_graph(index, net_id).shortest(ids_a, ids_b)
+    graph = net_graph(index, net_id)
+    result = graph.shortest(ids_a, ids_b)
+    pin_package = graph.pin_package(result.end_pads) if result.end_pads else None
     return {
         "net": _net_name(index, net_id),
         "from": pin_a,
         "to": pin_b,
-        **_path_fields(index, result),
+        **_path_fields(index, result, pin_package),
     }
 
 
@@ -812,7 +925,7 @@ def _net_measure(index, net_id: int) -> dict:
         path = graph.shortest([pad_ids[0]], [pad_ids[1]])
         result["measure"] = "signal_path"
         result["pads"] = [_pad_label(index, graph.pads[pid]) for pid in pad_ids]
-        result.update(_path_fields(index, path))
+        result.update(_path_fields(index, path, graph.pin_package(pad_ids)))
         if path.status != "ok":
             result["status"] = "incomplete" if has_copper else "unrouted"
     else:
@@ -821,6 +934,12 @@ def _net_measure(index, net_id: int) -> dict:
         result["length_mil"] = _r(graph.routed_mil + barrel)
         result["copper_mil"] = _r(graph.routed_mil)
         result["via_barrel_mil"] = _r(barrel) if known else None
+        # Routed length has no pin/package term (as in Altium); say when the
+        # pads carry one that is therefore left out.
+        result["pin_package_mil"] = 0.0
+        excluded = graph.pin_package(pad_ids)
+        if excluded:
+            result["pin_package_excluded_mil"] = _r(excluded)
         result["vias"] = used
         result["layers_mil"] = _layer_names(index, graph.routed_by_layer)
         result["status"] = "ok"
@@ -912,11 +1031,14 @@ def _xsignal_measure(index, xsignal) -> dict:
     barrel_known = True
     vias = 0
     layers: dict[int, float] = defaultdict(float)
+    # Routed legs reaching each pin position, and the pad a leg ended on.
+    leg_ends = [0] * len(xsignal.pins)
+    end_pad: dict[int, int] = {}
     if missing:
         status = "pin_not_found"
         result["missing_pins"] = missing
     else:
-        for pin_a, pin_b in zip(xsignal.pins, xsignal.pins[1:]):
+        for position, (pin_a, pin_b) in enumerate(zip(xsignal.pins, xsignal.pins[1:])):
             rows_a, rows_b = pins[pin_a.lower()], pins[pin_b.lower()]
             common = (
                 {row[2] for row in rows_a} & {row[2] for row in rows_b}
@@ -933,9 +1055,14 @@ def _xsignal_measure(index, xsignal) -> dict:
                 leg = {"from": pin_a, "to": pin_b, "net": net_name}
                 leg.update(_path_fields(index, path))
                 legs.append(leg)
+                leg_ends[position] += 1
+                leg_ends[position + 1] += 1
                 if path.status != "ok":
                     status = "incomplete"
                     continue
+                if path.end_pads:
+                    end_pad.setdefault(position, path.end_pads[0])
+                    end_pad.setdefault(position + 1, path.end_pads[1])
                 copper += path.copper
                 if path.barrel is None:
                     barrel_known = False
@@ -951,10 +1078,28 @@ def _xsignal_measure(index, xsignal) -> dict:
                 result["broken_between"] = [pin_a, pin_b]
                 break
     complete = status == "ok"
+    pin_package = None
+    if complete:
+        # Pin/Package Length at the first and last pins and at pins only one
+        # routed leg reaches (series-part pins); a fly-by pin the route passes
+        # through (a leg in, a leg out) adds none.
+        ppl = _pad_pin_package(index)
+        last = len(xsignal.pins) - 1
+        pin_package = 0.0
+        for position, pin in enumerate(xsignal.pins):
+            if position not in (0, last) and leg_ends[position] != 1:
+                continue
+            if position in end_pad:
+                pin_package += ppl.get(end_pad[position], 0.0)
+            else:
+                pin_package += max(
+                    (ppl.get(row[0], 0.0) for row in pins[pin.lower()]), default=0.0
+                )
     result.update({
-        "length_mil": _r(copper + barrel) if complete else None,
+        "length_mil": _r(copper + barrel + pin_package) if complete else None,
         "copper_mil": _r(copper) if complete else None,
         "via_barrel_mil": _r(barrel) if complete and barrel_known else None,
+        "pin_package_mil": _r(pin_package),
         "vias": vias if complete else None,
         "layers_mil": _layer_names(index, layers) if complete else {},
         "nets": nets,
@@ -967,7 +1112,8 @@ def _xsignal_measure(index, xsignal) -> dict:
 
 
 def xsignal_length(index, name: str) -> dict:
-    """Length of an xSignal: its routed legs summed, series hops as 0."""
+    """Length of an xSignal: its routed legs summed (series hops as 0) plus
+    the Pin/Package Length of its end pins."""
     xsignal = index.xsignals.get(name.lower())
     if xsignal is None:
         suggestions = [
@@ -997,7 +1143,8 @@ def _pair_measure(index, pair_key: str) -> dict:
             key: measured[key]
             for key in (
                 "net", "measure", "length_mil", "copper_mil", "via_barrel_mil",
-                "vias", "pad_count", "status", "unrouted_manhattan_mil",
+                "pin_package_mil", "vias", "pad_count", "status",
+                "unrouted_manhattan_mil",
             )
             if key in measured
         }
@@ -1008,21 +1155,28 @@ def _pair_measure(index, pair_key: str) -> dict:
         and p_len is not None and n_len is not None
     )
     if complete:
-        result["length_mil"] = max(p_len, n_len)
-        result["avg_mil"] = _r((p_len + n_len) / 2.0)
+        # Altium's DRC compares pairs by their P/N average; the longer leg is
+        # what interactive tuning matches.
+        result["length_mil"] = _r((p_len + n_len) / 2.0)
+        result["max_mil"] = max(p_len, n_len)
         result["skew_mil"] = _r(abs(p_len - n_len))
         result["status"] = "ok"
     else:
         result["length_mil"] = None
+        result["max_mil"] = None
         result["skew_mil"] = None
         statuses = {sides["positive"]["status"], sides["negative"]["status"]}
         result["status"] = "net_not_found" if "net_not_found" in statuses else "incomplete"
+    result["length_basis"] = (
+        "average of the positive and negative legs (the longer leg is reported as max)"
+    )
     cache[pair_key] = result
     return result
 
 
 def pair_lengths(index, pair: str) -> dict:
-    """Both nets of a differential pair, the pair length max(P, N) and skew."""
+    """Both nets of a differential pair, the pair length (P/N average, as
+    Altium's DRC uses it), the longer leg (max_mil) and skew."""
     key = pair.lower()
     if key not in index.rule_context.pairs:
         suggestions = [
@@ -1119,7 +1273,34 @@ def _object_nets(index, kind: str, name: str) -> set[str]:
     if kind == "diff_pair":
         entry = ctx.pairs.get(name.lower())
         return {entry[1].lower(), entry[2].lower()} if entry else set()
+    if kind in _CLASS_KINDS:
+        member_kind = _CLASS_KINDS[kind]
+        nets: set[str] = set()
+        for member in _class_members(index, kind, name):
+            nets |= _object_nets(index, member_kind, member)
+        return nets
     return set(ctx.xsignals.get(name.lower(), set()))
+
+
+# Class target kinds -> (member kind, RuleContext table of the classes).
+_CLASS_KINDS = {
+    "xsignal_class": "xsignal", "net_class": "net", "diff_pair_class": "diff_pair",
+}
+_CLASS_TABLES = {
+    "xsignal_class": "xsignal_classes", "net_class": "net_classes",
+    "diff_pair_class": "pair_classes",
+}
+
+
+def _class_members(index, kind: str, name: str) -> set[str]:
+    """Lower-case member names of a class; a superclass (All Nets, All
+    xSignals...) holds every object of its kind."""
+    ctx = index.rule_context
+    member_kind = _CLASS_KINDS[kind]
+    key = name.lower()
+    if key in ctx.superclasses.get(member_kind, set()):
+        return {item.lower() for item in _candidates(index, member_kind)}
+    return set(getattr(ctx, _CLASS_TABLES[kind]).get(key, set()))
 
 
 def _membership(index, rule, kinds: list[str]) -> dict:
@@ -1155,6 +1336,8 @@ def _member_row(index, kind: str, name: str) -> dict:
             "vias": measured["vias"],
             "nets": measured["nets"],
         }
+        if measured["pin_package_mil"]:
+            row["pin_package_mil"] = measured["pin_package_mil"]
         if measured["series_hops"]:
             row["series_hops"] = measured["series_hops"]
         if measured["status"] == "incomplete":
@@ -1174,7 +1357,7 @@ def _member_row(index, kind: str, name: str) -> dict:
         row = {
             "object": measured["pair"], "kind": "diff_pair",
             "length_mil": measured["length_mil"],
-            "avg_mil": measured.get("avg_mil"),
+            "max_mil": measured["max_mil"],
             "positive_mil": measured["positive"]["length_mil"],
             "negative_mil": measured["negative"]["length_mil"],
             "skew_mil": measured["skew_mil"],
@@ -1192,6 +1375,9 @@ def _member_row(index, kind: str, name: str) -> dict:
             "vias": measured["vias"],
             "pad_count": measured["pad_count"],
         }
+        for key in ("pin_package_mil", "pin_package_excluded_mil"):
+            if measured.get(key):
+                row[key] = measured[key]
         if "unrouted_manhattan_mil" in measured:
             row["unrouted_manhattan_mil"] = measured["unrouted_manhattan_mil"]
         measure_status = measured["status"]
@@ -1269,8 +1455,9 @@ def _page(rows: list[dict], offset: int, limit: int) -> tuple[list[dict], dict]:
     return page, meta
 
 
-def _find_object(index, name: str) -> tuple[str, str] | None:
-    """(kind, display name) of an xSignal, net or pair called name."""
+def _find_object(index, name: str, classes: bool = False) -> tuple[str, str] | None:
+    """(kind, display name) of an xSignal, net or pair called name; with
+    classes, then of an xSignal, net or differential-pair class."""
     key = name.lower()
     if key in index.xsignals:
         return "xsignal", index.xsignals[key].name
@@ -1278,6 +1465,11 @@ def _find_object(index, name: str) -> tuple[str, str] | None:
         return "net", index.rule_context.net_names[key]
     if key in index.rule_context.pairs:
         return "diff_pair", index.rule_context.pairs[key][0]
+    if classes:
+        for kind, member_kind in _CLASS_KINDS.items():
+            for pcb_class in index.pcb.classes:
+                if pcb_class.kind == member_kind and pcb_class.name.lower() == key:
+                    return kind, pcb_class.name
     return None
 
 
@@ -1317,19 +1509,15 @@ def _evaluate_rule(index, rule, memo: dict) -> dict:
     kinds = _member_kinds(rule, settings, calls)
     membership = _membership(index, rule, kinds)
     yes = membership["yes"]
+    # Every matching object is a member, a pair's own nets included: Altium
+    # checks nets against nets (pair legs among them), pairs against pairs
+    # and xSignals against xSignals.
     members: list[tuple[str, str]] = []
     covered: set[str] = set()
-    for kind in ("xsignal", "diff_pair"):
+    for kind in ("xsignal", "diff_pair", "net"):
         for name in yes.get(kind, []):
             members.append((kind, name))
             covered |= _object_nets(index, kind, name)
-    for name in yes.get("net", []):
-        # A matched-length group's "other nets" are those not already in it
-        # as part of a pair or xSignal; a Length rule checks every net.
-        if rule.kind == "MatchedLengths" and name.lower() in covered:
-            continue
-        members.append(("net", name))
-        covered.add(name.lower())
     conditional = [
         item for item in membership["conditional"]
         if not _object_nets(index, item["kind"], item["object"]) <= covered
@@ -1411,7 +1599,12 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
             members = [item for item in members if item not in overridden]
 
     def involved(row_nets: set[str], name: str) -> bool:
-        return target is None or name.lower() == target["name"].lower() or bool(row_nets & target["nets"])
+        return (
+            target is None
+            or name.lower() == target["name"].lower()
+            or name.lower() in target["members"]
+            or bool(row_nets & target["nets"])
+        )
 
     conditional = entry["conditional"]
     if target is not None:
@@ -1437,19 +1630,18 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
         out["summary"] = {"members": 0}
         return {"rule": out, "unknown": unknown, "involved": bool(conditional)}
 
-    sections: dict[str, list[dict]] = {}
+    # (container, key, rows): rows listed under container[key], paginated.
+    sections: list[tuple[dict, str, list[dict]]] = []
     if rule.kind == "Length":
         rows = [_member_row(index, kind, name) for kind, name in members]
         for row in rows:
             _classify(row, settings["min_mil"], settings["max_mil"])
         out["summary"] = _summary(rows)
-        sections["members"] = rows
+        sections.append((out, "members", rows))
     else:
         tolerance = settings["tolerance_mil"] or 0.0
         if "group" in (out.get("modes") or [out["mode"]]):
-            rows = [_member_row(index, kind, name) for kind, name in members]
-            measured = [row for row in rows if row["status"] == "ok" and row["length_mil"] is not None]
-            reference = None
+            source_reference = None
             if settings["target_source"]:
                 found = _find_object(index, settings["target_source"])
                 if found is None:
@@ -1464,7 +1656,7 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
                     source_row = _member_row(index, *found)
                     if source_row["status"] == "ok" and source_row["length_mil"] is not None:
                         length = source_row["length_mil"]
-                        reference = {
+                        source_reference = {
                             "object": source_row["object"], "kind": source_row["kind"],
                             "length_mil": length, "source": "target_source",
                             "band_min_mil": _r(length - tolerance),
@@ -1475,22 +1667,47 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
                             f"{rule.name}: target source '{settings['target_source']}' "
                             "could not be measured; the longest member is used."
                         )
-            if reference is None and measured:
-                longest = max(measured, key=lambda row: row["length_mil"])
-                reference = {
-                    "object": longest["object"], "kind": longest["kind"],
-                    "length_mil": longest["length_mil"], "source": "longest_member",
-                    "band_min_mil": _r(longest["length_mil"] - tolerance),
-                    "band_max_mil": longest["length_mil"],
-                }
-            if reference is not None:
-                for row in rows:
-                    if row["status"] == "ok" and row["length_mil"] is not None:
-                        row["delta_to_target_mil"] = _r(row["length_mil"] - reference["length_mil"])
-                    _classify(row, reference["band_min_mil"], reference["band_max_mil"])
-            out["reference"] = reference
-            out["summary"] = _summary(rows)
-            sections["members"] = rows
+            # Altium compares each object type separately: nets (pair legs
+            # included) against the longest net, pairs against the longest
+            # pair, xSignals against the longest xSignal.
+            groups: dict[str, dict] = {}
+            for section, kind, enabled in (
+                ("xsignals", "xsignal", settings["group_xsignals"]),
+                ("diff_pairs", "diff_pair", settings["group_diff_pairs"]),
+                ("nets", "net", settings["group_other_nets"]),
+            ):
+                names = [name for member_kind, name in members if member_kind == kind]
+                if not enabled or not names:
+                    continue
+                rows = [_member_row(index, kind, name) for name in names]
+                reference = dict(source_reference) if source_reference else None
+                measured = [
+                    row for row in rows
+                    if row["status"] == "ok" and row["length_mil"] is not None
+                ]
+                if reference is None and measured:
+                    longest = max(measured, key=lambda row: row["length_mil"])
+                    reference = {
+                        "object": longest["object"], "kind": longest["kind"],
+                        "length_mil": longest["length_mil"], "source": "longest_member",
+                        "band_min_mil": _r(longest["length_mil"] - tolerance),
+                        "band_max_mil": longest["length_mil"],
+                    }
+                if reference is not None:
+                    for row in rows:
+                        if row["status"] == "ok" and row["length_mil"] is not None:
+                            row["delta_to_target_mil"] = _r(
+                                row["length_mil"] - reference["length_mil"]
+                            )
+                        _classify(row, reference["band_min_mil"], reference["band_max_mil"])
+                groups[section] = {"reference": reference, "summary": _summary(rows)}
+                sections.append((groups[section], "members", rows))
+            out["groups"] = groups
+            out["summary"] = {
+                key: sum(group["summary"][key] for group in groups.values())
+                for key in ("members", "ok", "violations", "marginal_violations",
+                            "incomplete", "unknown")
+            }
         if "within_pair" in (out.get("modes") or [out["mode"]]):
             pair_rows = []
             for kind, name in members:
@@ -1524,12 +1741,12 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
             if "max_mil" in pair_summary:
                 pair_summary["max_skew_mil"] = pair_summary.pop("max_mil")
             out["pair_summary"] = pair_summary
-            sections["pairs"] = pair_rows
+            sections.append((out, "pairs", pair_rows))
             if not members or not pair_rows:
                 out.setdefault("note", "Within-pair checks need differential pairs in scope.")
     out["status"] = "evaluated"
     any_involved = bool(conditional)
-    for key, rows in sections.items():
+    for container, key, rows in sections:
         if target is not None:
             rows = [row for row in rows if involved({net.lower() for net in row.get("nets") or [row["object"]]}, row["object"])]
             any_involved = any_involved or bool(rows)
@@ -1539,8 +1756,8 @@ def _check_rule(index, rule, memo: dict, winners: dict, target, offset, limit, p
         for row in page:
             if row["kind"] == "net":
                 row.pop("nets", None)
-        out[key] = page
-        out[f"{key}_page"] = meta
+        container[key] = page
+        container[f"{key}_page"] = meta
     if problems_only:
         out["listing"] = "problems_only"
     return {"rule": out, "unknown": unknown, "involved": any_involved or target is None}
@@ -1556,11 +1773,14 @@ def check_length_rules(
 ) -> dict:
     """Check Length and MatchedLengths rules against measured lengths.
 
-    rule names one rule; target (a net, differential pair or xSignal) keeps
-    only the rules and members that involve it. Members are paginated per
-    rule with offset/limit. problems_only (default: when neither rule nor
-    target is given) lists only violations, incomplete and unknown members;
-    summaries always count every member.
+    rule names one rule; target (a net, differential pair, xSignal, or an
+    xSignal, net or differential-pair class) keeps only the rules and members
+    that involve it. A MatchedLengths group is checked per object type, each
+    under groups (xsignals, diff_pairs, nets) with its own reference; the
+    rule summary adds them up. Members are paginated per rule and group with
+    offset/limit. problems_only (default: when neither rule nor target is
+    given) lists only violations, incomplete and unknown members; summaries
+    always count every member.
     """
     length_rules = sorted(
         (item for item in index.pcb.rules if item.kind in LENGTH_RULE_KINDS),
@@ -1579,15 +1799,21 @@ def check_length_rules(
             }
     target_info = None
     if target is not None:
-        found = _find_object(index, target)
+        found = _find_object(index, target, classes=True)
         if found is None:
             return {
                 "error": "target_not_found",
-                "message": f"No net, differential pair or xSignal named '{target}'.",
+                "message": (
+                    f"No net, differential pair, xSignal or xSignal, net or "
+                    f"differential-pair class named '{target}'."
+                ),
             }
         kind, display = found
         target_info = {
             "name": display, "kind": kind, "nets": _object_nets(index, kind, display),
+            "members": (
+                _class_members(index, kind, display) if kind in _CLASS_KINDS else set()
+            ),
         }
     if problems_only is None:
         problems_only = rule is None and target is None

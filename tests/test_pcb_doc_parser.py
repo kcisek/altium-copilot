@@ -304,6 +304,43 @@ def test_decode_pads_out_of_range_layer_skipped():
     assert skipped == 1
 
 
+def _pad_record_with_main(main_length: int, pin_package: int | None) -> bytes:
+    """A pad record whose main subrecord has main_length bytes; pin_package
+    (internal units) is written at offset 158 when given."""
+    main = bytearray(main_length)
+    main[0] = 1
+    struct.pack_into("<H", main, 3, 3)
+    struct.pack_into("<H", main, 7, 5)
+    struct.pack_into("<ii", main, 13, 150_0000, 250_0000)
+    struct.pack_into("<iiiiiii", main, 21, 2_4000, 3_5000, 0, 0, 0, 0, 0)
+    main[49] = 2
+    if pin_package is not None:
+        struct.pack_into("<i", main, 158, pin_package)
+    name_blob = b"\x011"
+    body = struct.pack("<I", len(name_blob)) + name_blob
+    for subrecord in [b"\x00", b"\x00" * 5, b"\x00", bytes(main), b""]:
+        body += struct.pack("<I", len(subrecord)) + subrecord
+    return b"\x02" + body
+
+
+def test_decode_pads_pin_package_length():
+    # 194- and 202-byte main subrecords: int32 at offset 158, 1e-4 mil.
+    for main_length in (194, 202):
+        primitives, skipped = decode_pads(_pad_record_with_main(main_length, 1234_5000))
+        assert skipped == 0
+        assert primitives[0].pin_package == pytest.approx(1234.5)
+    # Unset is 0; the 185-byte layout carries the field too.
+    assert decode_pads(_pad_record())[0][0].pin_package == 0.0
+
+
+def test_decode_pads_pin_package_absent_or_invalid():
+    # Too short to hold the field, or a negative (meaningless) value.
+    short, _ = decode_pads(_pad_record_with_main(120, None))
+    assert short[0].pin_package is None
+    negative, _ = decode_pads(_pad_record_with_main(194, -5))
+    assert negative[0].pin_package is None
+
+
 BOARD_PROPS = {
     "ORIGINX": "7283.4648mil",
     "ORIGINY": "7775.5913mil",

@@ -1,5 +1,6 @@
 """MCP tools for design rules, classes and differential pairs."""
 
+import asyncio
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import server.main as main_mod
-from server.parsers.pcb_doc import DiffPair, PcbClass, PcbRule
+from server.parsers.pcb_doc import DiffPair, PcbClass, PcbRule, XSignal
 from server.parsers.prj_pcb import VariantDefinition, VariantState
 from server.services.pcb_index import PcbIndex
 from tests.test_pcb_index import NETLIST, pcb_data  # noqa: F401
@@ -412,3 +413,68 @@ def test_rules_for_net_trims_candidate_values_when_too_large(rules_pcb, monkeypa
     assert "values" in clearance["candidates"][0]
     assert "values" not in clearance["candidates"][1]
     assert "get_design_rules" in result["values_omitted"]
+
+
+def _with_xsignal(index, name="CLK_XS"):
+    index.pcb.xsignals = [XSignal(name, ["U3-1", "R1-1"])]
+    index.pcb.classes.append(_class("XS_GROUP", "xsignal", [name]))
+    index.pcb.rules += [
+        _rule("Length", 1, "IsxSignal", name="LEN_XS",
+              MINLIMIT="100mil", MAXLIMIT="900mil"),
+        _rule("MatchedLengths", 1, "InxSignalClass('XS_GROUP')", name="ML_XS",
+              TOLERANCE="5mil", CHECKNETSINDIFFPAIR="FALSE",
+              CHECKDIFFPAIRVSDIFFPAIR="FALSE", CHECKXSIGNALS="TRUE",
+              CHECKOTHERS="FALSE"),
+    ]
+    index._build_rule_context()
+
+
+def test_rules_for_xsignal_name(rules_pcb):
+    # Regression: an xSignal name (not a net or pair name) crashed with a
+    # KeyError on the pair lookup.
+    _with_xsignal(rules_pcb)
+    result = json.loads(main_mod.get_rules_for_net("clk_xs"))
+    assert result["type"] == "xsignal"
+    assert result["target"] == "CLK_XS"
+    assert result["nets"] == ["CLK_A", "GND"]
+    assert result["pins"] == ["U3-1", "R1-1"]
+    assert result["xsignal_classes"] == ["XS_GROUP"]
+    rules = _by_kind(result)
+    assert set(rules) == {("Length", None), ("MatchedLengths", None)}
+    assert rules[("Length", None)]["effective"]["name"] == "LEN_XS"
+    assert "ML_XS" in json.dumps(rules[("MatchedLengths", None)])
+    assert "get_rules_for_net on each net" in result["hint"]
+    assert "positive_net" not in result
+
+
+def test_rules_for_xsignal_name_with_kinds(rules_pcb):
+    _with_xsignal(rules_pcb)
+    result = json.loads(main_mod.get_rules_for_net("CLK_XS", kinds=["Width", "Length"]))
+    assert [entry["kind"] for entry in result["rules"]] == ["Length"]
+    assert result["kinds_not_resolved"] == ["Width"]
+    every = json.loads(main_mod.get_rules_for_net("CLK_XS", kinds=["all"]))
+    assert {entry["kind"] for entry in every["rules"]} == {"Length", "MatchedLengths"}
+
+
+def test_rules_for_xsignal_through_the_mcp_server(rules_pcb):
+    _with_xsignal(rules_pcb)
+    content = asyncio.run(
+        main_mod.mcp.call_tool("get_rules_for_net", {"net": "CLK_XS"})
+    )
+    blocks = content[0] if isinstance(content, tuple) else content
+    assert json.loads(blocks[0].text)["type"] == "xsignal"
+
+
+def test_rules_for_net_not_found_mentions_xsignals(rules_pcb):
+    _with_xsignal(rules_pcb)
+    missing = json.loads(main_mod.get_rules_for_net("XS"))
+    assert missing["error"] == "net_not_found"
+    assert "xSignal" in missing["message"]
+    assert "CLK_XS" in missing["suggestions"]
+
+
+def test_net_sharing_an_xsignal_name(rules_pcb):
+    _with_xsignal(rules_pcb, name="CLK_A")
+    result = json.loads(main_mod.get_rules_for_net("CLK_A"))
+    assert result["type"] == "net"
+    assert "also an xSignal name" in result["note"]

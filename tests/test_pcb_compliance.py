@@ -1,5 +1,7 @@
 """Per-object rule compliance checks (services/pcb_compliance)."""
 
+import asyncio
+import re
 from copy import deepcopy
 from dataclasses import replace
 
@@ -40,8 +42,8 @@ def _track(net, layer, x1, y1, x2, y2, width):
                      x1=x1, y1=y1, x2=x2, y2=y2, width=width)
 
 
-def _via(net, x, y, diameter=20.0, hole=8.0):
-    return Primitive(kind="via", layer=1, layer_to=32, net=net, component=None,
+def _via(net, x, y, diameter=20.0, hole=8.0, component=None):
+    return Primitive(kind="via", layer=1, layer_to=32, net=net, component=component,
                      x1=x, y1=y, x2=x, y2=y, width=diameter, hole=hole)
 
 
@@ -125,8 +127,13 @@ def test_unverified_fallback_to_width_when_no_pair_rule_applies(pcb_data):
     assert width["violation_count"] == 3
     assert all(v["unverified_fallback"] for v in width["violations"])
     assert all(v["diff_pair"] == "CLK" for v in width["violations"])
-    assert _kind(result, "DiffPairsRouting")["objects_checked"] == 0
+    # DiffPairsRouting counts the pair tracks no pair rule applies to.
+    pairs = _kind(result, "DiffPairsRouting")
+    assert (pairs["objects_checked"], pairs["no_rule_objects"]) == (3, 3)
     assert any("unverified_fallback" in note for note in result["approximations"])
+    # Asked alone, DiffPairsRouting still shows them instead of dropping them.
+    alone = _kind(check_compliance(index, kinds=["DiffPairsRouting"]), "DiffPairsRouting")
+    assert (alone["objects_checked"], alone["no_rule_objects"]) == (3, 3)
 
 
 def test_room_scoped_rule_is_resolved_per_object(pcb_data):
@@ -398,3 +405,188 @@ def test_output_converts_to_millimetres(pcb_data):
 def test_kind_names_are_case_insensitive(pcb_data, kinds):
     result = check_compliance(_index(pcb_data, [WIDTH_ALL]), kinds=kinds)
     assert [entry["kind"] for entry in result["kinds"]] == ["Width"]
+
+
+def _by_rule(entry):
+    return {(e["rule"], e["objects"], e["violations"]) for e in entry["by_rule"]}
+
+
+def test_no_net_via_scopes_are_decided_on_the_via(pcb_data):
+    # A no-net via in R1's footprint (a mounting-hole ring) and CLK_A's free via.
+    vias = [_via(None, 300, 300, hole=11.0, component=2), _via(1, 200, 100)]
+    footprint = [
+        _rule("RoutingVias", 1, "IsVia and InAnyComponent", name="ViaInFootprint",
+              MAXHOLEWIDTH="12mil"),
+        _rule("RoutingVias", 2, name="Default", MAXHOLEWIDTH="10mil"),
+    ]
+    result = check_compliance(_index(pcb_data, footprint, primitives=vias),
+                              kinds=["RoutingVias"])
+    routing = _kind(result, "RoutingVias")
+    assert _by_rule(routing) == {("ViaInFootprint", 1, 0), ("Default", 1, 0)}
+    assert routing["violation_count"] == 0
+
+    # InAnyNet does not select a no-net via (it falls through); Not InAnyNet does.
+    any_net = [
+        _rule("RoutingVias", 1, "InAnyNet", name="RV_AnyNet", MAXWIDTH="15mil"),
+        _rule("RoutingVias", 2, name="RV_All", MAXWIDTH="30mil"),
+    ]
+    free = [_via(None, 300, 300)]
+    routing = _kind(check_compliance(_index(pcb_data, any_net, primitives=free),
+                                     kinds=["RoutingVias"]), "RoutingVias")
+    assert _by_rule(routing) == {("RV_All", 1, 0)}
+    not_any = [replace(any_net[0], scope1="Not InAnyNet", name="RV_NoNet"), any_net[1]]
+    routing = _kind(check_compliance(_index(pcb_data, not_any, primitives=free),
+                                     kinds=["RoutingVias"]), "RoutingVias")
+    assert _by_rule(routing) == {("RV_NoNet", 1, 1)}
+
+
+def test_footprint_scopes_are_decided_per_object_for_net_vias(pcb_data):
+    # CLK_A has no pad on R1, but this CLK_A via belongs to R1's footprint.
+    rules = [
+        _rule("HoleSize", 1, "IsVia and InComponent('R1')", name="Holes_R1",
+              MINLIMIT="1mil", MAXLIMIT="10mil"),
+        _rule("HoleSize", 2, name="Holes_All", MINLIMIT="1mil", MAXLIMIT="6mil"),
+    ]
+    vias = [_via(1, 300, 300, component=2), _via(1, 200, 100)]
+    holes = _kind(check_compliance(_index(pcb_data, rules, primitives=vias),
+                                   kinds=["HoleSize"]), "HoleSize")
+    assert _by_rule(holes) == {("Holes_R1", 1, 0), ("Holes_All", 1, 1)}
+
+
+DP_NARROW = _rule("DiffPairsRouting", 1, "InDifferentialPair('CLK')", name="DP_CLK",
+                  TOPLAYER_MINWIDTH="7mil", TOPLAYER_MAXWIDTH="9mil",
+                  MIDLAYER2_MINWIDTH="5mil", MIDLAYER2_MAXWIDTH="7mil")
+
+
+def test_width_request_on_pair_nets_adds_diff_pairs_routing(pcb_data):
+    index = _index(pcb_data, [WIDTH_ALL, DP_NARROW], pairs=[CLK_PAIR])
+    for nets in (["CLK"], None):
+        result = check_compliance(index, nets=nets, kinds=["Width"])
+        assert [entry["kind"] for entry in result["kinds"]] == [
+            "Width", "DiffPairsRouting",
+        ]
+        assert [entry["kind"] for entry in result["kinds_added"]] == ["DiffPairsRouting"]
+        pairs = _kind(result, "DiffPairsRouting")
+        assert (pairs["objects_checked"], pairs["violation_count"]) == (3, 2)
+        assert _kind(result, "Width")["objects_checked"] == 0
+    # No pair net selected, or no pair rule on the board: nothing is added.
+    plain = check_compliance(index, nets=["GND"], kinds=["Width"])
+    assert [entry["kind"] for entry in plain["kinds"]] == ["Width"]
+    assert "kinds_added" not in plain
+    no_rule = _index(pcb_data, [WIDTH_ALL], pairs=[CLK_PAIR])
+    assert "kinds_added" not in check_compliance(no_rule, nets=["CLK"], kinds=["Width"])
+
+
+def test_diff_pairs_routing_says_uncoupled_length_is_not_checked(pcb_data):
+    index = _index(pcb_data, [WIDTH_ALL, DP_NARROW], pairs=[CLK_PAIR])
+    result = check_compliance(index, kinds=["DiffPairsRouting"])
+    assert _kind(result, "DiffPairsRouting")["checks"] == ["width"]
+    (entry,) = [e for e in result["not_checked"] if e["kind"].startswith("DiffPairs")]
+    assert "Max Uncoupled Length" in entry["reason"]
+    widths = check_compliance(_index(pcb_data, [WIDTH_ALL]), kinds=["Width"])
+    assert not any(e["kind"].startswith("DiffPairs") for e in widths["not_checked"])
+
+
+def _hints(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in ("message", "reason", "skipped", "next_page"):
+                yield item
+            else:
+                yield from _hints(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _hints(item)
+
+
+def test_hints_name_real_tools_and_parameters(pcb_data):
+    tools = {tool.name: tool for tool in asyncio.run(main_mod.mcp.list_tools())}
+    parameters = set(tools["check_rule_compliance"].inputSchema["properties"])
+    rules = [WIDTH_ALL, DP_NARROW, _rule("Clearance", 1, GENERICCLEARANCE="10mil")]
+    index = _index(pcb_data, rules, pairs=[CLK_PAIR])
+    outputs = [
+        check_compliance(index, limit=1),
+        check_compliance(index, kinds=["Clearance"]),
+        check_compliance(index, nets=[]),
+    ]
+    texts = [text for output in outputs for text in _hints(output)]
+    assert any("clearance_spot_check=True" in text for text in texts)
+    assert any("offset=" in text for text in texts)
+    assert any("check_lengths" in text for text in texts)
+    for text in texts:
+        for tool in re.findall(r"\b(check_\w+)\b", text):
+            assert tool in tools, text
+        for name in re.findall(r"\b([a-z_]+)=", text):
+            assert name in parameters, text
+
+
+def test_unparseable_scope_leaves_the_object_undecided(pcb_data):
+    broken = "InNet('CLK_A') and ("
+    rules = [
+        _rule("Length", 1, broken, name="Len_Broken", MAXLIMIT="10mil"),
+        _rule("Length", 2, name="Len_All", MAXLIMIT="10000mil"),
+        _rule("Width", 1, broken, name="Width_Broken", MAXLIMIT="1mil"),
+        WIDTH_ALL,
+    ]
+    result = check_compliance(_index(pcb_data, rules), nets=["CLK_A"],
+                              kinds=["Length", "Width"])
+    # Length treats it as Width does: the lower Len_All rule is not certain.
+    for kind, objects in (("Length", 1), ("Width", 2)):
+        entry = _kind(result, kind)
+        assert entry["by_rule"] == []
+        assert entry["undecided"]["count"] == objects
+        (example,) = entry["undecided"]["examples"]
+        (undecided,) = example["rules"]
+        assert undecided["rule"].endswith("_Broken")
+        assert undecided["conditions"] == [broken]
+    (example,) = _kind(result, "Length")["undecided"]["examples"]
+    assert example["rules"][0]["parse_error"]
+
+
+def _arc(net, chords, y=0.0, width=6.0, source_id=7):
+    return [
+        Primitive(kind="arc", layer=1, net=net, component=None, x1=10.0 * i, y1=y,
+                  x2=10.0 * (i + 1), y2=y, width=width, source_id=source_id,
+                  length=10.0)
+        for i in range(chords)
+    ]
+
+
+def test_clearance_counts_an_arc_once(pcb_data):
+    primitives = _arc(1, 8) + [_track(2, 1, 0, 12, 80, 12, 6.0)]  # 6 mil apart
+    rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE="10mil")]
+    index = _index(pcb_data, rules, primitives=primitives)
+    clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
+                      "Clearance")
+    assert (clearance["objects_checked"], clearance["violation_count"]) == (1, 1)
+    assert clearance["target_objects"] == 1
+    (violation,) = clearance["violations"]
+    assert (violation["count"], violation["actual_mil"]) == (1, 6.0)
+    assert violation["objects"] == "Arc-Track"
+
+    # The arc as the other object: its scope facts still come from the arc.
+    arc_rules = [_rule("Clearance", 1, "IsArc", name="Arc_Clr",
+                       GENERICCLEARANCE="8mil"), rules[0]]
+    index = _index(pcb_data, arc_rules, primitives=primitives)
+    clearance = _kind(check_compliance(index, nets=["CLK_B"], kinds=["Clearance"]),
+                      "Clearance")
+    assert _by_rule(clearance) == {("Arc_Clr", 1, 1)}
+    (violation,) = clearance["violations"]
+    assert (violation["count"], violation["required_mil"]) == (1, 8.0)
+
+
+def test_violation_groups_are_paged_with_offset(pcb_data):
+    primitives = [_track(0, 1, 0, y, 50, y, width)
+                  for y, width in ((100, 1.0), (200, 2.0), (300, 3.0))]
+    index = _index(pcb_data, [WIDTH_ALL], primitives=primitives)
+    first = check_compliance(index, kinds=["Width"], limit=2)
+    width = _kind(first, "Width")
+    assert [v["actual_mil"] for v in width["violations"]] == [1.0, 2.0]
+    assert (width["has_more"], width["next_offset"]) == (True, 2)
+    assert "check_rule_compliance" in first["next_page"]
+    second = check_compliance(index, kinds=["Width"], limit=2, offset=2)
+    width = _kind(second, "Width")
+    assert [v["actual_mil"] for v in width["violations"]] == [3.0]
+    assert (width["has_more"], width["offset"]) == (False, 2)
+    assert "next_offset" not in width and "next_page" not in second
+    assert width["violation_count"] == 3  # counts never depend on the page

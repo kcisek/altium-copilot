@@ -264,7 +264,8 @@ class RuleTarget:
     tested on.
 
     Names are lower-case. components/footprints/pads describe the pads the
-    target's nets connect to, so component-scoped rules can be ruled out.
+    target's nets connect to, so component-scoped rules can be ruled out. A
+    net-kind target with no nets stands for objects that carry no net.
     """
 
     kind: str  # "net" | "diff_pair" | "xsignal"
@@ -315,7 +316,7 @@ def _class_member(
 
 _COMPONENT_ONLY = {
     "isbga", "islcc", "issoic", "isthrucomponent", "issmtcomponent",
-    "iscomponent", "iscomment", "isdesignator", "istext", "isfree",
+    "iscomponent", "iscomment", "isdesignator", "istext",
     "iskeepout", "iscoordinate", "isdimension", "isroom",
 }
 _POLYGON_ONLY = {
@@ -370,16 +371,16 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
             return _TRUE if obj.kind == name[2:] else _FALSE
         if name in ("isfill", "isregion"):
             return _FALSE
+        # Altium decides IsThruPin/IsSMTPin (like IsThruPad/IsSMTPad) by the
+        # pad's hole size alone: a free pad (mounting hole, test point) is a
+        # pin too.
         is_pad = obj.kind == "pad"
         if name in ("isthrupad", "isthrupin"):
-            through = is_pad and obj.hole > 0
-            if name == "isthrupin":
-                through = through and obj.component is not None
-            return _TRUE if through else _FALSE
-        smt = is_pad and obj.hole <= 0
-        if name == "issmtpin":
-            smt = smt and obj.component is not None
-        return _TRUE if smt else _FALSE
+            return _TRUE if is_pad and obj.hole > 0 else _FALSE
+        return _TRUE if is_pad and obj.hole <= 0 else _FALSE
+    if name == "isfree":
+        # A free primitive is one that is not part of a component.
+        return _TRUE if obj.component is None else _FALSE
     if name in _LAYER_PREDICATES:
         layer = obj.layer
         if name in ("onlayer", "existsonlayer"):
@@ -532,12 +533,19 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
             ctx, ctx.pair_classes, "diff_pair", args, target.pairs
         )
         return _TRUE if member else _FALSE
+    # A target without nets stands for no-net objects (e.g. free vias in the
+    # compliance check): InAnyNet and IsNet select nothing there, so
+    # "Not InAnyNet" selects them, as in Altium.
     if name == "inanynet":
-        return _TRUE
+        return _TRUE if target.nets else _FALSE
     if name == "inanydifferentialpair":
         return _TRUE if target.pairs else _FALSE
     if name == "isnet":
-        return _TRUE if is_net and target.obj is None else _FALSE
+        return _TRUE if is_net and target.obj is None and target.nets else _FALSE
+    if name == "isfree":
+        # A net's tracks, arcs and vias are free primitives; its component
+        # pads are not. Decided per object (see _eval_object_call).
+        return _unknown(node) if is_net else _FALSE
     if name == "isdifferentialpair":
         # Tracks of a pair's nets are checked through the pair (member view).
         return _TRUE if target.kind == "diff_pair" else _FALSE
@@ -604,7 +612,7 @@ def _eval_cmp(node, target: RuleTarget) -> tuple:
         return _TRUE if matched else _FALSE
     if prop == "objectkind":
         if value == "net":
-            return _TRUE if target.kind == "net" else _FALSE
+            return _TRUE if target.kind == "net" and target.nets else _FALSE
         if value in ("differential pair", "differentialpair"):
             return _TRUE if target.kind == "diff_pair" else _FALSE
         if value in ("text", "component", "dimension", "coordinate", "room",
@@ -1286,7 +1294,9 @@ class ObjectResolver:
 
     Net-level verdicts are computed once; only rules whose scope is
     conditional at net level are re-evaluated per object (a decided net-level
-    verdict cannot change when object facts are added).
+    verdict cannot change when object facts are added). A target without nets
+    (no-net objects) has no net-level facts: its component, pad and footprint
+    terms describe nothing, so every rule is decided per object.
     """
 
     def __init__(self, rules: list[PcbRule], target: RuleTarget, ctx: RuleContext):
@@ -1296,7 +1306,10 @@ class ObjectResolver:
             (rule for rule in rules if rule.enabled), key=lambda rule: rule.priority
         )
         self.net_level = [
-            evaluate_scope(rule.scope1, target, ctx)["matches"] for rule in self.rules
+            evaluate_scope(rule.scope1, target, ctx)["matches"]
+            if target.nets
+            else "conditional"
+            for rule in self.rules
         ]
 
     def resolve(self, obj: ObjectFacts) -> tuple[PcbRule | None, list[dict]]:

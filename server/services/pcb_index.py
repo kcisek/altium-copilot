@@ -85,6 +85,7 @@ CREATE TABLE prims (
     hole REAL,
     pad_name TEXT,
     length REAL,
+    pin_package REAL,
     minx REAL,
     miny REAL,
     maxx REAL,
@@ -259,9 +260,9 @@ class PcbIndex:
                 "kind, net_id, layer, layer_to, component, pour_id, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
                 "source_id, "
-                "hole, pad_name, length, "
+                "hole, pad_name, length, pin_package, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -281,6 +282,7 @@ class PcbIndex:
                     primitive.hole,
                     primitive.pad_name,
                     primitive.length,
+                    primitive.pin_package,
                     min_x,
                     min_y,
                     max_x,
@@ -656,10 +658,10 @@ class PcbIndex:
     def rule_target(
         self, name: str, kind: str | None = None
     ) -> RuleTarget | None:
-        """Build the scope-evaluation target for a net or diff pair name.
+        """Build the scope-evaluation target for a net, diff pair or xSignal.
 
-        kind ("net" / "diff_pair") picks one when a pair shares a net's name;
-        without it the net wins.
+        kind ("net" / "diff_pair" / "xsignal") picks one when names collide;
+        without it a net wins over a pair, and a pair over an xSignal.
         """
         ctx = self.rule_context
         key = name.lower()

@@ -163,6 +163,36 @@ def test_ground_rules(review_index):
     assert "Net names are hints, not evidence" in prompt
 
 
+def _flat(prompt: str) -> str:
+    return re.sub(r"\s+", " ", prompt)
+
+
+def test_length_rules_match_the_length_engine(review_index):
+    # Pin/package length is included like Altium's Signal Length; it is not
+    # bounded to "a few mil" or said to be excluded.
+    flat = _flat(_prompt(review_index))
+    assert "plus the pin/package length (pad to die) stored on the end pads" in flat
+    assert "adds the pin/package length at its end pins" in flat
+    assert "no pin/package length, like Altium's Routed Length" in flat
+    assert "group length is the P/N average" in flat
+    assert "few mil" not in flat
+    assert "excluded" not in flat
+
+
+def test_prompt_promises_only_what_check_diff_pairs_returns(review_index):
+    flat = _flat(_prompt(review_index))
+    # check_diff_pairs has no per-leg via counts and does not compare
+    # schematic directives yet.
+    assert "via count per leg, AC-coupling" not in flat
+    assert "schematic directives missing on the PCB" not in flat
+    assert "Differential Pair directives are not compared with the PCB yet" in flat
+    assert "get_signal_length(<pair>) gives the via count per leg" in flat
+    step = flat[flat.index("3. check_diff_pairs(pattern=...) per interface"):]
+    assert step.startswith(
+        "3. check_diff_pairs(pattern=...) per interface: in-pair skew and AC-coupling symmetry."
+    )
+
+
 def test_prompt_offers_no_save_tool(review_index):
     prompt = _prompt(review_index)
     assert "save_" not in prompt

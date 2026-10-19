@@ -576,6 +576,81 @@ def test_object_scopes_are_decided(obj_ctx, scope, facts, expected):
     assert _matches(scope, _on(CLK_A, **facts), obj_ctx) == expected
 
 
+FREE_TH_PAD = dict(kind="pad", layer=MULTI_LAYER, span=frozenset({1, 3, 32}),
+                   points=((700, 700),), hole=102.36)
+FREE_SMD_PAD = dict(kind="pad", layer=1, span=frozenset({1}), points=((710, 700),))
+TH_PIN_U3 = dict(kind="pad", layer=MULTI_LAYER, span=frozenset({1, 3, 32}),
+                 points=((300, 300),), component="u3", pad="u3-2", hole=40.0)
+
+
+@pytest.mark.parametrize("scope, facts, expected", [
+    # Altium: IsThruPin = pad with a hole, IsSMTPin = pad without, whether or
+    # not the pad belongs to a component (mounting holes, test points).
+    ("IsThruPin", FREE_TH_PAD, "yes"),
+    ("IsThruPin", TH_PIN_U3, "yes"),
+    ("IsThruPin", FREE_SMD_PAD, "no"),
+    ("IsThruPin", VIA, "no"),
+    ("IsSMTPin", FREE_SMD_PAD, "yes"),
+    ("IsSMTPin", FREE_TH_PAD, "no"),
+    ("IsSMTPin", TRACK_TOP_IN_ROOM, "no"),
+    # IsFree: primitives that are not part of a component.
+    ("IsFree", TRACK_TOP_IN_ROOM, "yes"),
+    ("IsFree", FREE_TH_PAD, "yes"),
+    ("IsFree", PAD_U3, "no"),
+])
+def test_pad_type_and_free_scopes_per_object(obj_ctx, scope, facts, expected):
+    assert _matches(scope, _on(CLK_A, **facts), obj_ctx) == expected
+
+
+def test_is_free_is_decided_per_object_for_a_net(obj_ctx):
+    # A net's routing is free, its component pads are not.
+    assert _matches("IsFree", CLK_A, obj_ctx) == "conditional"
+    assert _matches("IsFree", PAIR, obj_ctx) == "no"
+    assert _matches("IsFree and IsKeepOut", CLK_A, obj_ctx) == "no"
+
+
+NO_NET = RuleTarget(kind="net", name="", nets=set(), pairs=set())
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ("InAnyNet", "no"),
+    ("Not InAnyNet", "yes"),
+    ("IsNet", "no"),
+    ("ObjectKind = 'Net'", "no"),
+    ("InNet('GND')", "no"),
+    ("All", "yes"),
+])
+def test_target_without_nets_is_in_no_net(obj_ctx, scope, expected):
+    assert _matches(scope, NO_NET, obj_ctx) == expected
+    assert _matches(scope, _on(NO_NET, **VIA), obj_ctx) == expected
+
+
+def test_real_nets_stay_in_any_net(obj_ctx):
+    assert _matches("InAnyNet", CLK_A, obj_ctx) == "yes"
+    assert _matches("Not InAnyNet", CLK_A, obj_ctx) == "no"
+    assert _matches("IsNet", CLK_A, obj_ctx) == "yes"
+    assert _matches("InAnyNet", PAIR, obj_ctx) == "yes"
+
+
+def test_object_resolver_decides_no_net_objects_per_object(obj_ctx):
+    rules = [
+        _rule("RoutingVias", 1, "IsVia and InAnyComponent", name="FootprintVias"),
+        _rule("RoutingVias", 2, "InAnyNet", name="NetVias"),
+        _rule("RoutingVias", 3, "Not InAnyNet", name="NoNetVias"),
+        _rule("RoutingVias", 4, "All", name="Default"),
+    ]
+    resolver = ObjectResolver(rules, NO_NET, obj_ctx)
+    in_footprint, _ = resolver.resolve(
+        ObjectFacts(**dict(VIA, component="u3", footprint="QFN32"))
+    )
+    free, undecided = resolver.resolve(ObjectFacts(**VIA))
+    assert in_footprint.name == "FootprintVias"
+    assert free.name == "NoNetVias" and undecided == []
+    # A real net never takes the no-net rule.
+    net_via, _ = ObjectResolver(rules, CLK_A, obj_ctx).resolve(ObjectFacts(**VIA))
+    assert net_via.name == "NetVias"
+
+
 def test_xsignal_scopes(obj_ctx):
     xsignal = RuleTarget(kind="xsignal", name="CLK_PP1", nets={"clk_a"}, pairs=set())
     assert _matches("InxSignalClass('Clocks_X')", xsignal, obj_ctx) == "yes"
