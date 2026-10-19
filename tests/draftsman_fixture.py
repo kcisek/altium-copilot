@@ -38,6 +38,10 @@ def _note_element(text: str) -> str:
     return f"<NoteElement><BorderStyle>None</BorderStyle><Postfix>.</Postfix><Text>{text}</Text></NoteElement>"
 
 
+def _param(name: str, value: str) -> str:
+    return f"<DrawingDocumentParameterData><Name>{name}</Name><Value>{value}</Value><Version/></DrawingDocumentParameterData>"
+
+
 def drawing_xml() -> str:
     holes = (
         _hole(0.3, True, "Via") * 3
@@ -45,17 +49,27 @@ def drawing_xml() -> str:
         + _hole(1.0, True, "Pad", slot_mm=2.5)
     )
     padding = " " * 300  # long runs give the encoder overlapping matches
+    layers = (
+        "<StackLayerBoardLayerData><Comment/><IdInBoard>1</IdInBoard><Material>Copper</Material>"
+        "<Name>Top Layer</Name><Note/></StackLayerBoardLayerData>"
+        "<StackLayerBoardLayerData><Comment>Controlled impedance core</Comment><IdInBoard>100</IdInBoard>"
+        "<Material>FR-4</Material><Name>Dielectric 1</Name><Note>Use Isola 370HR</Note></StackLayerBoardLayerData>"
+    )
     return (
         '<Document xmlns="http://schemas.datacontract.org/2004/07/Altium.Designer.PcbDrawing.DataSerialization.V1"'
         ' xmlns:i="http://www.w3.org/2001/XMLSchema-instance">'
-        "<Id>0</Id><BillOfMaterialsInformation i:nil=\"true\"/><DocumentId>ABCDEFGH</DocumentId>"
+        "<Id>0</Id><BillOfMaterialsInformation i:nil=\"true\"/>"
+        # The drawing's copy of the board: cut out before parsing.
+        "<BoardAssemblyInformation><Components><Text>board copy</Text></Components></BoardAssemblyInformation>"
+        "<DocumentId>ABCDEFGH</DocumentId>"
         f"<DrillTableInformation><Id>0</Id><Holes/><HolesV2>{holes}</HolesV2></DrillTableInformation>"
         "<FormatVersion>24</FormatVersion><LastUpdate>2026-10-01T12:00:00.0000000Z</LastUpdate>"
-        "<LayerStackInformation><BoardLayerStackData><BoardLayerStack><Name>Board Layer Stack</Name><Stack>"
-        "<StackLayerBoardLayerData><Comment/><Material>Copper</Material><Name>Top Layer</Name><Note/></StackLayerBoardLayerData>"
-        "<StackLayerBoardLayerData><Comment>Controlled impedance core</Comment><Material>FR-4</Material>"
-        "<Name>Dielectric 1</Name><Note>Use Isola 370HR</Note></StackLayerBoardLayerData>"
-        "</Stack></BoardLayerStack></BoardLayerStackData></LayerStackInformation>"
+        "<LayerStackInformation><BoardLayerStackData><BoardLayerStack><Name>Board Layer Stack</Name>"
+        f"<Stack>{layers}</Stack></BoardLayerStack></BoardLayerStackData>"
+        # Draftsman serialises the stack a second time; it must not double the notes.
+        "<LayerStack><TupleOfstringArrayOfStackLayerBoardLayerDataA8rmZfqX><m_Item1>Board Layer Stack</m_Item1>"
+        f"<m_Item2>{layers}</m_Item2></TupleOfstringArrayOfStackLayerBoardLayerDataA8rmZfqX></LayerStack>"
+        "</LayerStackInformation>"
         "<Pages>"
         "<Page><Id>1</Id><Items>"
         '<Item i:type="Note"><Id>2</Id><Anchor>Top Left</Anchor><OriginatedFromTemplate>false</OriginatedFromTemplate>'
@@ -63,6 +77,7 @@ def drawing_xml() -> str:
         + _note_element("Board material FR-4, Tg 150 or higher")
         + _note_element("Surface finish ENIG")
         + _note_element("")
+        + _note_element("Final thickness =Total_Thickness, part DEMO-v=PrjRev, =Unknown_Param kept")
         + "</Elements><Title>Notes:</Title><TitleVisible>true</TitleVisible></Item>"
         '<Item i:type="Text"><Id>3</Id><OriginatedFromTemplate>false</OriginatedFromTemplate>'
         f"<Rect><Height>20</Height><Width>200</Width><X>10</X><Y>10</Y></Rect><Text>Do not scale this drawing{padding}</Text></Item>"
@@ -78,7 +93,8 @@ def drawing_xml() -> str:
         f"<Bitmap>{TINY_PNG}</Bitmap><Bitmap2/><MaintainAspectRatio>true</MaintainAspectRatio>"
         f"<Rect><Height>{25 * _MM}</Height><Width>{50 * _MM}</Width><X>0</X><Y>0</Y></Rect></Item>"
         '<Item i:type="BoardFabricationViewData"><Id>7</Id><OriginatedFromTemplate>false</OriginatedFromTemplate>'
-        "<ShowTitle>true</ShowTitle><Title>=ViewLayerName (Scale =ViewScale)</Title><ViewSide>Top</ViewSide></Item>"
+        "<LayerV7Id>1</LayerV7Id><ShowTitle>true</ShowTitle><Title>=ViewLayerName (Scale =ViewScale)</Title>"
+        "<ViewSide>Top</ViewSide></Item>"
         '<Item i:type="Line"><Id>8</Id></Item>'
         "</Items><StandardSizeName>A4</StandardSizeName><TemplateFileName/></Page>"
         "<Page><Id>9</Id><Items>"
@@ -90,9 +106,14 @@ def drawing_xml() -> str:
         "<Page><Id>12</Id><Items/><StandardSizeName/></Page>"
         "</Pages>"
         "<Parameters>"
-        "<DrawingDocumentParameterData><Name>Revision</Name><Value>B</Value><Version/></DrawingDocumentParameterData>"
-        "<DrawingDocumentParameterData><Name>SheetTotal</Name><Value/><Version/></DrawingDocumentParameterData>"
+        + _param("Revision", "B")
+        + "<DrawingDocumentParameterData><Name>SheetTotal</Name><Value/><Version/></DrawingDocumentParameterData>"
         "</Parameters>"
+        # Values the drawing cached from the board and project for its special strings.
+        "<ParametersData><LastUpdate>0001-01-01T00:00:00</LastUpdate>"
+        f"<PCBParameters>{_param('Total_Thickness', '1.6mm')}</PCBParameters>"
+        f"<ProjectParameters>{_param('PrjRev', '3')}</ProjectParameters>"
+        "</ParametersData>"
         "<SourceDocumentName>C:\\Projects\\Demo\\Demo.PcbDoc</SourceDocumentName>"
         "</Document>"
     )

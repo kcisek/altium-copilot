@@ -6,6 +6,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- Design notes, after a review against 200 real sheets and 48 real Draftsman drawings:
+  - Text frames and notes decode Altium's escapes in one pass: `~~` is a `~` (so
+    "~10kHz" no longer turns into a line break and "0kHz"), `~2` is a `|`. Labels are
+    left as stored
+  - Special strings show what the sheet shows: label and text-frame formulas
+    (`=PrjMPN + '-v' + Version`) and title-block values that point at project
+    parameters (`Revision = =SCH_Revision`) are resolved against the sheet's and the
+    project's parameters. In Draftsman notes, text, tables and view titles, `=Name`
+    takes the value the drawing cached (e.g. `Final thickness of PCB: =Total_Thickness`)
+  - Fabrication views name the layer they show instead of `=ViewLayerName`
+  - Layer stack notes are no longer listed twice (Draftsman stores the stack twice);
+    with several stacks each note names its stack
+  - A hidden `PageSetup` printer blob is no longer shown as a title-block value
+  - Free text labels are measured at Altium's real font size and rotated labels are
+    turned about their anchor, so "near" names the right components
+  - Large drawings parse without the board copy they embed: ~0.7 s and ~120 MB instead
+    of ~3 s and ~770 MB for a 6.8 MB drawing. `get_design_image` takes Draftsman
+    pictures from that cached parse instead of reparsing the file
+  - A drawing last updated from a board of the same name in another folder is reported
+    as a copied project or earlier revision, not as "not this project's PcbDoc"; the
+    same board reached through a junction or mapped drive is not flagged
+  - Draftsman `last_update` keeps its UTC marker; a drill row without a hole size no
+    longer hides the whole drawing; `get_design_notes` returns `document_not_found` as
+    JSON like the other tools
+  - `get_design_image` refuses pictures over 8000 px per side (the API would reject the
+    conversation from then on) and reports a linked TIFF/metafile as an unsupported
+    format instead of a missing file
+  - The session-start guidance fits within the 4096 characters of server instructions
+    that Claude Code shows; the design-notes caveats moved into the tool descriptions
 - Projects that keep their `.SchDoc` files in a subfolder (e.g. `source\`) or outside
   the project folder (`..\common\`) now load components. Sheets come from the `.PrjPcb`
   document list instead of a top-level `*.SchDoc` glob, for both enrichment and netlist

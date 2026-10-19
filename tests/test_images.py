@@ -5,7 +5,7 @@ import zlib
 
 import pytest
 
-from services.images import bmp_to_png, image_format
+from services.images import bmp_to_png, image_format, image_size
 
 
 def _bmp(width: int, height: int, pixels: list[list[tuple]], bpp: int = 32,
@@ -123,3 +123,21 @@ def test_truncated_bmp_raises():
 ])
 def test_image_format(data, expected):
     assert image_format(data) == expected
+
+
+def _jpeg(width: int, height: int) -> bytes:
+    app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0" + b"\0" * 9
+    sof = b"\xff\xc0" + struct.pack(">HBHHB", 17, 8, height, width, 3) + b"\0" * 9
+    return b"\xff\xd8" + app0 + sof + b"\xff\xd9"
+
+
+@pytest.mark.parametrize("data,expected", [
+    (bmp_to_png(_bmp(3, 2, PICTURE)), (3, 2)),
+    (b"GIF89a" + struct.pack("<HH", 640, 480) + b"\0" * 10, (640, 480)),
+    (_jpeg(1024, 768), (1024, 768)),
+    (b"RIFF\0\0\0\0WEBPVP8 ", None),  # not read: no WebP pictures in Altium files seen
+    (b"\xff\xd8\xff\xe0\x00", None),   # truncated JPEG
+    (b"%PDF-1.7", None),
+])
+def test_image_size(data, expected):
+    assert image_size(data) == expected

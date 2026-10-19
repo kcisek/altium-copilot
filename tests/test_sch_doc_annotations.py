@@ -115,6 +115,19 @@ def test_note_author_collapsed_and_line_breaks():
     assert note.near == ["R1"]
 
 
+def test_text_frame_escapes_decode_in_one_pass():
+    # ~~ is a literal '~' (so "~~1.2V" is "~1.2V", not a line break), ~2 is a '|'.
+    notes = annotations_from_stream(_stream(
+        "|RECORD=28|Location.X=1|Location.Y=1|Corner.X=2|Corner.Y=2|Text=Sags to ~~1.2V~1VCC~2GND ~x",
+    ))
+    assert notes.items[0].text == "Sags to ~1.2V\nVCC|GND ~x"
+
+
+def test_labels_are_not_unescaped():
+    notes = annotations_from_stream(_stream("|RECORD=4|Location.X=1|Location.Y=1|Text=~1A max"))
+    assert notes.items[0].text == "~1A max"
+
+
 def test_note_utf8_text_wins_over_ansi():
     raw = b"|RECORD=209|Location.X=1|Location.Y=1|Text=Gr?e|%UTF8%Text=" + "Grüße".encode("utf-8")
     notes = annotations_from_stream(_stream(raw))
@@ -137,9 +150,24 @@ def test_pins_of_parts_not_drawn_do_not_count_as_near():
 
 
 def test_label_extent_reaches_nearby_component():
-    # Anchor 1000 mil left of R1, but a 30-character label at 10 pt is ~2300 mil wide.
+    # Anchor 1000 mil left of R1, but a 30-character label at size 10 is ~1350 mil wide.
     notes = _annotations("|RECORD=4|Location.X=0|Location.Y=100|Justification=0|Text=" + "x" * 30)
     assert notes.items[0].near == ["R1"]
+    assert notes.items[0].width_mil == pytest.approx(30 * 10 * 0.646 * 1000 / 72 * 0.5)
+
+
+def test_rotated_label_box_turns_about_its_anchor():
+    # Orientation=1 (90 deg), Justification=2 (bottom right): the text runs upward and
+    # ends at the anchor, so after turning it lies left of and below the anchor.
+    notes = annotations_from_stream(_stream(
+        SHEET, "|RECORD=4|Location.X=1000|Location.Y=1000|Orientation=1|Justification=2|Text=" + "x" * 10,
+    ))
+    label = notes.items[0]
+    em = 10 * 0.646 * 1000 / 72
+    assert label.x_mil == pytest.approx(10_000 - em)
+    assert label.y_mil == pytest.approx(10_000 - 10 * em * 0.5)
+    assert label.x_mil + label.width_mil == pytest.approx(10_000)
+    assert label.y_mil + label.height_mil == pytest.approx(10_000)
 
 
 def test_legacy_uppercase_keys():
@@ -191,22 +219,30 @@ def test_directive_parameters_and_sheet_parameters():
         "|RECORD=41|Name=Revision|Text=*",
         "|RECORD=41|Name=CurrentDate|Text=01/01/2026",
         "|RECORD=41|Name=VersionControl_RevNumber|Text=42",
+        "|RECORD=41|Name=PageSetup|IsHidden=T|Text=Record=PageOptions\xa6CenterHorizontal=True",
+        "|RECORD=41|Name=PrintSettings|Text=Record=PageOptions\xa6Scale=1",
+        "|RECORD=41|Name=SchRev|Text==SCH_Revision",
     )
     assert len(notes.directives) == 1
     assert notes.directives[0].name == "DiffPair"
     assert notes.directives[0].parameters == {"DifferentialPair": "True"}
     assert (notes.directives[0].x_mil, notes.directives[0].y_mil) == (500, 600)
-    assert notes.title_block == {"Title": "Main board"}
+    # Placeholders, automatic values and printer setup are not title-block information;
+    # a reference to a project parameter is kept for the renderer to resolve.
+    assert notes.title_block == {"Title": "Main board", "SchRev": "=SCH_Revision"}
+    assert notes.sheet_parameters["Revision"] == "*"
+    assert notes.sheet_parameters["CurrentDate"] == "01/01/2026"
 
 
 # ---------- embedded picture storage ----------
 
 def _storage(*entries: tuple[str, bytes]) -> bytes:
+    """A Storage stream as Altium writes it: picture records carry the binary-record flag."""
     out = _record("|HEADER=Icon storage|Weight=%d" % len(entries))
     for name, data in entries:
         packed = zlib.compress(data)
         body = b"\xd0" + bytes([len(name)]) + name.encode("latin-1") + struct.pack("<I", len(packed)) + packed
-        out += struct.pack("<I", len(body)) + body
+        out += struct.pack("<I", len(body) | 0x01000000) + body
     return out
 
 
