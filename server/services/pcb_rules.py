@@ -813,6 +813,7 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MAXIMP": ("", "skip"),
         "IMPEDANCEPROFILEDRIVEN": ("impedance_profile_driven", "bool"),
         "IMPEDANCEPROFILEVALUE": ("impedance_profile_ohm", "ohm"),
+        "IMPEDANCEPROFILEID": ("", "skip"),
     },
     "DiffPairsRouting": {
         "MINLIMIT": ("min_gap_mil", "mil"),
@@ -821,6 +822,7 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MAXUNCOUPLEDLENGTH": ("max_uncoupled_length_mil", "mil"),
         "IMPEDANCEPROFILEDRIVEN": ("impedance_profile_driven", "bool"),
         "IMPEDANCEPROFILEVALUE": ("impedance_profile_ohm", "ohm"),
+        "IMPEDANCEPROFILEID": ("", "skip"),
     },
     "RoutingVias": {
         "MINWIDTH": ("min_diameter_mil", "mil"),
@@ -1048,10 +1050,6 @@ def rule_values(
         values.pop("impedance_profile_ohm", None)
     profile_id = props.get("IMPEDANCEPROFILEID", "").strip()
     if profile_id:
-        other = values.get("other", {})
-        other.pop("impedanceprofileid", None)
-        if not other:
-            values.pop("other", None)
         profile = (profiles or {}).get(profile_id.upper())
         if profile:
             values["impedance_profile"] = profile

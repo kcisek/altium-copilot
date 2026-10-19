@@ -19,13 +19,14 @@ UNBOUNDED = "214748.3647mil"
 
 PROFILE_PROPS = {
     "V9_IMPEDANCEPROFILE0_ID": "{D90}",
-    "V9_IMPEDANCEPROFILE0_NAME": "D90",
-    "V9_IMPEDANCEPROFILE0_DISPLAY_NAME": "USB 90R",
+    "V9_IMPEDANCEPROFILE0_NAME": "USB",
+    "V9_IMPEDANCEPROFILE0_DISPLAY_NAME": "D90 (USB)",
     "V9_IMPEDANCEPROFILE0_IMPEDANCE": "90.000000",
     "V9_IMPEDANCEPROFILE0_IMPEDANCE_TOLERANCE": "10.000000",
     "V9_IMPEDANCEPROFILE0_ISDIFFPAIR": "TRUE",
     "V9_IMPEDANCEPROFILE1_ID": "{S50}",
-    "V9_IMPEDANCEPROFILE1_NAME": "S50",
+    "V9_IMPEDANCEPROFILE1_NAME": "",
+    "V9_IMPEDANCEPROFILE1_DISPLAY_NAME": "S50",
     "V9_IMPEDANCEPROFILE1_IMPEDANCE": "50.000000",
     "V9_IMPEDANCEPROFILE1_ISDIFFPAIR": "FALSE",
 }
@@ -65,8 +66,9 @@ def test_decode_profiles_and_layers():
     profiles = decode_impedance_profiles({**PROFILE_PROPS, **TRACES})
     d90, s50 = profiles
     assert (d90.name, d90.target_ohm, d90.tolerance_pct, d90.differential) == (
-        "D90", 90.0, 10.0, True,
+        "D90 (USB)", 90.0, 10.0, True,
     )
+    assert s50.name == "S50"  # empty NAME: the label Altium shows
     assert s50.tolerance_pct is None and not s50.differential
     assert len(d90.layers) == 3  # disabled entries kept, flagged
     top = d90.layers[0]
@@ -118,7 +120,6 @@ def profile_index(pcb_data):
 def test_impedance_profiles_resolve_layers_rules_and_issues(profile_index):
     d90, s50 = impedance_profiles(profile_index)
     assert d90["type"] == "differential"
-    assert d90["display_name"] == "USB 90R"
     assert d90["used_by_rules"] == [
         {"rule": "DP_USB", "kind": "DiffPairsRouting", "enabled": True}
     ]
@@ -127,7 +128,8 @@ def test_impedance_profiles_resolve_layers_rules_and_issues(profile_index):
     assert top["reference_layers"] == ["L2-GND"]  # 'no layer' above is dropped
     assert (top["width_mil"], top["gap_mil"], top["calculated_ohm"]) == (4.5, 5.0, 90.4)
     assert top["within_tolerance"] is True
-    assert top["delay_ps_per_inch"] == pytest.approx(169.3, abs=0.1)
+    # Stored 0.150 is ns/inch: 150 ps per inch.
+    assert top["delay_ps_per_inch"] == pytest.approx(150.0)
     assert "max_width_mil" not in top
     assert l3["reference_layers"] == ["L2-GND", "Bottom Layer"]
     assert l3["within_tolerance"] is False
@@ -145,7 +147,8 @@ def test_rule_values_name_the_profile(profile_index):
         rule, profile_index.signal_layers(), [], profile_refs(profile_index.pcb.board)
     )
     assert values["impedance_profile"] == {
-        "name": "D90", "type": "differential", "target_ohm": 90.0, "tolerance_pct": 10.0,
+        "name": "D90 (USB)", "type": "differential", "target_ohm": 90.0,
+        "tolerance_pct": 10.0,
     }
     assert "impedanceprofileid" not in values.get("other", {})
     missing = rule_values(rule, profile_index.signal_layers(), [], {})
@@ -155,7 +158,7 @@ def test_rule_values_name_the_profile(profile_index):
 def test_snapshot_line(profile_index):
     line = snapshot_line(profile_index)
     assert line.startswith("- Impedance profiles (2): ")
-    assert "D90 (differential 90 ohm +/-10%, used by 1 rule, has issues)" in line
+    assert "D90 (USB) (differential 90 ohm +/-10%, used by 1 rule, has issues)" in line
     assert "S50 (single-ended 50 ohm, unused)" in line
 
 
@@ -167,6 +170,33 @@ def test_get_board_info_lists_profiles(rules_pcb):
     )
     board = json.loads(main_mod.get_board_info(units="mm"))
     names = [profile["name"] for profile in board["impedance_profiles"]]
-    assert names == ["D90", "S50"]
+    assert names == ["D90 (USB)", "S50"]
     assert "width_mm" in board["impedance_profiles"][0]["layers"][0]
-    assert "m/ns" in board["impedance_note"]
+    assert "ns/inch" in board["impedance_note"]
+
+
+def test_profile_id_does_not_hide_other_rule_values():
+    for kind in ("Width", "DiffPairsRouting"):
+        rule = PcbRule(
+            name="R", kind=kind, kind_id=2, enabled=True, priority=1, scope1="All",
+            scope2="All", net_scope="AnyNet", comment="", unique_id=None,
+            from_schematic=False,
+            properties={"IMPEDANCEPROFILEDRIVEN": "TRUE", "IMPEDANCEPROFILEID": "{X}",
+                        "CHECKCONNECTEDCOPPER": "TRUE"},
+        )
+        values = rule_values(rule, {1: "Top"}, [], {})
+        assert values["other"] == {"checkconnectedcopper": True}
+        assert values["impedance_profile"] == {"id": "{X}", "missing": True}
+
+
+def test_delay_matches_stripline_physics():
+    # A homogeneous Dk 4.1 stripline: eps_eff = 4.1, delay = sqrt(4.1)/11.803 ns/in.
+    props = {
+        "V9_IMPEDANCEPROFILE0_ID": "{P}", "V9_IMPEDANCEPROFILE0_DISPLAY_NAME": "S50",
+        "V9_IMPEDANCEPROFILE0_IMPEDANCE": "50", "V9_IMPEDANCEPROFILE0_ISDIFFPAIR": "FALSE",
+        **_trace(0, "{P}", L3, "5mil", "5mil", "50", top=L2, bottom=BOTTOM),
+        "V9_TRACEIMPEDANCE0_PROPAGATION_SPEED": "0.171550",
+    }
+    (profile,) = decode_impedance_profiles(props)
+    delay = profile.layers[0].propagation_speed * 1000
+    assert delay == pytest.approx((4.1 ** 0.5) / 11.803 * 1000, rel=0.01)

@@ -11,11 +11,13 @@ try:
 except ImportError:
     from server.services.pcb_rules import rule_values
 
-# Propagation speed is stored per layer as ~0.146-0.179; that is consistent
-# with m/ns (= mm/ps). The unit is not documented, so derived delays say so.
+# PROPAGATION_SPEED (~0.13-0.18) is a delay in ns/inch (= ps/mil), not a
+# speed: read that way, striplines come out at their laminate Dk and
+# microstrips below it, as the physics requires. Altium does not document it.
 PROPAGATION_UNIT_NOTE = (
-    "delay_ps_per_inch is derived from the stack manager's propagation speed, "
-    "read as m/ns (the unit is not documented)."
+    "delay_ps_per_inch is the stack manager's stored propagation value, read as "
+    "ns/inch (= ps/mil); Altium does not document the unit, and this reading matches "
+    "the stack Dk (striplines at the laminate Dk, microstrips below it)."
 )
 _MATCH_TOLERANCE_MIL = 0.01
 
@@ -98,7 +100,7 @@ def impedance_profiles(index) -> list[dict]:
                         f"outside {profile.target_ohm:g} ohm +/-{profile.tolerance_pct:g}%"
                     )
             if entry.propagation_speed:
-                row["delay_ps_per_inch"] = round(25.4 / entry.propagation_speed, 1)
+                row["delay_ps_per_inch"] = round(entry.propagation_speed * 1000.0, 1)
             layers.append(row)
             if not entry.substack_id or len(substacks) <= 1:
                 by_layer[name.lower()] = row
@@ -134,8 +136,6 @@ def impedance_profiles(index) -> list[dict]:
             "used_by_rules": used_by,
             "layers": layers,
         }
-        if profile.display_name and profile.display_name != profile.name:
-            entry_out["display_name"] = profile.display_name
         if issues:
             entry_out["issues"] = issues
         result.append(entry_out)

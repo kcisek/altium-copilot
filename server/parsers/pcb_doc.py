@@ -447,7 +447,7 @@ class ImpedanceLayer:
     max_gap_mil: float | None
     calculated_ohm: float | None
     error_pct: float | None
-    propagation_speed: float | None  # apparently m/ns (= mm/ps)
+    propagation_speed: float | None  # a delay in ns/inch (= ps/mil), per the stack Dk
     enabled: bool
 
 
@@ -547,7 +547,12 @@ def decode_impedance_profiles(properties: dict[str, str]) -> list[ImpedanceProfi
         profile_id = properties[f"{prefix}ID"]
         profiles[profile_id.upper()] = ImpedanceProfile(
             id=profile_id,
-            name=properties.get(f"{prefix}NAME") or profile_id,
+            # Altium shows DISPLAY_NAME (e.g. "D90 (USB)"); NAME is often empty.
+            name=(
+                properties.get(f"{prefix}DISPLAY_NAME")
+                or properties.get(f"{prefix}NAME")
+                or profile_id
+            ),
             display_name=properties.get(f"{prefix}DISPLAY_NAME") or None,
             target_ohm=_optional_float(properties.get(f"{prefix}IMPEDANCE")),
             tolerance_pct=_optional_float(
