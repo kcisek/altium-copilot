@@ -343,7 +343,8 @@ def test_summary_by_rule_component_and_net():
     assert (first["rule"], first["rule_kind"], first["count"]) == (
         "Clearance Constraint (Gap=0.2mm) (All),(All)", "Clearance", 1,
     )
-    assert first["examples"][0]["location_mil"] == {"x_mil": 1415.35, "y_mil": 1797.24}
+    # Without the board neither its frame nor its copper is known: no location.
+    assert "location_mil" not in first["examples"][0]
     by_component = summarize(_demo_report(), linker, group_by="component")
     assert by_component["groups"][0]["count"] >= by_component["groups"][-1]["count"]
     by_net = summarize(_demo_report(), linker, group_by="net")
@@ -455,7 +456,7 @@ def test_html_cells_keep_their_whole_text():
               + "<br>Waived by K at 1/2/2025<br>mounting post</td></tr>")
     (table,) = _cell_report(waived, "waived").tables
     assert (table.violations[0].message, table.violations[0].waiver) == (
-        "Hole Size Constraint: x", "Waived by K at 1/2/2025mounting post",
+        "Hole Size Constraint: x", "Waived by K at 1/2/2025\nmounting post",
     )
     (table,) = _cell_report('<tr><td class="column1">Plain text row</td></tr>').tables
     assert table.violations[0].message == "Plain text row"
@@ -528,21 +529,75 @@ def test_rules_changed_ignores_kinds_the_report_cannot_name(tmp_path):
     assert rule_kind("Acute Angle Constraint (Minimum=90) (All)") == ("AcuteAngle", None)
 
 
+SHORT = (
+    "Short-Circuit Constraint: Between Pad U1-5(12.7mm,12.7mm) on Multi-Layer And "
+    "Polygon Region (2 hole(s)) Bottom Layer Location : [X = 50mm][Y = 1mm]"
+)
+
+
 def test_shorts_ignore_the_board_sized_box():
     index = _index()
+    index.pcb.layer_name_to_v6["bottom layer"] = 32
     index.pcb.board.outline_vertices = [(1000, 1000), (3000, 1000), (3000, 3000), (1000, 3000)]
-    index.pcb.pours = [PolygonPour(
-        pour_id=0, net=1, layer=32, hatch_style="Solid",
+    pour = PolygonPour(  # a GND pour on Bottom Layer around U1-5 (on CLK)
+        pour_id=0, net=0, layer=32, hatch_style="Solid",
         vertices=[(1400, 1400), (1600, 1400), (1600, 1600), (1400, 1600)],
-    )]
-    linker = DrcLinker(index)
-    linked = linker.link(
-        "Short-Circuit Constraint: Between Pad U1-5(12.7mm,12.7mm) on Multi-Layer And "
-        "Polygon Region (2 hole(s)) Bottom Layer Location : [X = 50mm][Y = 1mm]",
-        (-125000.0, -125000.0, 125000.0, 125000.0), "ShortCircuit",
     )
+    index.pcb.pours = [pour]
+    box = (-125000.0, -125000.0, 125000.0, 125000.0)  # Altium's board-sized box for shorts
+    linked = DrcLinker(index).link(SHORT, box, "ShortCircuit")
     assert linked["location_mil"] == {"x_mil": 1500.0, "y_mil": 1500.0}
-    assert linked["nets"] == ["CLK"]  # the pad's net and the pour's
+    assert linked["nets"] == ["CLK", "GND"]  # the pad's net and the pour's
+    pour.vertices = [(2400, 2400), (2600, 2400), (2600, 2600), (2400, 2600)]
+    assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK"]
+
+
+def test_clearance_to_a_polygon_takes_the_pours_net():
+    index = _index()
+    index.pcb.pours = [PolygonPour(
+        pour_id=0, net=0, layer=1, hatch_style="Solid",
+        vertices=[(1600, 1400), (1800, 1400), (1800, 1600), (1600, 1600)],
+    )]
+    linked = DrcLinker(index).link(
+        "Clearance Constraint: (0.1mm < 0.2mm) Between Polygon Region (0 hole(s)) Top Layer "
+        "And Pad U1-5(12.7mm,12.7mm) on Top Layer", (1500.0, 1495.0, 1602.0, 1505.0),
+        "Clearance",
+    )
+    assert linked["nets"] == ["CLK", "GND"]
+
+
+def test_layer_names_need_a_boundary():
+    index = _index()
+    linker = DrcLinker(index)
+    linker.layers = sorted([("L1", 1), ("L10", 10)], key=lambda item: -len(item[0]))
+    assert linker._named_layers("Track (1mm,1mm)(2mm,1mm) on L10 Actual Width = 1mm") == {10}
+    assert linker._named_layers("Track (1mm,1mm)(2mm,1mm) on L1 Actual Width = 1mm") == {1}
+
+
+def test_stop_notice_is_altiums_wording(tmp_path):
+    pcb = _pcb_with([_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16)],
+                    DrcOptions(max_violations=500, batch_kinds={15, 16}))
+    report = _report(*ALL_CHECKED)
+    report.tables.append(DrcTable(
+        type="warning", title="Unplated multi-layer pad(s) detected", count=1,
+        violations=[DrcViolation("Pad MH1-1(5mm,5mm) on Multi-Layer on Net MOTOR_STOPPED")],
+    ))
+    assert "violation_limit_reached" not in _assess(tmp_path, report, pcb)
+
+
+def test_an_incomplete_report_names_no_other_cause(tmp_path):
+    pcb = _pcb_with([_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16), _rule("Width", 2)],
+                    DrcOptions(batch_kinds={2, 15, 16}))
+    report = parse_drc_html("")
+    issues = _assess(tmp_path, report, pcb)
+    assert issues["report_incomplete"]["severity"] == "error"
+    assert "rules_changed" not in issues and "no_health_section" not in issues
+    assert "may be in the missing part" in issues["rule_kind_not_checked"]["detail"]
+    counts = _report(*ALL_CHECKED)
+    counts.problems = ["1 table lists a different number of rows than its count (e.g. X)"]
+    issues = _assess(tmp_path, counts, pcb)
+    assert "report_incomplete" not in issues
+    assert issues["report_counts_differ"]["severity"] == "warning"
 
 
 def test_box_nets_follow_the_named_layer():

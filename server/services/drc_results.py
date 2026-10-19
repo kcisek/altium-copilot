@@ -72,8 +72,13 @@ SECTION_LIMIT = 20
 _SAME_RUN_SECONDS = 60.0
 _HOUR = 3600.0
 _MULTI_LAYER = 74
-_STOP_NOTICE = re.compile(r"stopped|maximum violation|violations detected", re.IGNORECASE)
+# Altium's own wording ('More than %d violations detected, DRC was stopped'), not any
+# 'stopped' in a net name.
+_STOP_NOTICE = re.compile(
+    r"DRC was stopped|violations detected, DRC|maximum violation", re.IGNORECASE
+)
 
+_COUNT_PROBLEMS = ("1 table lists", "the rule counts")  # and 'N tables list'
 _PAD = re.compile(r"\bPad (\S+?)\(")
 _COMPONENT = re.compile(r"\bComponent (\S+)")
 _NET = re.compile(r"\b(?:Between|And) Net (\S+)")  # Matched Lengths rows
@@ -224,12 +229,20 @@ def assess(report, report_path: Path, pcb_path: Path, project: dict, pcb=None) -
     """What limits trust in the report: incomplete, stopped early, kinds not checked,
     older than the board, another board, rules changed since."""
     issues: list[dict] = []
-    if report.problems:
+    broken = [p for p in report.problems if not p.startswith(_COUNT_PROBLEMS)]
+    if broken:
         issues.append(_issue(
             "report_incomplete", "error",
             "The report is incomplete (" + "; ".join(report.problems) + "): it cannot "
             "show the board is clean. Altium writes an empty report when the path is over "
             "256 characters or its report templates are missing; run the DRC again.",
+        ))
+    elif report.problems:
+        issues.append(_issue(
+            "report_counts_differ", "warning",
+            "The rows read do not match the report's own counts ("
+            + "; ".join(report.problems) + "): some violations may be missing or extra "
+            "here; check the report file itself.",
         ))
     options = getattr(pcb, "drc_options", None) if pcb is not None else None
     kinds = Counter(rule_kind(table.title)[1] for table in report.tables if table.type == RULE)
@@ -282,6 +295,8 @@ def assess(report, report_path: Path, pcb_path: Path, project: dict, pcb=None) -
             )
         elif pcb is not None and not enabled.get(kind_id):
             reason = f"the board has no enabled {label} rule"
+        elif broken:
+            reason = "the report is incomplete, so it may be in the missing part"
         else:
             reason = "it is not in the report (the run stopped, or settings changed since)"
         extra = (
@@ -330,7 +345,7 @@ def assess(report, report_path: Path, pcb_path: Path, project: dict, pcb=None) -
                 "other_board", "warning",
                 f"The report was made for {report.pcb_file}, not {pcb_path}.",
             ))
-    if pcb is not None and batch is not None:
+    if pcb is not None and batch is not None and not broken:
         board = Counter(
             rule.kind for rule in pcb.rules
             if rule.enabled and rule.kind_id in batch and rule.kind in _VERIFIED
@@ -355,7 +370,7 @@ def assess(report, report_path: Path, pcb_path: Path, project: dict, pcb=None) -
     has_health = any(table.type == HEALTH for table in report.tables) or (
         "health_issues" in report.totals
     )
-    if not has_health:
+    if not has_health and not broken:
         issues.append(_issue(
             "no_health_section", "info",
             "The report has no PCB health section ('Report PCB Health Issues' was off, or "
@@ -380,6 +395,18 @@ def _inside(point: tuple[float, float], vertices) -> bool:
         if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
             inside = not inside
     return inside
+
+
+def _edge_distance(point: tuple[float, float], vertices) -> float:
+    """Distance from a point to a polygon's outline."""
+    x, y = point
+    best = float("inf")
+    for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1]):
+        dx, dy = x2 - x1, y2 - y1
+        length = dx * dx + dy * dy
+        t = 0.0 if not length else max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / length))
+        best = min(best, ((x - x1 - t * dx) ** 2 + (y - y1 - t * dy) ** 2) ** 0.5)
+    return best
 
 
 class DrcLinker:
@@ -407,16 +434,17 @@ class DrcLinker:
             key=lambda item: -len(item[0]),
         )
         self.origin = (pcb.board.origin_x or 0.0, pcb.board.origin_y or 0.0)
-        outline = pcb.board.outline_vertices
-        if outline:
-            xs, ys = [v[0] for v in outline], [v[1] for v in outline]
+        # The outline's vertices (its arcs can bulge past them) and the copper together.
+        xs = [v[0] for v in pcb.board.outline_vertices or []]
+        ys = [v[1] for v in pcb.board.outline_vertices or []]
+        row = index.db.execute(
+            "SELECT MIN(minx) a, MIN(miny) b, MAX(maxx) c, MAX(maxy) d FROM prims"
+        ).fetchone()
+        if row["a"] is not None:
+            xs += [row["a"], row["c"]]
+            ys += [row["b"], row["d"]]
+        if xs and max(xs) - min(xs) > 1 and max(ys) - min(ys) > 1:
             self.extents = (min(xs), min(ys), max(xs), max(ys))
-        else:
-            row = index.db.execute(
-                "SELECT MIN(minx) a, MIN(miny) b, MAX(maxx) c, MAX(maxy) d FROM prims"
-            ).fetchone()
-            if row["a"] is not None:
-                self.extents = (row["a"], row["b"], row["c"], row["d"])
 
     def split(self, token: str) -> tuple[str | None, str]:
         """'U1-5' -> ('U1', '5'), by the longest board designator before a '-'
@@ -434,10 +462,12 @@ class DrcLinker:
     def _named_layers(self, message: str) -> set[int]:
         lower = message.lower()
         named = set()
-        for name, v6 in self.layers:
-            key = name.lower()
-            if any(f"{lead}{key}" in lower for lead in ("on ", "from ", "to ", ") ")):
+        for name, v6 in self.layers:  # longest first: 'L10' before 'L1'
+            pattern = re.compile(r"(?:on |from |to |\) )" + re.escape(name.lower()) + r"(?![\w-])")
+            match = pattern.search(lower)
+            if match:
                 named.add(v6)
+                lower = lower[: match.start()] + " " * len(match[0]) + lower[match.end():]
         if "multi-layer" in lower:
             named.add(_MULTI_LAYER)
         return named
@@ -476,10 +506,15 @@ class DrcLinker:
             if pair:
                 nets.extend(net for net in pair if net)
         location = None
-        if self._trusted(box, kind):
+        if self.index is None:
+            pass  # no board: neither its frame nor its copper
+        elif self._trusted(box, kind):
             location = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
             if kind in _NET_KINDS:
                 nets.extend(self._box_nets(box, message))
+                if "polygon" in message.lower():
+                    reach = ((box[2] - box[0]) ** 2 + (box[3] - box[1]) ** 2) ** 0.5 / 2
+                    nets.extend(self._pour_nets(location, message, reach))
         elif self.origin is not None:
             # The first object's coordinates, relative to the board origin.
             match = _COORD.search(message)
@@ -489,7 +524,7 @@ class DrcLinker:
                     float(match[1]) * scale[match[2]] + self.origin[0],
                     float(match[3]) * scale[match[4]] + self.origin[1],
                 )
-                if kind == "ShortCircuit":
+                if kind in _NET_KINDS and "polygon" in message.lower():
                     nets.extend(self._pour_nets(location, message))
         linked: dict = {}
         if designators:
@@ -530,9 +565,9 @@ class DrcLinker:
         nets = list(dict.fromkeys(nets))
         return nets if len(nets) <= 3 else []
 
-    def _pour_nets(self, point, message: str) -> list[str]:
-        """For a short against a polygon: the net of the pour holding the point on the
-        layer the message names."""
+    def _pour_nets(self, point, message: str, reach: float = 0.0) -> list[str]:
+        """For a violation against a polygon: the net of the pour on the layer the
+        message names that holds the point, or whose edge is within reach of it."""
         if self.index is None:
             return []
         match = _REGION_LAYER.search(message)
@@ -541,9 +576,11 @@ class DrcLinker:
         layer = self.index.resolve_layer(match[1].strip())
         nets = []
         for pour in self.index.pcb.pours:
-            if pour.layer == layer and pour.net is not None and len(pour.vertices) > 2:
-                if _inside(point, list(pour.vertices)):
-                    nets.append(self.index.pcb.nets[pour.net])
+            if pour.layer != layer or pour.net is None or len(pour.vertices) < 3:
+                continue
+            vertices = list(pour.vertices)
+            if _inside(point, vertices) or (reach and _edge_distance(point, vertices) <= reach):
+                nets.append(self.index.pcb.nets[pour.net])
         return nets
 
 

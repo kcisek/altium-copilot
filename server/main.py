@@ -2802,8 +2802,8 @@ def get_drc_report(
     rule (a rule description or part of it, a rule kind such as Clearance, or a health,
     waived or warning title) lists all its violations. Groups and violations are
     paginated (offset from next_offset). location_* is absolute (board origin in
-    origin_mil, the frame query_pcb_region takes); a message's own coordinates are
-    relative to the origin. Locations use units (default: board display unit)."""
+    origin_*, the frame query_pcb_region takes); a message's own coordinates are relative
+    to the origin. Locations use units (default: board display unit)."""
     try:
         project, netlist, _ = _require_project()
     except ValueError as error:
@@ -2872,8 +2872,8 @@ def get_drc_report(
         }
     if index is None:
         header["note"] = (
-            "The PcbDoc could not be read: violations are not linked to components, nets "
-            "or board locations."
+            "The PcbDoc could not be read: violations are not linked to components, board "
+            "copper or locations; nets and pairs shown come only from the message text."
         )
         if group_by != "rule":
             header["grouping_note"] = (

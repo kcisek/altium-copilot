@@ -99,9 +99,9 @@ def _check_counts(report: DrcReport) -> None:
         if table.type != WARNING and len(table.violations) != table.count
     ]
     if mismatched:
+        tables = "1 table lists" if len(mismatched) == 1 else f"{len(mismatched)} tables list"
         report.problems.append(
-            f"{len(mismatched)} tables list a different number of rows than their count "
-            f"(e.g. {mismatched[0]})"
+            f"{tables} a different number of rows than its count (e.g. {mismatched[0]})"
         )
     total = report.totals.get("rule_violations")
     counted = sum(table.count for table in report.tables if table.type == RULE)
@@ -179,9 +179,11 @@ class _HtmlReport(HTMLParser):
                     x1, x2 = float(match["x1"]), float(match["x2"])
                     y1, y2 = float(match["y1"]), float(match["y2"])
                     cell["box"] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-        elif tag == "br" and not self._callback_depth and "".join(cell["text"]).strip():
-            # After the message: a waived row's 'Waived by ...<br>comment'.
-            cell["broken"] = True
+        elif tag == "br" and not self._callback_depth:
+            if cell["broken"]:
+                cell["after"].append("\n")  # 'Waived by ...<br>comment'
+            elif "".join(cell["text"]).strip():
+                cell["broken"] = True  # the message ends here
 
     def handle_endtag(self, tag):
         if tag == "html":
