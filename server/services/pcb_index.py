@@ -47,6 +47,7 @@ CREATE TABLE nets (id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE components (
     id INTEGER PRIMARY KEY,
     refdes TEXT,
+    logical_refdes TEXT,
     sch_refdes TEXT,
     source_uid TEXT,
     channel_path TEXT,
@@ -314,9 +315,10 @@ class PcbIndex:
             max_x = row["c"] if row["c"] is not None else component.x
             max_y = row["d"] if row["d"] is not None else component.y
             self.db.execute(
-                "INSERT INTO components VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO components VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     component.index,
+                    component.designator or component.refdes,
                     component.refdes,
                     None,
                     component.source_uid_tail,
@@ -347,55 +349,97 @@ class PcbIndex:
         }
 
     def _resolve_refdes(self, netlist: dict | None) -> None:
+        """Set sch_refdes, the netlist name of each PCB component.
+
+        A netlist names compiled designators, which match the PCB designator
+        while the board is in sync, so that match is tried first. Components
+        left over fall back to their schematic UniqueId, then SOURCEDESIGNATOR,
+        but only onto netlist names no PCB designator claimed: on a
+        board-annotated design SOURCEDESIGNATOR U1 is a logical name and the
+        netlist's U1 is another part.
+        """
         if not netlist:
             return
-        netlist_components = netlist.get("components", {})
+        netlist_components = netlist.get("components") or {}
+        by_name = {
+            name.lower(): name
+            for name in [*(netlist.get("pin_to_net") or {}), *netlist_components]
+        }
         by_unique_id: dict[str, list[str]] = defaultdict(list)
         for refdes, component in netlist_components.items():
             unique_id = component.get("unique_id")
             if unique_id:
                 by_unique_id[unique_id].append(refdes)
 
+        resolved: dict[int, str] = {}
         for component in self.pcb.components:
-            schematic_refdes = None
-            if (
-                component.refdes
-                and component.refdes in netlist_components
-            ):
-                schematic_refdes = component.refdes
-            elif (
-                component.source_uid_tail
-                and component.source_uid_tail in by_unique_id
-            ):
-                candidates = by_unique_id[component.source_uid_tail]
-                if len(candidates) == 1:
-                    schematic_refdes = candidates[0]
-                else:
-                    signature = {
-                        str(pad): net
-                        for pad, net in self._pad_net_signature(
-                            component.index
-                        ).items()
-                        if net
-                    }
-                    exact_matches = []
-                    for candidate in candidates:
-                        pins = netlist_components[candidate].get("pins", {})
-                        candidate_signature = {
-                            str(pin): metadata.get("net")
-                            for pin, metadata in pins.items()
-                            if metadata.get("net")
-                        }
-                        if candidate_signature == signature:
-                            exact_matches.append(candidate)
-                    if len(exact_matches) == 1:
-                        schematic_refdes = exact_matches[0]
-            if schematic_refdes:
-                self.db.execute(
-                    "UPDATE components SET sch_refdes = ? WHERE id = ?",
-                    (schematic_refdes, component.index),
+            designator = component.designator or component.refdes
+            if designator and designator.lower() in by_name:
+                resolved[component.index] = by_name[designator.lower()]
+        claimed = set(resolved.values())
+        for component in self.pcb.components:
+            if component.index in resolved:
+                continue
+            schematic_refdes = self._match_unique_id(
+                component, by_unique_id, netlist_components, claimed
+            )
+            if schematic_refdes is None and component.refdes:
+                candidate = by_name.get(component.refdes.lower())
+                unique_id = (
+                    netlist_components.get(candidate, {}).get("unique_id")
+                    if candidate
+                    else None
                 )
+                if candidate not in claimed and not (
+                    unique_id
+                    and component.source_uid_tail
+                    and unique_id != component.source_uid_tail
+                ):
+                    schematic_refdes = candidate
+            if schematic_refdes:
+                resolved[component.index] = schematic_refdes
+                claimed.add(schematic_refdes)
+        self.db.executemany(
+            "UPDATE components SET sch_refdes = ? WHERE id = ?",
+            [(name, index) for index, name in resolved.items()],
+        )
         self.db.commit()
+
+    def _match_unique_id(
+        self,
+        component,
+        by_unique_id: dict[str, list[str]],
+        netlist_components: dict,
+        claimed: set[str],
+    ) -> str | None:
+        """Netlist part sharing the component's schematic UniqueId.
+
+        Multi-channel copies share one UniqueId; their pad-net signature
+        picks the copy.
+        """
+        candidates = by_unique_id.get(component.source_uid_tail or "", [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return None if candidates[0] in claimed else candidates[0]
+        signature = {
+            str(pad): net
+            for pad, net in self._pad_net_signature(component.index).items()
+            if net
+        }
+        exact_matches = []
+        for candidate in candidates:
+            if candidate in claimed:
+                continue
+            pins = netlist_components[candidate].get("pins", {})
+            candidate_signature = {
+                str(pin): metadata.get("net")
+                for pin, metadata in pins.items()
+                if metadata.get("net")
+            }
+            if candidate_signature == signature:
+                exact_matches.append(candidate)
+        return exact_matches[0] if len(exact_matches) == 1 else None
 
     # ---------- rules, classes, differential pairs ----------
 
@@ -488,25 +532,18 @@ class PcbIndex:
         return round(row["total"] or 0.0, 1)
 
     def designator(self, component_index: int) -> str | None:
-        """The PCB designator of a component (Texts6), else its refdes."""
+        """The PCB designator of a component (Texts6), else SOURCEDESIGNATOR."""
         component = self.pcb.components[component_index]
         return component.designator or component.refdes
 
     def find_by_designator(self, designator: str) -> list[dict]:
         """Components whose PCB designator matches (class members use it)."""
-        matches = []
-        for component in self.pcb.components:
-            if (self.designator(component.index) or "").lower() == designator.lower():
-                row = self.db.execute(
-                    "SELECT refdes, sch_refdes FROM components WHERE id = ?",
-                    (component.index,),
-                ).fetchone()
-                matches.append({
-                    "designator": self.designator(component.index),
-                    "refdes": row["refdes"] if row else component.refdes,
-                    "sch_refdes": row["sch_refdes"] if row else None,
-                })
-        return matches
+        rows = self.db.execute(
+            "SELECT refdes, logical_refdes, sch_refdes FROM components "
+            "WHERE refdes = ? COLLATE NOCASE",
+            (designator,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def rule_target(
         self, name: str, kind: str | None = None
@@ -598,6 +635,26 @@ class PcbIndex:
             "SELECT COUNT(*) c FROM components WHERE sch_refdes IS NULL"
         ).fetchone()["c"]
 
+    def unmatched_refdes(self, limit: int) -> list[str]:
+        """PCB designators with no netlist part, e.g. PCB-only mechanicals."""
+        return [
+            row["refdes"]
+            for row in self.db.execute(
+                "SELECT refdes FROM components "
+                "WHERE sch_refdes IS NULL AND refdes IS NOT NULL "
+                "ORDER BY refdes LIMIT ?",
+                (limit,),
+            )
+        ]
+
+    def renamed_components(self) -> int:
+        """Components whose PCB designator differs from the logical refdes."""
+        return self.db.execute(
+            "SELECT COUNT(*) c FROM components "
+            "WHERE logical_refdes IS NOT NULL "
+            "AND refdes != logical_refdes COLLATE NOCASE"
+        ).fetchone()["c"]
+
     def resolve_layer(self, name_or_id: str | int | None) -> int | None:
         if name_or_id is None:
             return None
@@ -626,12 +683,25 @@ class PcbIndex:
         return row["name"] if row else f"layer{v6_id}"
 
     def find_components(self, refdes: str) -> list[dict]:
+        """Components by PCB designator or netlist refdes, else logical refdes.
+
+        A logical (schematic-sheet) refdes returns every channel instance of
+        a multi-channel part. It is only tried when nothing else matches:
+        on a board-annotated design the logical U1 and the board's U1 are
+        different parts.
+        """
         rows = self.db.execute(
             "SELECT * FROM components "
             "WHERE refdes = ? COLLATE NOCASE "
             "OR sch_refdes = ? COLLATE NOCASE",
             (refdes, refdes),
         ).fetchall()
+        if not rows:
+            rows = self.db.execute(
+                "SELECT * FROM components "
+                "WHERE logical_refdes = ? COLLATE NOCASE",
+                (refdes,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def net_id(self, name: str) -> int | None:
@@ -1210,6 +1280,7 @@ class PcbIndex:
                 {
                     "refdes": instance["refdes"],
                     "sch_refdes": instance["sch_refdes"],
+                    "logical_refdes": instance["logical_refdes"],
                     "channel_path": instance["channel_path"],
                     "x_mil": instance["x"],
                     "y_mil": instance["y"],
