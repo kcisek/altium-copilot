@@ -1,5 +1,6 @@
 import re
 import struct
+import zlib
 from dataclasses import dataclass, field
 
 import olefile
@@ -182,3 +183,291 @@ def _handle_parameter(
     # Comment is used as the primary part number in many Altium libraries.
     if name == "Comment" and best_mpn_priority.get(key, 999) == 999:
         comp.mpn = text
+
+
+# ---------- design annotations: notes, text frames, labels, images, directives ----------
+
+# Schematic coordinates are in units of 10 mil; a *_Frac field adds 1/100000 of a unit.
+_UNIT_MIL = 10.0
+NEAR_COMPONENT_MIL = 800.0  # text this close to a component's pins is reported as near it
+CAPTION_MIL = 250.0         # text this close to a picture is reported as its caption
+_MAX_NEAR = 4
+
+# Sheet parameters Altium fills in by itself, not information a designer entered.
+_AUTO_SHEET_PARAMS = {
+    "currenttime", "currentdate", "time", "date", "documentfullpathandname",
+    "documentname", "modifieddate", "application_buildnumber", "spicemodelcache",
+    "configurationparameters", "configuratorname", "isuserconfigurable",
+}
+# A label holding only a special string (e.g. "=Title") repeats a title-block parameter.
+_SPECIAL_STRING_RE = re.compile(r"^=[\w.]+$")
+_TEXT_KINDS = {"209": "note", "28": "text_frame", "4": "label"}
+
+
+@dataclass
+class SheetAnnotation:
+    kind: str                       # "note" | "text_frame" | "label" | "image"
+    text: str = ""
+    x_mil: float = 0.0              # lower-left corner; Altium's Y axis points up
+    y_mil: float = 0.0
+    width_mil: float = 0.0
+    height_mil: float = 0.0
+    author: str | None = None       # notes
+    collapsed: bool = False         # notes folded to an icon on the sheet
+    file_name: str | None = None    # images: embedded picture name or linked file path
+    embedded: bool = False          # images: picture data is stored in the .SchDoc
+    image_index: int | None = None  # images: index for get_design_image, in file order
+    near: list[str] = field(default_factory=list)      # refdes of components close by
+    captions: list[str] = field(default_factory=list)  # images: text placed next to them
+
+
+@dataclass
+class SheetDirective:
+    name: str
+    x_mil: float
+    y_mil: float
+    parameters: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class SheetAnnotations:
+    items: list[SheetAnnotation] = field(default_factory=list)
+    directives: list[SheetDirective] = field(default_factory=list)
+    title_block: dict[str, str] = field(default_factory=dict)
+    template: str | None = None
+
+
+def _read_records(data: bytes) -> list[dict[str, str]]:
+    """Split a schematic stream into property dicts with lower-case keys.
+
+    Each record is a 4-byte header (24-bit length, then a type byte, 0 = text) and a
+    `|KEY=VALUE|...` body. Binary records become empty dicts so that list positions,
+    which OwnerIndex refers to, stay aligned. Position 0 is the stream header, and a
+    child's OwnerIndex is its owner's position minus one.
+    """
+    records: list[dict[str, str]] = []
+    offset = 0
+    while offset + 4 <= len(data):
+        header = struct.unpack_from("<I", data, offset)[0]
+        length = header & 0xFFFFFF
+        body = data[offset + 4 : offset + 4 + length]
+        offset += 4 + length
+        if header >> 24:
+            records.append({})
+            continue
+        text = body.decode("latin-1").rstrip("\x00")
+        records.append({key.lower(): val for key, val in _parse_props(text).items()})
+    return records
+
+
+def _coord(props: dict[str, str], key: str) -> float:
+    try:
+        whole = int(props.get(key, "0"))
+        frac = int(props.get(key + "_frac", "0"))
+    except ValueError:
+        return 0.0
+    return (whole + frac / 100_000) * _UNIT_MIL
+
+
+def _rect(props: dict[str, str]) -> list[float]:
+    """[x0, y0, x1, y1] in mil from Location and Corner."""
+    x0, y0 = _coord(props, "location.x"), _coord(props, "location.y")
+    x1, y1 = _coord(props, "corner.x"), _coord(props, "corner.y")
+    return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
+
+
+def _label_rect(props: dict[str, str], text: str, font_sizes: dict[str, int]) -> list[float]:
+    """Approximate extent of a free text label; Altium stores only its anchor point.
+
+    Width is estimated from the font size (0.55 em per character), and the anchor is
+    placed by Justification (0..8 = bottom/center/top x left/center/right).
+    """
+    x, y = _coord(props, "location.x"), _coord(props, "location.y")
+    em = font_sizes.get(props.get("fontid", "1"), 10) * 1000 / 72  # points -> mil
+    lines = text.split("\n")
+    width, height = max(len(line) for line in lines) * em * 0.55, em * len(lines)
+    if props.get("orientation") in ("1", "3"):  # rotated by 90 or 270 degrees
+        width, height = height, width
+    try:
+        justification = int(props.get("justification", "0"))
+    except ValueError:
+        justification = 0
+    x0 = x - width * (justification % 3) / 2
+    y0 = y - height * (justification // 3) / 2
+    return [x0, y0, x0 + width, y0 + height]
+
+
+def _gap(a: list[float], b: list[float]) -> float:
+    """Edge-to-edge distance between two rectangles (0 when they overlap)."""
+    dx = max(b[0] - a[2], a[0] - b[2], 0.0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0.0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _owner_position(props: dict[str, str]) -> int | None:
+    """Position of the owning record, or None for objects placed on the sheet itself."""
+    try:
+        owner = int(props.get("ownerindex", ""))
+    except ValueError:
+        return None
+    return owner + 1 if owner > 0 else None
+
+
+def parse_sch_doc_annotations(path: str) -> SheetAnnotations:
+    """Read the information a designer added to a .SchDoc besides the circuit itself.
+
+    Returns sheet-level notes (RECORD=209), text frames (28), free text labels (4),
+    pictures (30), directives / parameter sets (43 with their RECORD=41 children), the
+    title-block (sheet) parameters (RECORD=41 without an owner) and the sheet template
+    (39). Text and pictures that belong to a component symbol or to the template are
+    skipped. Each text lists the components whose pins are close by, and each picture
+    the text placed next to it.
+    """
+    with olefile.OleFileIO(path) as f:
+        return annotations_from_stream(f.openstream("FileHeader").read())
+
+
+def annotations_from_stream(data: bytes) -> SheetAnnotations:
+    """parse_sch_doc_annotations for the bytes of a FileHeader stream."""
+    records = _read_records(data)
+    result = SheetAnnotations()
+    rects: dict[int, list[float]] = {}           # id(annotation) -> rectangle
+    part_boxes: dict[int, list[float]] = {}      # component part position -> pin bounding box
+    part_modes: dict[int, tuple[str, str]] = {}  # position -> (CurrentPartId, DisplayMode)
+    designators: dict[int, str] = {}
+    directives: dict[int, SheetDirective] = {}
+    font_sizes: dict[str, int] = {}
+    image_count = 0
+
+    for pos, props in enumerate(records):
+        record = props.get("record")
+        owner = _owner_position(props)
+        if record == "31":  # sheet settings, including the font table
+            for key, val in props.items():
+                if key.startswith("size") and key[4:].isdigit() and val.isdigit():
+                    font_sizes[key[4:]] = int(val)
+            continue
+        if record == "1":
+            x, y = _coord(props, "location.x"), _coord(props, "location.y")
+            part_boxes[pos] = [x, y, x, y]
+            part_modes[pos] = (props.get("currentpartid", "1"), props.get("displaymode", "0"))
+            continue
+        if owner is not None:
+            if record == "2" and owner in part_boxes:
+                # A placed part carries the pins of every part; only its own are drawn.
+                part, mode = part_modes[owner]
+                if (props.get("ownerpartid", part) in (part, "-1", "0")
+                        and props.get("ownerpartdisplaymode", "0") == mode):
+                    x, y = _coord(props, "location.x"), _coord(props, "location.y")
+                    box = part_boxes[owner]
+                    box[:] = [min(box[0], x), min(box[1], y), max(box[2], x), max(box[3], y)]
+            elif record == "34" and props.get("name") == "Designator" and owner in part_boxes:
+                designators[owner] = props.get("text", "")
+            elif record == "41" and owner in directives and props.get("name"):
+                directives[owner].parameters[props["name"]] = props.get("text", "")
+            continue  # symbol graphics, component parameters, template content
+
+        if record in _TEXT_KINDS:
+            text = props.get("text", "").replace("~1", "\n").strip()
+            if (not text or props.get("ishidden") == "T"
+                    or (record == "4" and _SPECIAL_STRING_RE.match(text))):
+                continue
+            rect = _label_rect(props, text, font_sizes) if record == "4" else _rect(props)
+            item = SheetAnnotation(kind=_TEXT_KINDS[record], text=text)
+            if record == "209":
+                item.author = props.get("author") or None
+                item.collapsed = props.get("collapsed") == "T"
+        elif record == "30":
+            rect = _rect(props)
+            item = SheetAnnotation(
+                kind="image",
+                file_name=props.get("filename") or None,
+                embedded=props.get("embedimage") == "T",
+                image_index=image_count,
+            )
+            image_count += 1
+        elif record == "43":
+            directives[pos] = SheetDirective(
+                name=props.get("name", ""),
+                x_mil=_coord(props, "location.x"),
+                y_mil=_coord(props, "location.y"),
+            )
+            result.directives.append(directives[pos])
+            continue
+        elif record == "41":
+            name, value = props.get("name", ""), props.get("text", "")
+            if (name and value not in ("", "*") and name.lower() not in _AUTO_SHEET_PARAMS
+                    and not name.lower().startswith("versioncontrol_")):
+                result.title_block[name] = value
+            continue
+        elif record == "39":
+            result.template = props.get("filename") or None
+            continue
+        else:
+            continue
+        item.x_mil, item.y_mil = rect[0], rect[1]
+        item.width_mil, item.height_mil = rect[2] - rect[0], rect[3] - rect[1]
+        rects[id(item)] = rect
+        result.items.append(item)
+
+    components = [(designators[pos], box) for pos, box in part_boxes.items() if designators.get(pos)]
+    texts = [(i.text, rects[id(i)]) for i in result.items if i.kind != "image"]
+    for item in result.items:
+        if item.kind != "image":
+            item.near = _closest(rects[id(item)], components, NEAR_COMPONENT_MIL, _MAX_NEAR)
+        elif item.kind == "image":
+            item.captions = _closest(rects[id(item)], texts, CAPTION_MIL, 3)
+    # Reading order: top of the sheet first, then left to right.
+    result.items.sort(key=lambda i: (-round(i.y_mil + i.height_mil), i.x_mil))
+    return result
+
+
+def _closest(rect: list[float], candidates: list[tuple[str, list[float]]],
+             limit_mil: float, count: int) -> list[str]:
+    names: list[str] = []
+    for distance, name in sorted((_gap(rect, box), name) for name, box in candidates):
+        if distance > limit_mil or len(names) == count:
+            break
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def read_sch_doc_image(path: str, file_name: str) -> bytes:
+    """Return the picture Altium embedded in a .SchDoc under `file_name`.
+
+    Embedded pictures live in the "Storage" stream: a `|HEADER=Icon storage|` record,
+    then one record per picture holding 0xD0, a length-prefixed name, a uint32 size and
+    zlib-compressed data. Altium stores the decoded bitmap (a BMP) whatever the original
+    file type was. Raises KeyError when no picture has that name.
+    """
+    with olefile.OleFileIO(path) as f:
+        if not f.exists("Storage"):
+            raise KeyError(file_name)
+        return image_from_storage(f.openstream("Storage").read(), file_name)
+
+
+def image_from_storage(data: bytes, file_name: str) -> bytes:
+    """read_sch_doc_image for the bytes of a Storage stream."""
+    offset = 0
+    first = True
+    while offset + 4 <= len(data):
+        length = struct.unpack_from("<I", data, offset)[0] & 0xFFFFFF
+        body = data[offset + 4 : offset + 4 + length]
+        offset += 4 + length
+        if first:  # |HEADER=Icon storage|Weight=N
+            first = False
+            continue
+        if len(body) < 6 or body[0] != 0xD0:
+            continue
+        name_len = body[1]
+        raw_name = body[2 : 2 + name_len]
+        size = struct.unpack_from("<I", body, 2 + name_len)[0]
+        names = {raw_name.decode("latin-1")}
+        try:
+            names.add(raw_name.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+        if file_name in names:
+            return zlib.decompress(body[6 + name_len : 6 + name_len + size])
+    raise KeyError(file_name)

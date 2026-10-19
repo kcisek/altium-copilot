@@ -27,6 +27,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- Design notes: Claude now reads what designers wrote into the project besides the
+  circuit. New tool `get_design_notes` (paginated, or one document by name) returns:
+  - project parameters from the `.PrjPcb`
+  - per schematic sheet: notes (author, collapsed state), text frames, free text labels,
+    pictures (embedded or linked, size, position, nearby caption text), directives /
+    parameter sets with their parameters, title-block parameters and the sheet template.
+    Text drawn inside component symbols or the template is left out. Each note lists the
+    components drawn next to it (`near R4, U1`) as a proximity hint
+  - per Draftsman document (`.PCBDwf`, now read from the `.PrjPcb` document list):
+    notes, free text, tables, view titles and sides, pictures, and the drill table and
+    layer stack notes cached from the board. A drawing last updated from a `.PcbDoc`
+    that is not this project's is flagged as possibly out of date
+  - not included: review comments made in Altium 365, which live in the cloud workspace,
+    not in the project files
+- `get_sheet_context` shows the sheet's notes above its components (first page)
+- New tool `get_design_image` returns a schematic or Draftsman picture as an image
+  Claude can look at (schematic bitmaps are re-encoded as PNG, no new dependency)
+- `set_project_dir` reports `project_parameters` and `draftsman_documents`; the
+  session-start instructions now read the design notes before summarising the board, and
+  `schematic_review` treats notes as intent to verify
 - Altium Designer 17 and older, which run as `DXP.exe` (e.g. 14.3), are now detected
   alongside `X2.exe` (AD 18+). Their title bar (`Altium Designer (14.3) - <sheet path> -
   <project>.PrjPcb. Licensed to …`) gives the project, active sheet and project path. The

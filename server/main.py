@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 vendor_dir = os.path.join(os.path.dirname(__file__), "vendor")
@@ -17,7 +17,7 @@ if os.path.exists(vendor_dir):
     sys.path.insert(0, vendor_dir)
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
 
 try:
@@ -26,15 +26,29 @@ try:
     from services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
     from services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
     from parsers.pcb_doc import parse_pcb_doc
+    from parsers.pcb_dwf import read_pcb_dwf_picture
+    from parsers.sch_doc import read_sch_doc_image
     from services.pcb_index import PcbIndex
+    from services.design_notes import (
+        DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
+        draftsman_documents, resolve_document, sheet_notes_for_context,
+    )
+    from services.images import MAX_IMAGE_BYTES, bmp_to_png, image_format
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
     from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
     from server.parsers.prj_pcb import parse_prj_pcb, VariantState
     from server.parsers.pcb_doc import parse_pcb_doc
+    from server.parsers.pcb_dwf import read_pcb_dwf_picture
+    from server.parsers.sch_doc import read_sch_doc_image
     from server.services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
     from server.services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
     from server.services.pcb_index import PcbIndex
+    from server.services.design_notes import (
+        DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
+        draftsman_documents, resolve_document, sheet_notes_for_context,
+    )
+    from server.services.images import MAX_IMAGE_BYTES, bmp_to_png, image_format
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -117,9 +131,14 @@ At the start of every session, run these steps in order:
 2. set_project_dir — load the project using the decision table below (required before any other tool)
 3. list_variants — ask the user which variant to work in, then call set_active_variant
    (always ask — do not auto-select even if there is only one variant)
-4. get_sheet_context — read the active tab, then synthesize a summary for the user:
-   project name, sheet count, variant count, and your read of what the board does
-   based on component descriptions and sheet names.
+4. get_sheet_context — read the active tab (its design_notes block shows the designer's
+   notes on that sheet)
+5. get_design_notes — read the designer-added information for the whole project
+   (project parameters, notes on every sheet, Draftsman fabrication/assembly notes).
+   Read every page (has_more). Then synthesize a summary for the user: project name,
+   sheet count, variant count, and your read of what the board does based on component
+   descriptions, sheet names and the designer's notes. Mention notes that state intent,
+   open questions, TODOs or manufacturing requirements.
 
 ### Decision table for set_project_dir
 
@@ -168,6 +187,27 @@ When the user asks about a component, net, or sub-circuit on a specific sheet:
 Do not call get_component or query_net individually for components already visible in a
 sheet context you have already loaded.
 Do not call get_sheet_context on the same sheet twice in the same conversation turn.
+
+## Design Notes
+
+Designers record intent the netlist cannot show: why a value was chosen, open questions,
+DNP reasons, fabrication requirements. Use it.
+
+- get_sheet_context includes the notes of that sheet; get_design_notes covers every sheet,
+  the project parameters and the Draftsman (.PCBDwf) drawings. Pass document="<sheet or
+  drawing name>" to read one document.
+- "(near R4, U1)" lists the components drawn next to a note — a proximity hint, not a
+  connection. Confirm with the circuit before relying on it.
+- Notes can be stale or wrong. When a note contradicts the circuit (a value, a part
+  number), point out the mismatch instead of trusting either side.
+- Pictures ([image N] on sheets, [picture N] in drawings) are often datasheet excerpts,
+  block diagrams or photos. Call get_design_image(document, index) when one may answer
+  the question; do not guess what a picture shows from its file name.
+- Draftsman drill tables and layer stack notes are cached from the board at the drawing's
+  last update; prefer get_board_info / get_net_pcb for current PCB data, and mention it
+  when source_pcb is flagged as not this project's PcbDoc.
+- Review comments made in Altium 365 are stored in the cloud workspace and cannot be
+  read by these tools. If the user asks about them, say so.
 
 ## PCB / Layout Questions
 
@@ -239,9 +279,10 @@ mcp._mcp_server.version = _read_version()
 
 # ---------- module-level state ----------
 _altium: AltiumClient = AltiumClient()
-_project: dict | None = None          # {name, root_dir, prj_pcb_path, sheets: [{name, path}]}
+_project: dict | None = None          # {name, root_dir, prj_pcb_path, sheets: [{name, path}], ...}
 _variant_state: VariantState | None = None
 _netlist_last_updated: str | None = None
+_design_notes = DesignNotesCache()
 
 
 def _require_project():
@@ -289,6 +330,25 @@ def _load_diagnostics(netlist: dict) -> dict:
                 "project, then call refresh_netlist."
             )
     return diagnostics
+
+
+def _project_documents(prj_data) -> dict:
+    """Board, Draftsman and parameter entries of the project state, from a parsed .PrjPcb."""
+    return {
+        "pcb_doc_paths": prj_data.pcb_doc_paths,
+        "pcb_dwf_paths": prj_data.pcb_dwf_paths,
+        "parameters": prj_data.parameters,
+    }
+
+
+def _design_info(prj_data) -> dict:
+    """Project parameters and Draftsman documents for load responses (omitted when empty)."""
+    info: dict = {}
+    if prj_data.parameters:
+        info["project_parameters"] = prj_data.parameters
+    if prj_data.pcb_dwf_paths:
+        info["draftsman_documents"] = [Path(p).name for p in prj_data.pcb_dwf_paths]
+    return info
 
 
 def _resolve_dnp_uids(variant_state: VariantState, netlist: dict | None) -> None:
@@ -467,7 +527,7 @@ def set_project_dir(project_dir: str) -> str:
                                     "root_dir": project_dir,
                                     "prj_pcb_path": prj_pcb_path,
                                     "sheets": sheets,
-                                    "pcb_doc_paths": prj_data.pcb_doc_paths,
+                                    **_project_documents(prj_data),
                                 }
                                 _variant_state = VariantState(prj_data.variants)
                                 _resolve_dnp_uids(_variant_state, _altium._netlist)
@@ -482,6 +542,7 @@ def set_project_dir(project_dir: str) -> str:
                                     "variant_count": len(prj_data.variants),
                                     "netlist_updated_utc": _netlist_last_updated,
                                     **_load_diagnostics(_altium._netlist or {}),
+                                    **_design_info(prj_data),
                                 }
                                 _claude_md = (
                                     list(Path(project_dir).glob("CLAUDE.md")) +
@@ -568,7 +629,7 @@ def set_project_dir(project_dir: str) -> str:
         "root_dir": project_dir,
         "prj_pcb_path": prj_pcb_path,
         "sheets": sheets,
-        "pcb_doc_paths": prj_data.pcb_doc_paths,
+        **_project_documents(prj_data),
     }
     _variant_state = VariantState(prj_data.variants)
     _resolve_dnp_uids(_variant_state, _altium._netlist)
@@ -590,6 +651,7 @@ def set_project_dir(project_dir: str) -> str:
         "variant_count": len(prj_data.variants),
         "netlist_updated_utc": _netlist_last_updated,
         **_load_diagnostics(_altium._netlist or {}),
+        **_design_info(prj_data),
     }
 
     claude_md_files = (
@@ -629,7 +691,7 @@ def refresh_netlist() -> str:
         return json.dumps({"error": "generate_failed", "message": str(e)})
     if prj_data is not None:
         project["sheets"] = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
-        project["pcb_doc_paths"] = prj_data.pcb_doc_paths
+        project.update(_project_documents(prj_data))
     _resolve_dnp_uids(variant_state, _altium._netlist)
     diagnostics = _load_diagnostics(_altium._netlist or {})
     if not regenerated:
@@ -850,7 +912,7 @@ def search_components(pattern: str, search_by: str = "description") -> str:
 
 def _get_sheet_context_impl(project: dict, netlist: dict, variant_state: VariantState,
                              sheet_name: str | None, altium_status: dict,
-                             offset: int = 0) -> str:
+                             offset: int = 0, notes_cache: DesignNotesCache | None = None) -> str:
     if sheet_name is None:
         if not altium_status.get("running"):
             return json.dumps({
@@ -896,6 +958,12 @@ def _get_sheet_context_impl(project: dict, netlist: dict, variant_state: Variant
             f"warning: sheet_load_failed — '{sheet_name}' could not be parsed "
             f"({sheet_error['error']}); its components are missing below.\n" + context
         )
+    if notes_cache is not None and offset == 0:
+        # Designer notes go between the header and the components, on the first page only.
+        notes = sheet_notes_for_context(notes_cache, project, sheet_name)
+        if notes:
+            header, _, components = context.partition("\n\n")
+            context = f"{header}\n\n{notes}\n\n{components}"
     return context
 
 
@@ -908,6 +976,10 @@ def get_sheet_context(sheet_name: str | None = None, offset: int = 0) -> str:
     again with sheet_name when following cross-sheet signals. Only call query_net or
     get_component afterward for high-fanout nets (>25 pins) or two-hop tracing.
 
+    The first page also carries a design_notes block: the designer's notes, text frames,
+    labels, pictures, directives and title block on that sheet, with the components each
+    note sits next to.
+
     Results are paginated by character budget. If the response contains has_more:true,
     call this tool again with the offset from the next: line and the same sheet_name,
     and repeat until has_more:false. Accumulate all pages before answering the user."""
@@ -917,7 +989,120 @@ def get_sheet_context(sheet_name: str | None = None, offset: int = 0) -> str:
         return json.dumps({"error": "no_project", "message": str(e)})
 
     altium_status = _altium.get_status() if sheet_name is None else {}
-    return _get_sheet_context_impl(project, netlist, variant_state, sheet_name, altium_status, offset)
+    return _get_sheet_context_impl(project, netlist, variant_state, sheet_name, altium_status,
+                                   offset, notes_cache=_design_notes)
+
+
+# ---------- get_design_notes ----------
+
+@mcp.tool(title="Get Design Notes", annotations=ToolAnnotations(readOnlyHint=True),
+          meta={"anthropic/maxResultSizeChars": NOTES_MAX_RESULT_SIZE_CHARS})
+def get_design_notes(document: str | None = None, offset: int = 0) -> str:
+    """Read what designers wrote into the project besides the circuit itself: project
+    parameters; on every schematic sheet the notes (author, collapsed state), text frames,
+    free text labels, pictures, directives and title-block parameters; and in every
+    Draftsman drawing (.PCBDwf) the fabrication/assembly notes, free text, tables, view
+    titles, pictures, and the drill table and layer stack notes cached from the board.
+
+    Pass document (a sheet name or Draftsman file name) to read one document. Schematic
+    notes, text frames and labels list the components drawn next to them ("near ...") —
+    a proximity hint, not a connection. Pictures carry an index for get_design_image.
+    Review comments made in Altium 365 live in the cloud workspace and cannot be read here.
+
+    Results are paginated by character budget. If the response contains has_more:true,
+    call again with the offset from the next: line until has_more:false."""
+    try:
+        project, _, _ = _require_project()
+    except ValueError as e:
+        return json.dumps({"error": "no_project", "message": str(e)})
+    return build_design_notes(_design_notes, project, document, offset)
+
+
+# ---------- get_design_image ----------
+
+_LINKED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+
+def _linked_image_path(sheet_path: str, file_name: str | None) -> Path | None:
+    """The picture file a schematic links to, if it is on disk.
+
+    A relative link is resolved against the sheet's folder. An absolute link that no
+    longer exists (e.g. the project was moved) falls back to its file name next to the sheet.
+    """
+    if not file_name:
+        return None
+    windows_path = PureWindowsPath(file_name)
+    if windows_path.suffix.lower() not in _LINKED_IMAGE_SUFFIXES:
+        return None
+    sheet_dir = Path(sheet_path).parent
+    if windows_path.is_absolute():
+        candidates = [Path(file_name), sheet_dir / windows_path.name]
+    else:
+        candidates = [sheet_dir / Path(*windows_path.parts)]
+    return next((c for c in candidates if c.is_file()), None)
+
+
+def _get_design_image_impl(project: dict, notes_cache: DesignNotesCache,
+                           document: str, index: int) -> Image | dict:
+    resolved = resolve_document(project, document)
+    if resolved is None:
+        available = [s["name"] for s in project.get("sheets") or []] + [
+            d["name"] for d in draftsman_documents(project)
+        ]
+        return {"error": "document_not_found",
+                "message": f"'{document}' is not a sheet or Draftsman document. Available: {available}"}
+    kind, doc = resolved
+    not_found = {"error": "image_not_found",
+                 "message": f"'{doc['name']}' has no picture {index}. "
+                            "get_design_notes lists the pictures of each document with their index."}
+    try:
+        if kind == "sheet":
+            image = next((i for i in notes_cache.sheet(doc["path"]).items
+                          if i.kind == "image" and i.image_index == index), None)
+            if image is None:
+                return not_found
+            if image.embedded:
+                data = read_sch_doc_image(doc["path"], image.file_name or "")
+            else:
+                linked = _linked_image_path(doc["path"], image.file_name)
+                if linked is None:
+                    return {"error": "linked_image_missing",
+                            "message": f"Picture {index} on '{doc['name']}' links to "
+                                       f"'{image.file_name}', which is not a readable image on disk."}
+                data = linked.read_bytes()
+        else:
+            data = read_pcb_dwf_picture(doc["path"], index)
+        fmt = image_format(data)
+        if fmt == "bmp":
+            data, fmt = bmp_to_png(data), "png"
+    except KeyError:
+        return not_found
+    except Exception as e:
+        return {"error": "image_read_failed", "message": f"{type(e).__name__}: {e}"}
+    if fmt is None:
+        return {"error": "unsupported_image_format",
+                "message": f"Picture {index} of '{doc['name']}' is not PNG, JPEG, GIF, WebP or BMP."}
+    if len(data) > MAX_IMAGE_BYTES:
+        return {"error": "image_too_large",
+                "message": f"Picture {index} of '{doc['name']}' is {len(data)} bytes; "
+                           f"the limit is {MAX_IMAGE_BYTES}."}
+    return Image(data=data, format=fmt)
+
+
+@mcp.tool(title="Get Design Image", annotations=ToolAnnotations(readOnlyHint=True),
+          structured_output=False)
+def get_design_image(document: str, index: int = 0) -> Image | str:
+    """Look at a picture placed on a schematic sheet or in a Draftsman drawing — e.g. a
+    pasted datasheet excerpt, block diagram, photo or logo. document is the sheet name or
+    Draftsman file name, index the picture number that get_design_notes and
+    get_sheet_context list as [image N] / [picture N]. Schematic pictures are stored as
+    bitmaps and returned as PNG."""
+    try:
+        project, _, _ = _require_project()
+    except ValueError as e:
+        return json.dumps({"error": "no_project", "message": str(e)})
+    result = _get_design_image_impl(project, _design_notes, document, index)
+    return json.dumps(result) if isinstance(result, dict) else result
 
 
 # ---------- list_variants ----------
@@ -1483,6 +1668,11 @@ Do not proceed until the user answers.
 Call get_sheet_context. Each pin already includes connected_to —
 the full cross-sheet neighbor list. Use this to trace every signal
 source-to-destination. Call query_net only if you need to go two hops deep on a specific net.
+
+Its design_notes block holds the designer's notes for the sheet. Treat them as stated
+intent to verify: a note that contradicts the circuit (a value, a part number, a DNP
+reason) is a finding. Look at pictures with get_design_image when they may hold the
+reference design or datasheet excerpt the circuit was built from.
 
 For each IC that has external components influencing its operating
 behavior, look up its manufacturer datasheet and confirm the parameters

@@ -121,8 +121,8 @@ server/
   main.py          — MCP tool definitions (FastMCP)
   altium.py        — Altium Designer client (PowerShell bridge)
   netlist_parser.py
-  parsers/         — .PrjPcb and .SchDoc parsers
-  services/        — registry, sheet context, and page netlist helpers
+  parsers/         — .PrjPcb, .SchDoc, .PcbDoc and Draftsman .PCBDwf parsers
+  services/        — registry, sheet context, PCB index, design notes and image helpers
   scripts/         — PowerShell scripts called at runtime
   dist/            — compiled binary (git-ignored, produced by PyInstaller)
 
@@ -145,3 +145,10 @@ IPC-2581 export of the same board. It is skipped unless you set:
 
 Use any board of your own. Never commit oracle files or values derived from them—
 they are private design data. Run this before releases that touch `pcb_doc.py`.
+
+## Draftsman parser check (optional, local-only)
+
+`tests/fixtures/pcb-fab-drawing.PCBDwf` is synthetic: `tests/draftsman_fixture.py` builds
+it from made-up XML in Altium's format (regenerate with `python tests/draftsman_fixture.py`).
+To also check a drawing Altium wrote, set `ALTIUM_COPILOT_ORACLE_PCBDWF` to any `.PCBDwf`
+of your own and run `pytest tests/test_pcb_dwf_parser.py`. Never commit that file.
