@@ -47,7 +47,8 @@ try:
     )
     from services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
-        group_lines as group_bom_lines, plan_variant, to_csv as bom_csv,
+        group_lines as group_bom_lines, natural_key, needs_mpn, plan_variant, variant_names,
+        to_csv as bom_csv,
     )
     from services.bom_checks import run_bom_checks
     from parsers.pcb_doc import CLASS_KINDS
@@ -86,7 +87,8 @@ except ImportError:
     )
     from server.services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
-        group_lines as group_bom_lines, plan_variant, to_csv as bom_csv,
+        group_lines as group_bom_lines, natural_key, needs_mpn, plan_variant, variant_names,
+        to_csv as bom_csv,
     )
     from server.services.bom_checks import run_bom_checks
     from server.parsers.pcb_doc import CLASS_KINDS
@@ -262,6 +264,8 @@ DNP reasons, fabrication requirements. Use it.
   low means the project keeps MPNs elsewhere (e.g. ActiveBOM, not read): say so instead
   of listing every part as missing one.
 - get_component's mpn falls back to Comment; for part numbers in a BOM use get_bom.
+  A line's varies lists values its parts disagree on: mention them, the line is not
+  one part.
 
 ## PCB / Layout Questions
 
@@ -494,12 +498,24 @@ def _design_info(prj_data) -> dict:
 
 
 def _resolve_dnp_uids(variant_state: VariantState, netlist: dict | None) -> None:
+    """Bind each variant's Not Fitted entries to the loaded parts the way get_bom does
+    (UniqueId path, then its last segment, then the stored designator), so is_dnp and
+    every DNP flag agree with the BOM. Without loaded parts, the stored designators and
+    the UniqueIds of '?' designators stay as read."""
+    netlist = netlist or {}
     uid_map = {
         comp.get("unique_id"): refdes
-        for refdes, comp in (netlist or {}).get("components", {}).items()
+        for refdes, comp in netlist.get("components", {}).items()
         if comp.get("unique_id")
     }
     variant_state.resolve_dnp_uid(uid_map)
+    names = variant_names(netlist)
+    if not names:
+        return
+    for variant in variant_state.variants:
+        if variant.variations:
+            plan = plan_variant(variant, netlist, names)
+            variant.dnp_refdes = sorted(plan.not_fitted, key=natural_key)
 
 
 class PcbSession:
@@ -823,7 +839,7 @@ def refresh_netlist() -> str:
     """Refresh the netlist after the user has saved schematic changes in Altium.
     Call this when the user says they changed, added, or saved anything in the schematic.
     Do not call speculatively — only when the user confirms they have saved."""
-    global _netlist_last_updated
+    global _netlist_last_updated, _variant_state
     try:
         project, _, variant_state = _require_project()
     except ValueError as e:
@@ -848,6 +864,13 @@ def refresh_netlist() -> str:
     if prj_data is not None:
         project["sheets"] = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
         project.update(_project_documents(prj_data))
+        # Variants saved since load (Not Fitted parts, parameter variations, new
+        # variants) come with the project file; the active one stays by name.
+        active = variant_state.active.name
+        variant_state = VariantState(prj_data.variants)
+        if variant_state.get(active):
+            variant_state.set_variant(active)
+        _variant_state = variant_state
     _resolve_dnp_uids(variant_state, _altium._netlist)
     diagnostics = _load_diagnostics(_altium._netlist or {})
     if not regenerated:
@@ -2798,14 +2821,15 @@ BOM_BASE_NAMES = ("[no variations]", "no variations", "none", "base")
 
 
 def _bom_plan(netlist: dict, variant_state: VariantState, variant: str | None):
-    """The variant plan for a BOM call: the active variant, a named one, or none."""
-    names = list(netlist.get("parts") or {}) or list(netlist.get("components") or {})
+    """The variant plan for a BOM call: the active variant, a named one, or none (a
+    project's own variant named e.g. 'Base' wins over the base-design aliases)."""
+    names = variant_names(netlist)
     if variant is None:
         chosen = variant_state.active
-    elif variant.strip().lower() in BOM_BASE_NAMES:
-        chosen = None
     else:
-        chosen = variant_state.get(variant)
+        chosen = variant_state.get(variant.strip())
+        if chosen is None and variant.strip().lower() in BOM_BASE_NAMES:
+            return plan_variant(None, netlist, names), names, None
         if chosen is None:
             return None, names, {
                 "error": "variant_not_found",
@@ -2818,7 +2842,7 @@ def _bom_plan(netlist: dict, variant_state: VariantState, variant: str | None):
 
 def _bom_header(netlist: dict, plan, parts: list, excluded: dict) -> dict:
     fitted = [part for part in parts if part.fitted]
-    counted = [part for part in fitted if part.kind != 1]
+    counted = [part for part in fitted if needs_mpn(part)]
     header: dict = {
         "variant": plan.name,
         "netlist_updated_utc": _netlist_last_updated,
@@ -2835,6 +2859,12 @@ def _bom_header(netlist: dict, plan, parts: list, excluded: dict) -> dict:
     }
     if plan.stale:
         header["stale_variant_entries"] = len(plan.stale)
+    if any(part.alternate_part for part in fitted):
+        header["alternate_parts_note"] = (
+            "Alternate parts take their footprint from the variant; their library data "
+            "(Comment, description, MPN) is not read, only the variant's parameter "
+            "variations."
+        )
     return header
 
 
@@ -2856,12 +2886,14 @@ def get_bom(
     footprint, manufacturer and manufacturer part number. Built from the compiled parts
     (compile-masked parts are not in it); Graphical, Net Tie and Standard (No BOM) parts
     and the variant's Not Fitted parts are left out, its parameter variations applied.
-    The MPN comes from part parameters, never from Comment. group_by mpn groups by MPN,
-    else Comment and footprint; comment always by Comment and footprint.
+    The MPN comes from part parameters, never from Comment ('N/A' and the like are
+    shown as mpn_placeholder). group_by mpn groups by MPN, else Comment and footprint;
+    comment always by Comment and footprint. A field the line's parts disagree on is in
+    varies with its values; logical_designators maps a part to its sheet designator.
 
     include_not_fitted lists the Not Fitted parts as lines; compare_variants adds what
-    each variant changes (Not Fitted parts, varied values); format csv returns the page
-    as CSV text. Lines are paginated (offset from next_offset)."""
+    each variant changes (Not Fitted parts, varied values, alternate parts); format csv
+    returns the page as CSV text. Lines are paginated (offset from next_offset)."""
     try:
         project, netlist, variant_state = _require_project()
     except ValueError as error:
@@ -2872,7 +2904,8 @@ def get_bom(
     plan, names, error = _bom_plan(netlist, variant_state, variant)
     if error:
         return json.dumps(error)
-    parts, excluded = build_bom_parts(netlist, plan)
+    project_params = project.get("parameters") or {}
+    parts, excluded = build_bom_parts(netlist, plan, project_params)
     fitted = [part for part in parts if part.fitted]
     not_fitted = [part for part in parts if not part.fitted]
     lines = group_bom_lines(fitted, group_by)
@@ -2898,7 +2931,7 @@ def get_bom(
                 v for v in variant_state.variants
                 if v.variations or v.param_variations or v.dnp_refdes
             ]
-            result["variants"] = compare_bom_variants(netlist, real, names)
+            result["variants"] = compare_bom_variants(netlist, real, names, project_params)
         if limit < BOM_LINE_LIMIT:
             result["lines_limited_to"] = limit
         rendered = json.dumps(result, indent=2)
@@ -2938,7 +2971,7 @@ def check_bom(
     plan, _, error = _bom_plan(netlist, variant_state, variant)
     if error:
         return json.dumps(error)
-    parts, excluded = build_bom_parts(netlist, plan)
+    parts, excluded = build_bom_parts(netlist, plan, project.get("parameters") or {})
     header = _bom_header(netlist, plan, parts, excluded)
     for limit in (100, 40, 15):
         result = run_bom_checks(parts, netlist, plan, checks=checks, offset=offset,

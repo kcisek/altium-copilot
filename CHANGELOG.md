@@ -8,6 +8,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Fixed
 - A variant's Not Fitted entry (Kind=1) that still carries an AlternatePart (Altium leaves
   some behind, e.g. 'NP') now makes the part DNP; it was read as fitted
+- Compile-masked parts are recognised (inside a sheet's compile mask, RECORD=211). A
+  masked copy that shares a live part's designator, on the same sheet or another, no
+  longer replaces the live part's parameters, description and kind, and is not reported
+  as a designator clash; a live part replaces a masked one. On real projects the masked
+  copy's data had replaced 25 live parts' (wrong MPN, Comment and description in their
+  BOM lines), and every recorded designator clash involved a masked copy
+- DNP flags (`get_component`, `list_variants`, sheet context, PCB tools, sync check,
+  export) bind a variant's Not Fitted entries by UniqueId, then the stored designator,
+  as Altium and `get_bom` do: a stale designator in the project file named the wrong part
+- `refresh_netlist` re-reads the project's variants, so Not Fitted parts, parameter
+  variations and variants saved since the project was loaded apply; the active variant
+  stays by name
 - Protel netlist members whose pin designator holds a '-' (a battery's '-' pin, written
   `BT1--`) are split at the rightmost '-' that leaves a known part, so the pin no longer
   becomes a phantom part `BT1-` with an empty pin. The .NET is read as UTF-8, falling
@@ -145,12 +157,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   description, value, footprint, manufacturer, manufacturer part number) built from the
   compiled parts, so compile-masked parts stay out, without Graphical, Net Tie and
   Standard (No BOM) parts and without the variant's Not Fitted parts, with its parameter
-  variations applied. Variants bind to parts by UniqueId as Altium does, so a stale
+  variations applied (they follow their variation's part) and an alternate part's
+  footprint used. Variants bind to parts by UniqueId as Altium does, so a stale
   designator in the project file does not pick the wrong part. The MPN comes from part
   parameters (the spellings libraries use for 'Manufacturer Part Number 1', paired with
-  its manufacturer), never from Comment; special strings such as '=Value' are resolved.
-  Lines group by MPN, else Comment and footprint; variants can be compared and the lines
-  returned as CSV. `check_bom` runs offline hygiene checks: duplicate designators,
+  its manufacturer), never from Comment; 'N/A' and the like are shown as placeholders,
+  not part numbers. Special strings such as '=Value' are resolved against the part's
+  parameters, then the project's. Lines group by MPN, else Comment and footprint, and
+  list the values a line's parts disagree on; variants can be compared and the lines
+  returned as CSV (formula-like cells kept as text). `check_bom` runs offline hygiene
+  checks: duplicate designators,
   unresolved special strings, fitted parts marked DNP in their text, parts without a
   footprint, one MPN with different values/descriptions/footprints, MPNs without a
   manufacturer, parts without an MPN (where the project keeps MPNs in parameters),

@@ -16,6 +16,11 @@ import io
 import re
 from dataclasses import dataclass, field
 
+try:
+    from parsers.prj_pcb import Variation
+except ImportError:
+    from server.parsers.prj_pcb import Variation
+
 # ComponentKind values that stay in the BOM: Standard, Mechanical, Net Tie (In BOM),
 # Jumper. Out: Graphical (2), Net Tie (4), Standard (No BOM) (5).
 BOM_KINDS = {0, 1, 3, 6}
@@ -26,6 +31,7 @@ KIND_NAMES = {
 BASE_VARIANT = "[No Variations]"
 LINE_LIMIT = 100
 _HOPS = 4
+_VARIES_SHOWN = 5  # distinct values listed per varying line field
 
 _MANUFACTURER = r"(?:manufacturer|manufact|manuf|mfr|mfg)"
 _MPN_NAME = re.compile(
@@ -34,6 +40,15 @@ _MPN_NAME = re.compile(
 _MFR_NAME = re.compile(rf"^{_MANUFACTURER}\.?(?: ?name)? ?(\d*)$")
 _PART_NUMBER = re.compile(r"^part ?(?:number|no\.?|#)(?: ?\d+)?$")
 _NATURAL = re.compile(r"(\d+)")
+# Part number texts that say there is none: on purpose ('N/A' on a test point or a
+# fiducial), or not chosen yet ('TBD'), which still needs one.
+_NO_MPN = {
+    "-", "--", "---", "n/a", "na", "n.a.", "n.a", "none", "x", "nc", "dnp",
+    "not applicable", "tbd", "tba", "?",
+}
+_UNDECIDED_MPN = {"tbd", "tba", "?"}
+# A CSV cell starting like this is run as a formula by spreadsheets.
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
 def _norm_name(name: str) -> str:
@@ -44,15 +59,23 @@ def _unset(text: str | None) -> bool:
     return text is None or text.strip() in ("", "*")
 
 
-def resolve(text: str | None, params: dict[str, str]) -> tuple[str | None, bool]:
-    """Resolve an '=Name' special string against the part's parameters (a few hops).
-    Returns (text, resolved); unresolvable text comes back as written."""
+def resolve(
+    text: str | None, params: dict[str, str], fallback: dict[str, str] | None = None,
+) -> tuple[str | None, bool]:
+    """Resolve an '=Name' special string against the part's parameters, then fallback
+    (the project parameters, lower-case names), a few hops deep. Returns (text,
+    resolved); unresolvable text comes back as written."""
+    fallback = fallback or {}
     hops = 0
     while text and text.startswith("=") and hops < _HOPS:
         name = text[1:].strip().strip('"').lower()
-        if name not in params:
+        if name in params:
+            text = params[name]
+        elif name in fallback:
+            text = fallback[name]
+        else:
             return text, False
-        text, hops = params[name], hops + 1
+        hops += 1
     if text and text.startswith("="):
         return text, False
     return text, True
@@ -110,6 +133,17 @@ class BomPart:
     lib_reference: str = ""
     overrides: dict[str, str] = field(default_factory=dict)  # field -> varied value
     unresolved: list[str] = field(default_factory=list)  # special strings left as written
+    mpn_placeholder: str | None = None  # 'N/A', 'TBD', ... written as the part number
+    alternate_part: str | None = None  # the variant's alternate part (Kind=2)
+
+
+def needs_mpn(part: BomPart) -> bool:
+    """Whether a part should carry a manufacturer part number: not a mechanical part,
+    and not marked as having none on purpose ('N/A'; 'TBD' still needs one)."""
+    if part.kind == 1:
+        return False
+    placeholder = (part.mpn_placeholder or "").strip().lower()
+    return not placeholder or placeholder in _UNDECIDED_MPN
 
 
 @dataclass
@@ -120,11 +154,74 @@ class VariantPlan:
     not_fitted: set[str] = field(default_factory=set)
     params: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)
     stale: list[dict] = field(default_factory=list)  # variation entries that do not fit
+    # Alternate parts (Kind=2) by designator: {"part": DesignItemID, "footprint": ...}.
+    alternates: dict[str, dict] = field(default_factory=dict)
+
+
+def _bind(variation, by_path: dict, by_tail: dict, known: set, plan: VariantPlan) -> list[str]:
+    """The compiled parts one variation line names; its problems go to plan.stale."""
+    stored = variation.designator
+    label = stored or variation.unique_id
+    targets = list(by_path.get(variation.unique_id) or []) if variation.unique_id else []
+    ambiguous = False
+    if not targets and variation.uid_tail:
+        candidates = by_tail.get(variation.uid_tail) or []
+        # Channel copies share the tail: the stored designator picks one if it can.
+        if stored in candidates:
+            targets = [stored]
+        else:
+            targets, ambiguous = list(candidates), len(candidates) > 1
+    if not targets and stored in known:
+        if variation.unique_id:
+            plan.stale.append({
+                "designator": stored, "issue": "unique_id_not_found",
+                "detail": "matched by designator; its UniqueId is on no part",
+            })
+        return [stored]
+    if not targets:
+        plan.stale.append({
+            "designator": label, "issue": "no_such_part",
+            "detail": "the variation names no part (deleted or renamed)",
+        })
+        return []
+    shown = ", ".join(sorted(targets, key=natural_key))
+    if ambiguous:
+        plan.stale.append({
+            "designator": label, "issue": "ambiguous_unique_id",
+            "detail": f"its UniqueId is on {len(targets)} channel copies ({shown}) and the "
+            "stored designator names none of them; applied to all of them",
+        })
+    elif stored and stored not in targets and "?" not in stored:
+        plan.stale.append({
+            "designator": stored, "issue": "designator_changed",
+            "detail": f"its UniqueId is on {shown} now; the stored designator is stale",
+        })
+    return targets
+
+
+def _alternate(variation) -> dict:
+    """An alternate part (Kind=2): its library item and, when it differs, footprint."""
+    alt = variation.alt or {}
+    same = alt.get("IsSameFootprint", "").strip().lower() in ("true", "t", "1")
+    return {
+        "part": alt.get("DesignItemID") or variation.alternate_part or None,
+        "footprint": None if same else (alt.get("Footprint") or None),
+    }
+
+
+def variant_names(netlist: dict) -> list[str]:
+    """The parts variants bind to: the compiled ones and every sheet component, so a
+    variation on a part outside the compiled design binds to it (and leaves the BOM
+    alone) instead of falling back to its designator."""
+    return list(dict.fromkeys([*(netlist.get("parts") or {}), *(netlist.get("components") or {})]))
 
 
 def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
     """Bind a variant's entries to compiled parts: by full UniqueId path, then its last
-    segment, then the designator stored with it (Altium follows the UniqueId)."""
+    segment, then the designator stored with it (Altium follows the UniqueId). Parameter
+    variations belong to the component variation of their designator and follow its
+    binding. A variant known only by its Not Fitted designators (the older [CompVar]
+    format, or one built by hand) binds by designator."""
     if variant is None or variant.name == BASE_VARIANT:
         return VariantPlan(name=BASE_VARIANT)
     components = netlist.get("components") or {}
@@ -141,45 +238,40 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
         for tail in tails:
             by_tail.setdefault(tail, []).append(name)
     plan = VariantPlan(name=variant.name)
-    for variation in getattr(variant, "variations", []) or []:
-        targets = by_path.get(variation.unique_id) or []
-        if not targets and variation.uid_tail:
-            candidates = by_tail.get(variation.uid_tail) or []
-            # Channel copies share the tail: the stored designator picks one if it can.
-            targets = (
-                [variation.designator] if variation.designator in candidates else candidates
-            )
-        if not targets and variation.designator in known:
-            targets = [variation.designator]
-            if variation.unique_id:
-                plan.stale.append({
-                    "designator": variation.designator, "issue": "unique_id_not_found",
-                    "detail": "matched by designator; its UniqueId is on no compiled part",
-                })
-        elif targets and variation.designator and variation.designator not in targets \
-                and "?" not in variation.designator:
-            plan.stale.append({
-                "designator": variation.designator, "issue": "designator_changed",
-                "detail": f"its UniqueId is on {', '.join(sorted(targets, key=natural_key))} "
-                f"now; the stored designator is stale",
-            })
-        if not targets:
-            plan.stale.append({
-                "designator": variation.designator or variation.unique_id,
-                "issue": "no_such_part",
-                "detail": "the variation names no compiled part (deleted or renamed)",
-            })
-            continue
+    variations = list(getattr(variant, "variations", None) or []) or [
+        Variation(designator=designator, unique_id="", kind=1)
+        for designator in getattr(variant, "dnp_refdes", None) or []
+    ]
+    line_targets: dict[str, set[tuple[str, ...]]] = {}
+    for variation in variations:
+        targets = _bind(variation, by_path, by_tail, known, plan)
+        line_targets.setdefault(variation.designator, set()).add(tuple(targets))
         if variation.kind == 1:
             plan.not_fitted.update(targets)
-    for designator, params in (getattr(variant, "param_variations", {}) or {}).items():
-        if designator not in known:
+        elif variation.kind == 2 and targets:
+            for target in targets:
+                plan.alternates[target] = _alternate(variation)
+    for designator, params in (getattr(variant, "param_variations", None) or {}).items():
+        bound = line_targets.get(designator)
+        if bound and len(bound) > 1:
             plan.stale.append({
-                "designator": designator, "issue": "no_such_part",
-                "detail": "a parameter variation names no compiled part",
+                "designator": designator, "issue": "ambiguous_designator",
+                "detail": "parameter variations on a designator that several variations "
+                "carry for different parts; not applied",
             })
             continue
-        plan.params[designator] = params
+        if bound:
+            targets = list(next(iter(bound)))  # empty: its variation was reported
+        elif designator in known:
+            targets = [designator]
+        else:
+            plan.stale.append({
+                "designator": designator, "issue": "no_such_part",
+                "detail": "a parameter variation names no part",
+            })
+            continue
+        for target in targets:
+            plan.params.setdefault(target, {}).update(params)
     for designator in sorted(set(plan.params) & plan.not_fitted, key=natural_key):
         plan.stale.append({
             "designator": designator, "issue": "varied_but_not_fitted",
@@ -188,12 +280,18 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
     return plan
 
 
-def build_parts(netlist: dict, plan: VariantPlan | None = None) -> tuple[list[BomPart], dict]:
-    """The variant's BOM parts, and what was left out (by kind, not fitted)."""
+def build_parts(
+    netlist: dict, plan: VariantPlan | None = None, project_params: dict | None = None,
+) -> tuple[list[BomPart], dict]:
+    """The variant's BOM parts, and what was left out by kind. Special strings resolve
+    against the part's parameters, then project_params (the .PrjPcb's)."""
     plan = plan or VariantPlan(name=BASE_VARIANT)
+    fallback = {name.lower(): value for name, value in (project_params or {}).items()}
     compiled = netlist.get("parts") or {}
     components = netlist.get("components") or {}
-    names = list(compiled) if compiled else list(components)
+    names = list(compiled) if compiled else [
+        name for name, meta in components.items() if not meta.get("compile_masked")
+    ]
     parts: list[BomPart] = []
     excluded: dict[str, list[str]] = {}
     for name in names:
@@ -211,7 +309,7 @@ def build_parts(netlist: dict, plan: VariantPlan | None = None) -> tuple[list[Bo
         unresolved: list[str] = []
 
         def text(raw):
-            value, ok = resolve(raw, params)
+            value, ok = resolve(raw, params, fallback)
             if not ok:
                 unresolved.append(raw)
             return None if _unset(value) else value.strip()
@@ -221,14 +319,21 @@ def build_parts(netlist: dict, plan: VariantPlan | None = None) -> tuple[list[Bo
             block.get("comment") or None
         )
         mpn, manufacturer, source = part_numbers(params)
+        mpn, manufacturer = text(mpn), text(manufacturer)
+        placeholder = None
+        if mpn and mpn.lower() in _NO_MPN:
+            placeholder, mpn, source = mpn, None, None
+            if manufacturer and manufacturer.lower() in _NO_MPN:
+                manufacturer = None
         # A variant can vary the footprint and description, which are not parameters.
         if "description" in varied:
             description = text(params["description"])
         else:
             description = meta.get("description") or text(params.get("description"))
+        alternate = plan.alternates.get(name) or {}
         footprint = (
             text(params["footprint"]) if "footprint" in varied
-            else block.get("footprint") or meta.get("footprint")
+            else alternate.get("footprint") or block.get("footprint") or meta.get("footprint")
         )
         part = BomPart(
             designator=name,
@@ -246,6 +351,8 @@ def build_parts(netlist: dict, plan: VariantPlan | None = None) -> tuple[list[Bo
             lib_reference=meta.get("lib_reference") or "",
             overrides=overrides,
             unresolved=unresolved,
+            mpn_placeholder=placeholder,
+            alternate_part=alternate.get("part"),
         )
         parts.append(part)
     parts.sort(key=lambda part: natural_key(part.designator))
@@ -270,7 +377,9 @@ _LINE_FIELDS = ("comment", "description", "value", "footprint", "manufacturer", 
 
 def group_lines(parts: list[BomPart], group_by: str = "mpn") -> list[dict]:
     """BOM lines: quantity, designators (natural order) and the members' fields; a
-    field the members disagree on is listed in 'varies'."""
+    field the members disagree on is listed in 'varies' with its values (null where a
+    member has none). logical_designators and alternate_parts map a member's
+    designator to its sheet designator and to the variant's alternate part."""
     groups: dict[tuple, list[BomPart]] = {}
     for part in parts:
         groups.setdefault(group_key(part, group_by), []).append(part)
@@ -281,21 +390,33 @@ def group_lines(parts: list[BomPart], group_by: str = "mpn") -> list[dict]:
             "quantity": len(members),
             "designators": [part.designator for part in members],
         }
-        varies = []
+        varies: dict[str, list] = {}
         for name in _LINE_FIELDS:
             values = [getattr(part, name) for part in members]
             present = [value for value in values if value]
             if present:
                 line[name] = present[0]
-            if len({_fold(value) for value in values}) > 1:
-                varies.append(name)
+            distinct: dict[str, str | None] = {}
+            for value in values:
+                distinct.setdefault(_fold(value), value or None)
+            if len(distinct) > 1:
+                varies[name] = list(distinct.values())[:_VARIES_SHOWN]
+        placeholder = next((part.mpn_placeholder for part in members if part.mpn_placeholder),
+                           None)
+        if placeholder and "mpn" not in line:
+            line["mpn_placeholder"] = placeholder
         if first.mpn_source and first.mpn_source != "parameter":
             line["mpn_source"] = first.mpn_source
         if varies:
             line["varies"] = varies
-        logical = [part.logical for part in members if part.logical]
+        logical = {part.designator: part.logical for part in members
+                   if part.logical and part.logical != part.designator}
         if logical:
             line["logical_designators"] = logical
+        alternates = {part.designator: part.alternate_part for part in members
+                      if part.alternate_part}
+        if alternates:
+            line["alternate_parts"] = alternates
         overridden = sorted({key for part in members for key in part.overrides})
         if overridden:
             line["varied_parameters"] = overridden
@@ -304,30 +425,34 @@ def group_lines(parts: list[BomPart], group_by: str = "mpn") -> list[dict]:
     return lines
 
 
-def compare_variants(netlist: dict, variants: list, names: list[str]) -> list[dict]:
-    """What each variant changes against the BOM with no variations: parts not fitted
-    and parameter values changed."""
-    base, _ = build_parts(netlist)
+def compare_variants(
+    netlist: dict, variants: list, names: list[str], project_params: dict | None = None,
+) -> list[dict]:
+    """What each variant changes against the BOM with no variations: its BOM parts not
+    fitted, values changed, and alternate parts."""
+    base, _ = build_parts(netlist, project_params=project_params)
     by_name = {part.designator: part for part in base}
     out = []
     for variant in variants:
         plan = plan_variant(variant, netlist, names)
-        parts, _ = build_parts(netlist, plan)
+        parts, _ = build_parts(netlist, plan, project_params)
         changed = []
         for part in parts:
-            if not part.fitted:
-                continue
             before = by_name.get(part.designator)
-            fields = {
+            if not part.fitted or before is None:
+                continue
+            fields: dict = {
                 name: {"from": getattr(before, name), "to": getattr(part, name)}
                 for name in _LINE_FIELDS
-                if before is not None and _fold(getattr(before, name)) != _fold(getattr(part, name))
+                if _fold(getattr(before, name)) != _fold(getattr(part, name))
             }
+            if part.alternate_part:
+                fields["alternate_part"] = part.alternate_part
             if fields:
                 changed.append({"designator": part.designator, **fields})
         out.append({
             "variant": variant.name,
-            "not_fitted": sorted(plan.not_fitted, key=natural_key),
+            "not_fitted": [part.designator for part in parts if not part.fitted],
             "changed": changed,
         })
     return out
@@ -340,13 +465,30 @@ CSV_COLUMNS = [
 ]
 
 
+def _cell(value) -> str:
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_FORMULA_START) else text
+
+
 def to_csv(lines: list[dict]) -> str:
+    """The lines as CSV. A field the members disagree on lists its values with ' / ';
+    a cell that would start a spreadsheet formula ('=', '+', '-', '@') gets a leading
+    apostrophe."""
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow([title for title, _ in CSV_COLUMNS])
     for line in lines:
-        writer.writerow([
-            ", ".join(line[key]) if key == "designators" else line.get(key, "")
-            for _, key in CSV_COLUMNS
-        ])
+        varies = line.get("varies") or {}
+        row = []
+        for _, key in CSV_COLUMNS:
+            if key == "designators":
+                value = ", ".join(line[key])
+            elif key in varies:
+                value = " / ".join(value for value in varies[key] if value)
+            elif key == "mpn":
+                value = line.get("mpn") or line.get("mpn_placeholder", "")
+            else:
+                value = line.get(key, "")
+            row.append(_cell(value))
+        writer.writerow(row)
     return out.getvalue()

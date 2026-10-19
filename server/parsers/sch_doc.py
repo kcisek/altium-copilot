@@ -34,6 +34,9 @@ class ComponentMeta:
     params: dict[str, str] = field(default_factory=dict)
     lib_reference: str = ""
     design_item_id: str = ""
+    # Inside a compile mask (RECORD=211) on its sheet: Altium leaves it out of the
+    # compiled design. A multi-part component is masked when all its parts are.
+    compile_masked: bool = False
 
 
 @dataclass
@@ -78,6 +81,8 @@ def components_from_stream(
     best_mpn_priority: dict[int, int] = {} # canonical owner_key -> lowest suffix seen (0 = best)
     parts: dict[int, _Part] = {}           # canonical owner_key -> which part it is
     model_lists: dict[int, int] = {}       # RECORD=44 owner_key -> its component's owner_key
+    origins: dict[int, list[tuple[float, float]]] = {}  # canonical owner_key -> part origins
+    masks: list[list[float]] = []          # compile mask rectangles
 
     for record_num, props in enumerate(_read_records(data)):
         record_type = props.get("record")
@@ -87,6 +92,11 @@ def components_from_stream(
             _handle_component(
                 props, record_num, components_by_owner, canonical_owner, uid_seen, parts
             )
+            origins.setdefault(canonical_owner[record_num - 1], []).append(
+                (_coord(props, "location.x"), _coord(props, "location.y"))
+            )
+        elif record_type == "211":
+            masks.append(_rect(props))
         elif record_type == "34":
             _handle_designator(props, components_by_owner, canonical_owner)
         elif record_type == "2":
@@ -104,6 +114,11 @@ def components_from_stream(
             _handle_model(props, components_by_owner, model_lists)
         # RECORD=17 (power ports) intentionally skipped
 
+    for key, meta in components_by_owner.items():
+        meta.compile_masked = bool(masks) and all(
+            any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in masks)
+            for x, y in origins.get(key) or [(float("nan"), float("nan"))]
+        )
     return _merge_parts(components_by_owner, parts, best_mpn_priority, source, clashes)
 
 
@@ -177,8 +192,9 @@ def _merge_parts(
     belong to the component holding its designator (a part id seen before, or another
     part count) is another component with the same designator: it replaces the earlier
     one, as before, and the clash is logged and appended to clashes, one entry per
-    designator. Unannotated parts (U?) share a designator and are neither merged nor
-    logged.
+    designator. A compile-masked copy is not compiled, so it never replaces a live
+    component and is never a clash; a live one replaces a masked one. Unannotated parts
+    (U?) share a designator and are neither merged nor logged.
     """
     components: dict[str, _Component] = {}
     clashed: dict[str, DesignatorClash] = {}
@@ -188,6 +204,10 @@ def _merge_parts(
             continue
         held = components.get(refdes)
         if held and "?" not in refdes:
+            if held.meta.compile_masked != meta.compile_masked:
+                if not meta.compile_masked:
+                    components[refdes] = _Component(meta, part, best_mpn_priority.get(key, 999))
+                continue
             if held.can_take(part):
                 if part.lib_reference != held.first.lib_reference:
                     logging.warning(
@@ -196,6 +216,9 @@ def _merge_parts(
                         held.first.lib_reference, part.lib_reference,
                     )
                 held.add(meta, part, best_mpn_priority.get(key, 999))
+                continue
+            if meta.compile_masked:  # two masked copies: neither is compiled
+                components[refdes] = _Component(meta, part, best_mpn_priority.get(key, 999))
                 continue
             logging.warning(
                 "%s: %s is the designator of two different components (%s and %s); "

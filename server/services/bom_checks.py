@@ -10,9 +10,9 @@ import re
 from collections import Counter, defaultdict
 
 try:
-    from services.bom import BomPart, natural_key
+    from services.bom import BomPart, natural_key, needs_mpn
 except ImportError:
-    from server.services.bom import BomPart, natural_key
+    from server.services.bom import BomPart, natural_key, needs_mpn
 
 CHECKS = (
     "duplicate_designator", "unresolved_special_string", "dnp_marker_on_fitted",
@@ -26,9 +26,17 @@ MPN_COVERAGE = 0.5  # below this share of parts with an MPN, MPNs are not kept h
 
 _MULTIPLIERS = {
     "p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6, "m": 1e-3, "": 1.0,
-    "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "R": 1.0, "r": 1.0,
+    "k": 1e3, "K": 1e3, "M": 1e6, "meg": 1e6, "G": 1e9, "R": 1.0, "r": 1.0, "V": 1.0,
+    "v": 1.0, "P": 1e-12, "N": 1e-9, "U": 1e-6,
 }
-_VALUE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([pnuµμmkKMGRr]?)(\d*)\s*([A-Za-zΩ]*)")
+_VALUE = re.compile(
+    r"^\s*(\d+(?:[.,]\d+)*|[.,]\d+)\s*"  # a comma is a decimal or thousands mark
+    # The prefix; R, k, V... with digits after them are decimal marks (4R7, 4k7, 3V3).
+    # Upper-case P, N, U only before a unit (100NF), since M is mega.
+    r"((?i:meg)|[pnuµμmkKMGRrVv]|[PNU](?=[FfHhΩ]|$|[\s/]))?"
+    r"(\d*)\s*([A-Za-zΩ]*)(?=$|[\s/,;(])"  # then the token ends: '0402WGF1000' is text
+)
+_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
 _DNP_MARK = re.compile(
     r"\b(?:DNP|DNF|DNI|NOT[ _-]?FITTED|NO[ _-]?POP|DO[ _-]NOT[ _-](?:POPULATE|FIT|PLACE))\b",
     re.IGNORECASE,
@@ -40,8 +48,16 @@ _GENERIC = {
 }
 _PASSIVE = re.compile(r"^(R|C|L|FB)\d", re.IGNORECASE)
 _SIZE = re.compile(r"(?<!\d)(01005|0201|0402|0603|0805|1206|1210|1812|2010|2512)(?!\d)")
+# IPC-7351 names give the metric size code (RESC1005X40N is an imperial 0402).
+_IPC_SIZE = re.compile(r"(?:RES|CAP|IND)[A-Z]{1,2}(\d{4})X", re.IGNORECASE)
+_METRIC_SIZE = {
+    "0402": "01005", "0603": "0201", "1005": "0402", "1608": "0603", "2012": "0805",
+    "3216": "1206", "3225": "1210", "4532": "1812", "5025": "2010", "6332": "2512",
+}
+_NUMBER = r"(?<![\w.])\d+(?:\.\d+)?\s?"
 _RATING = re.compile(
-    r"(\d+(?:\.\d+)?\s?k?V\b|\bX\d[RSTP]\b|\bC0G\b|\bNP0\b|\d+(?:\.\d+)?\s?%|\d+(?:\.\d+)?\s?W\b)",
+    rf"({_NUMBER}k?V(?:DC|AC)?\b|\b[XYZ]\d[A-Z]\b|\bC[0O]G\b|\bNP[0O]\b"
+    rf"|{_NUMBER}%|{_NUMBER}m?W\b|{_NUMBER}m?A\b)",
     re.IGNORECASE,
 )
 
@@ -56,9 +72,31 @@ def normalize_value(text: str | None):
     if not match:
         return re.sub(r"\s+", " ", text).strip().lower()
     number, prefix, tail, _unit = match.groups()
-    value = float(f"{number}.{tail}" if tail and "." not in number else number + tail)
-    value *= _MULTIPLIERS.get(prefix, 1.0)
+    number = number.replace(",", "") if _THOUSANDS.fullmatch(number) else number.replace(",", ".")
+    try:
+        value = float(f"{number}.{tail}" if tail and "." not in number else number + tail)
+    except ValueError:
+        return re.sub(r"\s+", " ", text).strip().lower()
+    prefix = prefix or ""
+    value *= _MULTIPLIERS.get("meg" if prefix.lower() == "meg" else prefix, 1.0)
     return round(value, 15) if value < 1 else round(value, 9)
+
+
+def _size(part: BomPart) -> str | None:
+    """The imperial size code from the footprint (IPC-7351 names are metric), else from
+    the footprint or description text."""
+    ipc = _IPC_SIZE.search(part.footprint or "")
+    if ipc:
+        return _METRIC_SIZE.get(ipc[1])
+    match = _SIZE.search(" ".join(filter(None, (part.footprint, part.description))))
+    return match[1] if match else None
+
+
+def _rating(token: str) -> str:
+    token = token.replace(" ", "").lower()
+    if token in ("c0g", "cog", "np0", "npo"):
+        return "c0g"
+    return re.sub(r"v(?:dc|ac)$", "v", token)
 
 
 def _fold(text: str | None) -> str:
@@ -75,7 +113,8 @@ def _finding(check, severity, issue, designators=(), **fields) -> dict:
 
 
 def _check_mpn(parts: list[BomPart], findings: list[dict]) -> None:
-    counted = [part for part in parts if part.kind != 1]  # mechanical parts often have none
+    # Mechanical parts often have none, and 'N/A' says a part has none on purpose.
+    counted = [part for part in parts if needs_mpn(part)]
     with_mpn = [part for part in counted if part.mpn]
     coverage = len(with_mpn) / len(counted) if counted else 1.0
     if counted and coverage < MPN_COVERAGE:
@@ -140,27 +179,33 @@ def _check_consolidation(parts: list[BomPart], findings: list[dict]) -> None:
         if not prefix or not part.mpn:
             continue
         value = normalize_value(part.value or part.comment)
-        size = _SIZE.search(" ".join(filter(None, (part.footprint, part.description))))
+        size = _size(part)
         if value is None or not size:
             continue
         rating = frozenset(
-            token.replace(" ", "").lower()
+            _rating(token)
             for token in _RATING.findall(" ".join(filter(None, (part.description, part.comment))))
         )
-        key = (prefix[1].upper(), value, size[1], rating)
+        key = (prefix[1].upper(), value, size, rating)
         groups[key][part.mpn].append(part.designator)
-    for (kind, _value, size, _rating), by_mpn in groups.items():
+    for (kind, _value, size, rating), by_mpn in groups.items():
         if len(by_mpn) < 2:
             continue
+        if not rating and kind in ("L", "FB"):
+            continue  # inductors and beads differ in current ratings the text does not give
         mpns = sorted(by_mpn)
         common = len(_common_prefix(mpns))
         if common >= 0.6 * min(len(mpn) for mpn in mpns):
             continue  # one series: packaging or tolerance suffixes
+        basis = (
+            "the same ratings in their text" if rating
+            else "no rating in their text to tell them apart"
+        )
         findings.append(_finding(
             "consolidation", "info",
-            f"{len(mpns)} part numbers for one {kind} value in {size} with the same "
-            f"ratings: {', '.join(mpns[:4])}. Consider one part (or check they are "
-            "deliberate second sources).",
+            f"{len(mpns)} part numbers for one {kind} value in {size} with {basis}: "
+            f"{', '.join(mpns[:4])}. Consider one part (or check they are deliberate "
+            "second sources).",
             [d for designators in by_mpn.values() for d in designators], mpns=mpns,
         ))
 
@@ -238,14 +283,23 @@ def run_bom_checks(
     _check_mpn(fitted, findings)
     _check_consistency(fitted, findings)
     _check_consolidation(fitted, findings)
+    compiled = netlist.get("parts") or {}
     for clash in netlist.get("designator_clashes") or []:
-        # A clash can be with a compile-masked copy, which the compiled design leaves out.
+        # Clashes are between live parts (compile-masked copies are not recorded); one
+        # outside the compiled design (its sheet is not compiled) is not in the BOM.
+        refdes = clash.get("refdes") or ""
+        if compiled and not any(
+            name == refdes or re.fullmatch(
+                rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", name)
+            for name in compiled
+        ):
+            continue
         findings.append(_finding(
             "duplicate_designator", "warning",
-            f"{clash.get('refdes')} names {len(clash.get('lib_references') or [])} different "
-            f"parts on sheet {clash.get('sheet')}: only one can be in the BOM, unless the "
-            "others are compile-masked.",
-            [clash.get("refdes")] if clash.get("refdes") else [],
+            f"{refdes} names {len(clash.get('lib_references') or [])} different parts on "
+            f"sheet {clash.get('sheet')}: the BOM can hold only one, and the loaded data "
+            "keeps the last.",
+            [refdes] if refdes else [],
         ))
     for entry in getattr(plan, "stale", []) or []:
         findings.append(_finding(
@@ -253,16 +307,18 @@ def run_bom_checks(
             f"Variant entry for {entry['designator']}: {entry['detail']}.",
             [entry["designator"]] if entry.get("designator") else [], reason=entry["issue"],
         ))
-    compiled = netlist.get("parts") or {}
-    if compiled:
-        uncompiled = [name for name in netlist.get("components") or {} if name not in compiled]
-        if uncompiled:
-            findings.append(_finding(
-                "not_compiled", "info",
-                f"{len(uncompiled)} sheet parts are not in the compiled design (compile "
-                "masks, or sheets outside the project) and are not in the BOM.",
-                uncompiled[:30], count=len(uncompiled),
-            ))
+    components = netlist.get("components") or {}
+    uncompiled = (
+        [name for name in components if name not in compiled] if compiled
+        else [name for name, meta in components.items() if meta.get("compile_masked")]
+    )
+    if uncompiled:
+        findings.append(_finding(
+            "not_compiled", "info",
+            f"{len(uncompiled)} sheet parts are not in the compiled design (compile "
+            "masks, or sheets outside the project) and are not in the BOM.",
+            uncompiled[:30], count=len(uncompiled),
+        ))
     wanted = set(requested or CHECKS)
     findings = [finding for finding in findings if finding["check"] in wanted]
     findings.sort(key=lambda finding: (

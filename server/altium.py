@@ -106,10 +106,11 @@ def enrich_netlist_sheets(
             _file_entry(result, refdes, entry)
             continue
 
-        # Subsheet fan-out: look for refdesA, refdesB, ... among the compiled names
+        # Subsheet fan-out: look for refdesA, refdesB, ... among the compiled names. A
+        # compile-masked part is not compiled, so it has no channel copies.
         suffixed = [
             r for r in names
-            if r not in taken
+            if r not in taken and not meta.compile_masked
             and re.fullmatch(rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", r)
         ]
         if suffixed:
@@ -144,16 +145,22 @@ def _file_entry(result: dict, name: str, entry: dict) -> None:
     reach here once per sheet: the latest entry is kept as before, with every part's
     unique IDs, footprints and pin designators united, since the PCB carries only one
     part's unique ID. Two different parts drawn with one designator (one usually
-    compile-masked) also meet here; footprint_by_uid keeps each one's footprint."""
+    compile-masked) also meet here: a compile-masked copy never replaces a live part's
+    fields (parameters, description, kind), and footprint_by_uid keeps each one's
+    footprint."""
     held = result.get(name)
     if held:
+        keep = entry.get("compile_masked") and not held.get("compile_masked")
+        winner, other = (held, entry) if keep else (entry, held)
+        merged = dict(winner)
         for key in _PART_LISTS:
-            entry[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
-        entry["footprint"] = entry.get("footprint") or held.get("footprint")
-        entry["footprint_by_uid"] = {
+            merged[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
+        if not other.get("compile_masked") or winner.get("compile_masked"):
+            merged["footprint"] = winner.get("footprint") or other.get("footprint")
+        merged["footprint_by_uid"] = {
             **held.get("footprint_by_uid", {}), **entry.get("footprint_by_uid", {})
         }
-        entry["kind"] = entry.get("kind") or held.get("kind", 0)
+        entry = merged
     result[name] = entry
 
 
@@ -269,6 +276,7 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "params": dict(meta.params),
         "lib_reference": meta.lib_reference,
         "design_item_id": meta.design_item_id,
+        "compile_masked": meta.compile_masked,
     }
 
 

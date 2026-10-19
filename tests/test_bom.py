@@ -2,18 +2,19 @@
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 import server.main as main_mod
-from server.altium import AltiumClient
+from server.altium import AltiumClient, enrich_netlist_sheets
 from server.parsers.prj_pcb import (
     VariantDefinition, VariantState, Variation, parse_prj_pcb,
 )
-from server.parsers.sch_doc import components_from_stream
+from server.parsers.sch_doc import ComponentMeta, components_from_stream
 from server.services.bom import (
-    BASE_VARIANT, build_parts, compare_variants, group_lines, part_numbers, plan_variant,
-    resolve, to_csv,
+    BASE_VARIANT, BomPart, build_parts, compare_variants, group_lines, part_numbers,
+    plan_variant, resolve, to_csv, variant_names,
 )
 from server.services.bom_checks import normalize_value, run_bom_checks
 from tests.test_sch_doc_parser import _stream
@@ -212,6 +213,18 @@ def test_value_normalisation():
     assert normalize_value("4k7") == normalize_value("4.7k") == 4700.0
     assert normalize_value("4R7") == 4.7 and normalize_value("1M") != normalize_value("1m")
     assert normalize_value("abc") == "abc"
+    # Upper-case units, comma decimals, thousands, a leading dot, 3V3, MEG.
+    assert normalize_value("100NF") == normalize_value("100nF")
+    assert normalize_value("10UF") != normalize_value("10PF")
+    assert normalize_value("4,7k") == 4700.0 and normalize_value("4,99k") == 4990.0
+    assert normalize_value("1,000pF") == normalize_value("1nF")
+    assert normalize_value(".1uF") == normalize_value("0.1uF")
+    assert normalize_value("3V3") == normalize_value("3.3V") == 3.3
+    assert normalize_value("1MEG") == normalize_value("1M")
+    # Part numbers and E notation stay text instead of reading as their first digits.
+    assert normalize_value("0402WGF1000TCE") != normalize_value("0402WGF4701TCE")
+    assert normalize_value("4E7") != normalize_value("4E3")
+    assert isinstance(normalize_value("1N4148"), str)
 
 
 def _checks(netlist, **kwargs):
@@ -273,8 +286,41 @@ def test_consolidation_candidates():
         netlist["components"][name]["description"] = "RES 10K 1% 0603"
     (finding,) = [f for f in _checks(netlist)["findings"] if f["check"] == "consolidation"]
     assert finding["mpns"] == ["ERJ-3EKF1002V", "RC0603FR-0710KL"]
+    assert "the same ratings" in finding["issue"]
     netlist["components"]["R3"]["description"] = "RES 10K 0.1% 0603"  # another rating
     assert not [f for f in _checks(netlist)["findings"] if f["check"] == "consolidation"]
+    # One series (packaging suffixes) is not a candidate.
+    netlist["components"]["R3"]["description"] = "RES 10K 1% 0603"
+    netlist["components"]["R3"]["params"]["manufacturer part number 1"] = "RC0603FR-0710KP"
+    assert not [f for f in _checks(netlist)["findings"] if f["check"] == "consolidation"]
+
+
+def _consolidation(parts):
+    return [f for f in run_bom_checks(parts, {})["findings"] if f["check"] == "consolidation"]
+
+
+def test_consolidation_reads_metric_sizes_and_current_ratings():
+    caps = [BomPart(designator="C7", value="1nF", footprint="CAPC0603X33N", mpn="AAA1"),
+            BomPart(designator="C8", value="1nF", footprint="C0603", mpn="BBB2")]
+    assert not _consolidation(caps)  # IPC CAPC0603 is a metric 0603: an imperial 0201
+    caps[0].footprint = "CAPC1608X90N"
+    (finding,) = _consolidation(caps)
+    assert "0603" in finding["issue"] and "no rating" in finding["issue"]
+    coils = [BomPart(designator="L1", value="10uH", footprint="IND_1210", mpn="LLL1",
+                     description="Inductor 10uH 20% 1A"),
+             BomPart(designator="L2", value="10uH", footprint="IND_1210", mpn="MMM2",
+                     description="Inductor 10uH 20% 3.5A")]
+    assert not _consolidation(coils)  # current ratings differ
+    for coil in coils:
+        coil.description = "Inductor"
+    assert not _consolidation(coils)  # no rating to compare: not suggested
+
+
+def test_generic_descriptions_without_mpn():
+    parts = [BomPart(designator="R1", value="10k", footprint="R0603", description="Resistor")]
+    (finding,) = [f for f in run_bom_checks(parts, {})["findings"]
+                  if f["check"] == "placeholder_description"]
+    assert finding["severity"] == "info" and finding["designators"] == ["R1"]
 
 
 def test_unresolved_strings_footprints_and_clashes():
@@ -365,3 +411,238 @@ def test_bom_tools_need_a_project(monkeypatch):
 def test_tool_descriptions_mention_paging():
     assert "next_offset" in main_mod.get_bom.__doc__
     assert "next_offset" in main_mod.check_bom.__doc__
+
+
+def test_dnp_flags_bind_like_the_bom(bom_project):
+    state = main_mod._variant_state
+    main_mod._resolve_dnp_uids(state, bom_project)
+    state.set_variant("Lite")
+    # R9's UniqueId is on R3 now: every tool's DNP flag follows it, as get_bom does.
+    assert state.is_dnp("R2") and state.is_dnp("R3") and not state.is_dnp("R9")
+    assert json.loads(main_mod.list_variants())["variants"][1]["dnp_components"] == ["R2", "R3"]
+    assert json.loads(main_mod.get_bom())["not_fitted_designators"] == ["R2", "R3"]
+
+
+def test_designator_only_variants_and_variant_names(bom_project):
+    state = main_mod._variant_state
+    state._variants.append(VariantDefinition(name="Base", dnp_refdes=["R1", "TP1"]))
+    # A project's own 'Base' wins over the base-design alias; the alias still works.
+    based = json.loads(main_mod.get_bom(variant="Base"))
+    assert based["variant"] == "Base" and based["not_fitted_designators"] == ["R1"]
+    assert json.loads(main_mod.get_bom(variant=" none "))["variant"] == BASE_VARIANT
+    assert json.loads(main_mod.get_bom(variant=" Lite"))["variant"] == "Lite"
+    compared = json.loads(main_mod.get_bom(compare_variants=True))["variants"]
+    # TP1 (Standard (No BOM)) was never in the BOM, so it is no BOM difference.
+    assert {v["variant"]: v["not_fitted"] for v in compared}["Base"] == ["R1"]
+
+
+def test_parameter_variations_follow_their_variation():
+    netlist = _netlist()
+    variant = VariantDefinition(
+        name="V", variations=[Variation(designator="R1", unique_id="\\RUID2", kind=0)],
+        param_variations={"R1": {"comment": ("Comment", "VARIED")}},
+    )
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    assert set(plan.params) == {"R2"}  # the line's UniqueId is R2's
+    parts = {p.designator: p for p in build_parts(netlist, plan)[0]}
+    assert (parts["R1"].comment, parts["R2"].comment) == ("10k", "VARIED")
+    variant.variations[0].kind = 1
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    assert ("R2", "varied_but_not_fitted") in {(e["designator"], e["issue"]) for e in plan.stale}
+
+
+def test_an_ambiguous_unique_id_is_reported():
+    netlist = {
+        "nets": {}, "pin_to_net": {}, "parts": {"R1_A": {}, "R1_B": {}},
+        "components": {"R1_A": _component("CH"), "R1_B": _component("CH")},
+    }
+    for designator in ("R?", "R1_X"):
+        variant = VariantDefinition(name="V", variations=[
+            Variation(designator=designator, unique_id="\\SYM\\CH", kind=1),
+        ])
+        plan = plan_variant(variant, netlist, variant_names(netlist))
+        assert plan.not_fitted == {"R1_A", "R1_B"}
+        assert [e["issue"] for e in plan.stale] == ["ambiguous_unique_id"]
+    variant.variations[0].designator = "R1_B"
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    assert (plan.not_fitted, plan.stale) == ({"R1_B"}, [])
+
+
+def test_alternate_parts_take_the_variant_footprint(variants):
+    netlist = _netlist()
+    lite = variants.variants[1]
+    plan = plan_variant(lite, netlist, variant_names(netlist))
+    c1 = next(p for p in build_parts(netlist, plan)[0] if p.designator == "C1")
+    assert (c1.footprint, c1.alternate_part) == ("C0402", "CAP")
+    assert group_lines([c1])[0]["alternate_parts"] == {"C1": "CAP"}
+    (diff,) = compare_variants(netlist, [lite], variant_names(netlist))
+    changed = next(c for c in diff["changed"] if c["designator"] == "C1")
+    assert changed["footprint"] == {"from": "C0603", "to": "C0402"}
+    assert changed["alternate_part"] == "CAP"
+
+
+def test_refresh_reads_variants_saved_since_load(bom_project, monkeypatch, tmp_path):
+    (tmp_path / "Demo.PrjPcb").write_text(
+        PRJ.replace(
+            "Description=Full\nVariationCount=0",
+            "Description=Full\nVariationCount=1\nVariation1=Designator=R1|UniqueId=\\RUID1|Kind=1",
+        ) + "\n[ProjectVariant3]\nDescription=New\n",
+        encoding="utf-8",
+    )
+    altium = MagicMock(_netlist=bom_project)
+    altium.generate_netlist.return_value = True
+    monkeypatch.setattr(main_mod, "_altium", altium)
+    monkeypatch.setattr(main_mod, "_pcb_session", MagicMock())
+    monkeypatch.setattr(main_mod, "upsert_registry_entry", MagicMock())
+    main_mod._variant_state.set_variant("Lite")
+    main_mod.refresh_netlist()
+    state = main_mod._variant_state
+    assert state.active.name == "Lite" and state.get("New") is not None
+    assert json.loads(main_mod.get_bom(variant="Full"))["not_fitted_designators"] == ["R1"]
+
+
+# ---------- compile masks ----------
+
+def _masked_sheet(*components) -> bytes:
+    """A sheet with one compile mask over x < 100; components are (designator, uid,
+    value, x) single-part resistors."""
+    records = ["|RECORD=211|Location.X=0|Location.Y=0|Corner.X=100|Corner.Y=100"]
+    for designator, uid, value, x in components:
+        owner = len(records)  # the RECORD=1's position (header first) minus one
+        records += [
+            f"|RECORD=1|LibReference=RES|UniqueID={uid}|CurrentPartId=1|PartCount=2"
+            f"|Location.X={x}|Location.Y=50",
+            f"|RECORD=34|OwnerIndex={owner}|Name=Designator|Text={designator}",
+            f"|RECORD=41|OwnerIndex={owner}|Name=Value|Text={value}",
+        ]
+    return _stream(*records)
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_a_compile_masked_copy_never_replaces_the_live_part(order):
+    clashes = []
+    copies = [("R1", "LIVEAAAA", "10k", 500), ("R1", "MASKAAAA", "1k", 50)][::order]
+    r1 = components_from_stream(_masked_sheet(*copies), clashes=clashes)["R1"]
+    assert (r1.unique_id, r1.value, r1.compile_masked, clashes) == ("LIVEAAAA", "10k", False, [])
+    alone = components_from_stream(_masked_sheet(("R2", "MASKBBBB", "1k", 50)))["R2"]
+    assert alone.compile_masked
+    components_from_stream(
+        _masked_sheet(("R4", "MASKCCCC", "1k", 50), ("R4", "MASKDDDD", "2k", 60)),
+        clashes=clashes,
+    )
+    assert clashes == []  # neither masked copy is compiled
+    clashes = []
+    components_from_stream(
+        _masked_sheet(("R3", "LIVECCCC", "1k", 500), ("R3", "LIVEDDDD", "2k", 600)),
+        clashes=clashes,
+    )
+    assert [clash.refdes for clash in clashes] == ["R3"]  # two live parts still clash
+
+
+@pytest.mark.parametrize("order", [1, -1])
+def test_masked_copies_on_other_sheets_keep_the_live_fields(order):
+    live = ComponentMeta(refdes="R1", unique_id="LIVE", unique_ids=["LIVE"],
+                         params={"value": "10k"}, footprint="R0603")
+    masked = ComponentMeta(refdes="R1", unique_id="MASK", unique_ids=["MASK"], kind=5,
+                           params={"value": "1k"}, footprint="R0402", compile_masked=True)
+    netlist = {"nets": {}, "pin_to_net": {}, "parts": {"R1": {"footprint": "R0603"}}}
+    enrich_netlist_sheets(netlist, [("A", {"R1": live}), ("B", {"R1": masked})][::order])
+    r1 = netlist["components"]["R1"]
+    assert (r1["params"], r1["kind"], r1["footprint"], r1["sheet"]) == (
+        {"value": "10k"}, 0, "R0603", "A",
+    )
+    assert sorted(r1["unique_ids"]) == ["LIVE", "MASK"]
+
+
+def test_sheet_only_boms_leave_compile_masked_parts_out():
+    netlist = _netlist()
+    del netlist["parts"]
+    netlist["components"]["MASKED"]["compile_masked"] = True
+    parts, _ = build_parts(netlist)
+    assert "MASKED" not in {p.designator for p in parts}
+    (finding,) = [f for f in run_bom_checks(parts, netlist)["findings"]
+                  if f["check"] == "not_compiled"]
+    assert finding["designators"] == ["MASKED"]
+
+
+def test_duplicate_designators_outside_the_compiled_design_are_skipped():
+    netlist = _netlist()
+    netlist["designator_clashes"] = [
+        {"sheet": "Main", "refdes": "R2", "lib_references": ["RES", "CAP"]},
+        {"sheet": "Old", "refdes": "Q7", "lib_references": ["A", "B"]},
+    ]
+    found = [f["designators"] for f in _checks(netlist)["findings"]
+             if f["check"] == "duplicate_designator"]
+    assert found == [["R2"]]
+
+
+# ---------- part numbers, lines and CSV ----------
+
+def test_part_numbers_resolve_project_parameters_and_csv_cells_stay_text():
+    netlist = _netlist()
+    params = netlist["components"]["R3"]["params"]
+    del params["manufacturer part number 1"]
+    params.update({"part number": "=ProjPN", "manufacturer 1": "=Maker", "comment": "=Missing"})
+    netlist["components"]["R3"]["description"] = "+5V LDO"
+    r3 = next(p for p in build_parts(netlist, project_params={"ProjPN": "PN-7"})[0]
+              if p.designator == "R3")
+    assert (r3.mpn, r3.manufacturer, r3.unresolved) == ("PN-7", "=Maker", ["=Missing", "=Maker"])
+    text = to_csv(group_lines([r3]))
+    assert "'=Missing" in text and "'+5V LDO" in text and "'=Maker" in text
+
+
+def test_placeholder_part_numbers():
+    netlist = _netlist()
+    for name, text in (("R1", "N/A"), ("R2", "-"), ("R3", "TBD")):
+        netlist["components"][name]["params"]["manufacturer part number 1"] = text
+    parts = {p.designator: p for p in build_parts(netlist)[0]}
+    assert (parts["R1"].mpn, parts["R1"].mpn_placeholder) == (None, "N/A")
+    findings = _checks(netlist)["findings"]
+    # 'N/A' and '-' say there is none on purpose; 'TBD' still needs one.
+    missing = [d for f in findings if f["check"] == "missing_mpn" for d in f["designators"]]
+    assert missing == ["R3"]
+    assert [f["mpn"] for f in findings if f["check"] == "mpn_without_manufacturer"] == ["CL10B104"]
+    assert not [f for f in findings if f["check"] == "mpn_inconsistent"]
+    line = next(line for line in group_lines(list(parts.values())) if "R1" in line["designators"])
+    assert line["mpn_placeholder"] == "N/A" and "N/A" in to_csv([line])
+
+
+def test_lines_map_logical_designators_and_list_what_varies():
+    parts = [BomPart(designator=d, comment="49R9", footprint="R0402", logical=logical,
+                     mpn=mpn, description=text, mpn_source="part number")
+             for d, logical, mpn, text in (("C3", None, "AAA", "49.9 Ohm"),
+                                           ("C27", "C3", "BBB", "39 Ohm"),
+                                           ("C28", "C4", "AAA", "49.9 Ohm"))]
+    (line,) = group_lines(parts, "comment")
+    assert line["logical_designators"] == {"C27": "C3", "C28": "C4"}
+    assert line["varies"] == {"description": ["49.9 Ohm", "39 Ohm"], "mpn": ["AAA", "BBB"]}
+    assert line["mpn_source"] == "part number"
+    assert "AAA / BBB" in to_csv([line])
+
+
+def test_comment_fallback_and_description_variation():
+    netlist = _netlist()
+    params = netlist["components"]["R3"]["params"]
+    del params["comment"]
+    variant = VariantDefinition(
+        name="V", param_variations={"R3": {"description": ("Description", "RES 1K 0.1%")}},
+    )
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    r3 = next(p for p in build_parts(netlist, plan)[0] if p.designator == "R3")
+    assert (r3.comment, r3.description) == ("1k", "RES 1K 0.1%")  # Comment from the .NET
+    assert group_lines([r3])[0]["varied_parameters"] == ["Description"]
+
+
+def test_check_bom_tool_paths(bom_project, monkeypatch):
+    assert json.loads(main_mod.check_bom(variant="Nope"))["error"] == "variant_not_found"
+    lite = json.loads(main_mod.check_bom(variant="Lite"))
+    assert lite["summary"]["stale_variant_entry"] == 1
+    for index in range(10, 160):
+        bom_project["parts"][f"R{index}"] = {"footprint": "R0603"}
+        bom_project["components"][f"R{index}"] = _component(f"U{index}", comment=f"=Nope{index}")
+    monkeypatch.setattr(main_mod, "QUERY_NET_MAX_RESULT_SIZE_CHARS", 9000)
+    checked = json.loads(main_mod.check_bom())
+    assert checked["findings_limited_to"] in (40, 15) and "next_offset" in checked
+    monkeypatch.setitem(bom_project, "components", {})
+    assert json.loads(main_mod.get_bom())["error"] == "no_components_loaded"
+    assert json.loads(main_mod.check_bom())["error"] == "no_components_loaded"
