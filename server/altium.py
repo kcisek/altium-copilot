@@ -266,6 +266,9 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "footprints": list(meta.footprints),
         "kind": meta.kind,
         "pin_designators": list(meta.pin_designators),
+        "params": dict(meta.params),
+        "lib_reference": meta.lib_reference,
+        "design_item_id": meta.design_item_id,
     }
 
 

@@ -6,6 +6,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- A variant's Not Fitted entry (Kind=1) that still carries an AlternatePart (Altium leaves
+  some behind, e.g. 'NP') now makes the part DNP; it was read as fitted
 - Protel netlist members whose pin designator holds a '-' (a battery's '-' pin, written
   `BT1--`) are split at the rightmost '-' that leaves a known part, so the pin no longer
   becomes a phantom part `BT1-` with an empty pin. The .NET is read as UTF-8, falling
@@ -139,6 +141,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- Bill of materials per variant. `get_bom` lists lines (quantity, designators, Comment,
+  description, value, footprint, manufacturer, manufacturer part number) built from the
+  compiled parts, so compile-masked parts stay out, without Graphical, Net Tie and
+  Standard (No BOM) parts and without the variant's Not Fitted parts, with its parameter
+  variations applied. Variants bind to parts by UniqueId as Altium does, so a stale
+  designator in the project file does not pick the wrong part. The MPN comes from part
+  parameters (the spellings libraries use for 'Manufacturer Part Number 1', paired with
+  its manufacturer), never from Comment; special strings such as '=Value' are resolved.
+  Lines group by MPN, else Comment and footprint; variants can be compared and the lines
+  returned as CSV. `check_bom` runs offline hygiene checks: duplicate designators,
+  unresolved special strings, fitted parts marked DNP in their text, parts without a
+  footprint, one MPN with different values/descriptions/footprints, MPNs without a
+  manufacturer, parts without an MPN (where the project keeps MPNs in parameters),
+  placeholder descriptions, stale variant entries, consolidation candidates among
+  passives, and sheet parts outside the compiled design. The sheets now keep every
+  parameter and the library reference, and the project file's variants are read in full
+  (alternate parts, parameter variations, CurrentVariant)
 - `get_drc_report`: reads Altium's last Batch DRC report ('Design Rule Check - <PcbDoc>'
   .html or .drc in the project's output folder) and explains it. Violations are grouped by
   rule, component or net and linked to the board (components and nets through 'Pad

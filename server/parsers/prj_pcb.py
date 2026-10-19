@@ -5,10 +5,33 @@ from pathlib import Path
 
 
 @dataclass
+class Variation:
+    """One component variation of a variant ([ProjectVariantN] VariationN).
+
+    kind: 1 Not Fitted, 2 an alternate part (AltLibLink_* fields), 0 fitted with
+    parameter variations. Altium keys variations by the component's UniqueId path; the
+    designator is what it was when the variation was made.
+    """
+
+    designator: str
+    unique_id: str  # as written, e.g. \\SHEETSYMBOL\\COMPONENT
+    kind: int
+    alternate_part: str = ""
+    alt: dict[str, str] = field(default_factory=dict)  # AltLibLink_* without the prefix
+
+    @property
+    def uid_tail(self) -> str:
+        return self.unique_id.rsplit("\\", 1)[-1]
+
+
+@dataclass
 class VariantDefinition:
     name: str
     dnp_refdes: list[str] = field(default_factory=list)
     dnp_uid: list[str] = field(default_factory=list)  # UniqueIds for stale R? designators
+    variations: list[Variation] = field(default_factory=list)
+    # Parameter variations by designator: lower-case parameter name -> (name, value).
+    param_variations: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -24,6 +47,8 @@ class PrjPcbData:
     # 'Project Outputs for <project>' and 'Project Logs for <project>').
     output_path: str = ""
     log_folder_path: str = ""
+    # [Design] CurrentVariant: the variant last active in Altium.
+    current_variant: str = ""
 
 
 def parse_prj_pcb(path: str) -> PrjPcbData:
@@ -42,6 +67,7 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
         annotation_paths=_extract_documents(sections, project_dir, ".annotation"),
         output_path=_design_field(sections, "OutputPath"),
         log_folder_path=_design_field(sections, "LogFolderPath"),
+        current_variant=_design_field(sections, "CurrentVariant"),
     )
 
 
@@ -152,15 +178,32 @@ def _extract_format_a(sections: list[tuple[str, list[str]]]) -> list[VariantDefi
             continue
         dnp: list[str] = []
         dnp_uid: list[str] = []
+        variations: list[Variation] = []
+        designators: dict[str, str] = {}
+        values: dict[str, str] = {}
         for line in lines:
+            pair = re.match(r"^\s*(ParamDesignator|ParamVariation)(\d+)=(.*)$", line,
+                            re.IGNORECASE)
+            if pair:
+                target = designators if pair.group(1).lower() == "paramdesignator" else values
+                target[pair.group(2)] = pair.group(3).strip()
+                continue
             m = re.match(r"^\s*Variation\d+=(.+)$", line, re.IGNORECASE)
             if not m:
                 continue
             props = _parse_inline_props(m.group(1))
             designator = props.get("Designator", "")
             kind = props.get("Kind", "")
-            alternate = props.get("AlternatePart", "")
-            if kind != "1" or alternate != "":
+            variations.append(Variation(
+                designator=designator,
+                unique_id=props.get("UniqueId", ""),
+                kind=int(kind) if kind.isdigit() else 0,
+                alternate_part=props.get("AlternatePart", ""),
+                alt={key[len("AltLibLink_"):]: value for key, value in props.items()
+                     if key.startswith("AltLibLink_")},
+            ))
+            # Not Fitted, whatever AlternatePart holds (Altium leaves some behind).
+            if kind != "1":
                 continue
             uid = _normalize_uid(props.get("UniqueId", ""))
             if designator and "?" not in designator:
@@ -168,7 +211,18 @@ def _extract_format_a(sections: list[tuple[str, list[str]]]) -> list[VariantDefi
             elif uid:
                 # Stale designator — defer resolution to uid map built from schematics
                 dnp_uid.append(uid)
-        variants.append(VariantDefinition(name=name, dnp_refdes=dnp, dnp_uid=dnp_uid))
+        param_variations: dict[str, dict[str, tuple[str, str]]] = {}
+        for index, designator in designators.items():
+            fields = _parse_inline_props(values.get(index, ""))
+            parameter = fields.get("ParameterName", "")
+            if designator and parameter:
+                param_variations.setdefault(designator, {})[parameter.lower()] = (
+                    parameter, fields.get("VariantValue", ""),
+                )
+        variants.append(VariantDefinition(
+            name=name, dnp_refdes=dnp, dnp_uid=dnp_uid, variations=variations,
+            param_variations=param_variations,
+        ))
     return variants or [VariantDefinition(name="Default")]
 
 
@@ -208,6 +262,13 @@ class VariantState:
     @property
     def active(self) -> VariantDefinition:
         return self._active
+
+    @property
+    def variants(self) -> list[VariantDefinition]:
+        return list(self._variants)
+
+    def get(self, name: str) -> VariantDefinition | None:
+        return next((v for v in self._variants if v.name.lower() == name.lower()), None)
 
 def _extract_format_b(sections: list[tuple[str, list[str]]]) -> list[VariantDefinition]:
     variants: list[VariantDefinition] = []

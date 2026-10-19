@@ -29,6 +29,11 @@ class ComponentMeta:
     kind: int = 0
     # Every pin designator, unnamed pins included (pins drops those).
     pin_designators: list[str] = field(default_factory=list)
+    # Every parameter as written (lower-case name -> text; the first part's wins), for
+    # the BOM. mpn above falls back to Comment; params does not.
+    params: dict[str, str] = field(default_factory=dict)
+    lib_reference: str = ""
+    design_item_id: str = ""
 
 
 @dataclass
@@ -146,6 +151,10 @@ def _merge_part_lists(target: ComponentMeta, other: ComponentMeta) -> None:
         held.extend(item for item in getattr(other, name) if item not in held)
     target.footprint = target.footprint or other.footprint
     target.kind = target.kind or other.kind
+    for name, text in other.params.items():
+        target.params.setdefault(name, text)
+    target.lib_reference = target.lib_reference or other.lib_reference
+    target.design_item_id = target.design_item_id or other.design_item_id
 
 
 def _merge_parts(
@@ -282,6 +291,8 @@ def _handle_component(
             unique_id=uid,
             unique_ids=[uid] if uid else [],
             kind=_component_kind(props),
+            lib_reference=props.get("libreference", ""),
+            design_item_id=props.get("designitemid", ""),
         )
         components_by_owner[owner_key] = comp
         canonical_owner[owner_key] = owner_key
@@ -378,6 +389,8 @@ def _handle_parameter(
     if key not in components_by_owner:
         return
     comp = components_by_owner[key]
+    if name:
+        comp.params.setdefault(name, text)
 
     if name == "value":
         comp.value = text
