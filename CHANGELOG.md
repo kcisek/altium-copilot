@@ -131,6 +131,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- `check_sch_pcb_sync`: an offline Project > Show Differences. It compares the compiled
+  schematic netlist with the saved PcbDoc and reports parts missing from or extra on the
+  PCB, designator, footprint and comment differences, pads whose net differs from their
+  pin's, renamed nets, nets on one side only, and schematic pins whose placed footprint
+  has no pad (Update PCB stops with 'Unknown Pin'). Components link by unique ID first and
+  by designator second; nets match by shared members first and by name second, with the
+  project's Comparator settings. Mechanical and graphical parts, variant alternates, net
+  ties and jumpers are handled as Altium does, and every finding names its Altium
+  difference type. Sheets saved after the PcbDoc are listed as the likely cause. To feed
+  it, the Protel netlist's part list (footprint, comment) is now read, the sheets give
+  each part's unique IDs, footprint models, kind and pin designators, and the PcbDoc gives
+  component kind and comment text (from WideStrings6, so µ and Ω survive)
 - Impedance profiles from the Layer Stack Manager: `get_board_info` lists each profile's
   target and tolerance, its solved trace width/gap, calculated impedance and reference
   layers per signal layer, a derived propagation delay, the rules that use it, and issues

@@ -41,6 +41,7 @@ try:
     from services.impedance import (
         PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
     )
+    from services.sch_pcb_sync import net_matching_options, run_sync_check
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -71,6 +72,7 @@ except ImportError:
     from server.services.impedance import (
         PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
     )
+    from server.services.sch_pcb_sync import net_matching_options, run_sync_check
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -258,7 +260,12 @@ component locations, distances):
     against tolerance, in-pair skew. get_signal_length measures one net, pair or xSignal.
 11. check_diff_pairs — undeclared pairs, polarity swaps at pins, AC-coupling symmetry,
     in-pair skew against within-pair rules.
-12. constraints_review — call when the user asks to review or verify the PCB's high-speed
+12. check_sch_pcb_sync — "is the PCB in sync with the schematic?", "did I forget Update
+    PCB?", before a release: an offline Show Differences (missing/extra parts, designator,
+    footprint and comment changes, pads on the wrong net, renamed or one-sided nets) plus
+    the ECO's 'Unknown Pin' failures. Name sheets saved after the PcbDoc as the likely
+    cause, and say Altium's Show Differences is the final word.
+13. constraints_review — call when the user asks to review or verify the PCB's high-speed
     constraints or the routing against them ("check my high-speed rules", "are my DDR
     length rules right?", "review the diff pairs before fab"): a whole-interface audit
     of rules and copper against each chip's layout guide. For one net use
@@ -2623,6 +2630,77 @@ def check_diff_pairs(
     if "error" in result:
         return json.dumps(result)
     return json.dumps(_convert_units(result, to_mm), indent=2)
+
+
+def _sheets_saved_after(project: dict, pcb_path: Path) -> list[str]:
+    """Sheets saved after the PcbDoc: their changes may not be on the board yet."""
+    pcb_saved = pcb_path.stat().st_mtime
+    newer = []
+    for sheet in project.get("sheets", []):
+        try:
+            if Path(sheet["path"]).stat().st_mtime > pcb_saved:
+                newer.append(sheet["name"])
+        except OSError:
+            continue
+    return newer
+
+
+@mcp.tool(
+    title="Check Schematic-PCB Sync",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
+    """Compare the schematic with the saved PCB offline, like Altium's Project > Show
+    Differences: parts missing from or extra on the PCB, designator, footprint and comment
+    differences, pads whose net differs from their pin's, renamed nets, nets on one side
+    only, and schematic pins whose placed footprint has no pad (Update PCB stops with
+    'Unknown Pin'). Parts link by unique ID, then designator; nets by shared members, then
+    name (the project's Comparator settings). The schematic side is the compiled netlist
+    from the last load or refresh_netlist.
+
+    checks narrows to components, pins, nets. Findings are paginated (offset from
+    next_offset), errors first; each names the Altium difference type in altium_names."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    project, netlist, variant_state = _require_project()
+    pcb_path = Path(project["pcb_doc_paths"][0])
+    newer = _sheets_saved_after(project, pcb_path)
+    options = net_matching_options(project.get("prj_pcb_path"))
+    for limit in (100, 30, 10):
+        result = run_sync_check(
+            index,
+            netlist,
+            is_dnp=variant_state.is_dnp,
+            checks=checks,
+            offset=offset,
+            limit=limit,
+            sheets_saved_after_pcb=newer,
+            net_matching=options,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        result = {
+            "pcb_doc": pcb_path.name,
+            "pcb_saved_utc": datetime.fromtimestamp(
+                pcb_path.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+            "netlist_updated_utc": _netlist_last_updated,
+            "sheets_saved_after_pcb": newer,
+            **result,
+        }
+        if len(project["pcb_doc_paths"]) > 1:
+            result["note"] = (
+                f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; compared with "
+                f"'{pcb_path.name}'."
+            )
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
 
 
 SCHEMATIC_REVIEW_PROMPT = """\

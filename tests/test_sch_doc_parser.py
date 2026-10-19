@@ -343,3 +343,47 @@ def test_parse_sch_doc_reports_clashes():
         result = parse_sch_doc("Power.SchDoc", clashes)
     assert result["U5"].unique_id == "BBBB0001"
     assert clashes == [DesignatorClash("U5", ["LDO", "LM339"])]
+
+
+# ---------- footprints, kind, unique IDs and pin designators (sync check) ----------
+
+def test_current_footprint_from_the_fixture(sheet1):
+    assert sheet1["R11"].footprint == "R0603_0.55MM"
+    assert sheet1["R11"].unique_ids == [sheet1["R11"].unique_id]
+
+
+def test_footprint_models_kind_and_pin_designators():
+    # A child's OwnerIndex is its owner's position - 1; RECORD=45 models own to RECORD=44.
+    data = _stream(
+        "|RECORD=1|LibReference=NT|UniqueID=AAAAAAAA|ComponentKind=4",                  # 1
+        "|RECORD=34|OwnerIndex=0|Name=Designator|Text=NT1",                            # 2
+        "|RECORD=2|OwnerIndex=0|Designator=1|Name=?",                                  # 3
+        "|RECORD=2|OwnerIndex=0|Designator=2|Name=B",                                  # 4
+        "|RECORD=44|OwnerIndex=0",                                                     # 5
+        "|RECORD=45|OwnerIndex=4|ModelName=NT_SMALL|ModelType=PCBLIB",                 # 6
+        "|RECORD=45|OwnerIndex=4|ModelName=NT_LARGE|ModelType=PCBLIB|IsCurrent=T",     # 7
+        "|RECORD=45|OwnerIndex=4|ModelName=NT_SIM|ModelType=SIM|IsCurrent=T",          # 8
+        "|RECORD=1|LibReference=TP|UniqueID=BBBBBBBB|ComponentKind=0|ComponentKindVersion2=5",  # 9
+        "|RECORD=34|OwnerIndex=8|Name=Designator|Text=TP1",                            # 10
+    )
+    parts = components_from_stream(data)
+    nt1 = parts["NT1"]
+    assert (nt1.footprint, nt1.footprints, nt1.kind) == ("NT_LARGE", ["NT_SMALL", "NT_LARGE"], 4)
+    assert nt1.pin_designators == ["1", "2"]  # pins keeps named ones only
+    assert nt1.pins == {"2": "B"}
+    assert (parts["TP1"].kind, parts["TP1"].footprint) == (5, None)
+
+
+def test_parts_with_their_own_unique_ids_keep_every_id():
+    data = _stream(
+        "|RECORD=1|LibReference=OPA|UniqueID=PARTAAAA|CurrentPartId=1|PartCount=3",    # 1
+        "|RECORD=34|OwnerIndex=0|Name=Designator|Text=U1",                             # 2
+        "|RECORD=1|LibReference=OPA|UniqueID=PARTBBBB|CurrentPartId=2|PartCount=3",    # 3
+        "|RECORD=34|OwnerIndex=2|Name=Designator|Text=U1",                             # 4
+        "|RECORD=44|OwnerIndex=2",                                                     # 5
+        "|RECORD=45|OwnerIndex=4|ModelName=SOIC8|ModelType=PCBLIB|IsCurrent=T",        # 6
+    )
+    u1 = components_from_stream(data)["U1"]
+    assert u1.unique_ids == ["PARTAAAA", "PARTBBBB"]
+    assert u1.unique_id == "PARTBBBB"  # the highest part's, as on the PCB
+    assert u1.footprint == "SOIC8"

@@ -366,3 +366,21 @@ def test_without_annotation_sheets_enrich_like_enrich_netlist():
     assert sorted(comps) == ["C1_A", "C1_B", "F1", "U1"]
     assert comps["C1_B"]["sheet"] == "Chan"
     assert not any("logical_refdes" in c for c in comps.values())
+
+
+def test_parts_of_one_component_on_two_sheets_unite_their_ids():
+    """A component split over sheets: the PCB carries one part's unique ID."""
+    netlist = _netlist("U1")
+    sheets = [
+        ("Power", {"U1": ComponentMeta(
+            refdes="U1", unique_id="PWR", unique_ids=["PWR"], footprint="BGA",
+            footprints=["BGA"], pin_designators=["A1"])}),
+        ("IO", {"U1": ComponentMeta(
+            refdes="U1", unique_id="IO", unique_ids=["IO"], footprint="BGA",
+            footprints=["BGA"], pin_designators=["B2"])}),
+    ]
+    comps = enrich_netlist_sheets(netlist, sheets)["components"]
+    assert comps["U1"]["unique_ids"] == ["PWR", "IO"]
+    assert comps["U1"]["pin_designators"] == ["A1", "B2"]
+    assert comps["U1"]["footprint_by_uid"] == {"PWR": "BGA", "IO": "BGA"}
+    assert comps["U1"]["sheet"] == "IO"  # the latest sheet, as before

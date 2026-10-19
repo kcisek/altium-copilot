@@ -17,6 +17,18 @@ class ComponentMeta:
     value: str | None = None
     unique_id: str = ""
     pins: dict[str, str] = field(default_factory=dict)  # pin_number -> pin_name
+    # Every part's UniqueID: parts placed separately keep their own, and the PCB
+    # carries only one of them (SOURCEUNIQUEID).
+    unique_ids: list[str] = field(default_factory=list)
+    # The current PCB footprint (RECORD=45 PCBLIB model with IsCurrent) and every
+    # footprint model the part offers, in file order.
+    footprint: str | None = None
+    footprints: list[str] = field(default_factory=list)
+    # ComponentKind: 0 Standard, 1 Mechanical, 2 Graphical, 3 Net Tie (In BOM),
+    # 4 Net Tie, 5 Standard (No BOM), 6 Jumper.
+    kind: int = 0
+    # Every pin designator, unnamed pins included (pins drops those).
+    pin_designators: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +72,7 @@ def components_from_stream(
     uid_seen: dict[str, int] = {}          # UniqueID -> canonical owner_key
     best_mpn_priority: dict[int, int] = {} # canonical owner_key -> lowest suffix seen (0 = best)
     parts: dict[int, _Part] = {}           # canonical owner_key -> which part it is
+    model_lists: dict[int, int] = {}       # RECORD=44 owner_key -> its component's owner_key
 
     for record_num, props in enumerate(_read_records(data)):
         record_type = props.get("record")
@@ -77,6 +90,13 @@ def components_from_stream(
             _handle_parameter(
                 props, components_by_owner, canonical_owner, best_mpn_priority
             )
+        elif record_type == "44":
+            # The component's implementation list; its models (RECORD=45) own to it.
+            key = _owner_key(props, canonical_owner)
+            if key is not None:
+                model_lists[record_num - 1] = key
+        elif record_type == "45":
+            _handle_model(props, components_by_owner, model_lists)
         # RECORD=17 (power ports) intentionally skipped
 
     return _merge_parts(components_by_owner, parts, best_mpn_priority, source, clashes)
@@ -110,12 +130,22 @@ class _Component:
         self.part_ids.add(part.part_id)
         for pin, name in meta.pins.items():
             self.meta.pins.setdefault(pin, name)
+        _merge_part_lists(self.meta, meta)
         self.meta.description = self.meta.description or meta.description
         self.meta.value = self.meta.value or meta.value
         if meta.mpn and (not self.meta.mpn or mpn_priority < self.mpn_priority):
             self.meta.mpn, self.mpn_priority = meta.mpn, mpn_priority
         if _part_number(part.part_id) > self.top_part:
             self.meta.unique_id, self.top_part = meta.unique_id, _part_number(part.part_id)
+
+
+def _merge_part_lists(target: ComponentMeta, other: ComponentMeta) -> None:
+    """Unite the identity and model lists of two parts of one component."""
+    for name in ("unique_ids", "footprints", "pin_designators"):
+        held = getattr(target, name)
+        held.extend(item for item in getattr(other, name) if item not in held)
+    target.footprint = target.footprint or other.footprint
+    target.kind = target.kind or other.kind
 
 
 def _merge_parts(
@@ -247,7 +277,12 @@ def _handle_component(
         # Subsequent part of a multi-part component — map to canonical owner_key
         canonical_owner[owner_key] = uid_seen[uid]
     else:
-        comp = ComponentMeta(description=desc, unique_id=uid)
+        comp = ComponentMeta(
+            description=desc,
+            unique_id=uid,
+            unique_ids=[uid] if uid else [],
+            kind=_component_kind(props),
+        )
         components_by_owner[owner_key] = comp
         canonical_owner[owner_key] = owner_key
         parts[owner_key] = _Part(
@@ -282,12 +317,45 @@ def _handle_pin(
     key = _owner_key(props, canonical_owner)
     name = props.get("name", "")
     designator = props.get("designator", "")
-    if key is None or not designator:
+    if key is None or not designator or key not in components_by_owner:
         return
+    component = components_by_owner[key]
+    if designator not in component.pin_designators:
+        component.pin_designators.append(designator)
     if not name or name == "?":
         return
-    if key in components_by_owner:
-        components_by_owner[key].pins[designator] = name
+    component.pins[designator] = name
+
+
+def _component_kind(props: dict[str, str]) -> int:
+    """ComponentKind, where ComponentKindVersion2 (e.g. 5, Standard (No BOM)) wins."""
+    for key in ("componentkindversion2", "componentkind"):
+        value = props.get(key, "")
+        if value.isdigit():
+            return int(value)
+    return 0
+
+
+def _handle_model(
+    props: dict[str, str],
+    components_by_owner: dict[int, ComponentMeta],
+    model_lists: dict[int, int],
+) -> None:
+    """A RECORD=45 model: PCBLIB models are the part's footprints."""
+    if props.get("modeltype", "").upper() != "PCBLIB":
+        return
+    try:
+        key = model_lists.get(int(props.get("ownerindex", "")))
+    except ValueError:
+        return
+    name = props.get("modelname", "")
+    if key is None or key not in components_by_owner or not name:
+        return
+    component = components_by_owner[key]
+    if name not in component.footprints:
+        component.footprints.append(name)
+    if props.get("iscurrent", "").upper() == "T" and not component.footprint:
+        component.footprint = name
 
 
 def _handle_parameter(

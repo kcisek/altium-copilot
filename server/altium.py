@@ -86,7 +86,7 @@ def enrich_netlist_sheets(
                 entry["sheet"] = sheet
                 if name != refdes:
                     entry["logical_refdes"] = refdes
-                result[name] = entry
+                _file_entry(result, name, entry)
 
     claimed = set(result)
     for sheet, refdes, meta in unannotated:
@@ -94,7 +94,7 @@ def enrich_netlist_sheets(
         if refdes in pin_to_net and refdes not in claimed:
             entry = _make_enriched(meta, pin_to_net[refdes])
             entry["sheet"] = sheet
-            result[refdes] = entry
+            _file_entry(result, refdes, entry)
             continue
 
         # Subsheet fan-out: look for refdesA, refdesB, ... in pin_to_net
@@ -107,7 +107,7 @@ def enrich_netlist_sheets(
             for suffixed_ref in suffixed:
                 entry = _make_enriched(meta, pin_to_net[suffixed_ref])
                 entry["sheet"] = sheet
-                result[suffixed_ref] = entry
+                _file_entry(result, suffixed_ref, entry)
             continue
 
         if refdes in claimed:
@@ -121,10 +121,31 @@ def enrich_netlist_sheets(
         # Still include so Claude can answer BOM questions about them.
         entry = _make_enriched(meta, {})
         entry["sheet"] = sheet
-        result[refdes] = entry
+        _file_entry(result, refdes, entry)
 
     netlist["components"] = result
     return netlist
+
+
+_PART_LISTS = ("unique_ids", "footprints", "pin_designators")
+
+
+def _file_entry(result: dict, name: str, entry: dict) -> None:
+    """File entry under name. The parts of one component placed on several sheets
+    reach here once per sheet: the latest entry is kept as before, with every part's
+    unique IDs, footprints and pin designators united, since the PCB carries only one
+    part's unique ID. Two different parts drawn with one designator (one usually
+    compile-masked) also meet here; footprint_by_uid keeps each one's footprint."""
+    held = result.get(name)
+    if held:
+        for key in _PART_LISTS:
+            entry[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
+        entry["footprint"] = entry.get("footprint") or held.get("footprint")
+        entry["footprint_by_uid"] = {
+            **held.get("footprint_by_uid", {}), **entry.get("footprint_by_uid", {})
+        }
+        entry["kind"] = entry.get("kind") or held.get("kind", 0)
+    result[name] = entry
 
 
 def _physical_designators(by_uid: dict[str, list["AnnotationEntry"]], sheet: str,
@@ -227,6 +248,13 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "value": meta.value,
         "unique_id": meta.unique_id,
         "pins": enriched_pins,
+        # For the schematic-vs-PCB sync check; tool outputs pick their fields.
+        "unique_ids": list(meta.unique_ids),
+        "footprint": meta.footprint,
+        "footprint_by_uid": {uid: meta.footprint for uid in meta.unique_ids if meta.footprint},
+        "footprints": list(meta.footprints),
+        "kind": meta.kind,
+        "pin_designators": list(meta.pin_designators),
     }
 
 

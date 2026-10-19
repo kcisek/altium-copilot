@@ -18,6 +18,7 @@ from server.parsers.pcb_doc import (
     iter_binary_records,
     parse_dim_mil,
     decode_classes,
+    decode_comments,
     decode_designators,
     decode_diff_pairs,
     decode_drc_rule_kinds,
@@ -25,6 +26,7 @@ from server.parsers.pcb_doc import (
     parse_streams,
     read_kind_prefixed_text_records,
     read_text_records,
+    decode_wide_strings,
 )
 from server.parsers.pcb_doc import _build_layer_aliases
 
@@ -840,3 +842,57 @@ def test_arc_chords_carry_true_arc_length():
     assert total == pytest.approx(math.pi * 20 / 2, rel=1e-6)
     chords = sum(math.hypot(a.x2 - a.x1, a.y2 - a.y1) for a in arcs)
     assert chords < total
+
+
+# ---------- component kind and comment (sync check) ----------
+
+def test_decode_components_reads_kind():
+    components = decode_components([
+        {"SOURCEDESIGNATOR": "U1"},
+        {"COMPONENTKIND": "1"},
+        {"COMPONENTKIND": "0", "COMPONENTKINDVERSION2": "5"},  # Standard (No BOM)
+        {"COMPONENTKIND": "4"},
+    ])
+    assert [component.kind for component in components] == [0, 1, 5, 4]
+
+
+def _comment_record(component: int, text: bytes, wide_index: int | None = None) -> bytes:
+    first = bytearray(120)
+    struct.pack_into("<H", first, 7, component)
+    first[40] = 1  # IsComment
+    if wide_index is not None:
+        struct.pack_into("<I", first, 115, wide_index)
+    second = bytes([len(text)]) + text
+    return (
+        b"\x05"
+        + struct.pack("<I", len(first)) + bytes(first)
+        + struct.pack("<I", len(second)) + second
+    )
+
+
+def _wide(index: int, text: str) -> bytes:
+    body = (text + "\0").encode("utf-16-le")
+    return struct.pack("<II", index, len(body)) + body
+
+
+def test_decode_comments_prefers_the_wide_text():
+    wide = decode_wide_strings(_wide(7, "10µF 6.3V") + _wide(8, "100Ω") + _wide(9, "OTHER"))
+    data = (
+        _comment_record(0, "10µF 6.3V".encode("utf-8"), 7)  # recent files: UTF-8
+        + _comment_record(1, b"100?", 8)                     # older: code page, Ω lost
+        + _comment_record(2, b"BAV99", 9)                    # an index naming other text
+        + _comment_record(3, b"LM358")                       # no wide string
+        + _text6_record(4, "R7")                             # a designator, not a comment
+    )
+    assert decode_comments(data, wide) == {
+        0: "10µF 6.3V", 1: "100Ω", 2: "BAV99", 3: "LM358",
+    }
+
+
+def test_parse_streams_attaches_comments():
+    streams = _minimal_streams()
+    streams["Components6/Data"] = _stream_text([{"SOURCEDESIGNATOR": "C1"}])
+    streams["Texts6/Data"] = _comment_record(0, b"4.7?F", 3) + _text6_record(0, "C1")
+    streams["WideStrings6/Data"] = _wide(3, "4.7µF")
+    pcb = parse_streams(streams)
+    assert (pcb.components[0].designator, pcb.components[0].comment) == ("C1", "4.7µF")
