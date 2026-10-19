@@ -6,6 +6,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- Schematic enrichment reads sheets that write record keys in upper case (`OWNERINDEX`,
+  `TEXT`, `NAME`, `UNIQUEID`, ...), as most of Altium's AD25 examples do. `parse_sch_doc`
+  matched only the mixed-case spelling, so Bluetooth Sentinel, Mini PC (Motherboard,
+  WiFi) and SpiritLevel-SL1 loaded no components and `set_project_dir` reported
+  `no_components_loaded`; PC4-SODIMM loaded 16 of 199. Keys and component parameter
+  names (`VALUE`, `COMMENT`) are now matched case-insensitively, a record's trailing NUL
+  no longer ends up in its last value, and a non-numeric `OwnerIndex` is skipped instead
+  of failing the sheet. On the 84 example sheets 1537 of 1581 parts load (was 98); the
+  others share a designator with another part on the same sheet
 - PCB tools name components by the designator printed on the board (decoded from
   `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
   name and differs on multi-channel and board-annotated designs (57 of 73 parts on
