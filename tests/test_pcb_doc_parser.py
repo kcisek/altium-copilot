@@ -22,6 +22,8 @@ from server.parsers.pcb_doc import (
     decode_designators,
     decode_diff_pairs,
     decode_drc_rule_kinds,
+    decode_drc_options,
+    DrcOptions,
     decode_rules,
     parse_streams,
     read_kind_prefixed_text_records,
@@ -825,6 +827,19 @@ def test_decode_xsignals_from_board_record():
 def test_decode_drc_rule_kinds():
     assert decode_drc_rule_kinds([{"RULESETTOCHECK": "0,2,11,51"}]) == {0, 2, 11, 51}
     assert decode_drc_rule_kinds([{}]) is None
+
+
+def test_decode_drc_options():
+    options = decode_drc_options([{
+        "MAXVIOLATIONCOUNT": "500", "RULESETTOCHECK": "0,15,16", "ONLINERULESETTOCHECK": "0,15",
+        "DOMAKEDRCFILE": "TRUE", "INCLUDEPCBHEALTH": "FALSE", "DOSUBNETDETAILS": "TRUE",
+    }])
+    assert options == DrcOptions(
+        max_violations=500, batch_kinds={0, 15, 16}, online_kinds={0, 15}, make_report=True,
+        include_health=False, sub_net_details=True,
+    )
+    assert decode_drc_options([]) is None
+    assert decode_drc_options([{}]) == DrcOptions()  # older files: settings unknown
 
 
 def test_arc_chords_carry_true_arc_length():

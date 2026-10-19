@@ -32,6 +32,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Where does RMII_REF_CLK route?"* | Layers, routed length per layer, vias, endpoints |
 | *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths |
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
+| *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, part or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board |
 | *"Is the PCB in sync with the schematic?"* | Offline Show Differences: missing or extra parts, footprint and comment changes, pads on the wrong net, and pins Update PCB would fail on |
 | *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them |
 | *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |

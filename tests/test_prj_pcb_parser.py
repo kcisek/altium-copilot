@@ -275,3 +275,14 @@ def test_unresolved_dnp_uid_kept_for_later_resolution():
     state.resolve_dnp_uid({"BBBB": "R2"})
     assert state.is_dnp("R1")
     assert state.is_dnp("R2")
+
+
+def test_output_and_log_folders(tmp_path):
+    prj = tmp_path / "Demo.PrjPcb"
+    prj.write_text(
+        "\ufeff[Design]\nOutputPath=Out\\Rev2\nLogFolderPath=\n\n[Document1]\n"
+        "DocumentPath=Main.SchDoc\n",
+        encoding="utf-8",
+    )
+    data = parse_prj_pcb(str(prj))
+    assert (data.output_path, data.log_folder_path) == ("Out\\Rev2", "")

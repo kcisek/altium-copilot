@@ -411,6 +411,7 @@ CONSTRAINTS_REVIEW_TOOLS = (
     "check_rule_compliance",
     "check_lengths",
     "check_diff_pairs",
+    "get_drc_report",
     "get_net_neighbors",
     "search_components",
     "get_component",
@@ -456,8 +457,10 @@ Do not proceed until the user answers.
 - Every finding cites evidence: a rule (name: value), a measured fact from a tool, or a
   datasheet value with its source. What you cannot evidence goes in the Warnings &
   Unverifiable table.
-- Rules are read from the saved PcbDoc; DRC results are not read. Never say the board passes
-  DRC or meets its constraints; say which rules and measurements you checked.
+- Rules are read from the saved PcbDoc. Altium's own DRC result is get_drc_report: quote it
+  only with its assessment (a stopped run, unchecked kinds, a report older than the board).
+  Never say the board passes DRC or meets its constraints; say which rules and measurements
+  you checked.
 - Lengths follow Altium's Signal Length. check_lengths measures the copper path pad to pad
   plus the via barrel over the stackup span it traverses plus the pin/package length (pad to
   die) stored on the end pads; an xSignal runs through series parts and adds the pin/package

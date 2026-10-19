@@ -139,6 +139,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- `get_drc_report`: reads Altium's last Batch DRC report ('Design Rule Check - <PcbDoc>'
+  .html or .drc in the project's output folder) and explains it. Violations are grouped by
+  rule, part or net and linked to the board (parts and nets through 'Pad <designator>-<pad>',
+  nets of the copper in each violation's zoom box, and the board location), with PCB
+  health issues, waived violations and the report's own warnings. An assessment comes
+  first: the DRC stopped at its violation limit (later rules, shorts included, read 0),
+  Un-Routed Net or Short-Circuit was not checked, the report is older than the board or an
+  Update PCB ran since, it was made for another board, or the rules changed since. The
+  PcbDoc's Design Rule Checker settings (violation limit, batch and online rule kinds,
+  report and health options) and the PrjPcb's output and log folders are now read
 - `check_sch_pcb_sync`: an offline Project > Show Differences. It compares the compiled
   schematic netlist with the saved PcbDoc and reports parts missing from or extra on the
   PCB, designator, footprint and comment differences, pads whose net differs from their
