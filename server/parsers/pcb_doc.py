@@ -421,6 +421,8 @@ class BoardInfo:
     outline_vertices: list[tuple[float, float]] = field(
         default_factory=list
     )
+    # Layer-stack regions (rigid/flex); each {"id", "name", "is_flex"}.
+    substacks: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -436,6 +438,10 @@ class PcbComponent:
     rotation: float | None
     side: str
     footprint: str | None = None
+    # The designator shown on the board (Texts6). Differs from refdes
+    # (SOURCEDESIGNATOR) on multi-channel and board-annotated designs; class
+    # members and rule scopes use it.
+    designator: str | None = None
 
 
 @dataclass
@@ -542,6 +548,21 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
             outline_vertices.append((x, y))
         vertex_index += 1
 
+    substacks: list[dict] = []
+    substack_index = 0
+    while f"V9_SUBSTACK{substack_index}_ID" in properties:
+        prefix = f"V9_SUBSTACK{substack_index}_"
+        substacks.append(
+            {
+                "id": properties[f"{prefix}ID"],
+                "name": properties.get(f"{prefix}NAME")
+                or properties[f"{prefix}ID"],
+                "is_flex": properties.get(f"{prefix}ISFLEX", "").upper()
+                == "TRUE",
+            }
+        )
+        substack_index += 1
+
     return BoardInfo(
         origin_x=parse_dim_mil(properties.get("ORIGINX")),
         origin_y=parse_dim_mil(properties.get("ORIGINY")),
@@ -555,6 +576,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         layers=layers,
         stackup_source=stackup_source,
         outline_vertices=outline_vertices,
+        substacks=substacks,
     )
 
 
@@ -650,6 +672,37 @@ def decode_polygons(
                 )
             )
     return pours, edges
+
+
+def decode_designators(data: bytes) -> dict[int, str]:
+    """Map component index -> designator text from Texts6.
+
+    Each record is u8 type, u32 length, a fixed sub-record (component index
+    u16 at offset 7, IsDesignator flag at offset 41), then u32 length and a
+    Pascal string holding the text.
+    """
+    designators: dict[int, str] = {}
+    offset = 0
+    while offset + 5 <= len(data):
+        (first_length,) = struct.unpack_from("<I", data, offset + 1)
+        second_at = offset + 5 + first_length
+        if second_at + 4 > len(data):
+            break
+        (second_length,) = struct.unpack_from("<I", data, second_at)
+        if second_at + 4 + second_length > len(data):
+            break
+        first = data[offset + 5 : second_at]
+        text = data[second_at + 4 : second_at + 4 + second_length]
+        offset = second_at + 4 + second_length
+        if first_length < 42 or not first[41]:
+            continue
+        (component,) = struct.unpack_from("<H", first, 7)
+        if component == NO_COMPONENT or not text:
+            continue
+        designator = text[1 : 1 + text[0]].decode("latin-1", "replace")
+        if designator:
+            designators.setdefault(component, designator)
+    return designators
 
 
 @dataclass
@@ -929,6 +982,14 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
     if invalid_net_count:
         skipped_records["net_range"] = invalid_net_count
 
+    if "Texts6/Data" in streams:
+        try:
+            designators = decode_designators(streams["Texts6/Data"])
+            for component in components:
+                component.designator = designators.get(component.index)
+        except Exception as error:
+            warnings.append(f"Texts6 parse failed: {error}")
+
     # Rules, classes and pairs are optional: older or simple boards may lack
     # a stream, and an empty DifferentialPairs6 is normal. Only failures warn.
     rules: list[PcbRule] = []
@@ -986,6 +1047,7 @@ _WANTED_STREAMS = (
     "Arcs6/Data",
     "Pads6/Data",
     "Polygons6/Data",
+    "Texts6/Data",
     "Rules6/Data",
     "Rules6/Header",
     "Classes6/Data",

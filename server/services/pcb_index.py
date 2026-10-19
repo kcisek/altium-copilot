@@ -487,11 +487,38 @@ class PcbIndex:
         ).fetchone()
         return round(row["total"] or 0.0, 1)
 
-    def rule_target(self, name: str) -> RuleTarget | None:
-        """Build the scope-evaluation target for a net or diff pair name."""
+    def designator(self, component_index: int) -> str | None:
+        """The PCB designator of a component (Texts6), else its refdes."""
+        component = self.pcb.components[component_index]
+        return component.designator or component.refdes
+
+    def find_by_designator(self, designator: str) -> list[dict]:
+        """Components whose PCB designator matches (class members use it)."""
+        matches = []
+        for component in self.pcb.components:
+            if (self.designator(component.index) or "").lower() == designator.lower():
+                row = self.db.execute(
+                    "SELECT refdes, sch_refdes FROM components WHERE id = ?",
+                    (component.index,),
+                ).fetchone()
+                matches.append({
+                    "designator": self.designator(component.index),
+                    "refdes": row["refdes"] if row else component.refdes,
+                    "sch_refdes": row["sch_refdes"] if row else None,
+                })
+        return matches
+
+    def rule_target(
+        self, name: str, kind: str | None = None
+    ) -> RuleTarget | None:
+        """Build the scope-evaluation target for a net or diff pair name.
+
+        kind ("net" / "diff_pair") picks one when a pair shares a net's name;
+        without it the net wins.
+        """
         ctx = self.rule_context
         key = name.lower()
-        if key in ctx.net_names:
+        if key in ctx.net_names and kind != "diff_pair":
             kind = "net"
             nets = {key}
             pairs = {
@@ -499,7 +526,7 @@ class PcbIndex:
                 for pair_name, _, _ in self._net_to_pairs.get(key, [])
             }
             display = ctx.net_names[key]
-        elif key in ctx.pairs:
+        elif key in ctx.pairs and kind != "net":
             kind = "diff_pair"
             display, positive, negative = ctx.pairs[key]
             nets = {positive.lower(), negative.lower()}
@@ -515,25 +542,27 @@ class PcbIndex:
         if not net_ids:
             return target
         placeholders = ",".join("?" * len(net_ids))
+        target.has_pours = self.db.execute(
+            f"SELECT 1 FROM pours WHERE net_id IN ({placeholders}) LIMIT 1",
+            net_ids,
+        ).fetchone() is not None
         rows = self.db.execute(
-            "SELECT DISTINCT p.component, p.pad_name, c.refdes, c.sch_refdes "
-            "FROM prims p JOIN components c ON c.id = p.component "
-            f"WHERE p.kind = 'pad' AND p.net_id IN ({placeholders})",
+            "SELECT DISTINCT component, pad_name FROM prims "
+            "WHERE kind = 'pad' AND component IS NOT NULL "
+            f"AND net_id IN ({placeholders})",
             net_ids,
         ).fetchall()
-        footprints = {
-            component.index: component.footprint
-            for component in self.pcb.components
-        }
+        # Scope terms and class members name PCB designators, which differ
+        # from the schematic refdes on multi-channel / board-annotated boards.
         for row in rows:
-            for designator in (row["refdes"], row["sch_refdes"]):
-                if designator:
-                    target.components.add(designator.lower())
-                    if row["pad_name"]:
-                        target.pads.add(
-                            f"{designator}-{row['pad_name']}".lower()
-                        )
-            footprint = footprints.get(row["component"])
+            if not 0 <= row["component"] < len(self.pcb.components):
+                continue
+            designator = self.designator(row["component"])
+            if designator:
+                target.components.add(designator.lower())
+                if row["pad_name"]:
+                    target.pads.add(f"{designator}-{row['pad_name']}".lower())
+            footprint = self.pcb.components[row["component"]].footprint
             if footprint:
                 target.footprints.add(footprint)
         return target

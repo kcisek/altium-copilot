@@ -30,8 +30,8 @@ try:
     from parsers.sch_doc import read_sch_doc_image
     from services.pcb_index import PcbIndex
     from services.pcb_rules import (
-        NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header, rule_values,
-        stale_references,
+        BINARY_KINDS, NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header,
+        rule_values, stale_references,
     )
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
@@ -50,8 +50,8 @@ except ImportError:
     from server.services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
     from server.services.pcb_index import PcbIndex
     from server.services.pcb_rules import (
-        NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header, rule_values,
-        stale_references,
+        BINARY_KINDS, NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header,
+        rule_values, stale_references,
     )
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
@@ -240,11 +240,14 @@ component locations, distances):
 
 Rule scopes are evaluated per net or pair. A rule marked conditional (with
 "conditions") applies only to some of the net's objects — e.g. only its vias, only on
-one layer, only inside a room. Quote the condition instead of claiming it applies.
-Binary rules (Clearance, ...) list candidates: which one wins depends on the other
-object. stale_references are scope names that match nothing on the board, so that
-part of the rule silently applies to nothing — worth pointing out. Rule values are what
-is stored in the PcbDoc; DRC results are not read, so do not claim the board passes.
+one layer, only inside a room, only its pour copper. Quote the condition instead of
+claiming it applies. Binary rules (Clearance, ...) list candidates with orientations:
+which one wins depends on the other object, so name the other object when you quote a
+clearance. Widths and diff-pair gaps are per layer: quote layers_mil for the layer in
+question. A diff-pair net's track width is checked by its DiffPairsRouting rule, not
+the Width rule. stale_references are scope names that match nothing on the board, so
+that part of the rule silently applies to nothing — worth pointing out. Rule values are
+what is stored in the PcbDoc; DRC results are not read, so do not claim the board passes.
 
 Net names are shared between schematic and PCB — pivot freely between query_net
 (connectivity) and get_net_pcb (physical routing). Component refdes may differ on
@@ -1705,16 +1708,23 @@ def _design_rule_counts(index) -> dict:
     }
 
 
+def _rule_stale(index, rule) -> list[str]:
+    stale = stale_references(rule.scope1, index.rule_context)
+    if rule.kind in BINARY_KINDS:
+        stale += stale_references(rule.scope2, index.rule_context)
+    return list(dict.fromkeys(stale))
+
+
 def _rule_detail(index, rule) -> dict:
     detail = rule_header(rule)
-    values = rule_values(rule, index.signal_layers())
+    values = rule_values(
+        rule, index.signal_layers(), index.pcb.board.substacks
+    )
     if values:
         detail["values"] = values
-    stale = stale_references(rule.scope1, index.rule_context)
-    if rule.kind in ("Clearance", "ComponentClearance", "Creepage"):
-        stale += stale_references(rule.scope2, index.rule_context)
+    stale = _rule_stale(index, rule)
     if stale:
-        detail["stale_references"] = list(dict.fromkeys(stale))
+        detail["stale_references"] = stale
     return detail
 
 
@@ -1761,7 +1771,7 @@ def _get_design_rules_impl(index, kind, name, offset, to_mm) -> dict:
     headers = []
     for rule in page:
         header = rule_header(rule)
-        stale = stale_references(rule.scope1, index.rule_context)
+        stale = _rule_stale(index, rule)
         if stale:
             header["stale_references"] = stale
         headers.append(header)
@@ -1832,6 +1842,9 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
     target = index.rule_target(net)
     if target is None:
         return _net_or_pair_not_found(index, net)
+    also_pair = (
+        target.kind == "net" and net.lower() in index.rule_context.pairs
+    )
     by_kind: dict[str, list] = {}
     for rule in index.pcb.rules:
         if rule.kind != ROOM_KIND:
@@ -1868,7 +1881,7 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
     for kind in wanted:
         if kind == "DiffPairsRouting" and target.kind == "net":
             for pair in index.diff_pairs_of(target.name):
-                pair_target = index.rule_target(pair["name"])
+                pair_target = index.rule_target(pair["name"], kind="diff_pair")
                 resolved = resolve_kind(
                     by_kind[kind], pair_target, index.rule_context, describe
                 )
@@ -1878,6 +1891,20 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
         results.append(
             resolve_kind(by_kind[kind], target, index.rule_context, describe)
         )
+    pair_rules = [
+        entry["effective"]["name"]
+        for entry in results
+        if entry["kind"] == "DiffPairsRouting" and entry.get("effective")
+    ]
+    if pair_rules:
+        for entry in results:
+            if entry["kind"] == "Width":
+                entry["note"] = (
+                    "This net is in a differential pair: Altium checks the "
+                    "width of its pair tracks with DiffPairsRouting "
+                    f"{', '.join(pair_rules)} (per-layer widths there), not "
+                    "with this Width rule."
+                )
     result: dict = {"target": target.name, "type": target.kind}
     if target.kind == "net":
         classes = index.net_classes_of(target.name)
@@ -1892,10 +1919,17 @@ def _get_rules_for_net_impl(index, net, kinds) -> dict:
         result["negative_net"] = negative
         result["pair_classes"] = index.pair_classes_of(target.name)
         result["hint"] = (
-            "Width, clearance and via rules apply to the member nets: call "
+            "Track widths come from the DiffPairsRouting rule above. Clearance, "
+            "via and length rules apply to the member nets: call "
             "get_rules_for_net on each net."
         )
     result["rules"] = results
+    if also_pair:
+        result["note"] = (
+            f"'{net}' is also a differential pair name; its pair rules are "
+            "listed under DiffPairsRouting when the net belongs to it, or call "
+            "list_diff_pairs."
+        )
     return result
 
 
@@ -1915,7 +1949,9 @@ def get_rules_for_net(
     matches), plus higher-priority rules that apply only to some of the net's objects
     (conditions: only its vias, only on a layer, only in a room...). Binary kinds such as
     Clearance list candidates in priority order, since the winner depends on the other
-    object. Diff-pair routing rules are resolved for the pairs the net belongs to.
+    object; each lists orientations (which side of the rule the net is on, and what the
+    other object must be). Diff-pair routing rules are resolved for the pairs the net
+    belongs to; a pair net's track width comes from them, not from Width.
     kinds narrows the kinds (default: routing-related kinds; ['all'] for every kind).
     Lengths use units (default: board display unit)."""
     index, error = _pcb_index_or_error()
@@ -1927,7 +1963,19 @@ def get_rules_for_net(
     result = _get_rules_for_net_impl(index, net, kinds)
     if "error" in result:
         return json.dumps(result)
-    return json.dumps(_convert_units(result, to_mm), indent=2)
+    rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    if len(rendered) > QUERY_NET_MAX_RESULT_SIZE_CHARS:
+        # Keep every rule's identity and the winners' values; drop values of
+        # lower-priority binary candidates, which get_design_rules can show.
+        for entry in result["rules"]:
+            for candidate in entry.get("candidates", [])[1:]:
+                candidate.pop("values", None)
+        result["values_omitted"] = (
+            "Response too large: values are shown only for the first candidate "
+            "of each binary kind. Call get_design_rules(name=...) for the rest."
+        )
+        rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    return rendered
 
 
 def _class_members(index, pcb_class, offset: int) -> dict:
@@ -1959,7 +2007,7 @@ def _class_members(index, pcb_class, offset: int) -> dict:
     elif pcb_class.kind == "component":
         rendered = []
         for member in members:
-            found = index.find_components(member)
+            found = index.find_by_designator(member)
             record = {"refdes": member}
             if found and found[0].get("sch_refdes"):
                 record["sch_refdes"] = found[0]["sch_refdes"]
@@ -1967,7 +2015,7 @@ def _class_members(index, pcb_class, offset: int) -> dict:
         _annotate_dnp(rendered)
         unresolved = [
             member for member in pcb_class.members
-            if not index.find_components(member)
+            if not index.find_by_designator(member)
         ]
     else:
         rendered = members
@@ -1992,8 +2040,8 @@ def get_classes(
     kind filters: net, component, diff_pair, pad, polygon, xsignal, layer, from_to,
     design_channel. Without name: each class with its member count; superclasses
     ('All Nets'...) have implicit membership; auto_generated marks Altium's side/board
-    component classes. With name: members (component members include DNP for the active
-    variant; unresolved_members name nets, pairs or parts not on the board). Paginated:
+    component classes. With name: members (component members are PCB designators, with DNP for
+    the active variant; unresolved_members match no net, pair or designator). Paginated:
     pass offset from next_offset."""
     index, error = _pcb_index_or_error()
     if error:
@@ -2087,7 +2135,7 @@ def _list_diff_pairs_impl(index, pattern, offset) -> dict:
         if routing_rules:
             resolved = resolve_kind(
                 routing_rules,
-                index.rule_target(pair.name),
+                index.rule_target(pair.name, kind="diff_pair"),
                 index.rule_context,
                 rule_header,
             )

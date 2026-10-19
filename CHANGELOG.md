@@ -36,8 +36,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   - `get_rules_for_net` — which rule of each kind applies to a net or pair, resolved
     by priority like Altium. Scopes are evaluated with an Altium query-language subset
     that decides every scope seen on 61 real boards; rules that apply only to some of
-    the net's objects (vias, a layer, a room, a component's pads) are listed with that
-    condition instead of being claimed or dropped. Clearance-type rules list candidates
+    the net's objects (vias, a layer, a room, a component's pads, its pour copper) are
+    listed with that condition instead of being claimed or dropped. Clearance-type
+    rules list candidates with both orientations and their connective checking.
+    Component and pad scopes use the PCB designator (decoded from `Texts6`), which
+    differs from the schematic designator on multi-channel and board-annotated designs.
+    For a diff-pair net, the note on Width points to the DiffPairsRouting rule that
+    checks its track width
   - `get_classes` — net, component, diff-pair, pad, polygon and xSignal classes and
     members, with unresolved members and DNP flags
   - `list_diff_pairs` — pairs with nets, classes, routed length per leg, skew and the

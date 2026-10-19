@@ -11,7 +11,7 @@ inside a room). Unknown results carry the sub-expressions that decide them.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 try:
     from parsers.pcb_doc import ALTIUM_UNITS_PER_MIL, PcbRule
@@ -99,21 +99,14 @@ class _Parser:
             raise ScopeSyntaxError(f"unexpected {self.peek().value!r}")
         return node
 
-    # Precedence, loosest first: || then && then Or/Xor then And then Not.
+    # Precedence, loosest first: && and || (one level, left to right), then
+    # Or/Xor, then And, then Not — as in Altium's query-language reference.
     def parse_loose_or(self):
         start = self.peek().start
-        node = self.parse_loose_and()
-        while self.peek().kind == "op" and self.peek().value == "||":
-            self.take()
-            node = ("or", node, self.parse_loose_and(), self.source(start))
-        return node
-
-    def parse_loose_and(self):
-        start = self.peek().start
         node = self.parse_or()
-        while self.peek().kind == "op" and self.peek().value == "&&":
-            self.take()
-            node = ("and", node, self.parse_or(), self.source(start))
+        while self.peek().kind == "op" and self.peek().value in ("&&", "||"):
+            operator = "and" if self.take().value == "&&" else "or"
+            node = (operator, node, self.parse_or(), self.source(start))
         return node
 
     def parse_or(self):
@@ -251,6 +244,12 @@ class RuleTarget:
     components: set[str] = field(default_factory=set)
     footprints: set[str] = field(default_factory=set)
     pads: set[str] = field(default_factory=set)
+    has_pours: bool = False
+    # Evaluation views (set by evaluate_scope / resolve_kind, not callers):
+    # member — evaluate a pair as one of its nets; pour_view — evaluate the
+    # net's polygon pour copper instead of its routing.
+    member: str | None = None
+    pour_view: bool = False
 
 
 # Result: (value, conditions) with value True / False / None (unknown).
@@ -305,21 +304,34 @@ _REGION_PREDICATES = {
 }
 
 
+def _net_membership(node, target: RuleTarget, test) -> tuple:
+    """Decide a net-membership test; a pair matches when all its nets do."""
+    nets = {target.member} if target.member else target.nets
+    hits = [test({net}) for net in sorted(nets)]
+    if hits and all(hits):
+        return _TRUE
+    if not any(hits):
+        return _FALSE
+    return _unknown(node)
+
+
 def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
     name, args = node[1], node[2]
     is_net = target.kind == "net"
     if name == "all":
         return _TRUE
     if name == "innet":
-        if is_net:
-            return _TRUE if _any_matches(args, target.nets) else _FALSE
-        # A pair's member nets match InNet, but the pair object does not.
-        return _unknown(node) if _any_matches(args, target.nets) else _FALSE
+        return _net_membership(
+            node, target, lambda nets: _any_matches(args, nets)
+        )
     if name == "innetclass":
-        member = _class_member(ctx, ctx.net_classes, "net", args, target.nets)
-        if not member:
-            return _FALSE
-        return _TRUE if is_net else _unknown(node)
+        return _net_membership(
+            node,
+            target,
+            lambda nets: _class_member(
+                ctx, ctx.net_classes, "net", args, nets
+            ),
+        )
     if name == "indifferentialpair":
         return _TRUE if _any_matches(args, target.pairs) else _FALSE
     if name == "indifferentialpairclass":
@@ -328,13 +340,17 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
         )
         return _TRUE if member else _FALSE
     if name == "inanynet":
-        return _TRUE if is_net else _unknown(node)
+        return _TRUE
     if name == "inanydifferentialpair":
         return _TRUE if target.pairs else _FALSE
     if name == "isnet":
         return _TRUE if is_net else _FALSE
     if name == "isdifferentialpair":
         return _FALSE if is_net else _TRUE
+    if name in _POLYGON_ONLY and target.pour_view:
+        if name in ("inpoly", "inpolygon", "ispoly", "ispolygon"):
+            return _TRUE
+        return _unknown(node)
     if name in _COMPONENT_ONLY or name in _POLYGON_ONLY:
         # These select components, text or pour children, never a net's
         # routing or the pair object itself.
@@ -393,6 +409,14 @@ def _eval_cmp(node, target: RuleTarget) -> tuple:
         return _FALSE
     if prop == "comppincount":
         return _unknown(node) if target.components else _FALSE
+    if prop == "name" and target.kind == "diff_pair":
+        # The pair wizard scopes rules as IsDifferentialPair And (Name = 'X').
+        # For nets Name may mean a pad or a primitive's name, so stay unknown.
+        operator = node[2]
+        if operator in ("=", "like"):
+            return _TRUE if _wildcard_matches(str(node[3]), target.name) else _FALSE
+        if operator == "<>":
+            return _FALSE if _wildcard_matches(str(node[3]), target.name) else _TRUE
     return _unknown(node)
 
 
@@ -441,6 +465,17 @@ def evaluate_scope(text: str, target: RuleTarget, ctx: RuleContext) -> dict:
             "parse_error": str(error),
         }
     value, conditions = evaluate(node, target, ctx)
+    if value is None and target.kind == "diff_pair" and not target.member:
+        # "InNet('A_P') or InNet('A_N')" is unknown term by term but true for
+        # each member net, so it covers the whole pair.
+        per_member = [
+            evaluate(node, replace(target, member=net), ctx)[0]
+            for net in sorted(target.nets)
+        ]
+        if per_member and all(result is True for result in per_member):
+            value = True
+        elif per_member and all(result is False for result in per_member):
+            value = False
     if value is None:
         return {
             "matches": "conditional",
@@ -551,9 +586,13 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MINLIMIT": ("min_width_mil", "mil"),
         "PREFEREDWIDTH": ("preferred_width_mil", "mil"),
         "MAXLIMIT": ("max_width_mil", "mil"),
-        "MINIMP": ("min_impedance_ohm", "ohm"),
-        "FAVIMP": ("preferred_impedance_ohm", "ohm"),
-        "MAXIMP": ("max_impedance_ohm", "ohm"),
+        # Legacy keys saved with a 50 ohm default whatever the rule targets;
+        # the real target is the impedance profile below.
+        "MINIMP": ("", "skip"),
+        "FAVIMP": ("", "skip"),
+        "MAXIMP": ("", "skip"),
+        "IMPEDANCEPROFILEDRIVEN": ("impedance_profile_driven", "bool"),
+        "IMPEDANCEPROFILEVALUE": ("impedance_profile_ohm", "ohm"),
     },
     "DiffPairsRouting": {
         "MINLIMIT": ("min_gap_mil", "mil"),
@@ -673,12 +712,15 @@ def _plain_value(raw: str):
 def rule_values(
     rule: PcbRule,
     signal_layers: dict[int, str],
+    substacks: list[dict] | None = None,
 ) -> dict:
     """Decode a rule's kind-specific values.
 
     signal_layers maps v6 id -> display name for the board's routable copper
     layers; per-layer values for slots the board does not have are dropped.
-    Lengths are in mils under *_mil keys; unrecognised keys are kept.
+    substacks ({"id", "name", "is_flex"}, primary first) names rigid/flex
+    per-layer tables. Lengths are in mils under *_mil keys; unrecognised keys
+    are kept.
     """
     props = rule.properties
     known = _KIND_VALUES.get(rule.kind, {})
@@ -749,14 +791,29 @@ def rule_values(
                 layers_out[layer_name] = entry
         if layers_out:
             values["layers_mil"] = layers_out
+            # Every routable layer is listed with its resolved value, so the
+            # rule-level numbers would only be a misleading average.
+            for field_name in fallback:
+                values.pop(f"{field_name}_mil", None)
+    substack_names = {
+        substack["id"].upper(): substack for substack in substacks or []
+    }
     if substack_layers:
-        values["substack_layers_mil"] = {
-            guid: {
+        named: dict[str, dict] = {}
+        for guid, layers in substack_layers.items():
+            substack = substack_names.get(guid.upper())
+            label = substack["name"] if substack else guid
+            named[label] = {
                 signal_layers[v6_id]: fields
                 for v6_id, fields in layers.items()
             }
-            for guid, layers in substack_layers.items()
-        }
+        values["substack_layers_mil"] = named
+    if (substack_layers or len(substack_names) > 1) and substacks and (
+        "layers_mil" in values
+    ):
+        values["layers_substack"] = substacks[0]["name"]
+    if not values.get("impedance_profile_driven"):
+        values.pop("impedance_profile_ohm", None)
     if routing_layers:
         values["routing_layers"] = routing_layers
     if rule.kind == ROOM_KIND:
@@ -819,6 +876,50 @@ def room_geometry(rule: PcbRule) -> dict:
 # ---------- resolution ----------
 
 
+# NETSCOPE of binary rules ("Connective Checking" in Altium).
+_CONNECTIVE = {
+    "DifferentNets": "different nets only",
+    "SameNet": "same net only",
+    "AnyNet": "any net (including the same net)",
+}
+
+
+def _connective_condition(net_scope: str | None) -> str | None:
+    """Extra condition a binary rule's connective checking adds, if any."""
+    scope = (net_scope or "").lower()
+    if "pair" in scope and "same" in scope:
+        return "only between the two nets of the same differential pair"
+    if "pair" in scope and "different" in scope:
+        return "only between nets of different differential pairs"
+    if scope == "samenet":
+        return "only between objects of the same net"
+    return None
+
+
+def _scope_is_all(text: str) -> bool:
+    return text.strip().lower() == "all"
+
+
+def _side(rule_scope: str, target: RuleTarget, ctx: RuleContext) -> dict:
+    """Evaluate one side of a binary rule, including the net's pour copper."""
+    side = evaluate_scope(rule_scope, target, ctx)
+    if (
+        side["matches"] == "no"
+        and target.kind == "net"
+        and target.has_pours
+    ):
+        pour_side = evaluate_scope(
+            rule_scope, replace(target, pour_view=True), ctx
+        )
+        if pour_side["matches"] != "no":
+            return {
+                "matches": "conditional",
+                "conditions": ["only the net's polygon pour copper"]
+                + pour_side.get("conditions", []),
+            }
+    return side
+
+
 def rule_header(rule: PcbRule) -> dict:
     """Compact identity of a rule for listings."""
     header: dict = {
@@ -830,6 +931,10 @@ def rule_header(rule: PcbRule) -> dict:
     }
     if rule.kind in BINARY_KINDS:
         header["scope2"] = rule.scope2
+        if rule.net_scope:
+            header["connective_checking"] = _CONNECTIVE.get(
+                rule.net_scope, rule.net_scope
+            )
     if rule.comment:
         header["comment"] = rule.comment
     if rule.from_schematic:
@@ -861,26 +966,44 @@ def resolve_kind(
     if kind in BINARY_KINDS:
         candidates = []
         for rule in ordered:
-            side1 = evaluate_scope(rule.scope1, target, ctx)
-            side2 = evaluate_scope(rule.scope2, target, ctx)
-            if side1["matches"] == "no" and side2["matches"] == "no":
+            sides = (
+                ("scope1", _side(rule.scope1, target, ctx), rule.scope2),
+                ("scope2", _side(rule.scope2, target, ctx), rule.scope1),
+            )
+            live = [side for side in sides if side[1]["matches"] != "no"]
+            if not live:
                 continue
+            # Altium tests both orientations of an object pair. One that
+            # matches the target fully against All covers the other, as does
+            # a symmetric rule; otherwise report each orientation.
+            full = [side for side in live if side[1]["matches"] == "yes"]
+            if any(_scope_is_all(other) for _, _, other in full):
+                live = [next(side for side in full if _scope_is_all(side[2]))]
+            elif (
+                len(live) == 2
+                and rule.scope1.strip().lower() == rule.scope2.strip().lower()
+            ):
+                live = live[:1]
+            connective = _connective_condition(rule.net_scope)
+            orientations = []
+            for side_name, matched, other in live:
+                orientation = {"target_side": side_name, "other_side": other}
+                conditions = list(matched.get("conditions", []))
+                if connective:
+                    conditions.append(connective)
+                if conditions:
+                    orientation["conditions"] = conditions
+                if "parse_error" in matched:
+                    orientation["parse_error"] = matched["parse_error"]
+                orientations.append(orientation)
             candidate = describe(rule)
-            if side1["matches"] != "no":
-                candidate["target_side"] = "scope1"
-                candidate["other_side"] = rule.scope2
-                matched = side1
-            else:
-                candidate["target_side"] = "scope2"
-                candidate["other_side"] = rule.scope1
-                matched = side2
-            if matched["matches"] != "yes":
-                candidate["conditions"] = matched["conditions"]
+            candidate["orientations"] = orientations
             candidates.append(candidate)
         result["candidates"] = candidates
         result["note"] = (
-            "Binary rule: the first candidate (by priority) whose other "
-            "side matches the other object applies to that pair of objects."
+            "Binary rule: for a pair of objects, the first candidate by "
+            "priority with an orientation whose target side matches this "
+            "object and whose other_side matches the other object applies."
         )
         return result
 

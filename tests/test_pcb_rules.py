@@ -196,18 +196,37 @@ def test_width_values_with_sparse_per_layer_overrides():
         "Width",
         MINLIMIT="5mil", PREFEREDWIDTH="8mil", MAXLIMIT="20mil",
         TOPLAYER_MINWIDTH="6mil", MIDLAYER9_MINWIDTH="4mil",
+        BOTTOMLAYER_MINWIDTH="7mil",
         MINIMP="50.000000", FAVIMP="50.000000", MAXIMP="50.000000",
     )
     values = rule_values(rule, SIGNAL_LAYERS)
-    assert values["min_width_mil"] == 5.0
-    assert values["preferred_width_mil"] == 8.0
-    assert values["preferred_impedance_ohm"] == 50.0
     assert values["layers_mil"]["Top"] == {
         "min_width": 6.0, "preferred_width": 8.0, "max_width": 20.0,
     }
+    assert values["layers_mil"]["Bottom"]["min_width"] == 7.0
     # Absent per-layer keys fall back to the base; slots not on the board drop.
-    assert values["layers_mil"]["Bottom"]["min_width"] == 5.0
+    assert values["layers_mil"]["Mid2"]["min_width"] == 5.0
     assert set(values["layers_mil"]) == {"Top", "Mid2", "Bottom"}
+    # With a per-layer table the base numbers are not repeated at the top,
+    # and the legacy 50 ohm default keys are not an impedance target.
+    assert "min_width_mil" not in values
+    assert not any("impedance" in key for key in values)
+
+
+def test_width_impedance_profile_is_reported_only_when_driven():
+    driven = rule_values(
+        _rule("Width", MINLIMIT="5mil", IMPEDANCEPROFILEDRIVEN="TRUE",
+              IMPEDANCEPROFILEVALUE="40.000000"),
+        SIGNAL_LAYERS,
+    )
+    assert driven["impedance_profile_ohm"] == 40.0
+    assert driven["min_width_mil"] == 5.0
+    not_driven = rule_values(
+        _rule("Width", MINLIMIT="5mil", IMPEDANCEPROFILEDRIVEN="FALSE",
+              IMPEDANCEPROFILEVALUE="50.000000"),
+        SIGNAL_LAYERS,
+    )
+    assert "impedance_profile_ohm" not in not_driven
 
 
 def test_width_without_layer_overrides_has_no_layer_table():
@@ -226,24 +245,33 @@ def test_diff_pair_values_per_layer_with_gap_fallback():
         MIDLAYER20_MINWIDTH="9mil",
     )
     values = rule_values(rule, SIGNAL_LAYERS)
-    assert values["preferred_gap_mil"] == 5.0
     assert values["max_uncoupled_length_mil"] == 500.0
+    assert "preferred_gap_mil" not in values
     top = values["layers_mil"]["Top"]
     assert top["preferred_gap"] == 7.0
     assert top["min_gap"] == 4.0
     assert top["preferred_width"] == 4.5
-    assert values["layers_mil"]["Mid2"]["min_width"] == 3.0
+    mid = values["layers_mil"]["Mid2"]
+    assert mid["min_width"] == 3.0
+    # Gaps missing on a layer fall back to MINLIMIT / MOSTFREQGAP / MAXLIMIT.
+    assert (mid["min_gap"], mid["preferred_gap"], mid["max_gap"]) == (4.0, 5.0, 6.0)
     assert "Mid20" not in str(values)
 
 
 def test_substack_keys_are_kept_apart():
     rule = _rule(
         "Width",
-        MINLIMIT="5mil",
+        MINLIMIT="5mil", TOPLAYER_MINWIDTH="6mil",
         **{"TOPLAYER_{AB-12}_MINWIDTH": "3mil", "SUBSTACK1": "{AB-12}"},
     )
     values = rule_values(rule, SIGNAL_LAYERS)
     assert values["substack_layers_mil"] == {"{AB-12}": {"Top": {"min_width": 3.0}}}
+    named = rule_values(rule, SIGNAL_LAYERS, [
+        {"id": "{RIGID}", "name": "Rigid", "is_flex": False},
+        {"id": "{ab-12}", "name": "Flex", "is_flex": True},
+    ])
+    assert named["substack_layers_mil"] == {"Flex": {"Top": {"min_width": 3.0}}}
+    assert named["layers_substack"] == "Rigid"
 
 
 def test_clearance_object_matrix_uses_raw_units():
@@ -287,10 +315,11 @@ def test_unknown_kind_keeps_every_value():
 def test_routing_layers_filtered_to_board():
     rule = _rule(
         "RoutingLayers",
-        **{"TOP LAYER_V5": "TRUE", "MID LAYER 2_V5": "FALSE", "MID LAYER 7_V5": "TRUE"},
+        **{"TOP LAYER_V5": "TRUE", "MID LAYER 2_V5": "FALSE",
+           "MID LAYER 7_V5": "TRUE", "BOTTOM LAYER_V5": "FALSE"},
     )
     values = rule_values(rule, SIGNAL_LAYERS)
-    assert values["routing_layers"] == {"Top": True, "Mid2": False}
+    assert values["routing_layers"] == {"Top": True, "Mid2": False, "Bottom": False}
 
 
 def test_room_geometry():
@@ -368,7 +397,112 @@ def test_binary_rule_lists_candidates_by_priority(ctx):
     result = resolve_kind(rules, CLK_A, ctx, _describe)
     names = [candidate["name"] for candidate in result["candidates"]]
     assert names == ["ToClocks", "Default"]
-    to_clocks = result["candidates"][0]
-    # Scope1 'All' matches the net too; the other side is then scope2.
-    assert to_clocks["target_side"] == "scope1"
-    assert to_clocks["other_side"] == "InNetClass('Clocks')"
+    # CLK_A is in Clocks, so ToClocks covers CLK_A against anything.
+    assert result["candidates"][0]["orientations"] == [
+        {"target_side": "scope2", "other_side": "All"}
+    ]
+    # GND is not: ToClocks covers GND only against clock objects.
+    gnd = resolve_kind(rules, GND, ctx, _describe)
+    to_clocks = next(c for c in gnd["candidates"] if c["name"] == "ToClocks")
+    assert to_clocks["orientations"] == [
+        {"target_side": "scope1", "other_side": "InNetClass('Clocks')"}
+    ]
+
+
+def test_binary_rule_reports_both_orientations(ctx):
+    rules = [_rule("Clearance", 1, "IsVia", "All", name="ViaClr")]
+    result = resolve_kind(rules, CLK_A, ctx, _describe)
+    assert result["candidates"][0]["orientations"] == [
+        {"target_side": "scope1", "other_side": "All", "conditions": ["IsVia"]},
+        {"target_side": "scope2", "other_side": "IsVia"},
+    ]
+
+
+def test_binary_rule_keeps_conditions(ctx):
+    rules = [_rule("Clearance", 1, "WithinRoom('RF')", "InNetClass('Power')", name="RF")]
+    candidate = resolve_kind(rules, CLK_A, ctx, _describe)["candidates"][0]
+    assert candidate["orientations"] == [
+        {"target_side": "scope1", "other_side": "InNetClass('Power')",
+         "conditions": ["WithinRoom('RF')"]}
+    ]
+
+
+def test_binary_connective_checking(ctx):
+    rule = _rule("Clearance", 1, "All", "All", name="SameNet")
+    rule.net_scope = "SameNet"
+    candidate = resolve_kind([rule], CLK_A, ctx, _describe)["candidates"][0]
+    assert candidate["connective_checking"] == "same net only"
+    assert candidate["orientations"][0]["conditions"] == [
+        "only between objects of the same net"
+    ]
+
+
+def test_binary_pour_copper_view(ctx):
+    target = _net("CLK_A", components={"u3"})
+    target.has_pours = True
+    rules = [
+        _rule("Clearance", 1, "InPolygon and InNetClass('Clocks')", "All", name="PourClr"),
+        _rule("Clearance", 2, "All", "All", name="Default"),
+    ]
+    result = resolve_kind(rules, target, ctx, _describe)
+    pour = result["candidates"][0]
+    assert pour["name"] == "PourClr"
+    assert pour["orientations"][0]["conditions"] == ["only the net's polygon pour copper"]
+    # Without pours only the other orientation remains: this net's routing
+    # against the clock nets' pour copper.
+    plain = resolve_kind(rules, _net("CLK_A"), ctx, _describe)
+    assert plain["candidates"][0]["orientations"] == [
+        {"target_side": "scope2", "other_side": "InPolygon and InNetClass('Clocks')"}
+    ]
+
+
+def test_unary_stops_at_first_match(ctx):
+    rules = [
+        _rule("Width", 2, "InNetClass('Clocks')", name="Clocks"),
+        _rule("Width", 3, "IsVia", name="ViaOnly"),
+    ]
+    result = resolve_kind(rules, CLK_A, ctx, _describe)
+    assert result["effective"]["name"] == "Clocks"
+    assert "overridden_for_some_objects_by" not in result
+
+
+def test_or_with_false_and_unknown_is_unknown(ctx):
+    assert _matches("InNet('GND') or IsVia", CLK_A, ctx) == "conditional"
+    assert _matches("IsVia or InNet('GND')", CLK_A, ctx) == "conditional"
+
+
+@pytest.mark.parametrize("scope, expected", [
+    # && and || share the loosest level and read left to right.
+    ("InNet('CLK_A') || InNet('GND') && IsVia", "conditional"),
+    ("InNet('GND') && IsVia || InNet('CLK_A')", "yes"),
+    ("InNet('X') || InNet('Y') && InNet('CLK_A')", "no"),
+    # And binds tighter than Or.
+    ("InNet('CLK_A') or InNet('X') and InNet('Y')", "yes"),
+])
+def test_operator_precedence(ctx, scope, expected):
+    assert _matches(scope, CLK_A, ctx) == expected
+
+
+@pytest.mark.parametrize("scope, expected", [
+    ("InNetClass('Clocks')", "yes"),
+    ("InNetClass('Power')", "no"),
+    ("InNetClass('All Nets')", "yes"),
+    ("InNet('CLK_A') or InNet('CLK_B')", "yes"),
+    ("InNet('CLK_*')", "yes"),
+    ("InAnyNet", "yes"),
+    ("IsDifferentialPair And (Name = 'CLK')", "yes"),
+    ("IsDifferentialPair And (Name = 'USB')", "no"),
+    ("Name <> 'CLK'", "no"),
+    ("Name Like 'CL*'", "yes"),
+])
+def test_pair_scopes_decided_on_member_nets_and_name(ctx, scope, expected):
+    assert _matches(scope, PAIR, ctx) == expected
+
+
+def test_net_class_rule_wins_for_pair(ctx):
+    rules = [
+        _rule("DiffPairsRouting", 1, "InNetClass('Clocks')", name="DP_Clocks"),
+        _rule("DiffPairsRouting", 2, "All", name="DP_All"),
+    ]
+    result = resolve_kind(rules, PAIR, ctx, _describe)
+    assert result["effective"]["name"] == "DP_Clocks"

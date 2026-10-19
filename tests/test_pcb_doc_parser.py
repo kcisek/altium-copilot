@@ -17,6 +17,7 @@ from server.parsers.pcb_doc import (
     iter_binary_records,
     parse_dim_mil,
     decode_classes,
+    decode_designators,
     decode_diff_pairs,
     decode_rules,
     parse_streams,
@@ -716,3 +717,53 @@ def test_parse_streams_reads_rules_classes_and_pairs():
 def test_decode_components_keeps_footprint():
     components = decode_components([{"SOURCEDESIGNATOR": "U1", "PATTERN": "QFN32"}])
     assert components[0].footprint == "QFN32"
+
+
+def _text6_record(component: int, text: str, designator: bool = True) -> bytes:
+    first = bytearray(60)
+    struct.pack_into("<H", first, 7, component)
+    first[41] = 1 if designator else 0
+    second = bytes([len(text)]) + text.encode("latin-1")
+    return (
+        b"\x05"
+        + struct.pack("<I", len(first)) + bytes(first)
+        + struct.pack("<I", len(second)) + second
+    )
+
+
+def test_decode_designators_reads_only_component_designators():
+    data = (
+        _text6_record(0, "U3")
+        + _text6_record(1, "Comment text", designator=False)
+        + _text6_record(0xFFFF, "Logo")
+        + _text6_record(1, "R7")
+    )
+    assert decode_designators(data) == {0: "U3", 1: "R7"}
+
+
+def test_parse_streams_attaches_pcb_designators():
+    streams = _minimal_streams()
+    streams["Components6/Data"] = _stream_text([
+        {"SOURCEDESIGNATOR": "U1"}, {"SOURCEDESIGNATOR": "U2"},
+    ])
+    # Board-level annotation swapped the board designators.
+    streams["Texts6/Data"] = _text6_record(0, "U2") + _text6_record(1, "U1")
+    pcb = parse_streams(streams)
+    assert [(c.refdes, c.designator) for c in pcb.components] == [
+        ("U1", "U2"), ("U2", "U1"),
+    ]
+    assert pcb.warnings == []
+
+
+def test_decode_board_reads_substacks():
+    board = decode_board([{
+        **BOARD_PROPS,
+        "V9_SUBSTACK0_ID": "{A}", "V9_SUBSTACK0_NAME": "Rigid",
+        "V9_SUBSTACK0_ISFLEX": "FALSE",
+        "V9_SUBSTACK1_ID": "{B}", "V9_SUBSTACK1_NAME": "Flex",
+        "V9_SUBSTACK1_ISFLEX": "TRUE",
+    }])
+    assert board.substacks == [
+        {"id": "{A}", "name": "Rigid", "is_flex": False},
+        {"id": "{B}", "name": "Flex", "is_flex": True},
+    ]

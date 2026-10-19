@@ -176,8 +176,14 @@ def test_rules_for_net(rules_pcb):
     assert override["conditions"] == ["OnLayer('Top Layer')"]
     clearance = rules[("Clearance", None)]
     assert [c["name"] for c in clearance["candidates"]] == ["Clearance_Clk", "Clearance"]
+    assert clearance["candidates"][0]["orientations"] == [
+        {"target_side": "scope1", "other_side": "All"}
+    ]
+    assert clearance["candidates"][0]["connective_checking"] == "different nets only"
     pair_rule = rules[("DiffPairsRouting", "CLK")]
     assert pair_rule["effective"]["name"] == "DP_HS"
+    # A pair net's track width is checked by the diff-pair rule.
+    assert "DP_HS" in width["note"]
     antennae = rules[("NetAntennae", None)]
     assert antennae["effective"] is None
     assert antennae["disabled_rules"] == ["NetAntennae"]
@@ -201,7 +207,9 @@ def test_rules_for_diff_pair(rules_pcb):
     assert result["positive_net"] == "CLK_A"
     assert result["pair_classes"] == ["HS"]
     assert [entry["kind"] for entry in result["rules"]] == ["DiffPairsRouting"]
-    assert result["rules"][0]["effective"]["values"]["preferred_gap_mil"] == 5.0
+    layers = result["rules"][0]["effective"]["values"]["layers_mil"]
+    assert layers["Top Layer"]["preferred_gap"] == 5.0
+    assert layers["Top Layer"]["preferred_width"] == 4.5
 
 
 def test_rules_for_net_kind_filter_and_errors(rules_pcb):
@@ -303,3 +311,104 @@ def test_rule_tools_without_project(monkeypatch):
         main_mod.list_diff_pairs,
     ):
         assert json.loads(call())["error"] == "no_project"
+
+
+def test_stale_references_cover_scope2_of_every_binary_kind(rules_pcb):
+    rules_pcb.pcb.rules.append(
+        _rule("ShortCircuit", 1, "All", "InNet('NO_SUCH_NET')", name="Shorts")
+    )
+    listing = json.loads(main_mod.get_design_rules())
+    shorts = next(rule for rule in listing["rules"] if rule["name"] == "Shorts")
+    assert shorts["stale_references"] == ["innet('NO_SUCH_NET')"]
+    detail = json.loads(main_mod.get_design_rules(name="Shorts"))["rules"][0]
+    assert detail["stale_references"] == ["innet('NO_SUCH_NET')"]
+
+
+@pytest.fixture
+def context_pcb(pcb_data, monkeypatch, tmp_path: Path):
+    """Board whose rules depend on what PcbIndex builds: superclasses, rooms,
+    PCB designators that differ from the schematic refdes, pour ownership."""
+    data = deepcopy(pcb_data)
+    # Board-level annotation: the part placed as R1 shows 'R7' on the board.
+    data.components[2].designator = "R7"
+    data.components[0].designator = "U3"
+    data.components[1].designator = "U4"
+    data.diff_pairs = [DiffPair("CLK", "CLK_A", "CLK_B", None)]
+    data.classes = [
+        _class("All Differential Pairs", "diff_pair", superclass=True),
+        _class("Passives", "component", ["R7"]),
+        _class("Clock", "net", ["CLK_A"]),
+    ]
+    data.rules = [
+        _rule("DiffPairsRouting", 1, "InDifferentialPairClass('All Differential Pairs')",
+              name="DP_ALL", MINLIMIT="4mil", MOSTFREQGAP="5mil", MAXLIMIT="6mil"),
+        _rule("Width", 1, "WithinRoom('RF')", name="W_ROOM", MINLIMIT="3mil"),
+        _rule("Width", 2, "InComponent('R7')", name="W_R7", MINLIMIT="4mil"),
+        _rule("Width", 3, "InComponentClass('Passives')", name="W_PASSIVES", MINLIMIT="4mil"),
+        _rule("Width", 4, "All", name="W_ALL", MINLIMIT="5mil"),
+        _rule("Clearance", 1, "InPolygon", "All", name="POUR", GENERICCLEARANCE="20mil"),
+        _rule("Clearance", 2, name="DEFAULT", GENERICCLEARANCE="6mil"),
+        _rule("RoomDefinition", 1, "All", name="RF", VX0="0mil", VY0="0mil"),
+    ]
+    pcb_file = tmp_path / "Board.PcbDoc"
+    pcb_file.write_bytes(b"fake")
+    index = PcbIndex(data, NETLIST)
+    monkeypatch.setattr(main_mod, "_project", {
+        "name": "Demo", "root_dir": str(tmp_path), "prj_pcb_path": "x",
+        "sheets": [], "pcb_doc_paths": [str(pcb_file)],
+    })
+    monkeypatch.setattr(main_mod._altium, "_netlist", NETLIST)
+    monkeypatch.setattr(
+        main_mod, "_variant_state", VariantState([VariantDefinition(name="Default")])
+    )
+    monkeypatch.setattr(main_mod._pcb_session, "_load", lambda path, netlist: index)
+    main_mod._pcb_session._index = None
+    return index
+
+
+def test_rule_context_through_tools(context_pcb):
+    clk_b = json.loads(main_mod.get_rules_for_net("CLK_B"))
+    rules = _by_kind(clk_b)
+    # The negative leg resolves its pair; the superclass covers every pair.
+    assert rules[("DiffPairsRouting", "CLK")]["effective"]["name"] == "DP_ALL"
+    width = rules[("Width", None)]
+    assert width["effective"]["name"] == "W_ALL"
+    assert [r["name"] for r in width["overridden_for_some_objects_by"]] == ["W_ROOM"]
+    gnd = _by_kind(json.loads(main_mod.get_rules_for_net("GND")))
+    # GND reaches the part whose PCB designator is R7 (schematic R1).
+    assert [r["name"] for r in gnd[("Width", None)]["overridden_for_some_objects_by"]] == [
+        "W_ROOM", "W_R7", "W_PASSIVES",
+    ]
+    # GND owns the pour, so the pour-only clearance applies to its pour copper.
+    pour = gnd[("Clearance", None)]["candidates"][0]
+    assert pour["name"] == "POUR"
+    assert "only the net's polygon pour copper" in pour["orientations"][0]["conditions"]
+    clk_a = _by_kind(json.loads(main_mod.get_rules_for_net("CLK_A")))
+    # CLK_A owns no pour: POUR only covers its routing against pour copper.
+    clk_pour = clk_a[("Clearance", None)]["candidates"][0]
+    assert clk_pour["orientations"] == [{"target_side": "scope2", "other_side": "InPolygon"}]
+
+
+def test_component_class_members_resolve_by_pcb_designator(context_pcb):
+    passives = json.loads(main_mod.get_classes(name="Passives"))["classes"][0]
+    assert passives["members"] == [{"refdes": "R7", "sch_refdes": "R1", "dnp": False}]
+    assert "unresolved_members" not in passives
+
+
+def test_pair_sharing_a_net_name(context_pcb):
+    context_pcb.pcb.nets.append("CLK")
+    context_pcb._build_rule_context()
+    pairs = json.loads(main_mod.list_diff_pairs())
+    assert pairs["diff_pairs"][0]["routing_rule"] == "DP_ALL"
+    net = json.loads(main_mod.get_rules_for_net("CLK"))
+    assert net["type"] == "net"
+    assert "also a differential pair" in net["note"]
+
+
+def test_rules_for_net_trims_candidate_values_when_too_large(rules_pcb, monkeypatch):
+    monkeypatch.setattr(main_mod, "QUERY_NET_MAX_RESULT_SIZE_CHARS", 500)
+    result = json.loads(main_mod.get_rules_for_net("CLK_A"))
+    clearance = next(entry for entry in result["rules"] if entry["kind"] == "Clearance")
+    assert "values" in clearance["candidates"][0]
+    assert "values" not in clearance["candidates"][1]
+    assert "get_design_rules" in result["values_omitted"]
