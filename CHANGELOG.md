@@ -11,7 +11,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 - Compile-masked parts are recognised (inside a sheet's compile mask, RECORD=211). A
   masked copy that shares a live part's designator, on the same sheet or another, no
   longer replaces the live part's parameters, description and kind, and is not reported
-  as a designator clash; a live part replaces a masked one. On real projects the masked
+  as a designator clash; a live part replaces a masked one, and a variant entry on the
+  masked copy no longer applies to it. A collapsed (disabled) mask masks nothing. On
+  real projects the masked
   copy's data had replaced 25 live parts' (wrong MPN, Comment and description in their
   BOM lines), and every recorded designator clash involved a masked copy
 - DNP flags (`get_component`, `list_variants`, sheet context, PCB tools, sync check,
@@ -19,7 +21,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   as Altium and `get_bom` do: a stale designator in the project file named the wrong part
 - `refresh_netlist` re-reads the project's variants, so Not Fitted parts, parameter
   variations and variants saved since the project was loaded apply; the active variant
-  stays by name
+  stays by name, and the response says so when it was renamed or deleted
 - Protel netlist members whose pin designator holds a '-' (a battery's '-' pin, written
   `BT1--`) are split at the rightmost '-' that leaves a known part, so the pin no longer
   becomes a phantom part `BT1-` with an empty pin. The .NET is read as UTF-8, falling

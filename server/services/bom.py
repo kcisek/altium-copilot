@@ -158,20 +158,49 @@ class VariantPlan:
     alternates: dict[str, dict] = field(default_factory=dict)
 
 
-def _bind(variation, by_path: dict, by_tail: dict, known: set, plan: VariantPlan) -> list[str]:
-    """The compiled parts one variation line names; its problems go to plan.stale."""
+@dataclass
+class _PartIndex:
+    """What variation lines bind against, see plan_variant."""
+
+    known: set[str]
+    by_path: dict[str, list[str]]
+    by_tail: dict[str, list[str]]
+    compiled: set[str]  # empty when there is no compiled part list
+    loose: set[str]  # sheet parts outside the compiled design that are not masked
+    masked: set[str]  # UniqueIds of compile-masked copies a live part replaced
+
+
+def _bind(variation, index: _PartIndex, plan: VariantPlan) -> list[str]:
+    """The parts one variation line names; its problems go to plan.stale."""
     stored = variation.designator
     label = stored or variation.unique_id
-    targets = list(by_path.get(variation.unique_id) or []) if variation.unique_id else []
+    path = variation.unique_id
+    targets = list(index.by_path.get(path) or []) if path else []
     ambiguous = False
     if not targets and variation.uid_tail:
-        candidates = by_tail.get(variation.uid_tail) or []
+        candidates = index.by_tail.get(variation.uid_tail) or []
         # Channel copies share the tail: the stored designator picks one if it can.
         if stored in candidates:
             targets = [stored]
         else:
             targets, ambiguous = list(candidates), len(candidates) > 1
-    if not targets and stored in known:
+    if not targets and variation.uid_tail in index.masked:
+        plan.stale.append({
+            "designator": label, "issue": "on_masked_part",
+            "detail": "its UniqueId is on a compile-masked copy, which is not compiled; "
+            "not applied",
+        })
+        return []
+    if targets and stored in index.compiled and set(targets) <= index.loose:
+        # The UniqueId is on a sheet part whose compiled copies were not matched to it
+        # (e.g. channel names outside the usual suffixes): the compiled designator wins.
+        plan.stale.append({
+            "designator": stored, "issue": "unique_id_not_compiled",
+            "detail": f"its UniqueId is on {', '.join(sorted(targets, key=natural_key))}, "
+            "which is not in the compiled design; matched by designator",
+        })
+        return [stored]
+    if not targets and stored in index.known and "?" not in stored:
         if variation.unique_id:
             plan.stale.append({
                 "designator": stored, "issue": "unique_id_not_found",
@@ -225,18 +254,21 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
     if variant is None or variant.name == BASE_VARIANT:
         return VariantPlan(name=BASE_VARIANT)
     components = netlist.get("components") or {}
-    known = set(names)
-    by_path: dict[str, list[str]] = {}
-    by_tail: dict[str, list[str]] = {}
+    compiled = set(netlist.get("parts") or {})
+    index = _PartIndex(known=set(names), by_path={}, by_tail={}, compiled=compiled,
+                       loose=set(), masked=set())
     for name in names:
         meta = components.get(name) or {}
         for path in meta.get("unique_paths") or []:
-            by_path.setdefault(path, []).append(name)
+            index.by_path.setdefault(path, []).append(name)
         tails = list(meta.get("unique_ids") or [])
         if meta.get("unique_id") and meta["unique_id"] not in tails:
             tails.append(meta["unique_id"])
         for tail in tails:
-            by_tail.setdefault(tail, []).append(name)
+            index.by_tail.setdefault(tail, []).append(name)
+        index.masked.update(meta.get("masked_unique_ids") or [])
+        if compiled and name not in compiled and not meta.get("compile_masked"):
+            index.loose.add(name)
     plan = VariantPlan(name=variant.name)
     variations = list(getattr(variant, "variations", None) or []) or [
         Variation(designator=designator, unique_id="", kind=1)
@@ -244,7 +276,7 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
     ]
     line_targets: dict[str, set[tuple[str, ...]]] = {}
     for variation in variations:
-        targets = _bind(variation, by_path, by_tail, known, plan)
+        targets = _bind(variation, index, plan)
         line_targets.setdefault(variation.designator, set()).add(tuple(targets))
         if variation.kind == 1:
             plan.not_fitted.update(targets)
@@ -262,7 +294,7 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
             continue
         if bound:
             targets = list(next(iter(bound)))  # empty: its variation was reported
-        elif designator in known:
+        elif designator in index.known and "?" not in designator:
             targets = [designator]
         else:
             plan.stale.append({
@@ -323,8 +355,8 @@ def build_parts(
         placeholder = None
         if mpn and mpn.lower() in _NO_MPN:
             placeholder, mpn, source = mpn, None, None
-            if manufacturer and manufacturer.lower() in _NO_MPN:
-                manufacturer = None
+        if manufacturer and manufacturer.lower() in _NO_MPN:
+            manufacturer = None
         # A variant can vary the footprint and description, which are not parameters.
         if "description" in varied:
             description = text(params["description"])
@@ -378,8 +410,9 @@ _LINE_FIELDS = ("comment", "description", "value", "footprint", "manufacturer", 
 def group_lines(parts: list[BomPart], group_by: str = "mpn") -> list[dict]:
     """BOM lines: quantity, designators (natural order) and the members' fields; a
     field the members disagree on is listed in 'varies' with its values (null where a
-    member has none). logical_designators and alternate_parts map a member's
-    designator to its sheet designator and to the variant's alternate part."""
+    member has none; the first five, with varies_count when there are more).
+    logical_designators and alternate_parts map a member's designator to its sheet
+    designator and to the variant's alternate part."""
     groups: dict[tuple, list[BomPart]] = {}
     for part in parts:
         groups.setdefault(group_key(part, group_by), []).append(part)
@@ -401,10 +434,13 @@ def group_lines(parts: list[BomPart], group_by: str = "mpn") -> list[dict]:
                 distinct.setdefault(_fold(value), value or None)
             if len(distinct) > 1:
                 varies[name] = list(distinct.values())[:_VARIES_SHOWN]
-        placeholder = next((part.mpn_placeholder for part in members if part.mpn_placeholder),
-                           None)
-        if placeholder and "mpn" not in line:
-            line["mpn_placeholder"] = placeholder
+                if len(distinct) > _VARIES_SHOWN:
+                    line.setdefault("varies_count", {})[name] = len(distinct)
+        placeholders = list(dict.fromkeys(
+            part.mpn_placeholder for part in members if part.mpn_placeholder
+        ))
+        if placeholders and "mpn" not in line:
+            line["mpn_placeholder"] = " / ".join(placeholders)
         if first.mpn_source and first.mpn_source != "parameter":
             line["mpn_source"] = first.mpn_source
         if varies:
@@ -471,9 +507,9 @@ def _cell(value) -> str:
 
 
 def to_csv(lines: list[dict]) -> str:
-    """The lines as CSV. A field the members disagree on lists its values with ' / ';
-    a cell that would start a spreadsheet formula ('=', '+', '-', '@') gets a leading
-    apostrophe."""
+    """The lines as CSV. A field the members disagree on lists its values with ' / '
+    ('(none)' for members without one, '...' when more were left out); a cell that
+    would start a spreadsheet formula ('=', '+', '-', '@') gets a leading apostrophe."""
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow([title for title, _ in CSV_COLUMNS])
@@ -484,7 +520,10 @@ def to_csv(lines: list[dict]) -> str:
             if key == "designators":
                 value = ", ".join(line[key])
             elif key in varies:
-                value = " / ".join(value for value in varies[key] if value)
+                shown = [value or "(none)" for value in varies[key]]
+                if key in (line.get("varies_count") or {}):
+                    shown.append("...")
+                value = " / ".join(shown)
             elif key == "mpn":
                 value = line.get("mpn") or line.get("mpn_placeholder", "")
             else:

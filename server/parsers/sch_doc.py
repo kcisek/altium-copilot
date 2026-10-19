@@ -37,6 +37,9 @@ class ComponentMeta:
     # Inside a compile mask (RECORD=211) on its sheet: Altium leaves it out of the
     # compiled design. A multi-part component is masked when all its parts are.
     compile_masked: bool = False
+    # UniqueIDs of compile-masked copies with this designator that this live part
+    # replaced: they are not this part's (a variation on one names no compiled part).
+    masked_unique_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -95,8 +98,8 @@ def components_from_stream(
             origins.setdefault(canonical_owner[record_num - 1], []).append(
                 (_coord(props, "location.x"), _coord(props, "location.y"))
             )
-        elif record_type == "211":
-            masks.append(_rect(props))
+        elif record_type == "211" and props.get("collapsed", "").upper() != "T":
+            masks.append(_rect(props))  # a collapsed compile mask is disabled
         elif record_type == "34":
             _handle_designator(props, components_by_owner, canonical_owner)
         elif record_type == "2":
@@ -205,6 +208,8 @@ def _merge_parts(
         held = components.get(refdes)
         if held and "?" not in refdes:
             if held.meta.compile_masked != meta.compile_masked:
+                live, masked = (held.meta, meta) if meta.compile_masked else (meta, held.meta)
+                live.masked_unique_ids += [*masked.unique_ids, *masked.masked_unique_ids]
                 if not meta.compile_masked:
                     components[refdes] = _Component(meta, part, best_mpn_priority.get(key, 999))
                 continue

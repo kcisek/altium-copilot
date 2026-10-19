@@ -146,17 +146,21 @@ def _file_entry(result: dict, name: str, entry: dict) -> None:
     unique IDs, footprints and pin designators united, since the PCB carries only one
     part's unique ID. Two different parts drawn with one designator (one usually
     compile-masked) also meet here: a compile-masked copy never replaces a live part's
-    fields (parameters, description, kind), and footprint_by_uid keeps each one's
-    footprint."""
+    fields (parameters, description, kind, unique IDs, models, pins), its unique IDs go
+    to masked_unique_ids, and footprint_by_uid keeps each one's footprint."""
     held = result.get(name)
     if held:
-        keep = entry.get("compile_masked") and not held.get("compile_masked")
-        winner, other = (held, entry) if keep else (entry, held)
+        mixed = bool(entry.get("compile_masked")) != bool(held.get("compile_masked"))
+        winner, other = (held, entry) if mixed and entry.get("compile_masked") else (entry, held)
         merged = dict(winner)
-        for key in _PART_LISTS:
-            merged[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
-        if not other.get("compile_masked") or winner.get("compile_masked"):
+        masked_ids = [*held.get("masked_unique_ids", []), *entry.get("masked_unique_ids", [])]
+        if mixed:
+            masked_ids += other.get("unique_ids", [])
+        else:
+            for key in _PART_LISTS:
+                merged[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
             merged["footprint"] = winner.get("footprint") or other.get("footprint")
+        merged["masked_unique_ids"] = list(dict.fromkeys(masked_ids))
         merged["footprint_by_uid"] = {
             **held.get("footprint_by_uid", {}), **entry.get("footprint_by_uid", {})
         }
@@ -277,6 +281,7 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "lib_reference": meta.lib_reference,
         "design_item_id": meta.design_item_id,
         "compile_masked": meta.compile_masked,
+        "masked_unique_ids": list(meta.masked_unique_ids),
     }
 
 

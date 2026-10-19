@@ -264,8 +264,8 @@ DNP reasons, fabrication requirements. Use it.
   low means the project keeps MPNs elsewhere (e.g. ActiveBOM, not read): say so instead
   of listing every part as missing one.
 - get_component's mpn falls back to Comment; for part numbers in a BOM use get_bom.
-  A line's varies lists values its parts disagree on: mention them, the line is not
-  one part.
+  A line's varies lists values its parts disagree on (varies_count when there are
+  more): mention them, the line is not one part.
 
 ## PCB / Layout Questions
 
@@ -847,6 +847,7 @@ def refresh_netlist() -> str:
     # Re-read the sheet list so sheets added, moved or removed since load are picked up
     # and the sheet names stay in step with the components' sheet attribution.
     prj_data = None
+    variant_note = None
     sheet_paths = [s["path"] for s in project.get("sheets", [])]
     annotation_paths = None
     try:
@@ -870,11 +871,19 @@ def refresh_netlist() -> str:
         variant_state = VariantState(prj_data.variants)
         if variant_state.get(active):
             variant_state.set_variant(active)
+        else:
+            variant_note = (
+                f"The active variant '{active}' is no longer in the project (renamed or "
+                f"deleted); '{variant_state.active.name}' is active now. Ask the user which "
+                "variant to work in, then call set_active_variant."
+            )
         _variant_state = variant_state
     _resolve_dnp_uids(variant_state, _altium._netlist)
     diagnostics = _load_diagnostics(_altium._netlist or {})
     if not regenerated:
         message = "Netlist is already up to date. If you expected changes, save in Altium and try refresh again."
+        if variant_note:
+            message += f"\n{variant_note}"
         if diagnostics.get("warning"):
             message += f"\nWarning ({diagnostics['warning']}): {diagnostics['message']}"
         for err in diagnostics.get("sheet_errors", []):
@@ -905,11 +914,14 @@ def refresh_netlist() -> str:
         _rn_dir,
         netlist_mtime=_rn_net[0].stat().st_mtime if _rn_net else None,
     )
-    return json.dumps({
+    result = {
         "refreshed": True,
         "netlist_updated_utc": _netlist_last_updated,
         **diagnostics,
-    })
+    }
+    if variant_note:
+        result["variant_note"] = variant_note
+    return json.dumps(result)
 
 
 # ---------- query_net ----------

@@ -225,6 +225,12 @@ def test_value_normalisation():
     assert normalize_value("0402WGF1000TCE") != normalize_value("0402WGF4701TCE")
     assert normalize_value("4E7") != normalize_value("4E3")
     assert isinstance(normalize_value("1N4148"), str)
+    # Punctuation after the unit ends the value; '0,100' is a decimal comma.
+    assert normalize_value("600R@100MHz") == normalize_value("600Ω@100MHz") == 600.0
+    assert normalize_value("100nF±10%") == normalize_value("100n") == 1e-07
+    assert normalize_value("4.7uF.") == normalize_value("4.7uF")
+    assert (normalize_value("10k-1%"), normalize_value("4k7_0603")) == (10000.0, 4700.0)
+    assert normalize_value("0,100uF") == normalize_value("0.1uF")
 
 
 def _checks(netlist, **kwargs):
@@ -306,6 +312,11 @@ def test_consolidation_reads_metric_sizes_and_current_ratings():
     caps[0].footprint = "CAPC1608X90N"
     (finding,) = _consolidation(caps)
     assert "0603" in finding["issue"] and "no rating" in finding["issue"]
+    # An IPC body size outside the table leaves the size to the description.
+    for cap in caps:
+        cap.footprint, cap.description = "CAPC2013X60N", "CAP 1NF 0805"
+    (finding,) = _consolidation(caps)
+    assert "0805" in finding["issue"]
     coils = [BomPart(designator="L1", value="10uH", footprint="IND_1210", mpn="LLL1",
                      description="Inductor 10uH 20% 1A"),
              BomPart(designator="L2", value="10uH", footprint="IND_1210", mpn="MMM2",
@@ -468,6 +479,22 @@ def test_an_ambiguous_unique_id_is_reported():
     assert (plan.not_fitted, plan.stale) == ({"R1_B"}, [])
 
 
+def test_bindings_outside_the_compiled_design():
+    netlist = _netlist()
+    # Channel copies R11/R12 got no sheet data; the sheet's R5 (UID CH) is uncompiled.
+    netlist["parts"].update({"R11": {}, "R12": {}})
+    netlist["components"]["R5"] = _component("CH")
+    netlist["components"]["R?"] = _component("NEWPART")  # unannotated, uncompiled
+    variant = VariantDefinition(name="V", variations=[
+        Variation(designator="R11", unique_id="\\SYM1\\CH", kind=1),
+        Variation(designator="R?", unique_id="\\GONE", kind=1),
+    ])
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    # The compiled designator wins over an uncompiled UniqueId owner; '?' names nothing.
+    assert plan.not_fitted == {"R11"}
+    assert [e["issue"] for e in plan.stale] == ["unique_id_not_compiled", "no_such_part"]
+
+
 def test_alternate_parts_take_the_variant_footprint(variants):
     netlist = _netlist()
     lite = variants.variants[1]
@@ -495,18 +522,29 @@ def test_refresh_reads_variants_saved_since_load(bom_project, monkeypatch, tmp_p
     monkeypatch.setattr(main_mod, "_pcb_session", MagicMock())
     monkeypatch.setattr(main_mod, "upsert_registry_entry", MagicMock())
     main_mod._variant_state.set_variant("Lite")
-    main_mod.refresh_netlist()
+    assert "variant_note" not in json.loads(main_mod.refresh_netlist())
     state = main_mod._variant_state
     assert state.active.name == "Lite" and state.get("New") is not None
     assert json.loads(main_mod.get_bom(variant="Full"))["not_fitted_designators"] == ["R1"]
+    # The active variant renamed in Altium: say which one is active now.
+    prj = tmp_path / "Demo.PrjPcb"
+    prj.write_text(prj.read_text(encoding="utf-8").replace("Description=Lite", "Description=Lite 2"),
+                   encoding="utf-8")
+    result = json.loads(main_mod.refresh_netlist())
+    assert "'Lite' is no longer in the project" in result["variant_note"]
+    altium.generate_netlist.return_value = False
+    assert "no longer in the project" not in main_mod.refresh_netlist()  # Full is active
+    prj.write_text(prj.read_text(encoding="utf-8").replace("Description=Full", "Description=F2"),
+                   encoding="utf-8")
+    assert "'Full' is no longer in the project" in main_mod.refresh_netlist()
 
 
 # ---------- compile masks ----------
 
-def _masked_sheet(*components) -> bytes:
-    """A sheet with one compile mask over x < 100; components are (designator, uid,
-    value, x) single-part resistors."""
-    records = ["|RECORD=211|Location.X=0|Location.Y=0|Corner.X=100|Corner.Y=100"]
+def _masked_sheet(*components, mask: str = "") -> bytes:
+    """A sheet with one compile mask over x < 100 (mask adds fields to it); components
+    are (designator, uid, value, x) single-part resistors."""
+    records = ["|RECORD=211|Location.X=0|Location.Y=0|Corner.X=100|Corner.Y=100" + mask]
     for designator, uid, value, x in components:
         owner = len(records)  # the RECORD=1's position (header first) minus one
         records += [
@@ -539,6 +577,11 @@ def test_a_compile_masked_copy_never_replaces_the_live_part(order):
     assert [clash.refdes for clash in clashes] == ["R3"]  # two live parts still clash
 
 
+def test_a_collapsed_compile_mask_is_disabled():
+    data = _masked_sheet(("R5", "LIVEEEEE", "1k", 50), mask="|Collapsed=T")
+    assert not components_from_stream(data)["R5"].compile_masked
+
+
 @pytest.mark.parametrize("order", [1, -1])
 def test_masked_copies_on_other_sheets_keep_the_live_fields(order):
     live = ComponentMeta(refdes="R1", unique_id="LIVE", unique_ids=["LIVE"],
@@ -551,7 +594,13 @@ def test_masked_copies_on_other_sheets_keep_the_live_fields(order):
     assert (r1["params"], r1["kind"], r1["footprint"], r1["sheet"]) == (
         {"value": "10k"}, 0, "R0603", "A",
     )
-    assert sorted(r1["unique_ids"]) == ["LIVE", "MASK"]
+    assert (r1["unique_ids"], r1["masked_unique_ids"]) == (["LIVE"], ["MASK"])
+    # A variation on the masked copy names no compiled part: the live R1 stays fitted.
+    variant = VariantDefinition(name="V", variations=[
+        Variation(designator="R1", unique_id="\\MASK", kind=1),
+    ])
+    plan = plan_variant(variant, netlist, variant_names(netlist))
+    assert plan.not_fitted == set() and [e["issue"] for e in plan.stale] == ["on_masked_part"]
 
 
 def test_sheet_only_boms_leave_compile_masked_parts_out():
@@ -574,6 +623,16 @@ def test_duplicate_designators_outside_the_compiled_design_are_skipped():
     found = [f["designators"] for f in _checks(netlist)["findings"]
              if f["check"] == "duplicate_designator"]
     assert found == [["R2"]]
+    # Board-annotated: sheet Main's Q1 is compiled as Q101 (no compiled name is Q1).
+    netlist["parts"]["Q101"] = {}
+    netlist["components"]["Q101"] = {**_component("QQ"), "logical_refdes": "Q1"}
+    netlist["designator_clashes"] = [
+        {"sheet": "Main", "refdes": "Q1", "lib_references": ["NPN", "PNP"]},
+        {"sheet": "Other", "refdes": "Q1", "lib_references": ["NPN", "PNP"]},
+    ]
+    found = [f["issue"] for f in _checks(netlist)["findings"]
+             if f["check"] == "duplicate_designator"]
+    assert len(found) == 1 and "sheet Main" in found[0]
 
 
 # ---------- part numbers, lines and CSV ----------
@@ -604,7 +663,13 @@ def test_placeholder_part_numbers():
     assert [f["mpn"] for f in findings if f["check"] == "mpn_without_manufacturer"] == ["CL10B104"]
     assert not [f for f in findings if f["check"] == "mpn_inconsistent"]
     line = next(line for line in group_lines(list(parts.values())) if "R1" in line["designators"])
-    assert line["mpn_placeholder"] == "N/A" and "N/A" in to_csv([line])
+    assert line["mpn_placeholder"] == "N/A / -" and "N/A / -" in to_csv([line])
+    # A placeholder manufacturer next to a real part number is no manufacturer.
+    netlist = _netlist()
+    netlist["components"]["R1"]["params"]["manufacturer 1"] = "-"
+    findings = _checks(netlist)["findings"]
+    without = [f for f in findings if f["check"] == "mpn_without_manufacturer"]
+    assert ["R1"] in [f["designators"] for f in without]
 
 
 def test_lines_map_logical_designators_and_list_what_varies():
@@ -618,6 +683,15 @@ def test_lines_map_logical_designators_and_list_what_varies():
     assert line["varies"] == {"description": ["49.9 Ohm", "39 Ohm"], "mpn": ["AAA", "BBB"]}
     assert line["mpn_source"] == "part number"
     assert "AAA / BBB" in to_csv([line])
+    # A member without a value, and more values than shown, are marked in the CSV.
+    parts = [BomPart(designator=f"R{n}", comment="10k", footprint="R0603",
+                     mpn="RC0603" if n == 1 else None, description=f"note {n}")
+             for n in range(1, 8)]
+    (line,) = group_lines(parts, "comment")
+    assert line["varies"]["mpn"] == ["RC0603", None]
+    assert line["varies_count"] == {"description": 7}
+    text = to_csv([line])
+    assert "RC0603 / (none)" in text and "note 5 / ..." in text
 
 
 def test_comment_fallback_and_description_variation():

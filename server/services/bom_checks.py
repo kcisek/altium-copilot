@@ -33,10 +33,12 @@ _VALUE = re.compile(
     r"^\s*(\d+(?:[.,]\d+)*|[.,]\d+)\s*"  # a comma is a decimal or thousands mark
     # The prefix; R, k, V... with digits after them are decimal marks (4R7, 4k7, 3V3).
     # Upper-case P, N, U only before a unit (100NF), since M is mega.
-    r"((?i:meg)|[pnuµμmkKMGRrVv]|[PNU](?=[FfHhΩ]|$|[\s/]))?"
-    r"(\d*)\s*([A-Za-zΩ]*)(?=$|[\s/,;(])"  # then the token ends: '0402WGF1000' is text
+    r"((?i:meg)|[pnuµμmkKMGRrVv]|[PNU](?=[FfHhΩ]|(?![^\W_])))?"
+    # Then no letter or digit may follow ('600R@100MHz' and '4k7_0603' read, while
+    # '0402WGF1000' and '1N4148' stay text).
+    r"(\d*)\s*([A-Za-zΩ]*)(?![^\W_])"
 )
-_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?")
+_THOUSANDS = re.compile(r"[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?")  # '0,100' is a decimal comma
 _DNP_MARK = re.compile(
     r"\b(?:DNP|DNF|DNI|NOT[ _-]?FITTED|NO[ _-]?POP|DO[ _-]NOT[ _-](?:POPULATE|FIT|PLACE))\b",
     re.IGNORECASE,
@@ -86,9 +88,11 @@ def _size(part: BomPart) -> str | None:
     """The imperial size code from the footprint (IPC-7351 names are metric), else from
     the footprint or description text."""
     ipc = _IPC_SIZE.search(part.footprint or "")
-    if ipc:
-        return _METRIC_SIZE.get(ipc[1])
-    match = _SIZE.search(" ".join(filter(None, (part.footprint, part.description))))
+    if ipc and ipc[1] in _METRIC_SIZE:
+        return _METRIC_SIZE[ipc[1]]
+    # An IPC body size outside the table (RESC2013) is no imperial code: the text decides.
+    footprint = "" if ipc else part.footprint
+    match = _SIZE.search(" ".join(filter(None, (footprint, part.description))))
     return match[1] if match else None
 
 
@@ -284,11 +288,17 @@ def run_bom_checks(
     _check_consistency(fitted, findings)
     _check_consolidation(fitted, findings)
     compiled = netlist.get("parts") or {}
+    components = netlist.get("components") or {}
+    # Sheet designators of board-annotated parts (R1 compiled as R101), by sheet.
+    annotated = {
+        (meta.get("sheet"), meta["logical_refdes"]) for name, meta in components.items()
+        if meta.get("logical_refdes") and name in compiled
+    }
     for clash in netlist.get("designator_clashes") or []:
         # Clashes are between live parts (compile-masked copies are not recorded); one
         # outside the compiled design (its sheet is not compiled) is not in the BOM.
         refdes = clash.get("refdes") or ""
-        if compiled and not any(
+        if compiled and (clash.get("sheet"), refdes) not in annotated and not any(
             name == refdes or re.fullmatch(
                 rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", name)
             for name in compiled
@@ -307,7 +317,6 @@ def run_bom_checks(
             f"Variant entry for {entry['designator']}: {entry['detail']}.",
             [entry["designator"]] if entry.get("designator") else [], reason=entry["issue"],
         ))
-    components = netlist.get("components") or {}
     uncompiled = (
         [name for name in components if name not in compiled] if compiled
         else [name for name, meta in components.items() if meta.get("compile_masked")]
