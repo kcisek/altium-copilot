@@ -32,7 +32,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Where does RMII_REF_CLK route?"* | Layers, routed length per layer, vias, endpoints |
 | *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths |
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
-| *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, part or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board |
+| *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, component or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board |
 | *"Is the PCB in sync with the schematic?"* | Offline Show Differences: missing or extra parts, footprint and comment changes, pads on the wrong net, and pins Update PCB would fail on |
 | *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them |
 | *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |
@@ -55,7 +55,7 @@ Claude activates these automatically based on what you say — no commands neede
 | Mode | Triggers when you say... | What happens |
 |---|---|---|
 | `schematic_review` | *"review this"*, *"is this correct?"*, *"check my power supply"* | 3-phase structured audit: Claude reads datasheets and confirms its understanding before flagging anything. Every finding cites a datasheet value or a netlist fact. Ask Claude to write the report to a file if you want one. |
-| `constraints_review` | *"check my high-speed constraints"*, *"are my DDR length rules right?"*, *"review the diff pairs before fab"* | 4-phase PCB constraints audit: Claude identifies each interface from its parts and pins, takes targets from the chip's own layout guide (typical values only as a labelled fallback), checks that pairs, classes and rules encode them, then spot-checks widths, lengths, skew and neighbours on the saved copper. Reads the saved rules, not DRC results. |
+| `constraints_review` | *"check my high-speed constraints"*, *"are my DDR length rules right?"*, *"review the diff pairs before fab"* | 4-phase PCB constraints audit: Claude identifies each interface from its parts and pins, takes targets from the chip's own layout guide (typical values only as a labelled fallback), checks that pairs, classes and rules encode them, then spot-checks widths, lengths, skew and neighbours on the saved copper. Checks the saved rules and copper; quotes Altium's last DRC report only with its assessment. |
 | `brainstorm_circuits` | *"I want to add a new circuit, lets brainstorm"*, *"How would i improve this circuit"*, *"What power supply topology should I use here?"*  | 5-phase design session: reads your loaded schematic first, then asks one question at a time — problem, constraints, proposes 2–3 topologies with tradeoffs, checks your existing design before recommending anything new. |
 
 ---
@@ -69,8 +69,8 @@ which rule applies to a net the way Altium does — including rules that only ap
 some of a net's objects (its vias, one layer, a room) and scopes that point at classes
 or pairs that no longer exist. It also checks the saved copper against those rules —
 widths, vias, routing layers, length groups and diff-pair consistency — and on the DRC
-reports we compared, its counts matched Altium's. It reads the saved file; it does not run
-or read Altium's DRC.
+reports we compared, its counts matched Altium's. It reads the saved file and never runs
+Altium's DRC; `get_drc_report` reads the last DRC report Altium saved.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
 

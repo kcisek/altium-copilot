@@ -12,10 +12,13 @@ from server.parsers.drc_report import (
     DrcReport, DrcTable, DrcViolation, parse_drc_html, parse_drc_report, parse_drc_txt,
     read_text,
 )
-from server.parsers.pcb_doc import DrcOptions, PcbComponent, PcbData, PcbRule
+from server.parsers.pcb_doc import (
+    DiffPair, DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour,
+)
 from server.parsers.prj_pcb import VariantState
 from server.services.drc_results import (
-    DrcLinker, assess, find_reports, pick_report, rule_kind, summarize,
+    DrcLinker, assess, find_reports, load_report, other_sections, pick_report, rule_kind,
+    summarize,
 )
 from server.services.pcb_index import PcbIndex
 from tests.test_pcb_index import _board, _pad
@@ -219,7 +222,9 @@ def test_a_clean_report_has_nothing_to_say(tmp_path):
         DrcOptions(max_violations=500, batch_kinds={15, 16}, make_report=True,
                    include_health=True),
     )
-    assert _assess(tmp_path, _report(*ALL_CHECKED), pcb) == {}
+    report = _report(*ALL_CHECKED)
+    report.totals["health_issues"] = 0  # a report with its (empty) health section
+    assert _assess(tmp_path, report, pcb) == {}
 
 
 def test_the_violation_limit(tmp_path):
@@ -264,7 +269,8 @@ def test_report_age_eco_logs_and_another_board(tmp_path):
     os.utime(log, (2_100_000, 2_100_000))
     assert "eco_after_report" in _assess(tmp_path, report, pcb)
     other = _report(*ALL_CHECKED, pcb_file="D:\\Old\\Rev1.PcbDoc")
-    assert "made for Rev1.PcbDoc" in _assess(tmp_path, other, pcb)["other_board"]["detail"]
+    detail = _assess(tmp_path, other, pcb)["other_board"]["detail"]
+    assert "made for D:\\Old\\Rev1.PcbDoc" in detail
 
 
 def test_rules_changed_and_settings_off(tmp_path):
@@ -275,7 +281,7 @@ def test_rules_changed_and_settings_off(tmp_path):
     )
     issues = _assess(tmp_path, _report(*ALL_CHECKED), pcb)
     assert "Width: 0 in the report, 1 on the board" in issues["rules_changed"]["detail"]
-    assert {"health_not_reported", "report_file_off"} <= set(issues)
+    assert {"no_health_section", "report_file_off"} <= set(issues)
 
 
 # ---------- linking to the board ----------
@@ -400,3 +406,200 @@ def test_get_drc_report_without_a_report(drc_project):
 
 def test_tool_description_mentions_paging():
     assert "next_offset" in main_mod.get_drc_report.__doc__
+
+
+# ---------- review fixes ----------
+
+def test_incomplete_reports_are_flagged():
+    text = HTML.read_text(encoding="utf-8")
+    cut = parse_drc_html(text[: text.index("Back to top") + 400])
+    assert any("ends early" in problem for problem in cut.problems)
+    assert parse_drc_html("").problems == ["the file is empty"]
+    drc = TXT.read_text(encoding="utf-8")
+    short = parse_drc_txt(drc[: drc.index("Rule Violations :1") - 5])
+    assert any("no count line" in problem for problem in short.problems)
+    assert any("no 'Violations Detected' footer" in problem for problem in short.problems)
+    assert parse_drc_report(HTML).problems == parse_drc_report(TXT).problems == []
+
+
+def test_an_empty_html_gives_way_to_the_drc(tmp_path):
+    project, pcb = _project(tmp_path)
+    folder = tmp_path / "Project Outputs for Demo"
+    _put_reports(folder, 2_000_000)
+    (folder / HTML.name).write_text("", encoding="utf-8")
+    os.utime(folder / HTML.name, (2_000_000, 2_000_000))
+    report, path, _, _, notes = load_report(project, pcb)
+    assert (path.suffix, report.totals["rule_violations"]) == (".drc", 25)
+    assert notes[0]["issue"] == "html_report_unusable"
+    (folder / TXT.name).unlink()
+    report, path, _, _, _ = load_report(project, pcb)
+    issues = {i["issue"] for i in assess(report, path, pcb, project)}
+    assert "report_incomplete" in issues
+
+
+def _cell_report(cells: str, section: str = "warning") -> DrcReport:
+    return parse_drc_html(
+        '<table><tr><th class="column1">Warnings</th></tr></table>'
+        f'<a name="IDX"><table><tr><th class="{section}">T</th></tr>{cells}</table></a></html>'
+    )
+
+
+def test_html_cells_keep_their_whole_text():
+    callback = '<a href="dxpprocess://x" class="callback"><acronym>{}</acronym></a>'
+    row = ('<tr><td class="column1">' + callback.format("Pad J1-1(5mm,5mm) on Multi-Layer")
+           + " on Net " + callback.format("GND") + "<br></td></tr>")
+    (table,) = _cell_report(row).tables
+    assert table.violations[0].message == "Pad J1-1(5mm,5mm) on Multi-Layer on Net GND"
+    assert table.violations[0].waiver is None
+    waived = ('<tr><td class="column1">' + callback.format("Hole Size Constraint: x")
+              + "<br>Waived by K at 1/2/2025<br>mounting post</td></tr>")
+    (table,) = _cell_report(waived, "waived").tables
+    assert (table.violations[0].message, table.violations[0].waiver) == (
+        "Hole Size Constraint: x", "Waived by K at 1/2/2025mounting post",
+    )
+    (table,) = _cell_report('<tr><td class="column1">Plain text row</td></tr>').tables
+    assert table.violations[0].message == "Plain text row"
+
+
+def test_txt_rows_start_only_at_violation_between():
+    report = parse_drc_txt(
+        "Processing Rule : Silk to Silk (Clearance=0.1mm) (All),(All)\n"
+        '   Violation between Silk To Silk Clearance Constraint: Text "A\n'
+        '   B" (1mm,1mm) on Top Overlay\n'
+        "Rule Violations :1\n\n\nViolations Detected : 1\n"
+    )
+    (row,) = report.tables[0].violations
+    assert row.message.endswith('Text "A\nB" (1mm,1mm) on Top Overlay')
+    assert report.problems == []
+
+
+def test_the_stop_notice_and_a_lowered_limit(tmp_path):
+    pcb = _pcb_with([_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16)],
+                    DrcOptions(max_violations=2000, batch_kinds={15, 16}))
+    report = _report(*ALL_CHECKED)
+    report.tables.append(DrcTable(type="warning", title="More than 500 violations detected, "
+                                  "DRC was stopped", count=0))
+    limit = _assess(tmp_path, report, pcb)["violation_limit_reached"]
+    assert "the board's limit is now 2000" in limit["detail"]
+    pcb.drc_options.max_violations = 30
+    lowered = _report(_table("Width Constraint (All)", 600, ["x"] * 600), *ALL_CHECKED)
+    assert _assess(tmp_path, lowered, pcb)["violation_limit_lowered"]["severity"] == "info"
+
+
+def test_only_this_boards_eco_logs_count(tmp_path):
+    pcb = _pcb_with([_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16)],
+                    DrcOptions(batch_kinds={15, 16}))
+    logs = tmp_path / "Project Logs for Demo"
+    logs.mkdir()
+    for name in ("Daughter PCB ECO 1-2-2025 10-00-00.LOG", "Demo SCH ECO 1-2-2025.LOG"):
+        (logs / name).write_text("x", encoding="utf-8")
+        os.utime(logs / name, (2_100_000, 2_100_000))
+    assert "eco_after_report" not in _assess(tmp_path, _report(*ALL_CHECKED), pcb)
+    (logs / "Demo PCB ECO 1-2-2025 10-00-00.LOG").write_text("x", encoding="utf-8")
+    os.utime(logs / "Demo PCB ECO 1-2-2025 10-00-00.LOG", (2_100_000, 2_100_000))
+    eco = _assess(tmp_path, _report(*ALL_CHECKED), pcb)["eco_after_report"]
+    assert eco["detail"].startswith("1 Update PCB (ECO) run logged")
+
+
+def test_a_report_made_for_a_same_named_board_elsewhere(tmp_path):
+    elsewhere = tmp_path / "RevA"
+    elsewhere.mkdir()
+    (elsewhere / "Demo.PcbDoc").write_bytes(b"old")
+    pcb = _pcb_with([_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16)],
+                    DrcOptions(batch_kinds={15, 16}))
+    report = _report(*ALL_CHECKED, pcb_file=str(elsewhere / "Demo.PcbDoc"))
+    assert "RevA" in _assess(tmp_path, report, pcb)["other_board"]["detail"]
+
+
+def test_a_report_found_outside_the_output_folder(tmp_path):
+    project, pcb = _project(tmp_path)
+    _put_reports(tmp_path / "Archive" / "Project Outputs for Old", 2_000_000)
+    _, path, _, _, notes = load_report(project, pcb)
+    assert path is not None and notes[-1]["issue"] == "report_outside_output_folder"
+
+
+def test_rules_changed_ignores_kinds_the_report_cannot_name(tmp_path):
+    pcb = _pcb_with(
+        [_rule("ShortCircuit", 15), _rule("UnRoutedNet", 16), _rule("AcuteAngle", 21)],
+        DrcOptions(batch_kinds={15, 16, 21}),
+    )
+    report = _report(*ALL_CHECKED, _table("Acute Angle Constraint (Minimum=90) (All)"))
+    assert "rules_changed" not in _assess(tmp_path, report, pcb)
+    assert rule_kind("Acute Angle Constraint (Minimum=90) (All)") == ("AcuteAngle", None)
+
+
+def test_shorts_ignore_the_board_sized_box():
+    index = _index()
+    index.pcb.board.outline_vertices = [(1000, 1000), (3000, 1000), (3000, 3000), (1000, 3000)]
+    index.pcb.pours = [PolygonPour(
+        pour_id=0, net=1, layer=32, hatch_style="Solid",
+        vertices=[(1400, 1400), (1600, 1400), (1600, 1600), (1400, 1600)],
+    )]
+    linker = DrcLinker(index)
+    linked = linker.link(
+        "Short-Circuit Constraint: Between Pad U1-5(12.7mm,12.7mm) on Multi-Layer And "
+        "Polygon Region (2 hole(s)) Bottom Layer Location : [X = 50mm][Y = 1mm]",
+        (-125000.0, -125000.0, 125000.0, 125000.0), "ShortCircuit",
+    )
+    assert linked["location_mil"] == {"x_mil": 1500.0, "y_mil": 1500.0}
+    assert linked["nets"] == ["CLK"]  # the pad's net and the pour's
+
+
+def test_box_nets_follow_the_named_layer():
+    index = _index()
+    linker = DrcLinker(index)
+    on_top = linker.link("Width Constraint: Track (12.7mm,12.7mm)(13mm,12.7mm) on Top Layer",
+                         (1495.0, 1495.0, 1505.0, 1505.0), "Width")
+    on_bottom = linker.link("Width Constraint: Track (12.7mm,12.7mm)(13mm,12.7mm) on "
+                            "Bottom Layer", (1495.0, 1495.0, 1505.0, 1505.0), "Width")
+    assert on_top["nets"] == ["CLK"] and "nets" not in on_bottom
+
+
+def test_diff_pair_rows_link_their_nets():
+    index = _index()
+    index.pcb.diff_pairs = [DiffPair("USB", "USB_P", "USB_N", None)]
+    linked = DrcLinker(index).link(
+        "Matched Net Lengths: Differential Pair USB Actual Length Difference against diff "
+        "pair USB is: 0.5mm, Length Tolerance : 0.1mm.", None, "MatchedLengths",
+    )
+    assert (linked["diff_pairs"], linked["nets"]) == (["USB"], ["USB_P", "USB_N"])
+
+
+def test_rules_sharing_a_description_stay_apart():
+    report = _report(_table("Width Constraint (All)", 2, ["a", "b"]),
+                     _table("Width Constraint (All)", 1, ["c"]))
+    groups = summarize(report, DrcLinker(None))["groups"]
+    assert [(g["rule"], g["count"]) for g in groups] == [
+        ("Width Constraint (All)", 2), ("Width Constraint (All)", 1),
+    ]
+    assert all("reported_count" not in g for g in groups)
+
+
+def test_sections_say_what_they_omit_and_can_be_listed():
+    report = _report(*ALL_CHECKED)
+    report.tables.append(DrcTable(type="waived", title="Hole Size Constraint (All)", count=25,
+                                  violations=[DrcViolation(f"w{i}") for i in range(25)]))
+    (waived,) = other_sections(report, DrcLinker(None))["waived"]
+    assert (len(waived["examples"]), waived["omitted"]) == (20, 5)
+    listed = summarize(report, DrcLinker(None), rule="Hole Size")
+    assert (listed["total"], listed["violations"][0]["section"]) == (25, "waived")
+
+
+def test_tool_without_the_pcbdoc(drc_project):
+    (drc_project / "Demo.PcbDoc").unlink()
+    result = json.loads(main_mod.get_drc_report(group_by="part"))
+    issues = {issue["issue"] for issue in result["assessment"]}
+    assert "pcb_file_missing" in issues and result["pcb_saved_utc"] is None
+    assert "grouped by rule instead" in result["grouping_note"]
+    assert result["groups"][0]["rule"].startswith("Clearance Constraint")
+
+
+def test_tool_trims_to_fit_and_reports_the_origin(drc_project, monkeypatch):
+    result = json.loads(main_mod.get_drc_report(group_by="part"))
+    assert result["origin_mil"] == {"x_mil": 1000.0, "y_mil": 1000.0}
+    assert "grouping_note" in result
+    monkeypatch.setattr(main_mod, "QUERY_NET_MAX_RESULT_SIZE_CHARS", 9000)
+    trimmed = json.loads(main_mod.get_drc_report())
+    assert trimmed["trimmed_to"] in (15, 5) and len(trimmed["groups"]) <= 15
+    monkeypatch.setattr(main_mod, "_project", None)
+    assert json.loads(main_mod.get_drc_report())["error"] == "no_project"

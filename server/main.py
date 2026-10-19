@@ -274,7 +274,7 @@ component locations, distances):
     it again. Otherwise name sheets saved after the PcbDoc as the likely cause. Altium's
     Show Differences is the final word.
 13. get_drc_report — "what does my DRC say?", "any shorts?", "why does DRC fail?":
-    Altium's last Batch DRC report, grouped by rule, part or net, linked to the board.
+    Altium's last Batch DRC report, grouped by rule, component or net, linked to the board.
     Quote its assessment first (stopped at the violation limit, rule kinds not checked,
     older than the board); it is the last run's result, not the board as saved now.
 14. constraints_review — call when the user asks to review or verify the PCB's high-speed
@@ -2785,27 +2785,31 @@ DRC_NOT_READ = (
     meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
 )
 def get_drc_report(
-    group_by: str = "rule",
+    group_by: Literal["rule", "component", "net", "part"] = "rule",
     rule: str | None = None,
     offset: int = 0,
     units: PcbUnits | None = None,
 ) -> str:
     """Read Altium's last Batch DRC report for the project's board ('Design Rule Check -
     <PcbDoc>.html' or '.drc' in the project's output folder): violations grouped by rule,
-    part or net (group_by), each linked to its parts, nets and board location; PCB health
-    issues, waived violations and the report's warnings. The assessment comes first and
-    says whether to trust the report: the DRC stopped at its violation limit (later rules,
-    shorts included, then read 0), Un-Routed Net or Short-Circuit was not checked, the
-    report is older than the board or an Update PCB ran since, it was made for another
-    board, or the rules changed since.
+    component or net (group_by), each linked to its components, nets and board location;
+    PCB health issues, waived violations and the report's warnings. The assessment comes
+    first and says whether to trust the report: incomplete, the DRC stopped at its
+    violation limit (later rules, shorts included, then read 0), Un-Routed Net or
+    Short-Circuit not checked, older than the board or an Update PCB ran since, made for
+    another board, or rules changed since.
 
-    rule (part of a rule description, or a rule kind such as Clearance) lists that rule's
-    violations. Groups and violations are paginated (offset from next_offset). Locations
-    use units (default: board display unit)."""
+    rule (a rule description or part of it, a rule kind such as Clearance, or a health,
+    waived or warning title) lists all its violations. Groups and violations are
+    paginated (offset from next_offset). location_* is absolute (board origin in
+    origin_mil, the frame query_pcb_region takes); a message's own coordinates are
+    relative to the origin. Locations use units (default: board display unit)."""
     try:
         project, netlist, _ = _require_project()
     except ValueError as error:
         return json.dumps({"error": "no_project", "message": str(error)})
+    if group_by == "part":
+        group_by = "component"
     if group_by not in ("rule", "component", "net"):
         return json.dumps({
             "error": "invalid_group_by",
@@ -2818,7 +2822,7 @@ def get_drc_report(
             "message": "The project lists no .PcbDoc, so there is no DRC report to read.",
         })
     pcb_path = Path(paths[0])
-    report, report_path, others, searched = load_report(project, pcb_path)
+    report, report_path, others, searched, notes = load_report(project, pcb_path)
     if report is None:
         return json.dumps({
             "error": "no_drc_report",
@@ -2829,23 +2833,23 @@ def get_drc_report(
             ),
             "searched": searched,
         })
-    index, _ = _pcb_session.get(project, netlist)
-    to_mm = False
+    index = None
+    if pcb_path.is_file():
+        index, _ = _pcb_session.get(project, netlist)
+    to_mm = units == "mm"
     if index is not None:
         to_mm, _, units_error = _pcb_units_or_error(index, units)
         if units_error:
             return json.dumps(units_error)
-    elif units == "mm":
-        to_mm = True
     pcb = index.pcb if index is not None else None
-    assessment = assess(report, report_path, pcb_path, project, pcb)
+    assessment = notes + assess(report, report_path, pcb_path, project, pcb)
     linker = DrcLinker(index)
     options = getattr(pcb, "drc_options", None)
+    folder = Path(project["prj_pcb_path"]).parent
     header: dict = {
         "report": {
-            "file": str(report_path.relative_to(Path(project["prj_pcb_path"]).parent))
-            if report_path.is_relative_to(Path(project["prj_pcb_path"]).parent)
-            else str(report_path),
+            "file": str(report_path.relative_to(folder))
+            if report_path.is_relative_to(folder) else str(report_path),
             "format": report.format,
             "made_for": re.split(r"[\\/]", report.pcb_file)[-1] if report.pcb_file else None,
             "generated": " ".join(part for part in (report.date, report.time) if part),
@@ -2853,9 +2857,13 @@ def get_drc_report(
             "elapsed": report.elapsed,
         },
         "pcb_doc": pcb_path.name,
-        "pcb_saved_utc": _utc(pcb_path.stat().st_mtime),
+        "pcb_saved_utc": _utc(pcb_path.stat().st_mtime) if pcb_path.is_file() else None,
         "totals": report.totals,
     }
+    if pcb is not None:
+        header["origin_mil"] = {
+            "x_mil": pcb.board.origin_x or 0.0, "y_mil": pcb.board.origin_y or 0.0,
+        }
     if options is not None:
         header["drc_settings"] = {
             "stop_after_violations": options.max_violations,
@@ -2863,7 +2871,15 @@ def get_drc_report(
             "report_health_issues": options.include_health,
         }
     if index is None:
-        header["note"] = "The PcbDoc could not be read: violations are not linked to it."
+        header["note"] = (
+            "The PcbDoc could not be read: violations are not linked to components, nets "
+            "or board locations."
+        )
+        if group_by != "rule":
+            header["grouping_note"] = (
+                f"Grouping by {group_by} needs the PcbDoc; grouped by rule instead."
+            )
+            group_by = "rule"
     header["assessment"] = assessment
     for limit in (None, 15, 5):
         body = summarize(report, linker, group_by=group_by, rule=rule, offset=offset,
@@ -2880,6 +2896,7 @@ def get_drc_report(
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
+
 
 
 SCHEMATIC_REVIEW_PROMPT = """\

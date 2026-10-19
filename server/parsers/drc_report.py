@@ -9,6 +9,9 @@ violation; the HTML lists rules without violations only in its summary. The HTML
 gives each row a zoom box: the violation area in absolute board coordinates (mil).
 The coordinates inside a message are relative to the board origin, in the report unit.
 Dates follow the generating machine's locale and are kept as written.
+
+A report Altium could not finish (an empty HTML when the path is over 256 characters, a
+file cut short) must not read as a clean board, so each parse lists its problems.
 """
 
 import re
@@ -63,6 +66,8 @@ class DrcReport:
     tables: list[DrcTable] = field(default_factory=list)
     # As the report states them: rule_violations, waived, health_issues, warnings.
     totals: dict[str, int] = field(default_factory=dict)
+    # Why the report may be incomplete (empty, cut short, rows not matching counts).
+    problems: list[str] = field(default_factory=list)
 
 
 def read_text(path: str | Path) -> str:
@@ -87,6 +92,25 @@ def _number(text: str) -> int | None:
     return int(text) if text.isdigit() else None
 
 
+def _check_counts(report: DrcReport) -> None:
+    """Rows against each table's count, and the rule counts against the stated total."""
+    mismatched = [
+        table.title for table in report.tables
+        if table.type != WARNING and len(table.violations) != table.count
+    ]
+    if mismatched:
+        report.problems.append(
+            f"{len(mismatched)} tables list a different number of rows than their count "
+            f"(e.g. {mismatched[0]})"
+        )
+    total = report.totals.get("rule_violations")
+    counted = sum(table.count for table in report.tables if table.type == RULE)
+    if total is not None and total != counted:
+        report.problems.append(
+            f"the rule counts add up to {counted}, the report states {total}"
+        )
+
+
 # ---------- HTML ----------
 
 class _HtmlReport(HTMLParser):
@@ -97,19 +121,23 @@ class _HtmlReport(HTMLParser):
         self.report = DrcReport(format="html")
         self.summary: list[tuple[str, str, int, str | None]] = []  # type, title, count, anchor
         self.sections: dict[str, DrcTable] = {}  # anchor -> table
+        self.closed = False  # </html> reached
         self._capture: str | None = None  # what the current text belongs to
         self._text: list[str] = []
         self._label = ""
-        self._anchor: str | None = None  # the last <a name=...>
+        self._anchor: str | None = None  # the last <a name=...> outside a cell
         self._summary_type: str | None = None
         self._summary_row: dict | None = None
         self._section: DrcTable | None = None
         self._cell: dict | None = None
-        self._in_callback = False
+        self._callback_depth = 0  # <a> tags open inside a callback link
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         cls = attrs.get("class") or ""
+        if self._cell is not None:
+            self._cell_start(tag, attrs, cls)
+            return
         if tag == "a" and attrs.get("name"):
             self._anchor = attrs["name"]
         if tag == "td" and cls in (
@@ -128,7 +156,7 @@ class _HtmlReport(HTMLParser):
             self._start("section_title")
         elif tag == "td" and cls == "column1":
             if self._section is not None:
-                self._cell = {"message": [], "extra": [], "box": None}
+                self._cell = {"text": [], "after": [], "box": None, "broken": False}
             elif self._summary_type is not None:
                 self._summary_row = {"title": "", "anchor": None, "count": None}
                 self._start("summary_desc")
@@ -138,47 +166,48 @@ class _HtmlReport(HTMLParser):
             href = attrs.get("href") or ""
             if href.startswith("#"):
                 self._summary_row["anchor"] = href[1:]
-        elif tag == "a" and cls == "callback" and self._cell is not None:
-            self._in_callback = True
-            match = _BOX.search(attrs.get("href") or "")
-            if match and self._cell["box"] is None:
-                x1, x2 = float(match["x1"]), float(match["x2"])
-                y1, y2 = float(match["y1"]), float(match["y2"])
-                self._cell["box"] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-        elif tag == "br" and self._cell is not None and not self._in_callback:
-            self._cell["extra"].append("\n")
+
+    def _cell_start(self, tag, attrs, cls):
+        cell = self._cell
+        if tag == "a":
+            if self._callback_depth:
+                self._callback_depth += 1  # e.g. a coordinate anchor inside the link
+            elif cls == "callback":
+                self._callback_depth = 1
+                match = _BOX.search(attrs.get("href") or "")
+                if match and cell["box"] is None:
+                    x1, x2 = float(match["x1"]), float(match["x2"])
+                    y1, y2 = float(match["y1"]), float(match["y2"])
+                    cell["box"] = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        elif tag == "br" and not self._callback_depth and "".join(cell["text"]).strip():
+            # After the message: a waived row's 'Waived by ...<br>comment'.
+            cell["broken"] = True
 
     def handle_endtag(self, tag):
-        if tag == "a" and self._in_callback:
-            self._in_callback = False
-            if self._cell is not None:
-                self._cell["message"].append(" ")
-        elif tag in ("td", "p", "th") and self._capture in (
+        if tag == "html":
+            self.closed = True
+        if self._cell is not None:
+            if tag == "a" and self._callback_depth:
+                self._callback_depth -= 1
+            elif tag == "td":
+                self._end_cell()
+            return
+        if tag in ("td", "p", "th") and self._capture in (
             "front_matter_column1", "front_matter_column3", "DRC_summary_header_col1",
             "DRC_summary_header_col3", "error", "summary_title", "section_title",
             "summary_count",
         ):
             self._finish(self._capture, "".join(self._text).strip())
             self._capture = None
-        elif tag == "td" and self._cell is not None:
-            # A text string's own line break reaches the message as CRLF.
-            message = "".join(self._cell["message"]).replace("\r\n", "\n").strip()
-            extra = "".join(self._cell["extra"]).strip()
-            if message:
-                self._section.violations.append(DrcViolation(
-                    message=message, box_mil=self._cell["box"], waiver=extra or None,
-                ))
-            self._cell = None
         elif tag == "td" and self._capture == "summary_desc":
             self._summary_row["title"] = "".join(self._text).strip()
             self._capture = None
         elif tag == "tr" and self._summary_row is not None:
             row = self._summary_row
-            if row["anchor"] or row["title"].lower() != "total":
-                if row["count"] is not None:
-                    self.summary.append(
-                        (self._summary_type, row["title"], row["count"], row["anchor"])
-                    )
+            if (row["anchor"] or row["title"].lower() != "total") and row["count"] is not None:
+                self.summary.append(
+                    (self._summary_type, row["title"], row["count"], row["anchor"])
+                )
             self._summary_row = None
         elif tag == "table":
             if self._section is not None:
@@ -186,9 +215,22 @@ class _HtmlReport(HTMLParser):
             elif self._summary_type is not None:
                 self._summary_type = None
 
+    def _end_cell(self):
+        cell = self._cell
+        self._cell, self._callback_depth = None, 0
+        # A text string's own line break reaches the text as CRLF.
+        message = "".join(cell["text"]).replace("\r\n", "\n").strip()
+        after = "".join(cell["after"]).replace("\r\n", "\n").strip()
+        if self._section.type != WAIVED and after:
+            message, after = f"{message}\n{after}".strip(), ""
+        if message or after:
+            self._section.violations.append(DrcViolation(
+                message=message, box_mil=cell["box"], waiver=after or None,
+            ))
+
     def handle_data(self, data):
         if self._cell is not None:
-            self._cell["message" if self._in_callback else "extra"].append(data)
+            self._cell["after" if self._cell["broken"] else "text"].append(data)
         elif self._capture is not None:
             self._text.append(data)
 
@@ -244,6 +286,14 @@ def parse_drc_html(text: str) -> DrcReport:
         if anchor not in used:  # a section the summary did not list (e.g. warnings)
             section.count = len(section.violations)
             report.tables.append(section)
+    if not text.strip():
+        report.problems.append("the file is empty")
+    else:
+        if not parser.closed:
+            report.problems.append("the file ends early (no </html>)")
+        if "rule_violations" not in report.totals:
+            report.problems.append("the header has no violation total")
+        _check_counts(report)
     return report
 
 
@@ -255,6 +305,8 @@ _TXT_STARTS = (
     ("PCB Health Issue Category : ", HEALTH),
     ("WARNING: ", WARNING),
 )
+# Each row starts with this (rule and waived tables); other lines continue the row.
+_ROW_STARTS = {RULE: "   Violation between ", WAIVED: "   Waived Violation between "}
 _TXT_COUNTS = ("Rule Violations :", "Waived Violations :", "Issues :")
 _TXT_FOOTER = {
     "Violations Detected": "rule_violations",
@@ -264,17 +316,36 @@ _TXT_FOOTER = {
 _WAIVED_BY = re.compile(r"Waived by ")
 
 
+def _continue_row(table: DrcTable, line: str) -> None:
+    """A line that continues the last row: a second cell (indented) or a text string's
+    own line break; for waived rows, the waiver and its comment."""
+    last = table.violations[-1]
+    stripped = line.strip()
+    if table.type == WAIVED and last.waiver is None:
+        found = _WAIVED_BY.search(stripped)
+        if found:
+            last.message = f"{last.message}\n{stripped[: found.start()]}".rstrip()
+            last.waiver = stripped[found.start():]
+            return
+    if table.type == WAIVED and last.waiver is not None:
+        last.waiver = f"{last.waiver}\n{stripped}"
+        return
+    joiner = " " if line.startswith("    ") else "\n"
+    last.message = f"{last.message}{joiner}{stripped}"
+
+
 def parse_drc_txt(text: str) -> DrcReport:
     report = DrcReport(format="txt")
     table: DrcTable | None = None
+    footer_seen = False
     for raw in text.splitlines():
         line = raw.rstrip("\r")
         stripped = line.strip()
-        header = re.match(r"^(PCB File|Date|Time|Time Elapsed)\s*:\s*(.*)$", stripped)
-        footer = re.match(r"^(Violations Detected|Waived Violations|PCB Health Issues)\s*:\s*(\d+)$",
-                          stripped)
         start = next((pair for pair in _TXT_STARTS if line.startswith(pair[0])), None)
         if start:
+            if table is not None and table.type != WARNING:
+                report.problems.append(f"'{table.title}' has no count line")
+                table.count = len(table.violations)
             table = DrcTable(type=start[1], title=line[len(start[0]):].strip(), count=0)
             report.tables.append(table)
             continue
@@ -287,9 +358,15 @@ def parse_drc_txt(text: str) -> DrcReport:
             table.count = int(stripped.rsplit(":", 1)[1])
             table = None
             continue
-        if footer and table is None:
+        footer = re.match(
+            r"^(Violations Detected|Waived Violations|PCB Health Issues)\s*:\s*(\d+)$", stripped
+        )
+        if footer and (table is None or table.type == WARNING):
+            table = None
+            footer_seen = footer_seen or footer[1] == "Violations Detected"
             report.totals[_TXT_FOOTER[footer[1]]] = int(footer[2])
             continue
+        header = re.match(r"^(PCB File|Date|Time|Time Elapsed)\s*:\s*(.*)$", stripped)
         if header and table is None:
             key, value = header[1], header[2].strip()
             if key == "PCB File":
@@ -311,22 +388,30 @@ def parse_drc_txt(text: str) -> DrcReport:
                 table.count = len(table.violations)
                 table = None
             continue
-        if line.startswith("   ") and not line.startswith("    ") and table.type in (RULE, WAIVED):
-            message = re.sub(r"^(Waived )?Violation between ", "", stripped)
-            waiver = None
-            if table.type == WAIVED:
-                found = _WAIVED_BY.search(message)
-                if found:
-                    message, waiver = message[: found.start()], message[found.start():]
-            table.violations.append(DrcViolation(message=message.rstrip(), waiver=waiver))
+        row_start = _ROW_STARTS.get(table.type)
+        if row_start is not None:
+            if line.startswith(row_start):
+                table.violations.append(DrcViolation(message=line[len(row_start):].strip()))
+                if table.type == WAIVED:
+                    last = table.violations[-1]
+                    found = _WAIVED_BY.search(last.message)
+                    if found:
+                        last.message, last.waiver = (
+                            last.message[: found.start()].rstrip(), last.message[found.start():]
+                        )
+            elif table.violations:
+                _continue_row(table, line)
         elif line.startswith("   ") and not line.startswith("    "):
             table.violations.append(DrcViolation(message=stripped))
         elif table.violations:
-            # A second cell, or a text string holding a line break: same violation.
-            last = table.violations[-1]
-            last.message = f"{last.message}\n{stripped}" if line[:1].strip() else (
-                f"{last.message} {stripped}"
-            )
-    if table is not None and table.type == WARNING:
+            _continue_row(table, line)
+    if table is not None:
+        if table.type != WARNING:
+            report.problems.append(f"'{table.title}' has no count line")
         table.count = len(table.violations)
+    if not text.strip():
+        report.problems.append("the file is empty")
+    elif not footer_seen:
+        report.problems.append("the file ends early (no 'Violations Detected' footer)")
+    _check_counts(report)
     return report
