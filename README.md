@@ -35,7 +35,10 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |
 | *"What width and clearance apply to USB_D_P?"* | The effective design rule per kind, resolved by priority, with values per layer |
 | *"Which nets are in the HighSpeed class?"* | Net, component and diff-pair classes with their members |
-| *"List my differential pairs and their skew"* | Pairs, classes, routed length per leg, and the routing rule for each |
+| *"List my differential pairs and their skew"* | Pairs, classes, length per leg (pad-to-pad path plus via barrels), and the routing rule for each |
+| *"Do my tracks and vias meet their rules?"* | Widths per layer, via sizes, holes and routing layers checked against the rule that applies to each object |
+| *"Are my DDR length groups within tolerance?"* | Length and matched-length rules evaluated like Altium, xSignals through series parts included |
+| *"Any polarity swaps or missing AC caps on my pairs?"* | Undeclared pairs, swapped P/N at pins, asymmetric series parts, in-pair skew against the rule |
 | *"What did we note about the power input?"* | Schematic notes, text frames and labels, with the parts they sit next to |
 | *"What are the fabrication notes?"* | Draftsman notes, tables, drill table and title-block data |
 | *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images |
@@ -48,7 +51,8 @@ Claude activates these automatically based on what you say — no commands neede
 
 | Mode | Triggers when you say... | What happens |
 |---|---|---|
-| `schematic_review` | *"review this"*, *"is this correct?"*, *"check my power supply"* | 3-phase structured audit: Claude reads datasheets and confirms its understanding before flagging anything. Every finding cites a datasheet value or a netlist fact. Report saved to markdown. |
+| `schematic_review` | *"review this"*, *"is this correct?"*, *"check my power supply"* | 3-phase structured audit: Claude reads datasheets and confirms its understanding before flagging anything. Every finding cites a datasheet value or a netlist fact. Ask Claude to write the report to a file if you want one. |
+| `constraints_review` | *"check my high-speed constraints"*, *"are my DDR length rules right?"*, *"review the diff pairs before fab"* | 4-phase PCB constraints audit: Claude identifies each interface from its parts and pins, takes targets from the chip's own layout guide (typical values only as a labelled fallback), checks that pairs, classes and rules encode them, then spot-checks widths, lengths, skew and neighbours on the saved copper. Reads the saved rules, not DRC results. |
 | `brainstorm_circuits` | *"I want to add a new circuit, lets brainstorm"*, *"How would i improve this circuit"*, *"What power supply topology should I use here?"*  | 5-phase design session: reads your loaded schematic first, then asks one question at a time — problem, constraints, proposes 2–3 topologies with tradeoffs, checks your existing design before recommending anything new. |
 
 ---
@@ -60,7 +64,10 @@ route, what's near what (crosstalk), your full stackup, and where components sit
 It also reads the board's design rules, classes and differential pairs, and works out
 which rule applies to a net the way Altium does — including rules that only apply to
 some of a net's objects (its vias, one layer, a room) and scopes that point at classes
-or pairs that no longer exist. It reads the saved rules; it does not run DRC.
+or pairs that no longer exist. It also checks the saved copper against those rules —
+widths, vias, routing layers, length groups and diff-pair consistency — and on the DRC
+reports we compared, its counts matched Altium's. It reads the saved file; it does not run
+or read Altium's DRC.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
 

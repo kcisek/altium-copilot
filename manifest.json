@@ -46,7 +46,12 @@
     { "name": "get_design_rules", "description": "List the PCB design rules saved in the PcbDoc by kind, priority and scope, or show a kind or rule with its values: widths, gaps, clearance matrix, per-layer values, and stale scope references." },
     { "name": "get_rules_for_net", "description": "Resolve which design rules apply to a net or differential pair, the way Altium does by priority: the effective rule per kind with values, conditional overrides, and clearance candidates." },
     { "name": "get_classes", "description": "List the PCB's net, component, differential-pair, pad and xSignal classes, or show one class's members with unresolved members and DNP flags." },
-    { "name": "list_diff_pairs", "description": "List differential pairs with their nets, classes, routed length per leg and skew, and the routing rule that applies to each pair." }
+    { "name": "list_diff_pairs", "description": "List differential pairs with their nets, classes, length per leg (pad-to-pad path plus via barrels) and skew, and the routing rule that applies to each pair." },
+    { "name": "check_rule_compliance", "description": "Check saved copper against the design rules per object: track widths per layer (diff-pair nets against their routing rule), via diameter and hole, via hole size and annular ring, routing layers and Length windows; optional approximate clearance spot-check. Groups violations and says whether the board's own batch DRC checks each kind." },
+    { "name": "check_lengths", "description": "Evaluate Length and MatchedLengths rules like Altium: length windows, matched-length groups of xSignals, pairs or nets against the longest member or target, and within-pair skew, measured as pad-to-pad copper path plus via barrels." },
+    { "name": "get_signal_length", "description": "Measure one net, differential pair, xSignal or pin-to-pin path on the saved copper, including via barrels, with per-layer lengths and unrouted gaps." },
+    { "name": "check_diff_pairs", "description": "Check differential-pair consistency: undeclared P/N pairs, polarity swaps at component pins (with interface hints), series parts and AC coupling symmetry, and in-pair skew against within-pair rules." },
+    { "name": "constraints_review", "description": "Start a structured 4-phase review of the PCB's high-speed constraints: identifies interfaces from parts and pins, takes targets from each chip's layout guide, checks pairs, classes, impedance-driven rules, matched-length groups, clearances, reference layers and stale rules, then spot-checks the saved copper. Reads saved rules, not DRC results. Automatically triggered when the user asks Claude to check the board's high-speed constraints." }
   ],
   "compatibility": {
     "claude_desktop": ">=1.0.0",

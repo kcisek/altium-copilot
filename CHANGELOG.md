@@ -131,6 +131,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- Rule-compliance, length and diff-pair checks on the saved copper, plus a constraints
+  review mode. New tools:
+  - `check_rule_compliance` — track widths per layer (diff-pair nets against their
+    DiffPairsRouting widths), via diameter and hole, via hole size and annular ring,
+    routing layers and Length windows, with the rule resolved for each object: room,
+    layer, via and pad scopes are decided per object. Optional approximate clearance
+    spot-check. Says whether the board's own batch DRC checks each kind
+  - `check_lengths` — Length and MatchedLengths rules evaluated like Altium: windows,
+    matched-length groups (xSignals, pairs or nets) against the longest member or the
+    target source, within-pair skew; stale scopes and conditional members reported
+  - `get_signal_length` — one net, pair, xSignal or pin-to-pin path
+  - `check_diff_pairs` — undeclared P/N pairs, polarity swaps at pins (with a hint when
+    the interface tolerates inversion), series parts and AC coupling symmetry (value,
+    footprint, DNP), in-pair skew against within-pair rules
+  - `constraints_review` — 4-phase audit of high-speed interfaces: targets from each
+    chip's layout guide, rules and copper checked against them
+- Lengths are the copper path from pad centre to pad centre plus the via barrel over the
+  layers it traverses, with true arc lengths; xSignals are read from the PcbDoc and
+  followed through series parts. `list_diff_pairs` reports these lengths (routed copper
+  stays as `routed_length_mil`)
+- Rule scopes are decided per object (IsVia/IsTrack/IsPad, OnLayer and layer classes,
+  WithinRoom/TouchesRoom, InComponent/HasPad/InPadClass, pad Name) and for xSignals
+  (InxSignal, InxSignalClass, InAnyxSignal, IsxSignal)
 - PCB design rules, classes and differential pairs, read from the `.PcbDoc`
   (`Rules6`, `Classes6`, `SignalClasses`, `DifferentialPairs6`). New tools:
   - `get_design_rules` — every rule's kind, priority, enabled flag and scope; per kind
