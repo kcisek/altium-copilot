@@ -288,6 +288,11 @@ otherwise your data may be stale.
   not answer component questions from the nets alone or retry search_components in a loop
 - sheet_errors in set_project_dir/refresh_netlist → those sheets failed to parse; their
   components are missing. Name the failing sheets and errors to the user
+- designator_clashes in set_project_dir/refresh_netlist → on that sheet one refdes names
+  two or more different components, and only the last one's metadata is loaded. Tell the
+  user each sheet, refdes and lib_references (and designator_clash_count if more than are
+  listed), and do not trust MPN, value or pin names of those refdes until they are renamed
+  and the netlist is refreshed
 - Component not found → call search_components with a regex to locate it
 - Net not found → use query_net with a keyword pattern to discover the real name
   (e.g. query_net('MISO') or query_net('CAN')). Never guess net names or
@@ -336,6 +341,9 @@ def _no_components_error(netlist: dict) -> dict | None:
     return error
 
 
+_MAX_DESIGNATOR_CLASHES = 20  # designator_clashes listed in a load response
+
+
 def _load_diagnostics(netlist: dict) -> dict:
     """Component count, per-sheet parse errors and coverage warnings for load responses."""
     components = netlist.get("components") or {}
@@ -344,6 +352,18 @@ def _load_diagnostics(netlist: dict) -> dict:
         diagnostics["sheet_errors"] = netlist["sheet_errors"]
     if netlist.get("annotation_errors"):
         diagnostics["annotation_errors"] = netlist["annotation_errors"]
+    clashes = netlist.get("designator_clashes") or []
+    if clashes:
+        diagnostics["designator_clash_count"] = len(clashes)
+        diagnostics["designator_clashes"] = clashes[:_MAX_DESIGNATOR_CLASHES]
+        diagnostics["designator_clashes_hint"] = (
+            "Each refdes names two or more different components on that sheet, one per "
+            "entry in lib_references. Only the last one's metadata (MPN, description, "
+            "value, pin names) is loaded; the others have none. Rename or re-annotate the "
+            "duplicates in Altium, save, then call refresh_netlist."
+            + (f" Only the first {_MAX_DESIGNATOR_CLASHES} are listed."
+               if len(clashes) > _MAX_DESIGNATOR_CLASHES else "")
+        )
     renamed = sum(1 for comp in components.values() if comp.get("logical_refdes"))
     if renamed:
         diagnostics["renamed_by_annotation"] = renamed
@@ -753,6 +773,16 @@ def refresh_netlist() -> str:
             message += f"\nSheet '{err['sheet']}' failed to load: {err['error']}"
         for err in diagnostics.get("annotation_errors", []):
             message += f"\nAnnotation file '{Path(err['path']).name}' not applied: {err['error']}"
+        clashes = diagnostics.get("designator_clashes", [])
+        for clash in clashes:
+            message += (
+                f"\nSheet '{clash['sheet']}': {clash['refdes']} names "
+                f"{len(clash['lib_references'])} different components "
+                f"({', '.join(clash['lib_references'])}); only the last one is loaded"
+            )
+        if diagnostics.get("designator_clash_count", 0) > len(clashes):
+            message += (f"\n... and {diagnostics['designator_clash_count'] - len(clashes)} "
+                        "more designator clashes")
         return message
     _pcb_session.invalidate()
     _netlist_last_updated = datetime.now(timezone.utc).isoformat()

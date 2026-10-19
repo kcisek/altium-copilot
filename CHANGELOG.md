@@ -34,6 +34,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   matched 28). Parts placed from different library references are merged and logged.
   Two different components with one designator on a sheet are logged and, as before,
   the later one is kept
+- A designator that names two or more different components on one sheet is reported
+  instead of only logged. Only the last component's metadata is loaded, so the others
+  silently had none. `set_project_dir` and `refresh_netlist` add `designator_clashes`
+  (sheet, refdes and each component's `lib_references`, the first 20),
+  `designator_clash_count` and a hint, and a `refresh_netlist` cache hit names them; the
+  server instructions tell Claude to pass them on. 200 real sheets have 31 such clashes
+  on 22 sheets, all pairs of single-part components with different library references.
+  `parse_sch_doc` and `components_from_stream` take an optional `clashes` list to fill
 - PCB tools name components by the designator printed on the board (decoded from
   `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
   name and differs on multi-channel and board-annotated designs (57 of 73 parts on

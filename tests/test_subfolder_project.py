@@ -10,6 +10,7 @@ import pytest
 
 from altium import AltiumClient
 from parsers.prj_pcb import parse_prj_pcb
+from parsers.sch_doc import DesignatorClash, parse_sch_doc
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SHEET1_COUNT = 67
@@ -378,6 +379,27 @@ def test_set_project_dir_reports_sheet_errors(main_env):
     assert result["component_count"] == TOTAL_COUNT
     assert [e["sheet"] for e in result["sheet_errors"]] == ["broken"]
     assert main.get_sheet_context("broken").startswith("warning: sheet_load_failed")
+
+
+def test_set_project_dir_reports_designator_clashes(main_env):
+    main, root, _, _, _ = main_env
+
+    def parse_with_clash(path, clashes=None):
+        result = parse_sch_doc(path, clashes)
+        if Path(path).stem == "sheet2":
+            clashes.append(DesignatorClash("U3", ["LTC6811", "LDO"]))
+        return result
+
+    with patch("altium.parse_sch_doc", side_effect=parse_with_clash):
+        result = json.loads(main.set_project_dir(str(root)))
+
+    assert result["loaded"] is True
+    assert result["component_count"] == TOTAL_COUNT
+    assert result["designator_clash_count"] == 1
+    assert result["designator_clashes"] == [
+        {"sheet": "sheet2", "refdes": "U3", "lib_references": ["LTC6811", "LDO"]},
+    ]
+    assert "designator_clashes_hint" in result
 
 
 def test_zero_components_is_reported_everywhere(main_env):

@@ -19,20 +19,38 @@ class ComponentMeta:
     pins: dict[str, str] = field(default_factory=dict)  # pin_number -> pin_name
 
 
-def parse_sch_doc(path: str) -> dict[str, ComponentMeta]:
-    """Parse an Altium .SchDoc OLE file and return component metadata keyed by refdes."""
+@dataclass
+class DesignatorClash:
+    """Two or more different components drawn with one designator on a sheet."""
+    refdes: str
+    # Each component's LibReference in file order; the last one is the one kept.
+    lib_references: list[str] = field(default_factory=list)
+
+
+def parse_sch_doc(
+    path: str, clashes: list[DesignatorClash] | None = None
+) -> dict[str, ComponentMeta]:
+    """Parse an Altium .SchDoc OLE file and return component metadata keyed by refdes.
+
+    Designators that name two or more different components are appended to clashes.
+    """
     with olefile.OleFileIO(path) as f:
-        return components_from_stream(f.openstream("FileHeader").read(), source=path)
+        return components_from_stream(
+            f.openstream("FileHeader").read(), source=path, clashes=clashes
+        )
 
 
-def components_from_stream(data: bytes, source: str = "") -> dict[str, ComponentMeta]:
+def components_from_stream(
+    data: bytes, source: str = "", clashes: list[DesignatorClash] | None = None
+) -> dict[str, ComponentMeta]:
     """parse_sch_doc for the bytes of a FileHeader stream.
 
     The OwnerIndex field in child records (pins, designators, parameters) refers to
     the 0-based sequential record number of the parent RECORD=1 minus 1, i.e. the
     record immediately preceding the component record in the file stream.
 
-    source names the sheet in logged warnings.
+    source names the sheet in logged warnings. Designators that name two or more
+    different components are appended to clashes, see _merge_parts.
     """
     # Parsing state
     # Key: owner_key = record_num - 1 for the RECORD=1 entry
@@ -61,7 +79,7 @@ def components_from_stream(data: bytes, source: str = "") -> dict[str, Component
             )
         # RECORD=17 (power ports) intentionally skipped
 
-    return _merge_parts(components_by_owner, parts, best_mpn_priority, source)
+    return _merge_parts(components_by_owner, parts, best_mpn_priority, source, clashes)
 
 
 @dataclass
@@ -105,6 +123,7 @@ def _merge_parts(
     parts: dict[int, _Part],
     best_mpn_priority: dict[int, int],
     source: str,
+    clashes: list[DesignatorClash] | None = None,
 ) -> dict[str, ComponentMeta]:
     """One ComponentMeta per designator, the parts of a multi-part component merged.
 
@@ -118,10 +137,12 @@ def _merge_parts(
     parts of one component can be placed from different libraries. A part that cannot
     belong to the component holding its designator (a part id seen before, or another
     part count) is another component with the same designator: it replaces the earlier
-    one, as before, and the clash is logged. Unannotated parts (U?) share a designator
-    and are neither merged nor logged.
+    one, as before, and the clash is logged and appended to clashes, one entry per
+    designator. Unannotated parts (U?) share a designator and are neither merged nor
+    logged.
     """
     components: dict[str, _Component] = {}
+    clashed: dict[str, DesignatorClash] = {}
     for key, meta in components_by_owner.items():
         refdes, part = meta.refdes, parts[key]
         if not refdes:
@@ -142,6 +163,11 @@ def _merge_parts(
                 "using the later one", source or "SchDoc", refdes,
                 held.first.lib_reference, part.lib_reference,
             )
+            if refdes not in clashed:
+                clashed[refdes] = DesignatorClash(refdes, [held.first.lib_reference])
+                if clashes is not None:
+                    clashes.append(clashed[refdes])
+            clashed[refdes].lib_references.append(part.lib_reference)
         components[refdes] = _Component(meta, part, best_mpn_priority.get(key, 999))
     return {refdes: held.meta for refdes, held in components.items()}
 
