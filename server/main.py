@@ -42,6 +42,9 @@ try:
         PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
     )
     from services.sch_pcb_sync import net_matching_options, run_sync_check
+    from services.drc_results import (
+        load_report, assess, summarize, other_sections, DrcLinker,
+    )
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -73,6 +76,9 @@ except ImportError:
         PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
     )
     from server.services.sch_pcb_sync import net_matching_options, run_sync_check
+    from server.services.drc_results import (
+        load_report, assess, summarize, other_sections, DrcLinker,
+    )
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -267,7 +273,11 @@ component locations, distances):
     netlist was compiled: call refresh_netlist (those saves prove the user saved) and run
     it again. Otherwise name sheets saved after the PcbDoc as the likely cause. Altium's
     Show Differences is the final word.
-13. constraints_review — call when the user asks to review or verify the PCB's high-speed
+13. get_drc_report — "what does my DRC say?", "any shorts?", "why does DRC fail?":
+    Altium's last Batch DRC report, grouped by rule, component or net, linked to the board.
+    Quote its assessment first (stopped at the violation limit, rule kinds not checked,
+    older than the board); it is the last run's result, not the board as saved now.
+14. constraints_review — call when the user asks to review or verify the PCB's high-speed
     constraints or the routing against them ("check my high-speed rules", "are my DDR
     length rules right?", "review the diff pairs before fab"): a whole-interface audit
     of rules and copper against each chip's layout guide. For one net use
@@ -283,7 +293,7 @@ on the end pads (xSignals: legs through series parts, pin/package length at the 
 Nets without exactly 2 pads use routed copper plus barrels and no pin/package length, like
 Altium's Routed Length. A pair's group length is the P/N average. Results marked marginal
 are too close to a limit to call. The checks read the saved
-rules and copper, not Altium's DRC report; checked_by_batch_drc false means the designer's
+rules and copper, not Altium's DRC report (get_drc_report reads that); checked_by_batch_drc false means the designer's
 own batch DRC does not check that kind — say so before calling it a problem.
 
 Rule scopes are evaluated per net or pair. A rule marked conditional (with
@@ -295,7 +305,8 @@ clearance. Widths and diff-pair gaps are per layer: quote layers_mil for the lay
 question. A diff-pair net's track width is checked by its DiffPairsRouting rule, not
 the Width rule. stale_references are scope names that match nothing on the board, so
 that part of the rule silently applies to nothing — worth pointing out. Rule values are
-what is stored in the PcbDoc; DRC results are not read, so do not claim the board passes.
+what is stored in the PcbDoc and do not show that the board passes: Altium's own DRC
+result is get_drc_report, whose assessment says whether it can be trusted.
 
 Net names are shared between schematic and PCB — pivot freely between query_net
 (connectivity) and get_net_pcb (physical routing). PCB tools return both `refdes` (the
@@ -446,6 +457,8 @@ def _project_documents(prj_data) -> dict:
         "pcb_doc_paths": prj_data.pcb_doc_paths,
         "pcb_dwf_paths": prj_data.pcb_dwf_paths,
         "parameters": prj_data.parameters,
+        "output_path": prj_data.output_path,
+        "log_folder_path": prj_data.log_folder_path,
     }
 
 
@@ -2757,6 +2770,133 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
+
+
+DRC_NOT_READ = (
+    "This is Altium's last Batch DRC run, not a check of the board as saved now "
+    "(check_rule_compliance and check_lengths measure the saved copper). ERC (the "
+    "Messages panel), OutJob validation outputs and the DRC XML report are not read."
+)
+
+
+@mcp.tool(
+    title="Get DRC Report",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_drc_report(
+    group_by: Literal["rule", "component", "net", "part"] = "rule",
+    rule: str | None = None,
+    offset: int = 0,
+    units: PcbUnits | None = None,
+) -> str:
+    """Read Altium's last Batch DRC report for the project's board ('Design Rule Check -
+    <PcbDoc>.html' or '.drc' in the project's output folder): violations grouped by rule,
+    component or net (group_by), each linked to its components, nets and board location;
+    PCB health issues, waived violations and the report's warnings. The assessment comes
+    first and says whether to trust the report: incomplete, the DRC stopped at its
+    violation limit (later rules, shorts included, then read 0), Un-Routed Net or
+    Short-Circuit not checked, older than the board or an Update PCB ran since, made for
+    another board, or rules changed since.
+
+    rule (a rule description or part of it, a rule kind such as Clearance, or a health,
+    waived or warning title) lists all its violations. Groups and violations are
+    paginated (offset from next_offset). location_* is absolute (board origin in
+    origin_*, the frame query_pcb_region takes); a message's own coordinates are relative
+    to the origin. Locations use units (default: board display unit)."""
+    try:
+        project, netlist, _ = _require_project()
+    except ValueError as error:
+        return json.dumps({"error": "no_project", "message": str(error)})
+    if group_by == "part":
+        group_by = "component"
+    if group_by not in ("rule", "component", "net"):
+        return json.dumps({
+            "error": "invalid_group_by",
+            "message": "group_by is one of rule, component, net.",
+        })
+    paths = project.get("pcb_doc_paths") or []
+    if not paths:
+        return json.dumps({
+            "error": "no_pcb_document",
+            "message": "The project lists no .PcbDoc, so there is no DRC report to read.",
+        })
+    pcb_path = Path(paths[0])
+    report, report_path, others, searched, notes = load_report(project, pcb_path)
+    if report is None:
+        return json.dumps({
+            "error": "no_drc_report",
+            "message": (
+                f"No 'Design Rule Check - {pcb_path.stem}.html' or '.drc' was found. In "
+                "Altium run Tools > Design Rule Check with 'Create Report File' on; the "
+                "report goes to the project's output folder."
+            ),
+            "searched": searched,
+        })
+    index = None
+    if pcb_path.is_file():
+        index, _ = _pcb_session.get(project, netlist)
+    to_mm = units == "mm"
+    if index is not None:
+        to_mm, _, units_error = _pcb_units_or_error(index, units)
+        if units_error:
+            return json.dumps(units_error)
+    pcb = index.pcb if index is not None else None
+    assessment = notes + assess(report, report_path, pcb_path, project, pcb)
+    linker = DrcLinker(index)
+    options = getattr(pcb, "drc_options", None)
+    folder = Path(project["prj_pcb_path"]).parent
+    header: dict = {
+        "report": {
+            "file": str(report_path.relative_to(folder))
+            if report_path.is_relative_to(folder) else str(report_path),
+            "format": report.format,
+            "made_for": re.split(r"[\\/]", report.pcb_file)[-1] if report.pcb_file else None,
+            "generated": " ".join(part for part in (report.date, report.time) if part),
+            "saved_utc": _utc(report_path.stat().st_mtime),
+            "elapsed": report.elapsed,
+        },
+        "pcb_doc": pcb_path.name,
+        "pcb_saved_utc": _utc(pcb_path.stat().st_mtime) if pcb_path.is_file() else None,
+        "totals": report.totals,
+    }
+    if pcb is not None:
+        header["origin_mil"] = {
+            "x_mil": pcb.board.origin_x or 0.0, "y_mil": pcb.board.origin_y or 0.0,
+        }
+    if options is not None:
+        header["drc_settings"] = {
+            "stop_after_violations": options.max_violations,
+            "create_report_file": options.make_report,
+            "report_health_issues": options.include_health,
+        }
+    if index is None:
+        header["note"] = (
+            "The PcbDoc could not be read: violations are not linked to components, board "
+            "copper or locations; nets and pairs shown come only from the message text."
+        )
+        if group_by != "rule":
+            header["grouping_note"] = (
+                f"Grouping by {group_by} needs the PcbDoc; grouped by rule instead."
+            )
+            group_by = "rule"
+    header["assessment"] = assessment
+    for limit in (None, 15, 5):
+        body = summarize(report, linker, group_by=group_by, rule=rule, offset=offset,
+                         limit=limit)
+        if "error" in body:
+            return json.dumps(body)
+        result = {**header, **body, **other_sections(report, linker, limit=limit or 20)}
+        if others:
+            result["other_reports"] = [path.name for path in others]
+        result["not_read"] = DRC_NOT_READ
+        if limit:
+            result["trimmed_to"] = limit
+        rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
 
 
 SCHEMATIC_REVIEW_PROMPT = """\

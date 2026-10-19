@@ -154,7 +154,7 @@ def test_ground_rules(review_index):
     assert "fallback only" in lower
     assert '"typical — confirm"' in prompt
     assert "never a critical issue on its own" in lower
-    assert "DRC results are not read" in prompt
+    assert "Altium's own DRC result is get_drc_report" in prompt
     assert "Never say the board passes" in prompt
     assert "via\n  barrel" in prompt or "via barrel" in prompt
     assert "pin/package length" in prompt

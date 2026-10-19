@@ -1130,6 +1130,48 @@ def decode_xsignals(properties: dict[str, str]) -> list[XSignal]:
     return xsignals
 
 
+@dataclass
+class DrcOptions:
+    """The board's Design Rule Checker settings (Design Rule Checker Options6)."""
+
+    max_violations: int | None = None  # 'Stop when n violations found' (default 500)
+    batch_kinds: set[int] | None = None  # rule kind ids the batch DRC checks
+    online_kinds: set[int] | None = None
+    make_report: bool | None = None  # 'Create Report File'
+    include_health: bool | None = None  # 'Report PCB Health Issues'
+    sub_net_details: bool | None = None
+    broken_planes: bool | None = None
+    dead_copper: bool | None = None
+
+
+def _kind_set(value: str | None) -> set[int] | None:
+    if value is None:
+        return None
+    return {int(part) for part in value.split(",") if part.strip().isdigit()}
+
+
+def _flag(value: str | None) -> bool | None:
+    return None if value is None else value.strip().upper() == "TRUE"
+
+
+def decode_drc_options(records: list[dict[str, str]]) -> DrcOptions | None:
+    """DrcOptions from the Design Rule Checker Options6 record, None without one."""
+    if not records:
+        return None
+    record = records[0]
+    limit = record.get("MAXVIOLATIONCOUNT", "").strip()
+    return DrcOptions(
+        max_violations=int(limit) if limit.isdigit() else None,
+        batch_kinds=_kind_set(record.get("RULESETTOCHECK")),
+        online_kinds=_kind_set(record.get("ONLINERULESETTOCHECK")),
+        make_report=_flag(record.get("DOMAKEDRCFILE")),
+        include_health=_flag(record.get("INCLUDEPCBHEALTH")),
+        sub_net_details=_flag(record.get("DOSUBNETDETAILS")),
+        broken_planes=_flag(record.get("REPORTBROKENPLANES")),
+        dead_copper=_flag(record.get("REPORTDEADCOPPER")),
+    )
+
+
 def decode_drc_rule_kinds(records: list[dict[str, str]]) -> set[int] | None:
     """Rule kind ids the board's batch DRC checks (RULESETTOCHECK)."""
     if not records or "RULESETTOCHECK" not in records[0]:
@@ -1173,6 +1215,7 @@ class PcbData:
     xsignals: list[XSignal] = field(default_factory=list)
     # Rules6 kind ids checked by the board's batch DRC; None when unknown.
     drc_rule_kinds: set[int] | None = None
+    drc_options: DrcOptions | None = None
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -1321,11 +1364,12 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         except Exception as error:
             warnings.append(f"{stream.split('/')[0]} parse failed: {error}")
     drc_rule_kinds: set[int] | None = None
+    drc_options: DrcOptions | None = None
     if "Design Rule Checker Options6/Data" in streams:
         try:
-            drc_rule_kinds = decode_drc_rule_kinds(
-                read_text_records(streams["Design Rule Checker Options6/Data"])
-            )
+            records = read_text_records(streams["Design Rule Checker Options6/Data"])
+            drc_rule_kinds = decode_drc_rule_kinds(records)
+            drc_options = decode_drc_options(records)
         except Exception as error:
             warnings.append(f"Design Rule Checker Options6 parse failed: {error}")
     diff_pairs: list[DiffPair] = []
@@ -1351,6 +1395,7 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         diff_pairs=diff_pairs,
         xsignals=xsignals,
         drc_rule_kinds=drc_rule_kinds,
+        drc_options=drc_options,
     )
 
 
