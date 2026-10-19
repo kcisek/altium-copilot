@@ -109,6 +109,9 @@ class Primitive:
     hole: float | None = None
     pad_name: str | None = None
     pour_id: int | None = None
+    # True copper length of an arc chord (r * sweep / steps); the chord itself
+    # is shorter. None for other primitives: their length is the segment's.
+    length: float | None = None
 
 
 def iter_binary_records(data: bytes):
@@ -286,6 +289,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
             )
             for index in range(steps + 1)
         ]
+        chord_length = radius_mil * math.radians(sweep) / steps
         for (x1, y1), (x2, y2) in zip(points, points[1:]):
             primitives.append(
                 Primitive(
@@ -299,6 +303,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
                     y2=y2,
                     width=_units_to_mil(width),
                     source_id=arc_id,
+                    length=chord_length,
                 )
             )
     return primitives, skipped
@@ -855,6 +860,48 @@ def decode_classes(records: list[dict[str, str]]) -> list[PcbClass]:
     return classes
 
 
+@dataclass
+class XSignal:
+    """A Board6 xSignal (PINPAIR*): a pad chain such as U1-W1,R4-1,R4-2,J1-3.
+
+    Consecutive pads on one net are a routed leg; consecutive pads on one
+    component are a hop through a series part.
+    """
+
+    name: str
+    pins: list[str]
+
+
+def decode_xsignals(properties: dict[str, str]) -> list[XSignal]:
+    """Decode the xSignal definitions held in the Board6 record."""
+    try:
+        count = int(properties.get("PINPAIRCOUNT", "0") or 0)
+    except ValueError:
+        count = 0
+    xsignals: list[XSignal] = []
+    for index in range(count):
+        name = properties.get(f"PINPAIRNAME{index}")
+        pins = [
+            pin.strip()
+            for pin in properties.get(f"PINPAIRPINS{index}", "").split(",")
+            if pin.strip()
+        ]
+        if name and pins:
+            xsignals.append(XSignal(name=name, pins=pins))
+    return xsignals
+
+
+def decode_drc_rule_kinds(records: list[dict[str, str]]) -> set[int] | None:
+    """Rule kind ids the board's batch DRC checks (RULESETTOCHECK)."""
+    if not records or "RULESETTOCHECK" not in records[0]:
+        return None
+    return {
+        int(part)
+        for part in records[0]["RULESETTOCHECK"].split(",")
+        if part.strip().isdigit()
+    }
+
+
 def decode_diff_pairs(records: list[dict[str, str]]) -> list[DiffPair]:
     """Decode DifferentialPairs6 records."""
     return [
@@ -884,6 +931,9 @@ class PcbData:
     rules: list[PcbRule] = field(default_factory=list)
     classes: list[PcbClass] = field(default_factory=list)
     diff_pairs: list[DiffPair] = field(default_factory=list)
+    xsignals: list[XSignal] = field(default_factory=list)
+    # Rules6 kind ids checked by the board's batch DRC; None when unknown.
+    drc_rule_kinds: set[int] | None = None
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -921,11 +971,17 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
             )
             return []
 
+    board_records = text("Board6/Data")
     try:
-        board = decode_board(text("Board6/Data"))
+        board = decode_board(board_records)
     except Exception as error:
         warnings.append(f"Board6 parse failed: {error}")
         board = decode_board([])
+    try:
+        xsignals = decode_xsignals(board_records[0] if board_records else {})
+    except Exception as error:
+        warnings.append(f"xSignals parse failed: {error}")
+        xsignals = []
     try:
         nets = decode_nets(text("Nets6/Data"))
     except Exception as error:
@@ -1014,6 +1070,14 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
             classes.extend(decode_classes(read_text_records(streams[stream])))
         except Exception as error:
             warnings.append(f"{stream.split('/')[0]} parse failed: {error}")
+    drc_rule_kinds: set[int] | None = None
+    if "Design Rule Checker Options6/Data" in streams:
+        try:
+            drc_rule_kinds = decode_drc_rule_kinds(
+                read_text_records(streams["Design Rule Checker Options6/Data"])
+            )
+        except Exception as error:
+            warnings.append(f"Design Rule Checker Options6 parse failed: {error}")
     diff_pairs: list[DiffPair] = []
     if "DifferentialPairs6/Data" in streams:
         try:
@@ -1035,6 +1099,8 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         rules=rules,
         classes=classes,
         diff_pairs=diff_pairs,
+        xsignals=xsignals,
+        drc_rule_kinds=drc_rule_kinds,
     )
 
 
@@ -1053,6 +1119,7 @@ _WANTED_STREAMS = (
     "Classes6/Data",
     "SignalClasses/Data",
     "DifferentialPairs6/Data",
+    "Design Rule Checker Options6/Data",
 )
 
 

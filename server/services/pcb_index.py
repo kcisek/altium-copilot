@@ -7,7 +7,9 @@ from collections import defaultdict
 
 try:
     from parsers.pcb_doc import PcbData
-    from services.pcb_rules import RuleContext, RuleTarget
+    from services.pcb_rules import (
+        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
+    )
     from services.pcb_geometry import (
         parallel_overlap,
         point_in_polygon,
@@ -20,7 +22,9 @@ try:
     )
 except ImportError:
     from server.parsers.pcb_doc import PcbData
-    from server.services.pcb_rules import RuleContext, RuleTarget
+    from server.services.pcb_rules import (
+        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
+    )
     from server.services.pcb_geometry import (
         parallel_overlap,
         point_in_polygon,
@@ -80,6 +84,7 @@ CREATE TABLE prims (
     source_id INTEGER,
     hole REAL,
     pad_name TEXT,
+    length REAL,
     minx REAL,
     miny REAL,
     maxx REAL,
@@ -254,9 +259,9 @@ class PcbIndex:
                 "kind, net_id, layer, layer_to, component, pour_id, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
                 "source_id, "
-                "hole, pad_name, "
+                "hole, pad_name, length, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -275,6 +280,7 @@ class PcbIndex:
                     primitive.source_id,
                     primitive.hole,
                     primitive.pad_name,
+                    primitive.length,
                     min_x,
                     min_y,
                     max_x,
@@ -452,6 +458,7 @@ class PcbIndex:
             "diff_pair": ctx.pair_classes,
             "component": ctx.component_classes,
             "pad": ctx.pad_classes,
+            "xsignal": ctx.xsignal_classes,
         }
         self._net_to_classes: dict[str, list[str]] = defaultdict(list)
         self._pair_to_classes: dict[str, list[str]] = defaultdict(list)
@@ -489,12 +496,113 @@ class PcbIndex:
             self._net_to_pairs[pair.negative_net.lower()].append(
                 (pair.name, "negative", pair.positive_net)
             )
-        ctx.rooms = {
-            rule.name.lower()
-            for rule in self.pcb.rules
-            if rule.kind == "RoomDefinition"
+        rooms = [rule for rule in self.pcb.rules if rule.kind == "RoomDefinition"]
+        ctx.rooms = {rule.name.lower() for rule in rooms}
+        ctx.room_shapes = {
+            rule.name.lower(): vertices
+            for rule in rooms
+            if len(vertices := room_vertices(rule)) >= 3
         }
+        ctx.layer_ids = self._layer_name_ids()
+        self._pad_nets: dict[str, str] = {}
+        for row in self.db.execute(
+            "SELECT component, pad_name, n.name net FROM prims p "
+            "JOIN nets n ON n.id = p.net_id "
+            "WHERE p.kind = 'pad' AND component IS NOT NULL AND pad_name IS NOT NULL"
+        ):
+            designator = (
+                self.designator(row["component"])
+                if 0 <= row["component"] < len(self.pcb.components)
+                else None
+            )
+            if designator:
+                self._pad_nets.setdefault(
+                    f"{designator}-{row['pad_name']}".lower(), row["net"]
+                )
+        self._net_to_xsignals: dict[str, list[str]] = defaultdict(list)
+        self.xsignals = {xsignal.name.lower(): xsignal for xsignal in self.pcb.xsignals}
+        for xsignal in self.pcb.xsignals:
+            nets = {
+                self._pad_nets[pin.lower()].lower()
+                for pin in xsignal.pins
+                if pin.lower() in self._pad_nets
+            }
+            ctx.xsignals[xsignal.name.lower()] = nets
+            for net in nets:
+                self._net_to_xsignals[net].append(xsignal.name)
         self.rule_context = ctx
+
+    def _layer_name_ids(self) -> dict[str, int]:
+        """Every name a scope may use for a layer: display names first, then
+        Altium's standard and positional names."""
+        ids: dict[str, int] = {}
+        for row in self.db.execute(
+            "SELECT v6_id, name FROM layers WHERE v6_id IS NOT NULL"
+        ):
+            ids.setdefault(row["name"].lower(), row["v6_id"])
+        for alias, v6_id in self.pcb.layer_name_to_v6.items():
+            ids.setdefault(alias, v6_id)
+        standard = {"top layer": 1, "toplayer": 1, "bottom layer": 32,
+                    "bottomlayer": 32, "multi-layer": MULTI_LAYER,
+                    "multilayer": MULTI_LAYER}
+        for mid in range(1, 31):
+            standard[f"mid-layer {mid}"] = mid + 1
+            standard[f"midlayer{mid}"] = mid + 1
+        for plane in range(1, 17):
+            standard[f"internal plane {plane}"] = 38 + plane
+            standard[f"internalplane{plane}"] = 38 + plane
+        for alias, v6_id in standard.items():
+            ids.setdefault(alias, v6_id)
+        return ids
+
+    def pad_net(self, pin: str) -> str | None:
+        """Net of a pad given as '<PCB designator>-<pad>' (xSignal pins)."""
+        return self._pad_nets.get(pin.lower())
+
+    def xsignals_of(self, net: str) -> list[str]:
+        return list(self._net_to_xsignals.get(net.lower(), []))
+
+    def object_facts(self, row) -> ObjectFacts:
+        """Facts of one prims row for object-level rule scopes."""
+        kind = row["kind"]
+        component = row["component"]
+        designator = (
+            self.designator(component)
+            if component is not None and 0 <= component < len(self.pcb.components)
+            else None
+        )
+        footprint = (
+            self.pcb.components[component].footprint
+            if designator
+            else None
+        )
+        if kind in ("via", "pad"):
+            points = ((row["x1"], row["y1"]),)
+            span = frozenset(self._primitive_layers(row))
+            layer = (
+                MULTI_LAYER
+                if kind == "via" or row["layer"] == MULTI_LAYER
+                else row["layer"]
+            )
+        else:
+            points = ((row["x1"], row["y1"]), (row["x2"], row["y2"]))
+            span = frozenset({row["layer"]})
+            layer = row["layer"]
+        pad = (
+            f"{designator}-{row['pad_name']}".lower()
+            if kind == "pad" and designator and row["pad_name"]
+            else None
+        )
+        return ObjectFacts(
+            kind=kind,
+            layer=layer,
+            span=span,
+            points=points,
+            component=designator.lower() if designator else None,
+            footprint=footprint,
+            pad=pad,
+            hole=row["hole"] or 0.0,
+        )
 
     def signal_layers(self) -> dict[int, str]:
         """Routable copper layers in stack order: v6 id -> display name."""
@@ -524,7 +632,7 @@ class PcbIndex:
         if net_id is None:
             return None
         row = self.db.execute(
-            "SELECT SUM(SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))) total "
+            "SELECT SUM(COALESCE(length, SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1)))) total "
             "FROM prims WHERE net_id = ? AND kind IN ('track','arc') "
             "AND pour_id IS NULL",
             (net_id,),
@@ -555,6 +663,25 @@ class PcbIndex:
         """
         ctx = self.rule_context
         key = name.lower()
+        if kind == "xsignal" or (
+            kind is None
+            and key in ctx.xsignals
+            and key not in ctx.net_names
+            and key not in ctx.pairs
+        ):
+            if key not in ctx.xsignals:
+                return None
+            xsignal = self.xsignals[key]
+            return RuleTarget(
+                kind="xsignal",
+                name=xsignal.name,
+                nets=set(ctx.xsignals[key]),
+                pairs=set(),
+                components={
+                    pin.rsplit("-", 1)[0].lower() for pin in xsignal.pins if "-" in pin
+                },
+                pads={pin.lower() for pin in xsignal.pins},
+            )
         if key in ctx.net_names and kind != "diff_pair":
             kind = "net"
             nets = {key}
@@ -725,7 +852,7 @@ class PcbIndex:
             "WHEN kind='arc' THEN 'a' || source_id "
             "ELSE 't' || id END) n, "
             "MIN(width) wmin, MAX(width) wmax, "
-            "SUM(SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))) total_len, "
+            "SUM(COALESCE(length, SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1)))) total_len, "
             "MIN(minx) a, MIN(miny) b, MAX(maxx) c, MAX(maxy) d "
             "FROM prims "
             "WHERE net_id = ? AND kind IN ('track','arc') "
@@ -832,14 +959,18 @@ class PcbIndex:
     MAX_NEIGHBORS = 25
 
     def _copper_layers_in_stack_order(self) -> list[int]:
-        return [
-            row["v6_id"]
-            for row in self.db.execute(
-                "SELECT v6_id FROM layers "
-                "WHERE kind = 'copper' AND v6_id IS NOT NULL "
-                "ORDER BY stack_order"
-            )
-        ]
+        # The stack never changes for an index; per-object checks call this
+        # tens of thousands of times.
+        if getattr(self, "_copper_order", None) is None:
+            self._copper_order = [
+                row["v6_id"]
+                for row in self.db.execute(
+                    "SELECT v6_id FROM layers "
+                    "WHERE kind = 'copper' AND v6_id IS NOT NULL "
+                    "ORDER BY stack_order"
+                )
+            ]
+        return list(self._copper_order)
 
     def _adjacent_copper_layers(self, v6_id: int) -> list[int]:
         ordered_layers = self._copper_layers_in_stack_order()

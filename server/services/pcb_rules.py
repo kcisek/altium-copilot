@@ -227,17 +227,47 @@ class RuleContext:
     pairs: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     net_names: dict[str, str] = field(default_factory=dict)
     rooms: set[str] = field(default_factory=set)
+    # Room outlines (lower name -> vertices in mil) for object-level checks.
+    room_shapes: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    # Layer names (display, standard and positional, lower) -> v6 id.
+    layer_ids: dict[str, int] = field(default_factory=dict)
+    # xSignal name (lower) -> its nets (lower); xSignal classes -> members.
+    xsignals: dict[str, set[str]] = field(default_factory=dict)
+    xsignal_classes: dict[str, set[str]] = field(default_factory=dict)
+
+
+MULTI_LAYER = 74
+
+
+@dataclass(frozen=True)
+class ObjectFacts:
+    """One copper object, so object scopes (IsVia, OnLayer, WithinRoom...)
+    can be decided exactly. Names are lower-case.
+
+    layer is the object's Layer property (v6 id; 74 = Multi-Layer for vias and
+    through-hole pads); span is every copper layer it occupies.
+    """
+
+    kind: str  # "track" | "arc" | "via" | "pad"
+    layer: int
+    span: frozenset = frozenset()
+    points: tuple = ()  # track/arc endpoints; via/pad centre
+    component: str | None = None
+    footprint: str | None = None
+    pad: str | None = None  # "u1-5"
+    hole: float = 0.0
 
 
 @dataclass
 class RuleTarget:
-    """A net or differential pair, with the facts its scopes are tested on.
+    """A net, differential pair or xSignal, with the facts its scopes are
+    tested on.
 
     Names are lower-case. components/footprints/pads describe the pads the
     target's nets connect to, so component-scoped rules can be ruled out.
     """
 
-    kind: str  # "net" | "diff_pair"
+    kind: str  # "net" | "diff_pair" | "xsignal"
     name: str
     nets: set[str]
     pairs: set[str]
@@ -245,11 +275,13 @@ class RuleTarget:
     footprints: set[str] = field(default_factory=set)
     pads: set[str] = field(default_factory=set)
     has_pours: bool = False
-    # Evaluation views (set by evaluate_scope / resolve_kind, not callers):
-    # member — evaluate a pair as one of its nets; pour_view — evaluate the
-    # net's polygon pour copper instead of its routing.
+    # Evaluation views (set by evaluate_scope / resolve_kind / callers that
+    # check one object): member — evaluate a pair as one of its nets;
+    # pour_view — the net's polygon pour copper instead of its routing;
+    # obj — one copper object of the target.
     member: str | None = None
     pour_view: bool = False
+    obj: ObjectFacts | None = None
 
 
 # Result: (value, conditions) with value True / False / None (unknown).
@@ -297,11 +329,166 @@ _OBJECT_TYPES = {
 _LAYER_PREDICATES = {
     "onlayer", "ontoplayer", "onbottomlayer", "onmultilayer", "onmid",
     "onplane", "onsignal", "oncopper", "onoutside", "oninside",
+    "existsonlayer",
 }
+_XSIGNAL_PREDICATES = {"inxsignal", "inxsignalclass", "inanyxsignal", "isxsignal"}
 _REGION_PREDICATES = {
     "withinroom", "touchesroom", "inroom", "inregion", "inregionabsolute",
     "inregionrelative", "touchesregion",
 }
+
+
+def point_in_polygon(x: float, y: float, vertices) -> bool:
+    inside = False
+    count = len(vertices)
+    for index in range(count):
+        x1, y1 = vertices[index]
+        x2, y2 = vertices[(index + 1) % count]
+        if (y1 > y) != (y2 > y):
+            crossing = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < crossing:
+                inside = not inside
+    return inside
+
+
+def _object_anchor(obj: ObjectFacts) -> tuple[float, float] | None:
+    """Point that decides room/region membership: a via or pad centre, the
+    midpoint of a track or arc chord (Altium tests pads and vias by their
+    centre; whole-object containment for straddling tracks is approximated)."""
+    if not obj.points:
+        return None
+    xs = [point[0] for point in obj.points]
+    ys = [point[1] for point in obj.points]
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
+    """Decide an object predicate for one object; None if not an object term."""
+    name, args = node[1], node[2]
+    if name in _OBJECT_TYPES:
+        if name in ("isvia", "ispad", "istrack", "isarc"):
+            return _TRUE if obj.kind == name[2:] else _FALSE
+        if name in ("isfill", "isregion"):
+            return _FALSE
+        is_pad = obj.kind == "pad"
+        if name in ("isthrupad", "isthrupin"):
+            through = is_pad and obj.hole > 0
+            if name == "isthrupin":
+                through = through and obj.component is not None
+            return _TRUE if through else _FALSE
+        smt = is_pad and obj.hole <= 0
+        if name == "issmtpin":
+            smt = smt and obj.component is not None
+        return _TRUE if smt else _FALSE
+    if name in _LAYER_PREDICATES:
+        layer = obj.layer
+        if name in ("onlayer", "existsonlayer"):
+            ids = [ctx.layer_ids.get(str(arg).lower()) for arg in args]
+            known = [layer_id for layer_id in ids if layer_id is not None]
+            if not known:
+                return _unknown(node)
+            if name == "onlayer":
+                return _TRUE if layer in known else _FALSE
+            span = obj.span or frozenset({layer})
+            return _TRUE if any(layer_id in span for layer_id in known) else _FALSE
+        checks = {
+            "ontoplayer": layer == 1,
+            "onbottomlayer": layer == 32,
+            "onmid": 2 <= layer <= 31,
+            "onmultilayer": layer == MULTI_LAYER,
+            "onsignal": 1 <= layer <= 32 or layer == MULTI_LAYER,
+            "oncopper": 1 <= layer <= 32 or layer == MULTI_LAYER or 39 <= layer <= 54,
+            "onplane": 39 <= layer <= 54,
+            "onoutside": layer in (1, 32),
+        }
+        if name in checks:
+            return _TRUE if checks[name] else _FALSE
+        return _unknown(node)
+    if name in ("withinroom", "touchesroom", "inroom"):
+        anchor = _object_anchor(obj)
+        shapes = [
+            vertices
+            for room, vertices in ctx.room_shapes.items()
+            if _any_matches(args, {room})
+        ]
+        if not shapes:
+            return _FALSE if args and not _any_matches(args, ctx.rooms) else _unknown(node)
+        if anchor is None:
+            return _unknown(node)
+        points = [anchor] + list(obj.points) if name == "touchesroom" else [anchor]
+        return _TRUE if any(
+            point_in_polygon(x, y, vertices)
+            for vertices in shapes
+            for x, y in points
+        ) else _FALSE
+    if name in ("inregion", "inregionabsolute") and len(args) == 4:
+        try:
+            x1, y1, x2, y2 = (float(str(arg).lower().replace("mil", "")) for arg in args)
+        except ValueError:
+            return _unknown(node)
+        anchor = _object_anchor(obj)
+        if anchor is None:
+            return _unknown(node)
+        inside = (
+            min(x1, x2) <= anchor[0] <= max(x1, x2)
+            and min(y1, y2) <= anchor[1] <= max(y1, y2)
+        )
+        return _TRUE if inside else _FALSE
+    if name == "incomponent":
+        return _TRUE if obj.component and _any_matches(args, {obj.component}) else _FALSE
+    if name == "hasfootprint":
+        return _TRUE if obj.footprint and _any_matches(args, {obj.footprint}) else _FALSE
+    if name == "inanycomponent":
+        return _TRUE if obj.component else _FALSE
+    if name == "incomponentclass":
+        if not obj.component:
+            return _FALSE
+        member = _class_member(
+            ctx, ctx.component_classes, "component", args, {obj.component}
+        )
+        return _TRUE if member else _FALSE
+    if name == "haspad":
+        return _TRUE if obj.pad and _any_matches(args, {obj.pad}) else _FALSE
+    if name == "inpadclass":
+        if not obj.pad:
+            return _FALSE
+        member = _class_member(ctx, ctx.pad_classes, "pad", args, {obj.pad})
+        return _TRUE if member else _FALSE
+    return None
+
+
+def _eval_xsignal_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
+    name, args = node[1], node[2]
+    if target.kind == "xsignal":
+        own = {target.name.lower()}
+        if name == "isxsignal" or name == "inanyxsignal":
+            return _TRUE
+        if name == "inxsignal":
+            return _TRUE if _any_matches(args, own) else _FALSE
+        member = _class_member(ctx, ctx.xsignal_classes, "xsignal", args, own)
+        return _TRUE if member else _FALSE
+    if name == "isxsignal":
+        return _FALSE
+    # A net or pair: the rule covers only the copper of xSignals running
+    # through it, if any.
+    if name == "inanyxsignal":
+        names = {
+            xsignal for xsignal, nets in ctx.xsignals.items() if nets & target.nets
+        }
+    elif name == "inxsignal":
+        names = {
+            xsignal
+            for xsignal, nets in ctx.xsignals.items()
+            if nets & target.nets and _any_matches(args, {xsignal})
+        }
+    else:
+        names = {
+            xsignal
+            for xsignal, nets in ctx.xsignals.items()
+            if nets & target.nets
+            and _class_member(ctx, ctx.xsignal_classes, "xsignal", args, {xsignal})
+        }
+    return _unknown(node) if names else _FALSE
 
 
 def _net_membership(node, target: RuleTarget, test) -> tuple:
@@ -320,6 +507,12 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
     is_net = target.kind == "net"
     if name == "all":
         return _TRUE
+    if name in _XSIGNAL_PREDICATES:
+        return _eval_xsignal_call(node, target, ctx)
+    if target.obj is not None:
+        decided = _eval_object_call(node, target.obj, ctx)
+        if decided is not None:
+            return decided
     if name == "innet":
         return _net_membership(
             node, target, lambda nets: _any_matches(args, nets)
@@ -344,9 +537,9 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
     if name == "inanydifferentialpair":
         return _TRUE if target.pairs else _FALSE
     if name == "isnet":
-        return _TRUE if is_net else _FALSE
+        return _TRUE if is_net and target.obj is None else _FALSE
     if name == "isdifferentialpair":
-        return _FALSE if is_net else _TRUE
+        return _TRUE if target.kind == "diff_pair" and target.obj is None else _FALSE
     if name in _POLYGON_ONLY and target.pour_view:
         if name in ("inpoly", "inpolygon", "ispoly", "ispolygon"):
             return _TRUE
@@ -396,6 +589,18 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
 
 def _eval_cmp(node, target: RuleTarget) -> tuple:
     prop, value = node[1], str(node[3]).lower()
+    obj = target.obj
+    if obj is not None and prop == "objectkind":
+        if node[2] == "=":
+            return _TRUE if value == obj.kind else _FALSE
+        if node[2] == "<>":
+            return _FALSE if value == obj.kind else _TRUE
+    if obj is not None and prop == "name" and node[2] in ("=", "like", "<>"):
+        # A pad's Name is "<designator>-<pad>"; other routed objects have none.
+        matched = bool(obj.pad) and _wildcard_matches(str(node[3]), obj.pad)
+        if node[2] == "<>":
+            return _FALSE if matched else _TRUE
+        return _TRUE if matched else _FALSE
     if prop == "objectkind":
         if value == "net":
             return _TRUE if target.kind == "net" else _FALSE
@@ -494,6 +699,8 @@ _REFERENCE_FUNCTIONS = {
     "inpadclass": "pad_classes",
     "withinroom": "rooms",
     "touchesroom": "rooms",
+    "inxsignal": "xsignals",
+    "inxsignalclass": "xsignal_classes",
 }
 
 
@@ -520,6 +727,10 @@ def stale_references(text: str, ctx: RuleContext) -> list[str]:
         ),
         "pad_classes": set(ctx.pad_classes) | ctx.superclasses.get("pad", set()),
         "rooms": ctx.rooms,
+        "xsignals": set(ctx.xsignals),
+        "xsignal_classes": (
+            set(ctx.xsignal_classes) | ctx.superclasses.get("xsignal", set())
+        ),
     }
     missing: list[str] = []
 
@@ -614,9 +825,20 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
     "Length": {
         "MINLIMIT": ("min_length_mil", "mil"),
         "MAXLIMIT": ("max_length_mil", "mil"),
+        "USEDELAYUNITS": ("use_delay_units", "bool"),
     },
     "MatchedLengths": {
         "TOLERANCE": ("tolerance_mil", "mil"),
+        # "Within Differential Pair Length" vs "Group Matched Lengths"; the
+        # group flags split the group by object type.
+        "CHECKNETSINDIFFPAIR": ("within_pair", "bool"),
+        "CHECKDIFFPAIRVSDIFFPAIR": ("group_diff_pairs", "bool"),
+        "CHECKXSIGNALS": ("group_xsignals", "bool"),
+        "CHECKOTHERS": ("group_other_nets", "bool"),
+        "USEDELAYUNITS": ("use_delay_units", "bool"),
+        "TARGETSOURCENAME": ("target_source", "str"),
+        "STYLE": ("", "skip"),
+        "AMPLITUDE": ("", "skip"),
     },
     "HoleSize": {
         "MINLIMIT": ("min_hole_mil", "mil"),
@@ -847,6 +1069,19 @@ def _object_clearances(raw: str) -> dict[str, float]:
     return matrix
 
 
+def room_vertices(rule: PcbRule) -> list[tuple[float, float]]:
+    """Outline of a RoomDefinition rule in board coordinates (mil)."""
+    props = rule.properties
+    vertices: list[tuple[float, float]] = []
+    index = 0
+    while f"VX{index}" in props and f"VY{index}" in props:
+        x, y = _mil(props[f"VX{index}"]), _mil(props[f"VY{index}"])
+        if x is not None and y is not None:
+            vertices.append((x, y))
+        index += 1
+    return vertices
+
+
 def room_geometry(rule: PcbRule) -> dict:
     """Side, vertex count and bounding box of a RoomDefinition rule."""
     props = rule.properties
@@ -1043,3 +1278,44 @@ def resolve_kind(
         if disabled:
             result["disabled_rules"] = disabled
     return result
+
+
+class ObjectResolver:
+    """Which rule of one kind applies to each object of one net or pair.
+
+    Net-level verdicts are computed once; only rules whose scope is
+    conditional at net level are re-evaluated per object (a decided net-level
+    verdict cannot change when object facts are added).
+    """
+
+    def __init__(self, rules: list[PcbRule], target: RuleTarget, ctx: RuleContext):
+        self.target = target
+        self.ctx = ctx
+        self.rules = sorted(
+            (rule for rule in rules if rule.enabled), key=lambda rule: rule.priority
+        )
+        self.net_level = [
+            evaluate_scope(rule.scope1, target, ctx)["matches"] for rule in self.rules
+        ]
+
+    def resolve(self, obj: ObjectFacts) -> tuple[PcbRule | None, list[dict]]:
+        """(rule, undecided): the first rule whose scope matches the object.
+
+        undecided lists higher-priority rules whose scope stayed unknown for
+        this object (e.g. an xSignal term); the result is then not certain.
+        """
+        undecided: list[dict] = []
+        object_target = None
+        for rule, verdict in zip(self.rules, self.net_level):
+            if verdict == "no":
+                continue
+            if verdict == "yes":
+                return rule, undecided
+            if object_target is None:
+                object_target = replace(self.target, obj=obj)
+            side = evaluate_scope(rule.scope1, object_target, self.ctx)
+            if side["matches"] == "yes":
+                return rule, undecided
+            if side["matches"] != "no":
+                undecided.append({"rule": rule.name, "conditions": side["conditions"]})
+        return None, undecided

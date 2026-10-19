@@ -14,11 +14,13 @@ from server.parsers.pcb_doc import (
     decode_polygons,
     decode_tracks,
     decode_vias,
+    decode_xsignals,
     iter_binary_records,
     parse_dim_mil,
     decode_classes,
     decode_designators,
     decode_diff_pairs,
+    decode_drc_rule_kinds,
     decode_rules,
     parse_streams,
     read_kind_prefixed_text_records,
@@ -767,3 +769,37 @@ def test_decode_board_reads_substacks():
         {"id": "{A}", "name": "Rigid", "is_flex": False},
         {"id": "{B}", "name": "Flex", "is_flex": True},
     ]
+
+
+def test_decode_xsignals_from_board_record():
+    xsignals = decode_xsignals({
+        "PINPAIRCOUNT": "2",
+        "PINPAIRNAME0": "DQ0_PP1", "PINPAIRPINS0": "U1-W1, R4-1,R4-2,J1-3",
+        "PINPAIRNAME1": "EMPTY", "PINPAIRPINS1": "",
+    })
+    assert [(x.name, x.pins) for x in xsignals] == [
+        ("DQ0_PP1", ["U1-W1", "R4-1", "R4-2", "J1-3"])
+    ]
+    assert decode_xsignals({}) == []
+
+
+def test_decode_drc_rule_kinds():
+    assert decode_drc_rule_kinds([{"RULESETTOCHECK": "0,2,11,51"}]) == {0, 2, 11, 51}
+    assert decode_drc_rule_kinds([{}]) is None
+
+
+def test_arc_chords_carry_true_arc_length():
+    payload = bytearray(60)
+    payload[0] = 1
+    struct.pack_into("<H", payload, 3, 0xFFFF)
+    struct.pack_into("<H", payload, 7, 0xFFFF)
+    struct.pack_into("<ii", payload, 13, 0, 0)
+    struct.pack_into("<i", payload, 21, 200000)
+    struct.pack_into("<dd", payload, 25, 0.0, 90.0)
+    struct.pack_into("<i", payload, 41, 50000)
+    data = b"\x01" + struct.pack("<I", len(payload)) + bytes(payload)
+    arcs, _ = decode_arcs(data)
+    total = sum(arc.length for arc in arcs)
+    assert total == pytest.approx(math.pi * 20 / 2, rel=1e-6)
+    chords = sum(math.hypot(a.x2 - a.x1, a.y2 - a.y1) for a in arcs)
+    assert chords < total
