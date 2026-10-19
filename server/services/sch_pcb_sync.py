@@ -4,10 +4,11 @@ The schematic side is the compiled netlist: the Protel .NET part list (every com
 part with its footprint and comment; compile-masked parts are not in it) and nets,
 enriched from the sheets with each part's unique IDs, footprint models, kind and pin
 designators. The PCB side is the saved PcbDoc. Matching follows Altium's comparator:
-components link by unique ID, and by designator only when no unique ID links them (the
-'Failed to Match Unique Identifiers' case); nets match by shared members first (Min
-Match %, Min Matched Members) and by name second. A pin whose net changed is one
-finding here, where Altium lists it under Extra Pins in Nets on both sides.
+components link by unique ID (the full path of sheet-symbol IDs where the .Annotation
+file gives it, as for channel copies), and by designator only when no unique ID links
+them (the 'Failed to Match Unique Identifiers' case); nets match by shared members
+first (Min Match %, Min Matched Members) and by name second. A pin whose net changed is
+one finding here, where Altium lists it under Extra Pins in Nets on both sides.
 """
 
 import re
@@ -55,6 +56,8 @@ DEFAULT_NET_MATCHING = {
     "source": "Altium defaults",
 }
 _UNNAMED_NET = re.compile(r"^__unnamed_\d+$")
+# Altium names an unnamed net Net<designator>_<pin>: the name follows the designator.
+_AUTO_NET = re.compile(r"^Net[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9]+$")
 
 NOT_COMPARED = (
     "Parameters, net classes, component classes, rooms, rules and differential pairs "
@@ -87,6 +90,10 @@ class _Part:
     pin_designators: list[str] = field(default_factory=list)
     # Without the compiled part list: each unique ID's footprint from the sheets.
     footprint_by_uid: dict[str, str] = field(default_factory=dict)
+    # Full UniqueId paths from the .Annotation file (channel copies differ only here).
+    unique_paths: list[str] = field(default_factory=list)
+    # False when no sheet gave this part metadata (e.g. its sheet failed to parse).
+    has_metadata: bool = True
 
 
 def net_matching_options(prj_pcb_path: str | None) -> dict:
@@ -161,6 +168,8 @@ def _schematic_parts(netlist: dict) -> tuple[dict[str, _Part], bool]:
             logical=meta.get("logical_refdes"),
             pin_designators=list(meta.get("pin_designators") or []),
             footprint_by_uid={} if compiled else dict(meta.get("footprint_by_uid") or {}),
+            unique_paths=list(meta.get("unique_paths") or []),
+            has_metadata=bool(meta),
         )
     return parts, bool(compiled)
 
@@ -208,6 +217,11 @@ class _Board:
         return folded[0] if len(folded) == 1 else None
 
 
+def _named(signature: dict[str, str]) -> dict[str, str]:
+    """A pad-net signature without auto-named nets, whose names follow designators."""
+    return {pad: net for pad, net in signature.items() if not _AUTO_NET.match(net)}
+
+
 def _same(a: str | None, b: str | None) -> bool:
     """Altium compares designators, footprints and comments case-insensitively."""
     return (a or "").strip().lower() == (b or "").strip().lower()
@@ -216,13 +230,40 @@ def _same(a: str | None, b: str | None) -> bool:
 def _link(parts: dict[str, _Part], board: _Board, pin_to_net: dict) -> dict[int, tuple]:
     """PCB component index -> (part name, how linked).
 
-    By unique ID first. Channel copies (and the parts of a component placed on
-    several sheets) share IDs, so a group with several parts or footprints pairs by
-    designator, then by pad-net signature, then the last one left. Components still
-    unlinked pair by designator.
+    By the full unique-ID path first, where the .Annotation file gives it: channel
+    copies differ only there. Then by unique ID; channel copies (and the parts of a
+    component placed on several sheets) share it, so a group with several parts or
+    placements pairs by designator, then by pad-net signature (auto-named nets left
+    out, as they follow designators), then copies with equal signatures in order (they
+    are interchangeable). Within a group, a placement with the part's own footprint
+    goes first, so a variant's alternate placement is not taken for the part. Components
+    still unlinked pair by designator.
     """
     links: dict[int, tuple] = {}
     taken: set[str] = set()
+
+    def link(component, name: str, how: str) -> None:
+        links[component.index] = (name, how)
+        taken.add(name)
+
+    def own_footprint_first(components, names):
+        return sorted(
+            components,
+            key=lambda c: not any(_same(c.footprint, parts[n].footprint) for n in names),
+        )
+
+    by_path: dict[str, str] = {}
+    for part in parts.values():
+        for path in part.unique_paths:
+            by_path.setdefault(path, part.name)
+    by_path_components: dict[str, list] = defaultdict(list)
+    for component in board.components.values():
+        name = by_path.get(component.source_unique_id or "")
+        if name:
+            by_path_components[name].append(component)
+    for name, components in by_path_components.items():
+        link(own_footprint_first(components, [name])[0], name, "unique_id")
+
     by_uid: dict[str, list[str]] = defaultdict(list)
     for part in parts.values():
         for uid in part.unique_ids:
@@ -230,30 +271,17 @@ def _link(parts: dict[str, _Part], board: _Board, pin_to_net: dict) -> dict[int,
     groups: dict[str, list] = defaultdict(list)
     for component in board.components.values():
         tail = component.source_uid_tail
-        if tail and tail in by_uid:
+        if tail and tail in by_uid and component.index not in links:
             groups[tail].append(component)
-
-    def link(component, name: str, how: str) -> None:
-        links[component.index] = (name, how)
-        taken.add(name)
 
     for uid, components in groups.items():
         names = [name for name in dict.fromkeys(by_uid[uid]) if name not in taken]
         if not names:
             continue
-        if len(names) == 1 and len(components) == 1:
-            link(components[0], names[0], "unique_id")
+        ordered = own_footprint_first(components, names)
+        if len(names) == 1 and len(ordered) == 1:
+            link(ordered[0], names[0], "unique_id")
             continue
-        # Prefer the footprint the part asks for when two placements share a designator
-        # (a variant's alternate part sits beside the main one).
-        footprint_of = {name: parts[name].footprint for name in names}
-        ordered = sorted(
-            components,
-            key=lambda c: not any(
-                _same(board.designator(c), name) and _same(c.footprint, footprint_of[name])
-                for name in names
-            ),
-        )
         for component in ordered:
             match = next(
                 (n for n in names if n not in taken and _same(n, board.designator(component))),
@@ -261,18 +289,27 @@ def _link(parts: dict[str, _Part], board: _Board, pin_to_net: dict) -> dict[int,
             )
             if match:
                 link(component, match, "unique_id")
-        left = [c for c in components if c.index not in links]
-        free = [n for n in names if n not in taken]
-        for component in left:
-            signature = board.signature(component)
+        raw = {name: dict(pin_to_net.get(name) or {}) for name in names}
+        named = {name: _named(signature) for name, signature in raw.items()}
+        for component in ordered:
+            if component.index in links:
+                continue
+            signature = _named(board.signature(component))
             matches = [
-                n for n in free
-                if n not in taken and signature
-                and dict(pin_to_net.get(n) or {}) == signature
+                n for n in names if n not in taken and signature and named[n] == signature
             ]
             if len(matches) == 1:
                 link(component, matches[0], "unique_id")
-        left = [c for c in components if c.index not in links]
+        # Copies with identical connectivity (decoupling caps on the same rails) are
+        # interchangeable: pair them in order.
+        for component in ordered:
+            if component.index in links:
+                continue
+            signature = board.signature(component)
+            match = next((n for n in names if n not in taken and raw[n] == signature), None)
+            if match:
+                link(component, match, "unique_id")
+        left = [c for c in ordered if c.index not in links]
         free = [n for n in names if n not in taken]
         if len(left) == 1 and len(free) == 1:
             link(left[0], free[0], "unique_id")
@@ -333,11 +370,12 @@ def _component_findings(report, parts, board, links, is_dnp, newer_sheets) -> No
             **fields,
         )
 
-    linked_uids = {
-        board.components[index].source_uid_tail: (name, index)
-        for index, (name, _) in links.items()
-        if board.components[index].source_uid_tail
-    }
+    linked_by_tail: dict[str, list] = defaultdict(list)
+    for index, (name, _) in links.items():
+        if board.components[index].source_uid_tail:
+            linked_by_tail[board.components[index].source_uid_tail].append(
+                (name, board.components[index])
+            )
     all_uids = {uid for part in parts.values() for uid in part.unique_ids}
     for component in board.components.values():
         if component.index in links:
@@ -354,21 +392,48 @@ def _component_findings(report, parts, board, links, is_dnp, newer_sheets) -> No
                 "synchronizes graphical parts.",
                 **fields,
             )
-        elif tail and tail in linked_uids:
-            twin_name, twin_index = linked_uids[tail]
-            twin = board.designator(board.components[twin_index])
-            if _same(twin, designator):
+        elif component.kind == MECHANICAL:
+            report.add(
+                "extra_on_pcb", "info",
+                f"{designator} is a mechanical part on the PCB only; Altium adds or "
+                "removes mechanical parts only when they are on both sides.",
+                **fields,
+            )
+        elif tail and tail in linked_by_tail:
+            twins = [
+                (name, twin) for name, twin in linked_by_tail[tail]
+                if not component.source_unique_id or not twin.source_unique_id
+                or twin.source_unique_id == component.source_unique_id
+            ]
+            twins.sort(key=lambda pair: not _same(board.designator(pair[1]), designator))
+            if not twins:
+                name, twin = linked_by_tail[tail][0]
+                report.add(
+                    "extra_on_pcb", "warning",
+                    f"{designator} is another channel's copy of {name} (on the PCB as "
+                    f"{board.designator(twin)}), and that channel is no longer in the "
+                    "compiled schematic: Update PCB would remove it.",
+                    **fields,
+                )
+                continue
+            name, twin = twins[0]
+            twin_designator = board.designator(twin)
+            if _same(twin_designator, designator) and not _same(
+                twin.footprint, component.footprint
+            ):
                 report.add(
                     "extra_on_pcb", "info",
-                    f"{designator} is placed twice with one schematic part ({twin_name}): "
-                    "normally a variant's alternate part with another footprint.",
+                    f"{designator} is placed twice, with footprints {twin.footprint} and "
+                    f"{component.footprint}: a variant's alternate part, which Altium "
+                    "places beside the main one.",
                     **fields,
                 )
             else:
                 report.add(
                     "extra_on_pcb", "warning",
-                    f"{designator} carries the unique ID of {twin_name} (on the PCB as "
-                    f"{twin}): a copied footprint; Update PCB would remove it.",
+                    f"{designator} is a second placement of {name} (on the PCB as "
+                    f"{twin_designator}) with the same unique ID: a copied footprint; "
+                    "Update PCB would remove it.",
                     **fields,
                 )
         elif tail:
@@ -378,12 +443,6 @@ def _component_findings(report, parts, board, links, is_dnp, newer_sheets) -> No
                 f"{designator} came from the schematic but its part is gone (deleted, "
                 f"compile-masked or re-placed with a new ID): Update PCB would remove "
                 f"it.{gone}",
-                **fields,
-            )
-        elif component.kind == MECHANICAL:
-            report.add(
-                "extra_on_pcb", "info",
-                f"{designator} is a mechanical part placed on the PCB only.",
                 **fields,
             )
         else:
@@ -400,11 +459,12 @@ def _component_findings(report, parts, board, links, is_dnp, newer_sheets) -> No
         part = parts[name]
         designator = board.designator(component)
         if how == "designator":
-            detail = (
-                "the PCB part has no schematic unique ID"
-                if not component.source_uid_tail
-                else "their unique IDs differ"
-            )
+            if not part.has_metadata:
+                detail = "no sheet gave the schematic part's unique ID (see sheet_errors)"
+            elif not component.source_uid_tail:
+                detail = "the PCB part has no schematic unique ID"
+            else:
+                detail = "their unique IDs differ"
             report.add(
                 "component_link", "info",
                 f"{designator} matched by designator: {detail}. Altium asks to match "
@@ -412,8 +472,11 @@ def _component_findings(report, parts, board, links, is_dnp, newer_sheets) -> No
                 "Component Links.",
                 component=designator,
             )
+        # Without a Texts6 designator the PCB offers only SOURCEDESIGNATOR, the
+        # logical name; a shown designator is compared with the physical one.
         if not _same(designator, name) and not (
-            part.logical and _same(designator, part.logical)
+            component.designator is None and part.logical
+            and _same(designator, part.logical)
         ):
             report.add(
                 "designator", "warning",
@@ -467,6 +530,7 @@ def _net_findings(report, parts, board, links, netlist, options) -> dict:
     # Schematic members as (PCB component, pad), and the pins with no pad.
     sch_members: dict[str, set] = defaultdict(set)
     off_board: Counter = Counter()
+    pending: Counter = Counter()  # pins behind a footprint change
     net_of_pad: dict[tuple[int, str], str] = {}
     for net, pins in (netlist.get("nets") or {}).items():
         sch_members.setdefault(net, set())
@@ -479,10 +543,14 @@ def _net_findings(report, parts, board, links, netlist, options) -> dict:
                 continue
             pad = board.pad_for(component, pin)
             if pad is None:
-                part = parts.get(name)
-                if part and part.footprint and not _same(part.footprint, component.footprint):
+                part = parts[name]
+                expected = part.footprint_by_uid.get(
+                    component.source_uid_tail or "", part.footprint
+                )
+                if expected and not _same(expected, component.footprint):
                     # Update PCB swaps the footprint first; its pads are not on the board.
                     counts["pins_behind_a_footprint_change"] += 1
+                    pending[net] += 1
                     continue
                 designator = board.designator(component)
                 report.add(
@@ -547,19 +615,23 @@ def _net_findings(report, parts, board, links, netlist, options) -> dict:
                 matched_pcb.add(pcb)
                 counts["matched_by_name"] += 1
 
+    from_pcb = {pcb: net for net, pcb in to_pcb.items()}
     for net, pcb in to_pcb.items():
         if pcb != net:
+            # Update PCB renames it; names drive classes, rules and pairs on the PCB.
             report.add(
-                "net_name", "info",
-                f"Net {net} is named {pcb} on the PCB.",
+                "net_name", "info" if _same(pcb, net) else "warning",
+                f"Net {net} is named {pcb} on the PCB: Update PCB would rename it.",
                 schematic=net, pcb=pcb, members=len(sch_members[net]),
             )
     for net, members in sch_members.items():
-        if net in to_pcb or not (members or off_board[net]):
+        if net in to_pcb or not (members or off_board[net] or pending[net]):
             continue  # matched, or only on jumpers (Altium does not sync their nets)
-        fields = {"net": net, "members": len(members) + off_board[net]}
+        fields = {"net": net, "members": len(members) + off_board[net] + pending[net]}
         if off_board[net]:
             fields["members_not_on_pcb"] = off_board[net]
+        if pending[net]:
+            fields["members_behind_a_footprint_change"] = pending[net]
         report.add(
             "net_only_in_schematic", "warning",
             f"Net {net} has no counterpart on the PCB: Update PCB would add it.",
@@ -574,13 +646,17 @@ def _net_findings(report, parts, board, links, netlist, options) -> dict:
             continue
         if all(key[0] in skip for key in members):
             continue  # only on jumper or graphical pads
-        on_linked = sum(1 for key in members if key[0] in linked_indexes)
+        on_linked = len(pcb_members.get(net, ()))
         if not on_linked:
             report.add(
                 "net_only_on_pcb", "info",
                 f"Net {net} is only on parts placed on the PCB alone.",
                 net=net, members=len(members),
             )
+            continue
+        if on_linked == 1:
+            # One compared pad (the rest on parts not compared): a single-pin net.
+            counts["single_pin_pcb_nets"] += 1
             continue
         report.add(
             "net_only_on_pcb", "warning",
@@ -608,22 +684,36 @@ def _net_findings(report, parts, board, links, netlist, options) -> dict:
                             pin=pin, schematic_net=net, pcb_net=None,
                         )
                     elif pcb_net != expected:
+                        other = from_pcb.get(pcb_net)
+                        here = (
+                            f" (the schematic's {other})" if other and other != pcb_net
+                            else " (a net the schematic lacks)" if other is None else ""
+                        )
+                        there = (
+                            f" ({expected} on the PCB)" if expected and expected != net
+                            else " (a net the PCB lacks)" if expected is None else ""
+                        )
                         report.add(
                             "pad_net", "error",
-                            f"Pad {pin} is on {pcb_net} on the PCB; the schematic "
-                            f"connects it to {net}"
-                            + (f" ({expected} on the PCB)." if expected and expected != net
-                               else "."),
+                            f"Pad {pin} is on {pcb_net}{here} on the PCB; the schematic "
+                            f"connects it to {net}{there}.",
                             pin=pin, schematic_net=net, pcb_net=pcb_net,
+                            pcb_net_matches=other, schematic_net_on_pcb=expected,
                         )
                     continue
                 if pcb_net is None:
                     continue
-                if board.net_members.get(pcb_net) == {key}:
+                if pcb_members.get(pcb_net, set()) <= {key}:
                     continue  # a single-pin net, absent from the Protel netlist
-                if part.pin_designators and not any(
-                    _same(pad, pin_name) for pin_name in part.pin_designators
-                ):
+                if not part.pin_designators:
+                    report.add(
+                        "pad_net", "warning",
+                        f"Pad {pin} is on {pcb_net} on the PCB but the schematic does not "
+                        "connect it; the part's pin list was not read, so it may have no "
+                        "such pin.",
+                        pin=pin, schematic_net=None, pcb_net=pcb_net,
+                    )
+                elif not any(_same(pad, pin_name) for pin_name in part.pin_designators):
                     report.add(
                         "pad_net", "warning",
                         f"Pad {pin} is on {pcb_net} on the PCB but the schematic symbol "
@@ -677,6 +767,10 @@ def run_sync_check(
     _component_findings(report, parts, board, links, is_dnp, newer)
     counts = _net_findings(report, parts, board, links, netlist or {}, options)
 
+    problems = Counter(
+        group for finding in report.findings if finding["severity"] != "info"
+        for group, group_checks in CHECK_GROUPS.items() if finding["check"] in group_checks
+    )
     wanted = {check for group in run for check in CHECK_GROUPS[group]}
     findings = [finding for finding in report.findings if finding["check"] in wanted]
     findings.sort(key=lambda finding: (
@@ -713,7 +807,8 @@ def run_sync_check(
             "reported: the Protel netlist leaves out single-pin nets."
         )
     result: dict = {
-        "in_sync": not (severities["error"] or severities["warning"]),
+        # Over every check, also those left out by checks.
+        "in_sync": not problems,
         "checks_run": run,
         "components": {
             "schematic": len(parts),
@@ -740,6 +835,9 @@ def run_sync_check(
     }
     if result["has_more"]:
         result["next_offset"] = offset + limit
+    others = sorted(group for group in problems if group not in run)
+    if others:
+        result["other_checks_with_differences"] = others
     result["not_checked"] = not_checked
     result["notes"] = notes
     return result

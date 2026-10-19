@@ -11,6 +11,20 @@ def _read_text(path) -> str:
         return data.decode("cp1252", errors="replace")
 
 
+def _split_at(member: str, parts: dict) -> int:
+    """Where a 'REFDES-PIN' member splits. Pins may hold '-' themselves (a battery's
+    '-' pin: 'BT1--'), so the rightmost '-' whose prefix is a known part wins; without
+    one (no part list), the last '-'."""
+    index = len(member)
+    while parts:
+        index = member.rfind("-", 0, index)
+        if index <= 0:
+            break
+        if member[:index] in parts:
+            return index
+    return member.rfind("-")
+
+
 def parse_protel_netlist(path) -> dict:
     """Parse a Protel .NET file into nets, an inverted pin index and the part list.
 
@@ -69,7 +83,7 @@ def parse_protel_netlist(path) -> dict:
             current_net = s
             nets[current_net] = []
         else:
-            idx = s.rfind("-")
+            idx = _split_at(s, parts)
             if idx <= 0:
                 continue
             refdes = s[:idx]

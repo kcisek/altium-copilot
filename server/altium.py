@@ -65,10 +65,14 @@ def enrich_netlist_sheets(
     from the sheet's (logical) ones, and the project's .Annotation file maps each placed
     part, by sheet and UniqueId, to its physical designators (one per channel). Those
     parts are filed under their physical designators, with logical_refdes set when it
-    differs. Parts the file does not list keep matching by sheet designator, onto netlist
-    names that no annotated part took.
+    differs, and with unique_paths, the full UniqueId path the PCB knows that copy by.
+    Parts the file does not list keep matching by sheet designator, onto netlist names
+    (connected parts, and every compiled part when the .NET part list was read) that no
+    annotated part took: an exact name first, then a channel suffix (C1 -> C1A, C1_2).
     """
     pin_to_net = netlist["pin_to_net"]
+    # Every compiled name: connected parts, and unconnected ones from the part list.
+    names = list(dict.fromkeys([*pin_to_net, *(netlist.get("parts") or {})]))
     by_uid: dict[str, list[AnnotationEntry]] = {}
     for annotation_entry in annotation or []:
         by_uid.setdefault(annotation_entry.component_uid, []).append(annotation_entry)
@@ -77,18 +81,22 @@ def enrich_netlist_sheets(
     unannotated: list[tuple[str, str, ComponentMeta]] = []
     for sheet, components in sheets:
         for refdes, meta in components.items():
-            physical = _physical_designators(by_uid, sheet, meta.unique_id)
+            physical = _physical_paths(by_uid, sheet, meta.unique_id)
             if not physical:
                 unannotated.append((sheet, refdes, meta))
                 continue
-            for name in physical:
+            for name, paths in physical.items():
                 entry = _make_enriched(meta, pin_to_net.get(name, {}))
                 entry["sheet"] = sheet
+                entry["unique_paths"] = paths
                 if name != refdes:
                     entry["logical_refdes"] = refdes
                 _file_entry(result, name, entry)
 
     claimed = set(result)
+    # Exact names first, so a channel fan-out never takes the name of a part that
+    # is filed under it.
+    fan_out: list[tuple[str, str, ComponentMeta]] = []
     for sheet, refdes, meta in unannotated:
         # Direct match (most components, and already-suffixed subsheet refs)
         if refdes in pin_to_net and refdes not in claimed:
@@ -96,16 +104,19 @@ def enrich_netlist_sheets(
             entry["sheet"] = sheet
             _file_entry(result, refdes, entry)
             continue
+        fan_out.append((sheet, refdes, meta))
+    taken = set(result) | {refdes for _, refdes, _ in fan_out}
 
-        # Subsheet fan-out: look for refdesA, refdesB, ... in pin_to_net
+    for sheet, refdes, meta in fan_out:
+        # Subsheet fan-out: look for refdesA, refdesB, ... among the compiled names
         suffixed = [
-            r for r in pin_to_net
-            if r not in claimed
+            r for r in names
+            if r not in taken
             and re.fullmatch(rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", r)
         ]
         if suffixed:
             for suffixed_ref in suffixed:
-                entry = _make_enriched(meta, pin_to_net[suffixed_ref])
+                entry = _make_enriched(meta, pin_to_net.get(suffixed_ref, {}))
                 entry["sheet"] = sheet
                 _file_entry(result, suffixed_ref, entry)
             continue
@@ -127,7 +138,7 @@ def enrich_netlist_sheets(
     return netlist
 
 
-_PART_LISTS = ("unique_ids", "footprints", "pin_designators")
+_PART_LISTS = ("unique_ids", "unique_paths", "footprints", "pin_designators")
 
 
 def _file_entry(result: dict, name: str, entry: dict) -> None:
@@ -148,17 +159,19 @@ def _file_entry(result: dict, name: str, entry: dict) -> None:
     result[name] = entry
 
 
-def _physical_designators(by_uid: dict[str, list["AnnotationEntry"]], sheet: str,
-                          unique_id: str) -> list[str]:
-    """Physical designators the .Annotation file gives a sheet's part, in file order."""
-    names: list[str] = []
+def _physical_paths(by_uid: dict[str, list["AnnotationEntry"]], sheet: str,
+                    unique_id: str) -> dict[str, list[str]]:
+    """Physical designators the .Annotation file gives a sheet's part, in file order,
+    each with its full UniqueId path(s)."""
+    names: dict[str, list[str]] = {}
     if not unique_id:
         return names
     for annotation_entry in by_uid.get(unique_id, []):
         if annotation_entry.sheet and annotation_entry.sheet.lower() != sheet.lower():
             continue
-        if annotation_entry.physical not in names:
-            names.append(annotation_entry.physical)
+        paths = names.setdefault(annotation_entry.physical, [])
+        if annotation_entry.unique_id not in paths:
+            paths.append(annotation_entry.unique_id)
     return names
 
 
@@ -439,6 +452,9 @@ class AltiumClient:
                        annotation_paths: list[str] | None = None) -> dict:
         """Parse a .NET file and enrich it from the given sheets. Always returns a new dict."""
         netlist = parse_protel_netlist(str(net_path))
+        # When it was compiled: sheets saved later are not in it.
+        netlist["net_file"] = str(net_path)
+        netlist["net_file_mtime"] = Path(net_path).stat().st_mtime
         try:
             self._enrich_from_schdocs(sheet_paths, netlist, annotation_paths)
         except Exception as e:

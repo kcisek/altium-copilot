@@ -505,6 +505,9 @@ class PcbComponent:
     # The comment text (Texts6), and ComponentKind (see _component_kind).
     comment: str | None = None
     kind: int = 0
+    # The full SOURCEUNIQUEID path (\SheetSymbol...\Component): channel copies
+    # share the tail but not the path.
+    source_unique_id: str | None = None
 
 
 @dataclass
@@ -761,6 +764,7 @@ def decode_components(
                 ),
                 footprint=record.get("PATTERN") or None,
                 kind=_component_kind(record),
+                source_unique_id=source_uid or None,
             )
         )
     return components
@@ -768,13 +772,28 @@ def decode_components(
 
 def _component_kind(record: dict[str, str]) -> int:
     """ComponentKind: 0 Standard, 1 Mechanical, 2 Graphical, 3 Net Tie (In BOM),
-    4 Net Tie, 5 Standard (No BOM), 6 Jumper. Standard (No BOM) is written as
-    COMPONENTKIND=0 with COMPONENTKINDVERSION2=5, and Standard as neither."""
-    for key in ("COMPONENTKINDVERSION2", "COMPONENTKIND"):
-        value = record.get(key, "").strip()
-        if value.isdigit():
-            return int(value)
-    return 0
+    4 Net Tie, 5 Standard (No BOM), 6 Jumper. Altium writes the newer kinds
+    backward-compatibly: Standard (No BOM) as ComponentKind=0 with
+    ComponentKindVersion2=5, Jumper with ComponentKindVersion3=6; it reads them back
+    in that order, as here."""
+    return component_kind(
+        record.get("COMPONENTKIND", ""),
+        record.get("COMPONENTKINDVERSION2", ""),
+        record.get("COMPONENTKINDVERSION3", ""),
+    )
+
+
+def component_kind(kind: str, version2: str, version3: str) -> int:
+    """The component kind from ComponentKind and its two version keys."""
+    def number(value: str) -> int:
+        value = value.strip()
+        return int(value) if value.isdigit() else 0
+
+    if number(version3) == 6:
+        return 6
+    if number(version2) >= 5:
+        return number(version2)
+    return number(kind)
 
 
 def decode_polygons(
@@ -870,14 +889,28 @@ _WIDE_STRING_INDEX_AT = 115
 
 
 def decode_wide_strings(data: bytes) -> dict[int, str]:
-    """WideStrings6: u32 index, u32 byte length, UTF-16LE text (NUL-terminated)."""
+    """WideStrings6: u32 index, u32 byte length, UTF-16LE text ending in a NUL.
+
+    Some files hold a record declared 2 bytes long with no body, the next record's
+    header (index + 1) following at once; it is read as empty. A record that is
+    otherwise malformed ends the walk, keeping what was read.
+    """
     strings: dict[int, str] = {}
     offset = 0
     while offset + 8 <= len(data):
         index, length = struct.unpack_from("<II", data, offset)
         body = data[offset + 8 : offset + 8 + length]
-        strings[index] = body.decode("utf-16-le", "replace").rstrip("\x00")
-        offset += 8 + length
+        if length % 2 == 0 and len(body) == length and body.endswith(b"\x00\x00"):
+            strings[index] = body.decode("utf-16-le", "replace").rstrip("\x00")
+            offset += 8 + length
+            continue
+        if offset + 12 <= len(data) and struct.unpack_from(
+            "<I", data, offset + 8
+        )[0] == index + 1:
+            strings[index] = ""
+            offset += 8
+            continue
+        break
     return strings
 
 

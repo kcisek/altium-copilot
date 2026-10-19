@@ -328,12 +328,17 @@ def _handle_pin(
 
 
 def _component_kind(props: dict[str, str]) -> int:
-    """ComponentKind, where ComponentKindVersion2 (e.g. 5, Standard (No BOM)) wins."""
-    for key in ("componentkindversion2", "componentkind"):
-        value = props.get(key, "")
-        if value.isdigit():
-            return int(value)
-    return 0
+    """ComponentKind as Altium reads it back: ComponentKindVersion3=6 is a Jumper,
+    ComponentKindVersion2 of 5 or more (Standard (No BOM)) wins over ComponentKind."""
+    def number(key: str) -> int:
+        value = props.get(key, "").strip()
+        return int(value) if value.isdigit() else 0
+
+    if number("componentkindversion3") == 6:
+        return 6
+    if number("componentkindversion2") >= 5:
+        return number("componentkindversion2")
+    return number("componentkind")
 
 
 def _handle_model(

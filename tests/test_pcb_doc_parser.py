@@ -852,8 +852,18 @@ def test_decode_components_reads_kind():
         {"COMPONENTKIND": "1"},
         {"COMPONENTKIND": "0", "COMPONENTKINDVERSION2": "5"},  # Standard (No BOM)
         {"COMPONENTKIND": "4"},
+        # Jumper: ComponentKindVersion3=6, written with or without the zeros before it.
+        {"COMPONENTKIND": "0", "COMPONENTKINDVERSION2": "0", "COMPONENTKINDVERSION3": "6"},
+        {"COMPONENTKINDVERSION3": "6"},
     ])
-    assert [component.kind for component in components] == [0, 1, 5, 4]
+    assert [component.kind for component in components] == [0, 1, 5, 4, 6, 6]
+
+
+def test_decode_components_keeps_the_full_unique_id_path():
+    (component,) = decode_components([{"SOURCEUNIQUEID": "\\SHEETSYM\\PARTUID"}])
+    assert (component.source_unique_id, component.source_uid_tail) == (
+        "\\SHEETSYM\\PARTUID", "PARTUID",
+    )
 
 
 def _comment_record(component: int, text: bytes, wide_index: int | None = None) -> bytes:
@@ -896,3 +906,17 @@ def test_parse_streams_attaches_comments():
     streams["WideStrings6/Data"] = _wide(3, "4.7µF")
     pcb = parse_streams(streams)
     assert (pcb.components[0].designator, pcb.components[0].comment) == ("C1", "4.7µF")
+
+
+def test_decode_wide_strings_steps_over_a_bodyless_record():
+    data = (
+        _wide(1, "A")
+        + struct.pack("<II", 2, 2)  # declared 2 bytes, but index 3's header follows
+        + _wide(3, "C")
+    )
+    assert decode_wide_strings(data) == {1: "A", 2: "", 3: "C"}
+
+
+def test_decode_wide_strings_stops_at_a_malformed_record():
+    data = _wide(1, "A") + struct.pack("<II", 9, 0xFFFFFF) + b"junk"
+    assert decode_wide_strings(data) == {1: "A"}

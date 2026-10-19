@@ -6,6 +6,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- Protel netlist members whose pin designator holds a '-' (a battery's '-' pin, written
+  `BT1--`) are split at the rightmost '-' that leaves a known part, so the pin no longer
+  becomes a phantom part `BT1-` with an empty pin. The .NET is read as UTF-8, falling
+  back to the Windows code page instead of replacing characters such as µ
+- A sheet part with no nets no longer takes, by channel-suffix matching, the netlist name
+  of another part (TP1 claiming TP1V8): exact designators are matched first. Unconnected
+  channel copies are now found through the compiled part list, so they get their
+  sheet's metadata
 - Device sheets are read as project sheets. The `.PrjPcb` lists them under
   `[DeviceSheetN]` (a managed one as `Managed\Sheets\<GUID>\Name.SchDoc`), not
   `[DocumentN]`, so their parts got no schematic metadata, saving one did not make the
@@ -135,14 +143,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   schematic netlist with the saved PcbDoc and reports parts missing from or extra on the
   PCB, designator, footprint and comment differences, pads whose net differs from their
   pin's, renamed nets, nets on one side only, and schematic pins whose placed footprint
-  has no pad (Update PCB stops with 'Unknown Pin'). Components link by unique ID first and
-  by designator second; nets match by shared members first and by name second, with the
-  project's Comparator settings. Mechanical and graphical parts, variant alternates, net
-  ties and jumpers are handled as Altium does, and every finding names its Altium
-  difference type. Sheets saved after the PcbDoc are listed as the likely cause. To feed
-  it, the Protel netlist's part list (footprint, comment) is now read, the sheets give
-  each part's unique IDs, footprint models, kind and pin designators, and the PcbDoc gives
-  component kind and comment text (from WideStrings6, so µ and Ω survive)
+  has no pad (Update PCB stops with 'Unknown Pin'). Components link by unique ID first
+  (channel copies by their full sheet-symbol path from the .Annotation file, else by
+  their non-auto-named nets) and by designator second; nets match by shared members
+  first and by name second, with the project's Comparator settings. Mechanical and
+  graphical parts, variant alternates, copied footprints, removed channels, net ties,
+  jumpers and single-pin nets are handled as Altium does, and every finding names its
+  Altium difference type. Sheets saved after the PcbDoc are listed as the likely cause;
+  sheets saved after the netlist was compiled are reported as `netlist_stale`, so a stale
+  netlist is not mistaken for an out-of-date board. To feed it, the Protel netlist's part
+  list (footprint, comment) is now read, the sheets give each part's unique IDs,
+  footprint models, kind and pin designators, and the PcbDoc gives the full source unique
+  ID, the component kind (Jumper included, stored as ComponentKindVersion3) and the
+  comment text (from WideStrings6, so µ and Ω survive)
 - Impedance profiles from the Layer Stack Manager: `get_board_info` lists each profile's
   target and tolerance, its solved trace width/gap, calculated impedance and reference
   layers per signal layer, a derived propagation delay, the rules that use it, and issues

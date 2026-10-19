@@ -127,3 +127,14 @@ def test_ansi_netlist_keeps_symbols(tmp_path):
     result = parse_protel_netlist(str(f))
     assert result["parts"]["C1"]["comment"] == "4.7µF"
     assert result["nets"] == {"NET1": [("C1", "1")]}
+
+
+def test_pin_designators_holding_a_dash(tmp_path):
+    """A battery's '-' pin: 'BT1--' is part BT1, pin '-'."""
+    f = tmp_path / "dash.NET"
+    f.write_text(
+        "[\nBT1\nBAT\nCR2032\n\n\n\n]\n[\nJ1\nHDR\n\n\n\n\n]\n"
+        "(\nGND\nBT1--\nJ1-2\n)\n",
+        encoding="utf-8",
+    )
+    assert parse_protel_netlist(str(f))["nets"] == {"GND": [("BT1", "-"), ("J1", "2")]}

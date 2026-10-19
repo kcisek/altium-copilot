@@ -387,3 +387,16 @@ def test_parts_with_their_own_unique_ids_keep_every_id():
     assert u1.unique_ids == ["PARTAAAA", "PARTBBBB"]
     assert u1.unique_id == "PARTBBBB"  # the highest part's, as on the PCB
     assert u1.footprint == "SOIC8"
+
+
+def test_jumper_kind_is_component_kind_version3():
+    """Altium writes a Jumper as ComponentKindVersion3=6 (with or without zeros before)."""
+    data = _stream(
+        "|RECORD=1|LibReference=W|UniqueID=AAAAAAAA|ComponentKind=0"
+        "|ComponentKindVersion2=0|ComponentKindVersion3=6",                            # 1
+        "|RECORD=34|OwnerIndex=0|Name=Designator|Text=W1",                             # 2
+        "|RECORD=1|LibReference=W|UniqueID=BBBBBBBB|ComponentKindVersion3=6",          # 3
+        "|RECORD=34|OwnerIndex=2|Name=Designator|Text=W2",                             # 4
+    )
+    parts = components_from_stream(data)
+    assert (parts["W1"].kind, parts["W2"].kind) == (6, 6)

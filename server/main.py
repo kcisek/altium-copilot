@@ -263,8 +263,10 @@ component locations, distances):
 12. check_sch_pcb_sync — "is the PCB in sync with the schematic?", "did I forget Update
     PCB?", before a release: an offline Show Differences (missing/extra parts, designator,
     footprint and comment changes, pads on the wrong net, renamed or one-sided nets) plus
-    the ECO's 'Unknown Pin' failures. Name sheets saved after the PcbDoc as the likely
-    cause, and say Altium's Show Differences is the final word.
+    the ECO's 'Unknown Pin' failures. With netlist_stale, sheets were saved after the
+    netlist was compiled: call refresh_netlist (those saves prove the user saved) and run
+    it again. Otherwise name sheets saved after the PcbDoc as the likely cause. Altium's
+    Show Differences is the final word.
 13. constraints_review — call when the user asks to review or verify the PCB's high-speed
     constraints or the routing against them ("check my high-speed rules", "are my DDR
     length rules right?", "review the diff pairs before fab"): a whole-interface audit
@@ -2632,17 +2634,20 @@ def check_diff_pairs(
     return json.dumps(_convert_units(result, to_mm), indent=2)
 
 
-def _sheets_saved_after(project: dict, pcb_path: Path) -> list[str]:
-    """Sheets saved after the PcbDoc: their changes may not be on the board yet."""
-    pcb_saved = pcb_path.stat().st_mtime
+def _sheets_saved_after(project: dict, saved: float) -> list[str]:
+    """The project's sheets saved after the given time (a missing sheet is skipped)."""
     newer = []
     for sheet in project.get("sheets", []):
         try:
-            if Path(sheet["path"]).stat().st_mtime > pcb_saved:
+            if Path(sheet["path"]).stat().st_mtime > saved:
                 newer.append(sheet["name"])
         except OSError:
             continue
     return newer
+
+
+def _utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
 
 
 @mcp.tool(
@@ -2657,7 +2662,9 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
     only, and schematic pins whose placed footprint has no pad (Update PCB stops with
     'Unknown Pin'). Parts link by unique ID, then designator; nets by shared members, then
     name (the project's Comparator settings). The schematic side is the compiled netlist
-    from the last load or refresh_netlist.
+    from the last load or refresh_netlist; netlist_stale lists sheets saved after it was
+    compiled, whose changes are not compared until refresh_netlist. in_sync covers every
+    check, also those left out by checks.
 
     checks narrows to components, pins, nets. Findings are paginated (offset from
     next_offset), errors first; each names the Altium difference type in altium_names."""
@@ -2665,8 +2672,14 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
     if error:
         return json.dumps(error)
     project, netlist, variant_state = _require_project()
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
     pcb_path = Path(project["pcb_doc_paths"][0])
-    newer = _sheets_saved_after(project, pcb_path)
+    pcb_saved = pcb_path.stat().st_mtime
+    newer = _sheets_saved_after(project, pcb_saved)
+    compiled = netlist.get("net_file_mtime")
+    stale = _sheets_saved_after(project, compiled) if compiled else []
     options = net_matching_options(project.get("prj_pcb_path"))
     for limit in (100, 30, 10):
         result = run_sync_check(
@@ -2681,15 +2694,24 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
         )
         if "error" in result:
             return json.dumps(result)
-        result = {
+        context: dict = {
             "pcb_doc": pcb_path.name,
-            "pcb_saved_utc": datetime.fromtimestamp(
-                pcb_path.stat().st_mtime, tz=timezone.utc
-            ).isoformat(),
+            "pcb_saved_utc": _utc(pcb_saved),
             "netlist_updated_utc": _netlist_last_updated,
-            "sheets_saved_after_pcb": newer,
-            **result,
         }
+        if compiled:
+            context["netlist_compiled_utc"] = _utc(compiled)
+        if stale:
+            context["netlist_stale"] = True
+            context["sheets_saved_after_netlist"] = stale
+            context["hint"] = (
+                "These sheets were saved after the netlist was compiled: their changes "
+                "are not compared. Call refresh_netlist, then check again."
+            )
+        context["sheets_saved_after_pcb"] = newer
+        if netlist.get("sheet_errors"):
+            context["sheet_errors"] = netlist["sheet_errors"][:20]
+        result = {**context, **result}
         if len(project["pcb_doc_paths"]) > 1:
             result["note"] = (
                 f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; compared with "
