@@ -539,7 +539,8 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
     if name == "isnet":
         return _TRUE if is_net and target.obj is None else _FALSE
     if name == "isdifferentialpair":
-        return _TRUE if target.kind == "diff_pair" and target.obj is None else _FALSE
+        # Tracks of a pair's nets are checked through the pair (member view).
+        return _TRUE if target.kind == "diff_pair" else _FALSE
     if name in _POLYGON_ONLY and target.pour_view:
         if name in ("inpoly", "inpolygon", "ispoly", "ispolygon"):
             return _TRUE
