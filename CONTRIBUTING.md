@@ -20,13 +20,22 @@ build and publish workflow. Contributors cannot ship a release.
 
 ## DB Schema Changes
 
-`server/export.py` defines `SCHEMA_VERSION` (currently 2). Any PR that changes the SQLite
-schema in `_create_schema()` **must** also:
+`server/export.py` defines `SCHEMA_VERSION` (currently 1). pcb-copilot refuses to open a
+snapshot whose version is higher than its `SUPPORTED_SCHEMA_VERSION`, so a bump locks out
+every pcb-copilot release that has not caught up.
+
+Any PR that changes or removes an existing table or column in `_create_schema()`, or
+changes what a column means, **must**:
 
 1. Bump `SCHEMA_VERSION` in `server/export.py`
-2. Bump `SUPPORTED_SCHEMA_VERSION` in `pcb-copilot/server/main.py` (separate repo)
+2. Bump `SUPPORTED_SCHEMA_VERSION` in `pcb-copilot/server/main.py` (separate repo), and
+   release pcb-copilot before releasing altium-copilot
 
 Failing to bump causes pcb-copilot to silently load a DB with an incompatible schema.
+
+Adding a new table that existing readers do not query (for example `notes`) needs no
+bump: pcb-copilot reads only the tables and columns it names. Bump when pcb-copilot
+starts depending on the new table.
 
 ## Prerequisites
 

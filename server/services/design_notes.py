@@ -326,15 +326,23 @@ def _note_row(document_kind: str, document: str, kind: str, *, text: str | None 
     }
 
 
+def _file_name(path: str | None) -> str | None:
+    """The last part of a Windows path. The snapshot is shared, so it keeps no local
+    folders (user profiles, drive layouts); pasted-picture names like
+    "ClipboardPicture03/06/2025 14:30" have no backslash and stay whole."""
+    return path.rsplit("\\", 1)[-1] if path else path
+
+
 def _sheet_rows(name: str, notes: SheetAnnotations) -> list[dict]:
     rows = []
     for item in notes.items:
         data = {"x_mil": item.x_mil, "y_mil": item.y_mil,
                 "width_mil": item.width_mil, "height_mil": item.height_mil}
         if item.kind == "image":
-            data.update(file_name=item.file_name, embedded=item.embedded,
+            file_name = _file_name(item.file_name)
+            data.update(file_name=file_name, embedded=item.embedded,
                         image_index=item.image_index, captions=item.captions)
-            rows.append(_note_row("sheet", name, "image", title=item.file_name,
+            rows.append(_note_row("sheet", name, "image", title=file_name,
                                   text="\n".join(item.captions), near=item.near, data=data))
             continue
         if item.kind == "note":
@@ -351,16 +359,17 @@ def _sheet_rows(name: str, notes: SheetAnnotations) -> list[dict]:
     rows += [_note_row("sheet", name, "title_block", title=k, text=v)
              for k, v in notes.title_block.items()]
     if notes.template:
-        rows.append(_note_row("sheet", name, "template", text=PureWindowsPath(notes.template).name,
-                              data={"path": notes.template}))
+        rows.append(_note_row("sheet", name, "template", text=_file_name(notes.template)))
     return rows
 
 
 def _draftsman_rows(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str]) -> list[dict]:
-    rows = [_note_row("draftsman", name, "drawing", text=doc.source_pcb, data={
-        "source_pcb": doc.source_pcb,
+    source = _file_name(doc.source_pcb)
+    rows = [_note_row("draftsman", name, "drawing", text=source, data={
+        "source_pcb": source,
         "matches_project_pcb": bool(doc.source_pcb) and any(
             _same_path(doc.source_pcb, p) for p in project_pcb_paths),
+        "source_warning": _source_warning(doc.source_pcb, project_pcb_paths) if doc.source_pcb else None,
         "last_update": doc.last_update,
         "pages": doc.pages,
     })]
@@ -396,9 +405,11 @@ def _draftsman_rows(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str]) 
 def note_rows(cache: DesignNotesCache, project: dict) -> tuple[list[dict], list[dict]]:
     """The package_for_xfn notes table: what get_design_notes reports, one row per item.
 
-    Pictures are described (file name, size, index) without their image data.
-    Returns (rows, errors); errors list [{document_kind, document, error}] for documents
-    that could not be read, so the export can go ahead without them.
+    Pictures are described (file name, size, index) without their image data, and paths
+    are reduced to file names. A document that could not be read gets one "unreadable"
+    row, so a reader can tell it apart from a document without notes. Returns (rows,
+    errors); errors list [{document_kind, document, error}] for those documents, so the
+    export can go ahead without them.
     """
     rows = [_note_row("project", project["name"], "parameter", title=k, text=v)
             for k, v in (project.get("parameters") or {}).items()]
@@ -416,6 +427,9 @@ def note_rows(cache: DesignNotesCache, project: dict) -> tuple[list[dict], list[
         except Exception as e:
             errors.append({"document_kind": kind, "document": doc["name"],
                            "error": f"{type(e).__name__}: {e}"})
+            reason = e.strerror if isinstance(e, OSError) and e.strerror else str(e)
+            reason = reason.replace(doc["path"], Path(doc["path"]).name)
+            rows.append(_note_row(kind, doc["name"], "unreadable", text=f"{type(e).__name__}: {reason}"))
     return rows, errors
 
 
