@@ -369,8 +369,11 @@ def test_export_notes_draftsman(notes_project):
 
     note = by_kind["note"][0]
     assert (note["page"], note["title"]) == (1, "Notes:")
-    assert note["text"] == "1. Board material FR-4, Tg 150 or higher\n2. Surface finish ENIG"
-    assert note["data"]["lines"] == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
+    assert note["text"] == (
+        "1. Board material FR-4, Tg 150 or higher\n2. Surface finish ENIG\n"
+        "3. Final thickness 1.6mm, part DEMO-v3, =Unknown_Param kept"
+    )
+    assert note["data"]["lines"][:2] == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
 
     texts = {r["text"]: r["data"]["from_template"] for r in by_kind["text"]}
     assert texts == {"Do not scale this drawing": False, "Drawn by: J. Doe": True}
@@ -380,12 +383,12 @@ def test_export_notes_draftsman(notes_project):
     assert table["text"] == "Layer | Impedance\nL1 | 50 ohm"
     assert table["data"]["rows"] == [["Layer", "Impedance"], ["L1", "50 ohm"]]
 
-    assert [(r["page"], r["text"], r["data"]["side"]) for r in by_kind["view"]] == [
-        (1, "fabrication view, Top side", "Top"),
-        (2, "assembly view, Bottom side", "Bottom"),
-        (2, "layer stack legend", None),
+    assert [(r["page"], r["text"], r["data"]["side"], r["data"]["layer"]) for r in by_kind["view"]] == [
+        (1, "fabrication view, Top side", "Top", "Top Layer"),
+        (2, "assembly view, Bottom side", "Bottom", None),
+        (2, "layer stack legend", None, None),
     ]
-    assert by_kind["view"][1]["title"] == "View from Bottom side (Scale =ViewScale)"
+    assert by_kind["view"][1]["title"] == "View from Bottom side (Scale 2:1)"
 
     assert [r["text"] for r in by_kind["drill"]] == [
         "0.300 mm plated Via Top Layer - Bottom Layer x3",

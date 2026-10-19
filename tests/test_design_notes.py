@@ -9,6 +9,7 @@ import pytest
 from mcp.server.fastmcp import Image
 
 import main
+import parsers.pcb_dwf as pcb_dwf
 import services.design_notes as design_notes
 from parsers.prj_pcb import PrjPcbData, VariantDefinition, VariantState, parse_prj_pcb
 from parsers.sch_doc import SheetAnnotation, SheetAnnotations
@@ -69,6 +70,108 @@ def test_drawing_from_another_board_is_flagged(project, cache):
     assert "not this project's PcbDoc" not in build_design_notes(cache, project, "Fab")
 
 
+def test_drawing_from_a_same_name_board_elsewhere_says_so(project, cache):
+    # A copied project or an earlier revision: same board file name, other folder.
+    project["pcb_doc_paths"] = [str(Path(project["root_dir"]) / "Demo.PcbDoc")]
+    text = build_design_notes(cache, project, "Fab")
+    assert "(a board of the same name in another folder" in text
+    assert "not this project's PcbDoc" not in text
+
+
+def test_same_board_through_another_path_is_not_flagged(tmp_path):
+    board = tmp_path / "Board.PcbDoc"
+    board.write_bytes(b"x")
+    alias = tmp_path / "Alias.PcbDoc"
+    os.link(board, alias)  # the same file reached by another path (cf. junction, mapped drive)
+    assert design_notes._source_warning(str(alias), [str(board)]) is None
+
+
+def test_last_update_keeps_utc_marker(project, cache):
+    assert "last_update:2026-10-01T12:00:00Z" in build_design_notes(cache, project, "Fab")
+
+
+def test_drill_row_without_size_does_not_hide_the_drawing(project, cache):
+    doc = cache.draftsman(project["pcb_dwf_paths"][0])
+    doc.drill_table[0]["size_mm"] = None
+    text = build_design_notes(cache, project, "Fab")
+    assert "    ? mm plated Via Top Layer - Bottom Layer x3" in text
+    assert "1. Board material FR-4" in text
+
+
+def test_fabrication_view_names_its_layer(project, cache):
+    text = build_design_notes(cache, project, "Fab")
+    assert "[view] fabrication view, Top side: Top Layer (Scale =ViewScale)" in text
+
+
+# ---------- special strings ----------
+
+@pytest.mark.parametrize("text,expected", [
+    ("=Title", "Main"),
+    ("=title", "Main"),                                   # names are case-insensitive
+    ("=PrjName + '-v' + Rev", "BMS-v3"),                  # expression of names and literals
+    ("=PrjName+\"+\"+Rev", "BMS+3"),                      # '+' inside a literal
+    ("=SchRev", "3"),                                     # sheet value pointing at a project one
+    ("=Missing", None),
+    ("plain text", None),
+])
+def test_resolve_special_string(text, expected):
+    sheet = {"Title": "Main", "SchRev": "=Rev"}
+    project = {"PrjName": "BMS", "Rev": "3", "Title": "ignored: the sheet wins"}
+    assert design_notes.resolve_special_string(text, sheet, project) == expected
+
+
+def test_resolve_special_string_stops_on_a_cycle():
+    assert design_notes.resolve_special_string("=A", {"A": "=B", "B": "=A"}) is None
+
+
+def _sheet_with_specials() -> SheetAnnotations:
+    return SheetAnnotations(
+        items=[
+            SheetAnnotation(kind="label", text="=PrjMPN + '-v' + PrjVersion"),
+            SheetAnnotation(kind="text_frame", text="=Unset"),
+            SheetAnnotation(kind="label", text="=Unknown + 'x'"),
+            SheetAnnotation(kind="label", text="=ProjectName + ' ' + DocumentName"),
+            SheetAnnotation(kind="label", text="='Drawn by ' + DrawnBy"),
+            SheetAnnotation(kind="label", text="='Printed ' + CurrentDate"),
+        ],
+        title_block={"Revision": "=SCH_Revision", "Title": "Main"},
+        sheet_parameters={
+            "Unset": "*", "Revision": "=SCH_Revision", "Title": "Main",
+            # Stored placeholders and computed values Altium does not draw as stored:
+            "ProjectName": "*", "DrawnBy": "*", "CurrentDate": "Not shown in title block",
+        },
+    )
+
+
+def test_sheet_notes_show_special_strings_as_displayed():
+    project = {"prj_pcb_path": "C:/Boards/BMS.PrjPcb",
+               "parameters": {"PrjMPN": "E002", "PrjVersion": "6.0", "SCH_Revision": "B", "DrawnBy": "KPC"}}
+    notes = design_notes.resolved_sheet(_sheet_with_specials(), project, "C:/Boards/Power.SchDoc")
+    text = design_notes.render_sheet_notes("S", notes)
+    assert "[label] E002-v6.0" in text
+    assert "=Unset" not in text  # set nowhere: nothing is drawn on the sheet
+    assert "[label] =Unknown + 'x'" in text  # unknown name: shown as typed
+    assert "[label] BMS.PrjPcb Power.SchDoc" in text  # built in, not the stored "*"
+    assert "[label] Drawn by KPC" in text  # the sheet's "*" falls through to the project
+    assert "[label] ='Printed ' + CurrentDate" in text  # computed when printed: left as typed
+    assert "title_block: Revision=B; Title=Main" in text
+    assert text.startswith("sheet:S notes:5 ")
+
+
+def test_project_parameters_reach_sheet_notes_and_snapshot_rows(project, cache):
+    notes = SheetAnnotations(items=[SheetAnnotation(kind="label", text="=PrjName + '-x'")],
+                             title_block={"Rev": "=PrjPCBRev"})
+    with patch.object(cache, "sheet", return_value=notes):
+        text = build_design_notes(cache, project, "sheet1")
+        context = sheet_notes_for_context(cache, project, "sheet1")
+        rows, _ = design_notes.note_rows(cache, project)
+    for shown in (text, context):
+        assert "[label] BMS_11-x" in shown and "title_block: Rev=1" in shown
+    sheet_rows = {r["kind"]: r for r in rows if r["document"] == "sheet1"}
+    assert sheet_rows["label"]["text"] == "BMS_11-x"
+    assert sheet_rows["title_block"]["text"] == "1"
+
+
 def test_pagination(project, cache, monkeypatch):
     monkeypatch.setattr(design_notes, "NOTES_PAGE_CHAR_BUDGET", 10)
     first = build_design_notes(cache, project)
@@ -91,9 +194,9 @@ def test_single_document_by_name(project, cache):
 
 
 def test_unknown_document(project, cache):
-    text = build_design_notes(cache, project, "nope")
-    assert text.startswith("error: document_not_found")
-    assert "'sheet1', 'sheet2', 'Fab.PCBDwf'" in text
+    error = json.loads(build_design_notes(cache, project, "nope"))
+    assert error["error"] == "document_not_found"
+    assert "'sheet1', 'sheet2', 'Fab.PCBDwf'" in error["message"]
 
 
 def test_unreadable_document_does_not_hide_the_others(project, cache):
@@ -194,6 +297,15 @@ def test_draftsman_picture(project, cache):
     assert image.data.startswith(b"\x89PNG")
 
 
+def test_draftsman_pictures_come_from_the_cached_parse(project, cache):
+    # The file is decoded once for the notes; pictures, and bad indexes, reuse that parse.
+    with patch.object(pcb_dwf, "_decode", wraps=pcb_dwf._decode) as decode:
+        build_design_notes(cache, project, "Fab")
+        assert isinstance(main._get_design_image_impl(project, cache, "Fab", 0), Image)
+        assert main._get_design_image_impl(project, cache, "Fab", 7)["error"] == "image_not_found"
+    assert decode.call_count == 1
+
+
 def test_embedded_schematic_picture_becomes_png(project, cache):
     with patch.object(cache, "sheet", return_value=_sheet_with_image("ClipboardPicture1", True)), \
          patch("main.read_sch_doc_image", return_value=_bmp(3, 2, PICTURE)) as read:
@@ -242,6 +354,32 @@ def test_unsupported_picture_data(project, cache):
     assert result["error"] == "unsupported_image_format"
 
 
+def test_linked_picture_in_another_format_is_not_called_missing(project, cache):
+    (Path(project["root_dir"]) / "scan.tif").write_bytes(b"II*\x00 tiff data")
+    with patch.object(cache, "sheet", return_value=_sheet_with_image("scan.tif", False)):
+        result = main._get_design_image_impl(project, cache, "sheet1", 0)
+    assert result["error"] == "unsupported_image_format"
+
+
+def test_oversized_picture_is_refused_before_it_reaches_the_conversation(project, cache):
+    header = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (9000).to_bytes(4, "big") + (10).to_bytes(4, "big")
+    (Path(project["root_dir"]) / "wide.png").write_bytes(header + b"\x08\x02\x00\x00\x00")
+    with patch.object(cache, "sheet", return_value=_sheet_with_image("wide.png", False)):
+        result = main._get_design_image_impl(project, cache, "sheet1", 0)
+    assert result["error"] == "image_too_large"
+    assert "9000x10 px" in result["message"]
+
+
+# ---------- server instructions ----------
+
+def test_key_instructions_fit_in_claude_codes_4096_character_cut():
+    # Claude Code truncates MCP server instructions at 4096 characters.
+    visible = main.SERVER_INSTRUCTIONS[:4096]
+    assert "then get_design_notes (all pages)" in visible
+    assert ("Do not call get_component or query_net individually for components already visible in a\n"
+            "sheet context you have already loaded.") in visible
+
+
 # ---------- tool wrappers and load responses ----------
 
 def test_tools_need_a_project():
@@ -256,6 +394,7 @@ def test_get_design_image_tool_returns_json_errors(project):
          patch("main._variant_state", VariantState([VariantDefinition(name="Default")])):
         altium._netlist = NETLIST
         assert json.loads(main.get_design_image("Nope"))["error"] == "document_not_found"
+        assert json.loads(main.get_design_notes(document="Nope"))["error"] == "document_not_found"
         assert isinstance(main.get_design_image("Fab"), Image)
         assert main.get_design_notes(document="sheet2").startswith("design_notes total:1")
 

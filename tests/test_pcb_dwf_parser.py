@@ -6,12 +6,13 @@ Altium wrote; never commit it.
 """
 import os
 import random
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
-from parsers.pcb_dwf import decode_pcb_dwf, parse_pcb_dwf, read_pcb_dwf_picture
-from tests.draftsman_fixture import FIXTURE, build, drawing_xml, lz4_stream
+from parsers.pcb_dwf import _without_board_copy, decode_pcb_dwf, parse_pcb_dwf, read_pcb_dwf_picture
+from tests.draftsman_fixture import FIXTURE, TINY_PNG, build, drawing_xml, lz4_stream
 
 
 @pytest.fixture(scope="module")
@@ -76,8 +77,16 @@ def test_document_metadata(drawing):
 def test_note_lines_skip_empty_entries(drawing):
     note = next(i for i in drawing.items if i.kind == "note")
     assert note.title == "Notes:"
-    assert note.lines == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
+    assert note.lines[:2] == ["Board material FR-4, Tg 150 or higher", "Surface finish ENIG"]
+    assert len(note.lines) == 3
     assert note.page == 1
+
+
+def test_special_strings_take_the_values_the_drawing_cached(drawing):
+    # =Total_Thickness from ParametersData/PCBParameters, =PrjRev from ProjectParameters
+    # (also right after a letter, as "v=PrjRev"); a name without a value stays as typed.
+    note = next(i for i in drawing.items if i.kind == "note")
+    assert note.lines[2] == "Final thickness 1.6mm, part DEMO-v3, =Unknown_Param kept"
 
 
 def test_free_text_and_template_text(drawing):
@@ -97,12 +106,13 @@ def test_picture_size_and_index(drawing):
     assert (picture.width_mm, picture.height_mm) == (50.0, 25.0)
 
 
-def test_views_with_side_and_resolved_title(drawing):
-    views = [(i.page, i.view, i.side, i.title) for i in drawing.items if i.kind == "view"]
+def test_views_with_side_layer_and_resolved_title(drawing):
+    views = [(i.page, i.view, i.side, i.layer, i.title) for i in drawing.items if i.kind == "view"]
     assert views == [
-        (1, "fabrication view", "Top", "=ViewLayerName (Scale =ViewScale)"),
-        (2, "assembly view", "Bottom", "View from Bottom side (Scale =ViewScale)"),
-        (2, "layer stack legend", None, "Layer Stack Legend"),
+        # LayerV7Id 1 is IdInBoard 1 of the cached stack
+        (1, "fabrication view", "Top", "Top Layer", "Top Layer (Scale =ViewScale)"),
+        (2, "assembly view", "Bottom", None, "View from Bottom side (Scale 2:1)"),
+        (2, "layer stack legend", None, None, "Layer Stack Legend"),
     ]
 
 
@@ -119,10 +129,50 @@ def test_drill_table_groups_holes_in_mm(drawing):
     ]
 
 
-def test_layer_stack_notes(drawing):
+def test_layer_stack_notes_once_despite_the_second_stack_copy(drawing):
+    # The fixture, like real drawings, also serialises the stack under LayerStack/Tuple...
     assert drawing.layer_notes == [
         {"layer": "Dielectric 1", "comment": "Controlled impedance core", "note": "Use Isola 370HR"}
     ]
+
+
+def _with_layer_stacks(*stacks: str) -> str:
+    body = "".join(
+        f"<BoardLayerStack><Name>{name}</Name><Stack><StackLayerBoardLayerData><Comment>c</Comment>"
+        f"<Name>Core</Name><Note/></StackLayerBoardLayerData></Stack></BoardLayerStack>"
+        for name in stacks
+    )
+    xml = drawing_xml()
+    start = xml.index("<LayerStackInformation>")
+    end = xml.index("</LayerStackInformation>") + len("</LayerStackInformation>")
+    return (xml[:start] + f"<LayerStackInformation><BoardLayerStackData>{body}</BoardLayerStackData>"
+            "</LayerStackInformation>" + xml[end:])
+
+
+def test_layer_notes_name_their_stack_when_there_are_several(tmp_path):
+    path = tmp_path / "flex.PCBDwf"
+    path.write_bytes(lz4_stream(_with_layer_stacks("Rigid", "Flex").encode()))
+    assert parse_pcb_dwf(str(path)).layer_notes == [
+        {"layer": "Core", "stack": "Rigid", "comment": "c"},
+        {"layer": "Core", "stack": "Flex", "comment": "c"},
+    ]
+
+
+def test_board_copy_is_cut_before_parsing():
+    xml = bytearray(drawing_xml().encode())
+    assert b"board copy" in xml
+    kept = _without_board_copy(xml)
+    assert b"board copy" not in kept and b"<BoardAssemblyInformation" not in kept
+    assert b'<BillOfMaterialsInformation i:nil="true"/>' in kept  # self-closing: left alone
+    assert len(xml) - len(kept) == len(
+        b"<BoardAssemblyInformation><Components><q:Part>board copy</q:Part></Components></BoardAssemblyInformation>"
+    )
+
+
+def test_pictures_are_kept_with_the_parse(drawing):
+    assert len(drawing.pictures) == 1
+    assert drawing.pictures[0].startswith(b"\x89PNG\r\n\x1a\n")
+    assert "pictures" not in repr(drawing)
 
 
 def test_read_picture_returns_png():
@@ -145,3 +195,43 @@ def test_real_draftsman_file_parses():
     for item in drawing.items:
         if item.kind == "picture":
             assert read_pcb_dwf_picture(str(path), item.picture_index)
+
+
+def test_fixture_needs_the_board_copy_cut_to_parse():
+    # Guards the wiring: the fixture's board copy is not valid XML on its own.
+    with pytest.raises(ET.ParseError):
+        ET.fromstring(drawing_xml())
+
+
+@pytest.mark.parametrize("xml", [
+    # Draftsman's empty form, then a same-named element elsewhere: nothing is cut
+    b'<D><BoardAssemblyInformation i:nil="true"/><P>keep</P><BoardAssemblyInformation>x</BoardAssemblyInformation></D>',
+    # a same-named element nested inside: the outer one is left alone
+    b"<D><BoardAssemblyInformation><BoardAssemblyInformation>x</BoardAssemblyInformation></BoardAssemblyInformation><P>keep</P></D>",
+    # no closing tag
+    b"<D><BoardAssemblyInformation><P>keep</P></D>",
+    # a longer tag that only starts with the name
+    b"<D><BoardAssemblyInformationX>keep</BoardAssemblyInformationX></D>",
+])
+def test_board_copy_cut_leaves_unusual_elements_alone(xml):
+    assert _without_board_copy(bytearray(xml)) == xml
+
+
+def test_bad_picture_does_not_hide_the_drawing(tmp_path):
+    path = tmp_path / "bad.PCBDwf"
+    path.write_bytes(lz4_stream(drawing_xml().replace(TINY_PNG, TINY_PNG[:-1]).encode()))
+    drawing = parse_pcb_dwf(str(path))
+    assert drawing.pictures == [b""]
+    assert any(i.kind == "note" for i in drawing.items)
+
+
+def test_fabrication_view_without_cached_stack_uses_default_layer_names(tmp_path):
+    xml = drawing_xml().replace("<LayerV7Id>1</LayerV7Id>", "<LayerV7Id>32</LayerV7Id>")
+    start = xml.index("<LayerStackInformation>")
+    end = xml.index("</LayerStackInformation>") + len("</LayerStackInformation>")
+    xml = xml[:start] + '<LayerStackInformation i:nil="true"/>' + xml[end:]
+    path = tmp_path / "led.PCBDwf"
+    path.write_bytes(lz4_stream(xml.encode()))
+    view = next(i for i in parse_pcb_dwf(str(path)).items if i.view == "fabrication view")
+    assert view.layer == "Bottom Layer"
+    assert view.title.startswith("Bottom Layer (Scale")

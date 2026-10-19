@@ -197,11 +197,18 @@ _MAX_NEAR = 4
 _AUTO_SHEET_PARAMS = {
     "currenttime", "currentdate", "time", "date", "documentfullpathandname",
     "documentname", "modifieddate", "application_buildnumber", "spicemodelcache",
-    "configurationparameters", "configuratorname", "isuserconfigurable",
+    "configurationparameters", "configuratorname", "isuserconfigurable", "pagesetup",
 }
 # A label holding only a special string (e.g. "=Title") repeats a title-block parameter.
 _SPECIAL_STRING_RE = re.compile(r"^=[\w.]+$")
 _TEXT_KINDS = {"209": "note", "28": "text_frame", "4": "label"}
+# Text frames and notes escape their text: ~1 is a line break, ~2 a '|', ~~ a '~'.
+_TEXT_ESCAPES = {"1": "\n", "2": "|", "~": "~"}
+_TEXT_ESCAPE_RE = re.compile(r"~([12~])")
+# Altium draws schematic font size N at about 0.646 N points (checked against its own
+# 1:1 PDF export); an average character is about half an em wide.
+_FONT_SIZE_MIL = 0.646 * 1000 / 72
+_CHAR_WIDTH_EM = 0.5
 
 
 @dataclass
@@ -235,6 +242,8 @@ class SheetAnnotations:
     directives: list[SheetDirective] = field(default_factory=list)
     title_block: dict[str, str] = field(default_factory=dict)
     template: str | None = None
+    # Every sheet-level parameter as stored, for resolving special strings ("=Revision").
+    sheet_parameters: dict[str, str] = field(default_factory=dict)
 
 
 def _read_records(data: bytes) -> list[dict[str, str]]:
@@ -279,22 +288,26 @@ def _rect(props: dict[str, str]) -> list[float]:
 def _label_rect(props: dict[str, str], text: str, font_sizes: dict[str, int]) -> list[float]:
     """Approximate extent of a free text label; Altium stores only its anchor point.
 
-    Width is estimated from the font size (0.55 em per character), and the anchor is
-    placed by Justification (0..8 = bottom/center/top x left/center/right).
+    The box is sized from the font size and placed by Justification (0..8 = bottom/
+    center/top x left/center/right) in the text's own frame, then turned about the
+    anchor by Orientation x 90 degrees counter-clockwise.
     """
     x, y = _coord(props, "location.x"), _coord(props, "location.y")
-    em = font_sizes.get(props.get("fontid", "1"), 10) * 1000 / 72  # points -> mil
+    em = font_sizes.get(props.get("fontid", "1"), 10) * _FONT_SIZE_MIL
     lines = text.split("\n")
-    width, height = max(len(line) for line in lines) * em * 0.55, em * len(lines)
-    if props.get("orientation") in ("1", "3"):  # rotated by 90 or 270 degrees
-        width, height = height, width
+    width, height = max(len(line) for line in lines) * em * _CHAR_WIDTH_EM, em * len(lines)
     try:
         justification = int(props.get("justification", "0"))
+        turns = int(props.get("orientation", "0")) % 4
     except ValueError:
-        justification = 0
-    x0 = x - width * (justification % 3) / 2
-    y0 = y - height * (justification // 3) / 2
-    return [x0, y0, x0 + width, y0 + height]
+        justification, turns = 0, 0
+    x0, y0 = -width * (justification % 3) / 2, -height * (justification // 3) / 2
+    corners = [(x0, y0), (x0 + width, y0), (x0, y0 + height), (x0 + width, y0 + height)]
+    for _ in range(turns):
+        corners = [(-cy, cx) for cx, cy in corners]
+    xs = [x + cx for cx, _ in corners]
+    ys = [y + cy for _, cy in corners]
+    return [min(xs), min(ys), max(xs), max(ys)]
 
 
 def _gap(a: list[float], b: list[float]) -> float:
@@ -368,7 +381,10 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
             continue  # symbol graphics, component parameters, template content
 
         if record in _TEXT_KINDS:
-            text = props.get("text", "").replace("~1", "\n").strip()
+            text = props.get("text", "")
+            if record != "4":  # labels are single-line and stored without escapes
+                text = _TEXT_ESCAPE_RE.sub(lambda m: _TEXT_ESCAPES[m.group(1)], text)
+            text = text.strip()
             if (not text or props.get("ishidden") == "T"
                     or (record == "4" and _SPECIAL_STRING_RE.match(text))):
                 continue
@@ -396,8 +412,11 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
             continue
         elif record == "41":
             name, value = props.get("name", ""), props.get("text", "")
+            if name:
+                result.sheet_parameters[name] = value
             if (name and value not in ("", "*") and name.lower() not in _AUTO_SHEET_PARAMS
-                    and not name.lower().startswith("versioncontrol_")):
+                    and not name.lower().startswith("versioncontrol_")
+                    and not value.startswith("Record=")):  # printer setup, not a title
                 result.title_block[name] = value
             continue
         elif record == "39":
@@ -411,9 +430,12 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
         result.items.append(item)
 
     components = [(designators[pos], box) for pos, box in part_boxes.items() if designators.get(pos)]
-    texts = [(i.text, rects[id(i)]) for i in result.items if i.kind != "image"]
+    # A special string ("=A + '-' + B") is drawn as its value, whose extent is unknown
+    # here, so it is not related to nearby parts or pictures.
+    texts = [(i.text, rects[id(i)]) for i in result.items
+             if i.kind != "image" and not i.text.startswith("=")]
     for item in result.items:
-        if item.kind != "image":
+        if item.kind != "image" and not item.text.startswith("="):
             item.near = _closest(rects[id(item)], components, NEAR_COMPONENT_MIL, _MAX_NEAR)
         elif item.kind == "image":
             item.captions = _closest(rects[id(item)], texts, CAPTION_MIL, 3)
