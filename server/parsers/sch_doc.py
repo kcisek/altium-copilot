@@ -19,15 +19,18 @@ class ComponentMeta:
 
 
 def parse_sch_doc(path: str) -> dict[str, ComponentMeta]:
-    """Parse an Altium .SchDoc OLE file and return component metadata keyed by refdes.
+    """Parse an Altium .SchDoc OLE file and return component metadata keyed by refdes."""
+    with olefile.OleFileIO(path) as f:
+        return components_from_stream(f.openstream("FileHeader").read())
+
+
+def components_from_stream(data: bytes) -> dict[str, ComponentMeta]:
+    """parse_sch_doc for the bytes of a FileHeader stream.
 
     The OwnerIndex field in child records (pins, designators, parameters) refers to
     the 0-based sequential record number of the parent RECORD=1 minus 1, i.e. the
     record immediately preceding the component record in the file stream.
     """
-    with olefile.OleFileIO(path) as f:
-        data = f.openstream("FileHeader").read()
-
     # Parsing state
     # Key: owner_key = record_num - 1 for the RECORD=1 entry
     components_by_owner: dict[int, ComponentMeta] = {}
@@ -36,51 +39,40 @@ def parse_sch_doc(path: str) -> dict[str, ComponentMeta]:
     uid_seen: dict[str, int] = {}          # UniqueID -> canonical owner_key
     best_mpn_priority: dict[int, int] = {} # canonical owner_key -> lowest suffix seen (0 = best)
 
-    offset = 0
-    record_num = 0
-    while offset < len(data):
-        if offset + 4 > len(data):
-            break
-        rec_len = struct.unpack_from("<I", data, offset)[0]
-        if rec_len == 0 or rec_len > 500_000:
-            break
-        rec_bytes = data[offset + 4 : offset + 4 + rec_len]
-        text = rec_bytes.decode("latin-1")
-
-        m = re.search(r"\|RECORD=(\d+)", text)
-        if m:
-            record_type = int(m.group(1))
-            props = _parse_props(text)
-            # owner_key for a RECORD=1 at record_num is (record_num - 1),
-            # matching the OwnerIndex used by child records.
-            if record_type == 1:
-                _handle_component(
-                    props, record_num, components_by_owner, canonical_owner, uid_seen
-                )
-            elif record_type == 34:
-                _handle_designator(props, components_by_owner, canonical_owner)
-            elif record_type == 2:
-                _handle_pin(props, components_by_owner, canonical_owner)
-            elif record_type == 41:
-                _handle_parameter(
-                    props, components_by_owner, canonical_owner, best_mpn_priority
-                )
-            # RECORD=17 (power ports) intentionally skipped
-
-        offset += 4 + rec_len
-        record_num += 1
+    for record_num, props in enumerate(_read_records(data)):
+        record_type = props.get("record")
+        # owner_key for a RECORD=1 at record_num is (record_num - 1),
+        # matching the OwnerIndex used by child records.
+        if record_type == "1":
+            _handle_component(
+                props, record_num, components_by_owner, canonical_owner, uid_seen
+            )
+        elif record_type == "34":
+            _handle_designator(props, components_by_owner, canonical_owner)
+        elif record_type == "2":
+            _handle_pin(props, components_by_owner, canonical_owner)
+        elif record_type == "41":
+            _handle_parameter(
+                props, components_by_owner, canonical_owner, best_mpn_priority
+            )
+        # RECORD=17 (power ports) intentionally skipped
 
     return {comp.refdes: comp for comp in components_by_owner.values() if comp.refdes}
 
 
 def _parse_props(text: str) -> dict[str, str]:
+    """`|KEY=VALUE|...` as a dict with lower-case keys.
+
+    Altium writes the same key as OwnerIndex in some sheets and OWNERINDEX in others
+    (most of its AD25 examples), so keys are matched case-insensitively.
+    """
     props: dict[str, str] = {}
     for part in text.split("|"):
         if "=" in part:
             key, _, val = part.partition("=")
-            key = key.strip()
+            key = key.strip().lower()
             val = val.strip()
-            if key.startswith("%UTF8%"):
+            if key.startswith("%utf8%"):
                 # The record was decoded as latin-1, so %UTF8% values are
                 # latin-1 bytes that are actually UTF-8. Re-encode→decode to
                 # get the correct Unicode (e.g. "ÂµF" → "µF").
@@ -94,6 +86,38 @@ def _parse_props(text: str) -> dict[str, str]:
     return props
 
 
+def _read_records(data: bytes) -> list[dict[str, str]]:
+    """Split a schematic stream into property dicts with lower-case keys.
+
+    Each record is a 4-byte header (24-bit length, then a type byte, 0 = text) and a
+    `|KEY=VALUE|...` body. Binary records become empty dicts so that list positions,
+    which OwnerIndex refers to, stay aligned. Position 0 is the stream header, and a
+    child's OwnerIndex is its owner's position minus one.
+    """
+    records: list[dict[str, str]] = []
+    offset = 0
+    while offset + 4 <= len(data):
+        header = struct.unpack_from("<I", data, offset)[0]
+        length = header & 0xFFFFFF
+        body = data[offset + 4 : offset + 4 + length]
+        offset += 4 + length
+        if header >> 24:
+            records.append({})
+            continue
+        text = body.decode("latin-1").rstrip("\x00")
+        records.append(_parse_props(text))
+    return records
+
+
+def _owner_key(props: dict[str, str], canonical_owner: dict[int, int]) -> int | None:
+    """The canonical owner_key a child record belongs to, or None if it has no owner."""
+    try:
+        owner = int(props.get("ownerindex", ""))
+    except ValueError:
+        return None
+    return canonical_owner.get(owner, owner)
+
+
 def _handle_component(
     props: dict[str, str],
     record_num: int,
@@ -103,8 +127,8 @@ def _handle_component(
 ) -> None:
     # The owner_key used by child records equals record_num - 1
     owner_key = record_num - 1
-    uid = props.get("UniqueID", "")
-    desc = props.get("ComponentDescription") or None
+    uid = props.get("uniqueid", "")
+    desc = props.get("componentdescription") or None
 
     if uid and uid in uid_seen:
         # Subsequent part of a multi-part component — map to canonical owner_key
@@ -122,13 +146,12 @@ def _handle_designator(
     components_by_owner: dict[int, ComponentMeta],
     canonical_owner: dict[int, int],
 ) -> None:
-    if props.get("Name") != "Designator":
+    if props.get("name", "").lower() != "designator":
         return
-    owner_str = props.get("OwnerIndex")
-    text = props.get("Text", "")
-    if not owner_str or not text:
+    key = _owner_key(props, canonical_owner)
+    text = props.get("text", "")
+    if key is None or not text:
         return
-    key = canonical_owner.get(int(owner_str), int(owner_str))
     if key in components_by_owner:
         components_by_owner[key].refdes = text
 
@@ -138,14 +161,13 @@ def _handle_pin(
     components_by_owner: dict[int, ComponentMeta],
     canonical_owner: dict[int, int],
 ) -> None:
-    owner_str = props.get("OwnerIndex")
-    name = props.get("Name", "")
-    designator = props.get("Designator", "")
-    if not owner_str or not designator:
+    key = _owner_key(props, canonical_owner)
+    name = props.get("name", "")
+    designator = props.get("designator", "")
+    if key is None or not designator:
         return
     if not name or name == "?":
         return
-    key = canonical_owner.get(int(owner_str), int(owner_str))
     if key in components_by_owner:
         components_by_owner[key].pins[designator] = name
 
@@ -156,17 +178,17 @@ def _handle_parameter(
     canonical_owner: dict[int, int],
     best_mpn_priority: dict[int, int],
 ) -> None:
-    owner_str = props.get("OwnerIndex")
-    name = props.get("Name", "")
-    text = props.get("Text", "")
-    if not owner_str or not text or text.startswith('"'):
+    key = _owner_key(props, canonical_owner)
+    # Parameter names are case-insensitive in Altium ("Value" and "VALUE" both occur).
+    name = props.get("name", "").lower()
+    text = props.get("text", "")
+    if key is None or not text or text.startswith('"'):
         return
-    key = canonical_owner.get(int(owner_str), int(owner_str))
     if key not in components_by_owner:
         return
     comp = components_by_owner[key]
 
-    if name == "Value":
+    if name == "value":
         comp.value = text
         return
 
@@ -181,7 +203,7 @@ def _handle_parameter(
 
     # Fall back to Comment as MPN when no Manufacturer Part Number exists.
     # Comment is used as the primary part number in many Altium libraries.
-    if name == "Comment" and best_mpn_priority.get(key, 999) == 999:
+    if name == "comment" and best_mpn_priority.get(key, 999) == 999:
         comp.mpn = text
 
 
@@ -244,29 +266,6 @@ class SheetAnnotations:
     template: str | None = None
     # Every sheet-level parameter as stored, for resolving special strings ("=Revision").
     sheet_parameters: dict[str, str] = field(default_factory=dict)
-
-
-def _read_records(data: bytes) -> list[dict[str, str]]:
-    """Split a schematic stream into property dicts with lower-case keys.
-
-    Each record is a 4-byte header (24-bit length, then a type byte, 0 = text) and a
-    `|KEY=VALUE|...` body. Binary records become empty dicts so that list positions,
-    which OwnerIndex refers to, stay aligned. Position 0 is the stream header, and a
-    child's OwnerIndex is its owner's position minus one.
-    """
-    records: list[dict[str, str]] = []
-    offset = 0
-    while offset + 4 <= len(data):
-        header = struct.unpack_from("<I", data, offset)[0]
-        length = header & 0xFFFFFF
-        body = data[offset + 4 : offset + 4 + length]
-        offset += 4 + length
-        if header >> 24:
-            records.append({})
-            continue
-        text = body.decode("latin-1").rstrip("\x00")
-        records.append({key.lower(): val for key, val in _parse_props(text).items()})
-    return records
 
 
 def _coord(props: dict[str, str], key: str) -> float:
