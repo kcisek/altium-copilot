@@ -32,6 +32,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Where does RMII_REF_CLK route?"* | Layers, routed length per layer, vias, endpoints |
 | *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths |
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
+| *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them |
 | *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |
 | *"What width and clearance apply to USB_D_P?"* | The effective design rule per kind, resolved by priority, with values per layer |
 | *"Which nets are in the HighSpeed class?"* | Net, component and diff-pair classes with their members |

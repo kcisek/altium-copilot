@@ -314,6 +314,14 @@ def _rule_count_lines(by_kind: dict[str, list]) -> list[str]:
     ]
 
 
+def _impedance_line(index) -> str:
+    try:
+        from services.impedance import snapshot_line
+    except ImportError:
+        from server.services.impedance import snapshot_line
+    return snapshot_line(index)
+
+
 def _stale_order(rule) -> tuple[bool, int]:
     """Enabled rules of the review kinds first; file order otherwise."""
     rank = (
@@ -383,6 +391,7 @@ def constraints_snapshot(index) -> str:
         *_pair_lines(index),
         _class_line(index),
         *_rule_count_lines(by_kind),
+        _impedance_line(index),
         _stale_line(index),
         _drc_line(index, by_kind),
     ]
@@ -458,8 +467,10 @@ Do not proceed until the user answers.
   use the same measure. Pads without a pin/package length add nothing, so a die-to-die budget
   needs the package length from the datasheet. A result marked marginal is inconclusive, not
   a violation.
-- Impedance cannot be measured from the files: only an impedance-profile-driven rule states
-  a target. Never present a closed-form impedance estimate as evidence.
+- Impedance comes only from the Layer Stack Manager: get_board_info lists each impedance
+  profile with its solved width/gap and calculated impedance per layer and the rules using
+  it. Without a profile the impedance cannot be confirmed from the files. Never present a
+  closed-form impedance estimate as evidence.
 - Work in the active variant ({active_variant}): a DNP AC-coupling capacitor, termination or
   series resistor on an interface net is a finding.
 - Net names are hints, not evidence. Identify interfaces from parts and pin names.
@@ -510,10 +521,12 @@ Do not proceed to Phase 2 until then.
    which wins by priority), and class names that state another impedance than the target
    (e.g. a USB 2.0 pair in an 85 Ω class). get_design_rules(kind=...) shows every rule of a
    kind with its values.
-3. Impedance — a profile-driven rule (impedance_profile_driven, impedance_profile_ohm)
-   states its target: compare it with the requirement. A fixed-width rule: quote layers_mil
-   per layer with the stackup from get_board_info, say the impedance cannot be confirmed from
-   the files, and ask for the Layer Stack Manager result or the fabricator's impedance report.
+3. Impedance — a profile-driven rule names its impedance_profile: compare the profile's
+   target and tolerance with the requirement, check its calculated impedance per layer
+   (get_board_info impedance_profiles, within_tolerance) and its issues (rule widths that
+   drifted from the profile, unused profiles). A fixed-width rule: quote layers_mil per layer
+   with the stackup, say the impedance cannot be confirmed from the files, and ask for the
+   Layer Stack Manager result or the fabricator's impedance report.
 4. Lengths — every MatchedLengths rule whose scope matches applies (priority is ignored).
    Check membership (exactly the interface's nets; xSignals carry a signal through series
    parts), tolerance against the budget, and mode (within-pair or group). A tolerance far
