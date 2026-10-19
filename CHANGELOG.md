@@ -6,6 +6,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- Device sheets are read as project sheets. The `.PrjPcb` lists them under
+  `[DeviceSheetN]` (a managed one as `Managed\Sheets\<GUID>\Name.SchDoc`), not
+  `[DocumentN]`, so their parts got no schematic metadata, saving one did not make the
+  netlist stale, and `get_sheet_context` and design notes did not know the sheet. On
+  Altium's Bluetooth_Sentinel example (10 device sheets) 72 of 72 schematic parts now
+  load (was 15). A listed device sheet missing on disk is reported in `sheet_errors`,
+  like a missing project sheet; a sheet listed both ways is read once. Projects without
+  device sheets are unchanged
 - Schematic enrichment reads sheets that write record keys in upper case (`OWNERINDEX`,
   `TEXT`, `NAME`, `UNIQUEID`, ...), as most of Altium's AD25 examples do. `parse_sch_doc`
   matched only the mixed-case spelling, so Bluetooth Sentinel, Mini PC (Motherboard,

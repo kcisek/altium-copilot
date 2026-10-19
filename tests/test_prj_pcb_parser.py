@@ -213,6 +213,58 @@ def test_sheet_paths_resolve_subfolder_and_parent_paths(tmp_path):
     ]
 
 
+# A managed device sheet's GUID folder, as Altium writes it into the .PrjPcb.
+DEVICE_DIR = "Managed\\Sheets\\2C007D27-9DB2-40E7-9A59-B05D1E0767B6"
+
+
+def test_device_sheets_are_sheets(tmp_path):
+    """Device sheets are listed under [DeviceSheetN], not [DocumentN]; their .SchDoc
+    files are schematic sheets of the project, their .Harness files are not."""
+    prj = tmp_path / "Board.PrjPcb"
+    prj.write_text(
+        "[Design]\nVersion=1.0\n"
+        "[Document1]\nDocumentPath=Main.SchDoc\n"
+        "[Document2]\nDocumentPath=Board.PcbDoc\n"
+        "[Document3]\nDocumentPath=Board.Annotation\n"
+        f"[DeviceSheet1]\nDocumentPath={DEVICE_DIR}\\Oscillator.SchDoc\n"
+        "ClassGenCCAutoEnabled=1\n"
+        f"[DeviceSheet2]\nDocumentPath={DEVICE_DIR}\\Oscillator.Harness\n"
+        "[DeviceSheet3]\nDocumentPath=Managed\\Sheets\\F6C39D47\\Battery.SchDoc\n",
+        encoding="utf-8",
+    )
+    data = parse_prj_pcb(str(prj))
+    device = tmp_path / "Managed" / "Sheets"
+    assert data.sheet_paths == [
+        str((tmp_path / "Main.SchDoc").resolve()),
+        str((device / "2C007D27-9DB2-40E7-9A59-B05D1E0767B6" / "Oscillator.SchDoc").resolve()),
+        str((device / "F6C39D47" / "Battery.SchDoc").resolve()),
+    ]
+    assert data.pcb_doc_paths == [str((tmp_path / "Board.PcbDoc").resolve())]
+    assert data.annotation_paths == [str((tmp_path / "Board.Annotation").resolve())]
+
+
+def test_device_sheet_outside_project_folder(tmp_path):
+    """An unmanaged device sheet may live in a shared library folder (absolute path)."""
+    library = tmp_path / "Device Sheets" / "Power.SchDoc"
+    prj = tmp_path / "proj" / "Board.PrjPcb"
+    prj.parent.mkdir()
+    prj.write_text(f"[DeviceSheet1]\nDocumentPath={library}\n", encoding="utf-8")
+    assert parse_prj_pcb(str(prj)).sheet_paths == [str(library.resolve())]
+
+
+def test_sheet_listed_as_document_and_device_sheet_is_listed_once(tmp_path):
+    prj = tmp_path / "Board.PrjPcb"
+    prj.write_text(
+        f"[Document1]\nDocumentPath={DEVICE_DIR}\\Oscillator.SchDoc\n"
+        "[Document2]\nDocumentPath=Main.SchDoc\n"
+        f"[DeviceSheet1]\nDocumentPath={DEVICE_DIR}\\Oscillator.SchDoc\n",
+        encoding="utf-8",
+    )
+    assert [Path(p).name for p in parse_prj_pcb(str(prj)).sheet_paths] == [
+        "Oscillator.SchDoc", "Main.SchDoc",
+    ]
+
+
 def test_unresolved_dnp_uid_kept_for_later_resolution():
     """A UID the schematics did not cover (e.g. its sheet failed to parse) must survive,
     so a later refresh can still resolve it instead of silently dropping the DNP."""
