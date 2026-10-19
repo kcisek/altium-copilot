@@ -65,7 +65,8 @@ Claude also reads what you wrote into the project besides the circuit: notes (wi
 author and collapsed state), text frames, free text, pictures, directives and title
 blocks on every schematic sheet, project parameters, and the notes, tables, view titles,
 drill table and layer stack notes in your Draftsman (`.PCBDwf`) drawings. Pictures can be
-shown to Claude as images. Review comments made in Altium 365 are stored in your cloud
+shown to Claude as images. `package_for_xfn` snapshots carry the same notes (pictures are
+described, not embedded). Review comments made in Altium 365 are stored in your cloud
 workspace, not in the project files, so they are not available.
 
 ---

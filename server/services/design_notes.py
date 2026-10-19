@@ -1,4 +1,5 @@
-"""Designer-added information for the loaded project, rendered as compact text.
+"""Designer-added information for the loaded project, rendered as compact text and as
+rows for the package_for_xfn snapshot.
 
 Sources: project parameters (.PrjPcb), per-sheet annotations (.SchDoc notes, text
 frames, labels, pictures, directives, title block) and Draftsman documents (.PCBDwf).
@@ -167,22 +168,130 @@ def render_draftsman(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str])
                 lines.append(f"    [view] {item.view}{side}{title}")
     if doc.drill_table:
         lines.append("  drill_table (cached from the board at last_update):")
-        for row in doc.drill_table:
-            line = (
-                f"    {row['size_mm']:.3f} mm {'plated' if row['plated'] else 'non-plated'} "
-                f"{row['type']} {row['span']} x{row['count']}"
-            )
-            if row.get("slot_length_mm"):
-                line += f" slot {row['slot_length_mm']:.3f} mm"
-            if row.get("backdrill"):
-                line += " backdrill"
-            lines.append(line)
+        lines.extend("    " + _drill_text(row) for row in doc.drill_table)
     if doc.layer_notes:
         lines.append("  layer_stack_notes:")
         for layer in doc.layer_notes:
-            details = "; ".join(f"{k}={v}" for k, v in layer.items() if k != "layer")
-            lines.append(f"    {layer['layer']}: {details}")
+            lines.append(f"    {layer['layer']}: {_layer_note_text(layer)}")
     return "\n".join(lines)
+
+
+def _drill_text(row: dict) -> str:
+    text = (
+        f"{row['size_mm']:.3f} mm {'plated' if row['plated'] else 'non-plated'} "
+        f"{row['type']} {row['span']} x{row['count']}"
+    )
+    if row.get("slot_length_mm"):
+        text += f" slot {row['slot_length_mm']:.3f} mm"
+    if row.get("backdrill"):
+        text += " backdrill"
+    return text
+
+
+def _layer_note_text(layer: dict) -> str:
+    return "; ".join(f"{k}={v}" for k, v in layer.items() if k != "layer")
+
+
+def _note_row(document_kind: str, document: str, kind: str, *, text: str | None = "",
+              title: str | None = None, page: int | None = None, author: str | None = None,
+              near: list[str] | None = None, data: dict | None = None) -> dict:
+    return {
+        "document_kind": document_kind, "document": document, "kind": kind, "page": page,
+        "title": title, "text": text or "", "author": author,
+        "near_refdes": list(near or []), "data": data or {},
+    }
+
+
+def _sheet_rows(name: str, notes: SheetAnnotations) -> list[dict]:
+    rows = []
+    for item in notes.items:
+        data = {"x_mil": item.x_mil, "y_mil": item.y_mil,
+                "width_mil": item.width_mil, "height_mil": item.height_mil}
+        if item.kind == "image":
+            data.update(file_name=item.file_name, embedded=item.embedded,
+                        image_index=item.image_index, captions=item.captions)
+            rows.append(_note_row("sheet", name, "image", title=item.file_name,
+                                  text="\n".join(item.captions), near=item.near, data=data))
+            continue
+        if item.kind == "note":
+            data["collapsed"] = item.collapsed
+        rows.append(_note_row("sheet", name, item.kind, text=item.text, author=item.author,
+                              near=item.near, data=data))
+    for directive in notes.directives:
+        rows.append(_note_row(
+            "sheet", name, "directive", title=directive.name,
+            text=", ".join(f"{k}={v}" for k, v in directive.parameters.items()),
+            data={"parameters": directive.parameters,
+                  "x_mil": directive.x_mil, "y_mil": directive.y_mil},
+        ))
+    rows += [_note_row("sheet", name, "title_block", title=k, text=v)
+             for k, v in notes.title_block.items()]
+    if notes.template:
+        rows.append(_note_row("sheet", name, "template", text=PureWindowsPath(notes.template).name,
+                              data={"path": notes.template}))
+    return rows
+
+
+def _draftsman_rows(name: str, doc: DraftsmanDoc, project_pcb_paths: list[str]) -> list[dict]:
+    rows = [_note_row("draftsman", name, "drawing", text=doc.source_pcb, data={
+        "source_pcb": doc.source_pcb,
+        "matches_project_pcb": bool(doc.source_pcb) and any(
+            _same_path(doc.source_pcb, p) for p in project_pcb_paths),
+        "last_update": doc.last_update,
+        "pages": doc.pages,
+    })]
+    rows += [_note_row("draftsman", name, "parameter", title=k, text=v)
+             for k, v in doc.parameters.items()]
+    for item in doc.items:
+        data = {"from_template": item.from_template}
+        if item.kind == "note":
+            data["lines"] = item.lines
+            text = "\n".join(f"{n}. {line}" for n, line in enumerate(item.lines, start=1))
+        elif item.kind == "table":
+            data["rows"] = item.rows
+            text = "\n".join(" | ".join(row) for row in item.rows)
+        elif item.kind == "picture":
+            data.update(picture_index=item.picture_index,
+                        width_mm=item.width_mm, height_mm=item.height_mm)
+            text = ""
+        elif item.kind == "view":
+            data.update(view=item.view, side=item.side)
+            text = item.view + (f", {item.side} side" if item.side else "")
+        else:
+            text = item.text
+        rows.append(_note_row("draftsman", name, item.kind, title=item.title, text=text,
+                              page=item.page, data=data))
+    rows += [_note_row("draftsman", name, "drill", text=_drill_text(row), data=row)
+             for row in doc.drill_table]
+    rows += [_note_row("draftsman", name, "layer_note", title=layer["layer"],
+                       text=_layer_note_text(layer), data=layer)
+             for layer in doc.layer_notes]
+    return rows
+
+
+def note_rows(cache: DesignNotesCache, project: dict) -> tuple[list[dict], list[dict]]:
+    """The package_for_xfn notes table: what get_design_notes reports, one row per item.
+
+    Pictures are described (file name, size, index) without their image data.
+    Returns (rows, errors); errors list [{document_kind, document, error}] for documents
+    that could not be read, so the export can go ahead without them.
+    """
+    rows = [_note_row("project", project["name"], "parameter", title=k, text=v)
+            for k, v in (project.get("parameters") or {}).items()]
+    errors = []
+    documents = [("sheet", s) for s in project.get("sheets") or []]
+    documents += [("draftsman", d) for d in draftsman_documents(project)]
+    for kind, doc in documents:
+        try:
+            if kind == "sheet":
+                rows += _sheet_rows(doc["name"], cache.sheet(doc["path"]))
+            else:
+                rows += _draftsman_rows(doc["name"], cache.draftsman(doc["path"]),
+                                        project.get("pcb_doc_paths") or [])
+        except Exception as e:
+            errors.append({"document_kind": kind, "document": doc["name"],
+                           "error": f"{type(e).__name__}: {e}"})
+    return rows, errors
 
 
 def render_project_parameters(project: dict) -> str | None:
