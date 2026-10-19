@@ -102,3 +102,39 @@ def test_empty_lines_ignored(tmp_path):
     result = parse_protel_netlist(str(f))
     assert ("R1", "1") in result["nets"]["NET1"]
     assert ("R1", "2") in result["nets"]["NET1"]
+
+
+def test_part_blocks_give_footprint_and_comment(net_file):
+    parts = parse_protel_netlist(net_file)["parts"]
+    # BT1 is on no net but is still a compiled part.
+    assert parts == {
+        "BT1": {"footprint": "HOLDER_BATT_CR2032_HARWIN_S8421-45R", "comment": "S8421-45R"},
+        "C1A": {"footprint": "C0402_0.55MM", "comment": "CGA2B3X7R1H104M050BB"},
+    }
+
+
+def test_part_block_lines_are_positional(tmp_path):
+    f = tmp_path / "p.NET"
+    f.write_text("[\nJ1\n\nNo footprint\n\n\n\n]\n[\nTP1\nTP_PAD\n\n\n\n\n]\n", encoding="utf-8")
+    parts = parse_protel_netlist(str(f))["parts"]
+    assert parts["J1"] == {"footprint": "", "comment": "No footprint"}
+    assert parts["TP1"] == {"footprint": "TP_PAD", "comment": ""}
+
+
+def test_ansi_netlist_keeps_symbols(tmp_path):
+    f = tmp_path / "ansi.NET"
+    f.write_bytes("[\nC1\nC0603\n4.7µF\n\n\n\n]\n(\nNET1\nC1-1\n)\n".encode("cp1252"))
+    result = parse_protel_netlist(str(f))
+    assert result["parts"]["C1"]["comment"] == "4.7µF"
+    assert result["nets"] == {"NET1": [("C1", "1")]}
+
+
+def test_pin_designators_holding_a_dash(tmp_path):
+    """A battery's '-' pin: 'BT1--' is part BT1, pin '-'."""
+    f = tmp_path / "dash.NET"
+    f.write_text(
+        "[\nBT1\nBAT\nCR2032\n\n\n\n]\n[\nJ1\nHDR\n\n\n\n\n]\n"
+        "(\nGND\nBT1--\nJ1-2\n)\n",
+        encoding="utf-8",
+    )
+    assert parse_protel_netlist(str(f))["nets"] == {"GND": [("BT1", "-"), ("J1", "2")]}

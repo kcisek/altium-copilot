@@ -366,3 +366,73 @@ def test_without_annotation_sheets_enrich_like_enrich_netlist():
     assert sorted(comps) == ["C1_A", "C1_B", "F1", "U1"]
     assert comps["C1_B"]["sheet"] == "Chan"
     assert not any("logical_refdes" in c for c in comps.values())
+
+
+def test_parts_of_one_component_on_two_sheets_unite_their_ids():
+    """A component split over sheets: the PCB carries one part's unique ID."""
+    netlist = _netlist("U1")
+    sheets = [
+        ("Power", {"U1": ComponentMeta(
+            refdes="U1", unique_id="PWR", unique_ids=["PWR"], footprint="BGA",
+            footprints=["BGA"], pin_designators=["A1"])}),
+        ("IO", {"U1": ComponentMeta(
+            refdes="U1", unique_id="IO", unique_ids=["IO"], footprint="BGA",
+            footprints=["BGA"], pin_designators=["B2"])}),
+    ]
+    comps = enrich_netlist_sheets(netlist, sheets)["components"]
+    assert comps["U1"]["unique_ids"] == ["PWR", "IO"]
+    assert comps["U1"]["pin_designators"] == ["A1", "B2"]
+    assert comps["U1"]["footprint_by_uid"] == {"PWR": "BGA", "IO": "BGA"}
+    assert comps["U1"]["sheet"] == "IO"  # the latest sheet, as before
+
+
+
+def test_annotated_channel_copies_keep_their_full_paths():
+    """The PCB tells channel copies apart by the full path; so must the netlist."""
+    netlist = {"nets": {}, "pin_to_net": {"LED3": {"1": "A"}, "LED4": {"1": "B"}}}
+    sheets = [("Red_LED", {"LED1": _part("LED1", "LEDUID", "LED")})]
+    annotation = [
+        _entry("LED1", "LED3", "\\TOP\\CH1\\LEDUID", "Red_LED"),
+        _entry("LED1", "LED4", "\\TOP\\CH2\\LEDUID", "Red_LED"),
+    ]
+    comps = enrich_netlist_sheets(netlist, sheets, annotation)["components"]
+    assert comps["LED3"]["unique_paths"] == ["\\TOP\\CH1\\LEDUID"]
+    assert comps["LED4"]["unique_paths"] == ["\\TOP\\CH2\\LEDUID"]
+
+
+def test_unconnected_channel_copies_come_from_the_part_list():
+    """TP1 has no nets; the compiled part list names its copies TP1A and TP1B."""
+    netlist = _netlist("R1")
+    netlist["parts"] = {name: {"footprint": "", "comment": ""} for name in ("R1", "TP1A", "TP1B")}
+    tp1 = ComponentMeta(refdes="TP1", unique_id="UTP", unique_ids=["UTP"], kind=1)
+    comps = enrich_netlist(netlist, {"R1": _meta("R1"), "TP1": tp1})["components"]
+    assert set(comps) == {"R1", "TP1A", "TP1B"}
+    assert (comps["TP1B"]["unique_ids"], comps["TP1B"]["kind"]) == (["UTP"], 1)
+
+
+def test_a_fan_out_never_takes_a_part_filed_under_its_own_name():
+    """TP1 (no nets) must not claim TP1V8, which is a part of its own."""
+    netlist = _netlist("TP1V8")
+    comps = enrich_netlist(netlist, {
+        "TP1": ComponentMeta(refdes="TP1", unique_id="A", unique_ids=["A"]),
+        "TP1V8": ComponentMeta(refdes="TP1V8", unique_id="B", unique_ids=["B"]),
+    })["components"]
+    assert comps["TP1V8"]["unique_ids"] == ["B"]
+    assert comps["TP1"]["pins"] == {}
+
+
+def test_an_unconnected_compiled_part_keeps_its_own_name():
+    """TP1 has no nets; TP1A is another compiled part whose sheet was not read."""
+    netlist = _netlist("R1")
+    netlist["parts"] = {name: {"footprint": "", "comment": ""} for name in ("R1", "TP1", "TP1A")}
+    tp1 = ComponentMeta(refdes="TP1", unique_id="U", unique_ids=["U"])
+    comps = enrich_netlist(netlist, {"R1": _meta("R1"), "TP1": tp1})["components"]
+    assert "TP1" in comps and "TP1A" not in comps
+
+
+def test_parts_keep_their_sheet_order():
+    netlist = _netlist("R2")
+    comps = enrich_netlist(
+        netlist, {"R1": _meta("R1"), "R2": _meta("R2"), "R3": _meta("R3")}
+    )["components"]
+    assert list(comps) == ["R1", "R2", "R3"]

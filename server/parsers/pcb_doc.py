@@ -502,6 +502,12 @@ class PcbComponent:
     # (SOURCEDESIGNATOR) on multi-channel and board-annotated designs; class
     # members and rule scopes use it.
     designator: str | None = None
+    # The comment text (Texts6), and ComponentKind (see _component_kind).
+    comment: str | None = None
+    kind: int = 0
+    # The full SOURCEUNIQUEID path (\SheetSymbol...\Component): channel copies
+    # share the tail but not the path.
+    source_unique_id: str | None = None
 
 
 @dataclass
@@ -757,9 +763,37 @@ def decode_components(
                     else "top"
                 ),
                 footprint=record.get("PATTERN") or None,
+                kind=_component_kind(record),
+                source_unique_id=source_uid or None,
             )
         )
     return components
+
+
+def _component_kind(record: dict[str, str]) -> int:
+    """ComponentKind: 0 Standard, 1 Mechanical, 2 Graphical, 3 Net Tie (In BOM),
+    4 Net Tie, 5 Standard (No BOM), 6 Jumper. Altium writes the newer kinds
+    backward-compatibly: Standard (No BOM) as ComponentKind=0 with
+    ComponentKindVersion2=5, Jumper with ComponentKindVersion3=6; it reads them back
+    in that order, as here."""
+    return component_kind(
+        record.get("COMPONENTKIND", ""),
+        record.get("COMPONENTKINDVERSION2", ""),
+        record.get("COMPONENTKINDVERSION3", ""),
+    )
+
+
+def component_kind(kind: str, version2: str, version3: str) -> int:
+    """The component kind from ComponentKind and its two version keys."""
+    def number(value: str) -> int:
+        value = value.strip()
+        return int(value) if value.isdigit() else 0
+
+    if number(version3) == 6:
+        return 6
+    if number(version2) >= 5:
+        return number(version2)
+    return number(kind)
 
 
 def decode_polygons(
@@ -812,14 +846,13 @@ def decode_polygons(
     return pours, edges
 
 
-def decode_designators(data: bytes) -> dict[int, str]:
-    """Map component index -> designator text from Texts6.
+def _component_texts(data: bytes):
+    """Yield (first sub-record, text record) for each Texts6 text owned by a component.
 
     Each record is u8 type, u32 length, a fixed sub-record (component index
-    u16 at offset 7, IsDesignator flag at offset 41), then u32 length and a
-    Pascal string holding the text.
+    u16 at offset 7, IsComment flag at offset 40, IsDesignator at 41), then u32
+    length and a Pascal string holding the text.
     """
-    designators: dict[int, str] = {}
     offset = 0
     while offset + 5 <= len(data):
         (first_length,) = struct.unpack_from("<I", data, offset + 1)
@@ -832,15 +865,88 @@ def decode_designators(data: bytes) -> dict[int, str]:
         first = data[offset + 5 : second_at]
         text = data[second_at + 4 : second_at + 4 + second_length]
         offset = second_at + 4 + second_length
-        if first_length < 42 or not first[41]:
+        if first_length < 42 or not text:
             continue
         (component,) = struct.unpack_from("<H", first, 7)
-        if component == NO_COMPONENT or not text:
+        if component != NO_COMPONENT:
+            yield component, first, text
+
+
+def decode_designators(data: bytes) -> dict[int, str]:
+    """Map component index -> designator text from Texts6."""
+    designators: dict[int, str] = {}
+    for component, first, text in _component_texts(data):
+        if not first[41]:
             continue
         designator = text[1 : 1 + text[0]].decode("latin-1", "replace")
         if designator:
             designators.setdefault(component, designator)
     return designators
+
+
+# Texts6 sub-record offset of the text's WideStrings6 index.
+_WIDE_STRING_INDEX_AT = 115
+
+
+def decode_wide_strings(data: bytes) -> dict[int, str]:
+    """WideStrings6: u32 index, u32 byte length, UTF-16LE text ending in a NUL.
+
+    Some files hold a record declared 2 bytes long with no body, the next record's
+    header (index + 1) following at once; it is read as empty. A record that is
+    otherwise malformed ends the walk, keeping what was read.
+    """
+    strings: dict[int, str] = {}
+    offset = 0
+    while offset + 8 <= len(data):
+        index, length = struct.unpack_from("<II", data, offset)
+        body = data[offset + 8 : offset + 8 + length]
+        if length % 2 == 0 and len(body) == length and body.endswith(b"\x00\x00"):
+            strings[index] = body.decode("utf-16-le", "replace").rstrip("\x00")
+            offset += 8 + length
+            continue
+        if offset + 12 <= len(data) and struct.unpack_from(
+            "<I", data, offset + 8
+        )[0] == index + 1:
+            strings[index] = ""
+            offset += 8
+            continue
+        break
+    return strings
+
+
+def _same_text(narrow: str, wide: str) -> bool:
+    """The Pascal string is the wide text with characters outside its code page
+    replaced: they agree everywhere else."""
+    return len(narrow) == len(wide) and all(
+        a == b or a == "?" or ord(b) > 127 for a, b in zip(narrow, wide)
+    )
+
+
+def decode_comments(data: bytes, wide_strings: dict[int, str]) -> dict[int, str]:
+    """Map component index -> comment text from Texts6.
+
+    The Pascal string holds UTF-8 in recent files and an 8-bit code page in
+    older ones, where characters such as Ω are lost; the full text is the
+    WideStrings6 entry the sub-record names, used when it agrees with the
+    Pascal string.
+    """
+    comments: dict[int, str] = {}
+    for component, first, text in _component_texts(data):
+        if not first[40] or component in comments:
+            continue
+        raw = text[1 : 1 + text[0]]
+        narrow = raw.decode("latin-1")
+        try:
+            comment = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            comment = narrow
+        if len(first) >= _WIDE_STRING_INDEX_AT + 4:
+            (index,) = struct.unpack_from("<I", first, _WIDE_STRING_INDEX_AT)
+            wide = wide_strings.get(index)
+            if wide and (wide == comment or _same_text(narrow, wide)):
+                comment = wide
+        comments[component] = comment
+    return comments
 
 
 @dataclass
@@ -1178,6 +1284,17 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
                 component.designator = designators.get(component.index)
         except Exception as error:
             warnings.append(f"Texts6 parse failed: {error}")
+        try:
+            wide_strings = (
+                decode_wide_strings(streams["WideStrings6/Data"])
+                if "WideStrings6/Data" in streams
+                else {}
+            )
+            comments = decode_comments(streams["Texts6/Data"], wide_strings)
+            for component in components:
+                component.comment = comments.get(component.index)
+        except Exception as error:
+            warnings.append(f"Texts6 comment parse failed: {error}")
 
     # Rules, classes and pairs are optional: older or simple boards may lack
     # a stream, and an empty DifferentialPairs6 is normal. Only failures warn.
@@ -1247,6 +1364,7 @@ _WANTED_STREAMS = (
     "Pads6/Data",
     "Polygons6/Data",
     "Texts6/Data",
+    "WideStrings6/Data",
     "Rules6/Data",
     "Rules6/Header",
     "Classes6/Data",
