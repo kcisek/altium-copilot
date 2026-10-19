@@ -647,7 +647,8 @@ def annotated_pcb(pcb_data):
 
 # The netlist names physical designators. Its components come from the
 # sheets' logical names, so U1 carries the accelerometer's UniqueId and the
-# sheet's U4 (no physical U4) has no pins: what enrich_netlist produces.
+# sheet's U4 (no physical U4) has no pins: what enrich_netlist produces when
+# it cannot read the project's .Annotation file.
 ANNOTATED_NETLIST = {
     "pin_to_net": {
         "U1": {"1": "CLK_B", "2": "GND"},

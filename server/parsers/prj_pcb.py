@@ -17,6 +17,8 @@ class PrjPcbData:
     pcb_doc_paths: list[str] = field(default_factory=list)
     pcb_dwf_paths: list[str] = field(default_factory=list)  # Draftsman documents
     parameters: dict[str, str] = field(default_factory=dict)  # project parameters
+    # Board-level annotation files (logical -> physical designators)
+    annotation_paths: list[str] = field(default_factory=list)
 
 
 def parse_prj_pcb(path: str) -> PrjPcbData:
@@ -32,6 +34,7 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
         pcb_doc_paths=pcb_doc_paths,
         pcb_dwf_paths=_extract_documents(sections, project_dir, ".pcbdwf"),
         parameters=_extract_parameters(sections),
+        annotation_paths=_extract_documents(sections, project_dir, ".annotation"),
     )
 
 

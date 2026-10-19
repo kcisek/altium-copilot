@@ -342,6 +342,16 @@ def _load_diagnostics(netlist: dict) -> dict:
     diagnostics: dict = {"component_count": len(components)}
     if netlist.get("sheet_errors"):
         diagnostics["sheet_errors"] = netlist["sheet_errors"]
+    if netlist.get("annotation_errors"):
+        diagnostics["annotation_errors"] = netlist["annotation_errors"]
+    renamed = sum(1 for comp in components.values() if comp.get("logical_refdes"))
+    if renamed:
+        diagnostics["renamed_by_annotation"] = renamed
+        diagnostics["renamed_by_annotation_hint"] = (
+            "The project's .Annotation file gives these parts a board designator other than "
+            "the one drawn on their sheet. Tools name board designators; logical_refdes is "
+            "the sheet's."
+        )
     if not components and netlist.get("pin_to_net"):
         error = _no_components_error(netlist)
         diagnostics["warning"] = error["error"]
@@ -538,7 +548,10 @@ def set_project_dir(project_dir: str) -> str:
                         if abs(_net_matches[0].stat().st_mtime - _stored_mtime) < 0.01:
                             prj_data = parse_prj_pcb(prj_pcb_path)
                             _fresh = bool(prj_data.sheet_paths) and is_netlist_fresh(
-                                _net_matches[0], netlist_sources(prj_pcb_path, prj_data.sheet_paths)
+                                _net_matches[0],
+                                netlist_sources(
+                                    prj_pcb_path, prj_data.sheet_paths, prj_data.annotation_paths
+                                ),
                             )
                             _stale_cache = bool(prj_data.sheet_paths) and not _fresh
                             if _fresh:
@@ -548,7 +561,10 @@ def set_project_dir(project_dir: str) -> str:
                                 _altium._netlist = None
                                 _netlist_last_updated = None
                                 _pcb_session.__init__()
-                                _altium.load_netlist_from_file(str(_net_matches[0]), prj_data.sheet_paths)
+                                _altium.load_netlist_from_file(
+                                    str(_net_matches[0]), prj_data.sheet_paths,
+                                    prj_data.annotation_paths,
+                                )
                                 _project = {
                                     "name": project_name,
                                     "root_dir": project_dir,
@@ -644,7 +660,11 @@ def set_project_dir(project_dir: str) -> str:
     sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
 
     try:
-        _altium.generate_netlist(prj_pcb_path, sheet_paths=prj_data.sheet_paths)
+        _altium.generate_netlist(
+            prj_pcb_path,
+            sheet_paths=prj_data.sheet_paths,
+            annotation_paths=prj_data.annotation_paths,
+        )
     except (RuntimeError, OSError) as e:
         return json.dumps({
             "error": "netlist_generation_failed",
@@ -707,13 +727,17 @@ def refresh_netlist() -> str:
     # and the sheet names stay in step with the components' sheet attribution.
     prj_data = None
     sheet_paths = [s["path"] for s in project.get("sheets", [])]
+    annotation_paths = None
     try:
         prj_data = parse_prj_pcb(project["prj_pcb_path"])
         sheet_paths = prj_data.sheet_paths
+        annotation_paths = prj_data.annotation_paths
     except Exception as e:
         logging.warning("Could not re-read .PrjPcb, using the sheet list from load: %s", e)
     try:
-        regenerated = _altium.generate_netlist(project["prj_pcb_path"], sheet_paths=sheet_paths)
+        regenerated = _altium.generate_netlist(
+            project["prj_pcb_path"], sheet_paths=sheet_paths, annotation_paths=annotation_paths
+        )
     except Exception as e:
         return json.dumps({"error": "generate_failed", "message": str(e)})
     if prj_data is not None:
@@ -727,6 +751,8 @@ def refresh_netlist() -> str:
             message += f"\nWarning ({diagnostics['warning']}): {diagnostics['message']}"
         for err in diagnostics.get("sheet_errors", []):
             message += f"\nSheet '{err['sheet']}' failed to load: {err['error']}"
+        for err in diagnostics.get("annotation_errors", []):
+            message += f"\nAnnotation file '{Path(err['path']).name}' not applied: {err['error']}"
         return message
     _pcb_session.invalidate()
     _netlist_last_updated = datetime.now(timezone.utc).isoformat()
@@ -830,14 +856,33 @@ def _get_component_impl(netlist: dict, variant_state: VariantState, refdes: str)
     components = netlist.get("components", {})
     matched = next((k for k in components if k.lower() == refdes.lower()), None)
     if matched is None:
+        # On a board-annotated project, a sheet designator that names no board part.
+        placed = [k for k, comp in components.items()
+                  if (comp.get("logical_refdes") or "").lower() == refdes.lower()]
+        if len(placed) > 1:
+            return json.dumps({
+                "error": "component_not_found",
+                "message": (
+                    f"'{refdes}' is a sheet designator placed {len(placed)} times; on the "
+                    f"board it is {', '.join(placed)}. Call get_component with one of those."
+                ),
+                "board_designators": [
+                    {"refdes": k, "sheet": components[k].get("sheet")} for k in placed
+                ],
+            })
+        matched = placed[0] if placed else None
+    if matched is None:
         return json.dumps({
             "error": "component_not_found",
             "message": f"Component '{refdes}' not found. Use search_components to find available components.",
         })
 
     comp = components[matched]
+    detail = {"refdes": matched}
+    if comp.get("logical_refdes"):
+        detail["logical_refdes"] = comp["logical_refdes"]
     return json.dumps({
-        "refdes": matched,
+        **detail,
         "mpn": comp.get("mpn"),
         "description": comp.get("description"),
         "value": comp.get("value"),
@@ -850,7 +895,10 @@ def _get_component_impl(netlist: dict, variant_state: VariantState, refdes: str)
 @mcp.tool(title="Get Component", annotations=ToolAnnotations(readOnlyHint=True))
 def get_component(refdes: str) -> str:
     """Get full detail for one component: MPN, value, DNP status, and every pin with its net.
-    Use this to drill into a specific component and trace its connections."""
+    Use this to drill into a specific component and trace its connections.
+    refdes is the board designator; logical_refdes, when present, is the different one
+    drawn on the sheet (board-level annotation), also accepted as refdes when no board
+    part has that name."""
     try:
         _, netlist, variant_state = _require_project()
     except ValueError as e:

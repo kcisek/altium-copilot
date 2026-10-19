@@ -27,9 +27,12 @@ def _render_component(comp: dict, current_sheet: str) -> str:
         PIN_LABEL:NET[HF:fanout]
 
     Same-sheet neighbors are shortened to refdes.pin; cross-sheet neighbors
-    keep @sheet suffix so the caller knows where to look next.
+    keep @sheet suffix so the caller knows where to look next. A board designator
+    that differs from the sheet's (board-level annotation) reads "U3 (U1 on sheet)".
     """
     refdes = comp["refdes"]
+    if comp.get("logical_refdes"):
+        refdes = f"{refdes} ({comp['logical_refdes']} on sheet)"
     mpn = comp.get("mpn") or ""
     desc = comp.get("description") or ""
     value = comp.get("value") or ""
@@ -96,6 +99,7 @@ def build_sheet_context(netlist: dict, sheet_name: str, variant_state, offset: i
 
         sheet_components.append({
             "refdes": refdes,
+            "logical_refdes": comp.get("logical_refdes"),
             "mpn": comp.get("mpn"),
             "description": comp.get("description"),
             "value": comp.get("value"),

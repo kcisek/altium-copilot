@@ -22,6 +22,11 @@ try:
 except ImportError:
     from server.parsers.prj_pcb import parse_prj_pcb
 
+try:
+    from parsers.annotation import AnnotationEntry, parse_annotation
+except ImportError:
+    from server.parsers.annotation import AnnotationEntry, parse_annotation
+
 # When bundled with PyInstaller (--onefile), data files are extracted to sys._MEIPASS.
 # In normal Python execution, scripts live next to this file.
 if getattr(sys, "frozen", False):
@@ -41,25 +46,75 @@ def enrich_netlist(netlist: dict, components: dict[str, "ComponentMeta"],
     (C1 → C1A, C1B, C1C). The SchDoc contains the bare refdes (C1); this function
     detects those suffixed variants and creates enriched entries for each one.
     """
-    pin_to_net = netlist["pin_to_net"]
     sheet_map = refdes_to_sheet or {}
-    result: dict = {}
+    sheets: dict[str, dict[str, ComponentMeta]] = {}
     for refdes, meta in components.items():
-        sheet = sheet_map.get(refdes, "")
+        sheets.setdefault(sheet_map.get(refdes, ""), {})[refdes] = meta
+    return enrich_netlist_sheets(netlist, list(sheets.items()))
+
+
+def enrich_netlist_sheets(
+    netlist: dict,
+    sheets: list[tuple[str, dict[str, "ComponentMeta"]]],
+    annotation: list["AnnotationEntry"] | None = None,
+) -> dict:
+    """Merge each sheet's component metadata into the netlist, see enrich_netlist.
+
+    sheets holds (sheet name, {sheet designator: metadata}) per parsed sheet. The netlist
+    names physical designators. On a board-annotated or multi-channel project these differ
+    from the sheet's (logical) ones, and the project's .Annotation file maps each placed
+    part, by sheet and UniqueId, to its physical designators (one per channel). Those
+    parts are filed under their physical designators, with logical_refdes set when it
+    differs. Parts the file does not list keep matching by sheet designator, onto netlist
+    names that no annotated part took.
+    """
+    pin_to_net = netlist["pin_to_net"]
+    by_uid: dict[str, list[AnnotationEntry]] = {}
+    for annotation_entry in annotation or []:
+        by_uid.setdefault(annotation_entry.component_uid, []).append(annotation_entry)
+
+    result: dict = {}
+    unannotated: list[tuple[str, str, ComponentMeta]] = []
+    for sheet, components in sheets:
+        for refdes, meta in components.items():
+            physical = _physical_designators(by_uid, sheet, meta.unique_id)
+            if not physical:
+                unannotated.append((sheet, refdes, meta))
+                continue
+            for name in physical:
+                entry = _make_enriched(meta, pin_to_net.get(name, {}))
+                entry["sheet"] = sheet
+                if name != refdes:
+                    entry["logical_refdes"] = refdes
+                result[name] = entry
+
+    claimed = set(result)
+    for sheet, refdes, meta in unannotated:
         # Direct match (most components, and already-suffixed subsheet refs)
-        if refdes in pin_to_net:
+        if refdes in pin_to_net and refdes not in claimed:
             entry = _make_enriched(meta, pin_to_net[refdes])
             entry["sheet"] = sheet
             result[refdes] = entry
             continue
 
         # Subsheet fan-out: look for refdesA, refdesB, ... in pin_to_net
-        suffixed = [r for r in pin_to_net if re.fullmatch(rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", r)]
+        suffixed = [
+            r for r in pin_to_net
+            if r not in claimed
+            and re.fullmatch(rf"{re.escape(refdes)}(?:[_.\-]?[A-Za-z]+\d*|[_.\-]\d+)+", r)
+        ]
         if suffixed:
             for suffixed_ref in suffixed:
                 entry = _make_enriched(meta, pin_to_net[suffixed_ref])
                 entry["sheet"] = sheet
                 result[suffixed_ref] = entry
+            continue
+
+        if refdes in claimed:
+            # The netlist's part of this name is an annotated part from another sheet;
+            # this one's physical designator is not known.
+            logging.warning("%s on sheet %s is not in the .Annotation file and its "
+                            "designator names another part", refdes, sheet)
             continue
 
         # No net connections (chassis fuses, heatsinks, mounting holes, etc.)
@@ -70,6 +125,20 @@ def enrich_netlist(netlist: dict, components: dict[str, "ComponentMeta"],
 
     netlist["components"] = result
     return netlist
+
+
+def _physical_designators(by_uid: dict[str, list["AnnotationEntry"]], sheet: str,
+                          unique_id: str) -> list[str]:
+    """Physical designators the .Annotation file gives a sheet's part, in file order."""
+    names: list[str] = []
+    if not unique_id:
+        return names
+    for annotation_entry in by_uid.get(unique_id, []):
+        if annotation_entry.sheet and annotation_entry.sheet.lower() != sheet.lower():
+            continue
+        if annotation_entry.physical not in names:
+            names.append(annotation_entry.physical)
+    return names
 
 
 def is_netlist_fresh(net_path: str | Path, sources: list[str | Path]) -> bool:
@@ -89,9 +158,10 @@ def is_netlist_fresh(net_path: str | Path, sources: list[str | Path]) -> bool:
     return bool(src_mtimes) and net_mtime >= max(src_mtimes)
 
 
-def netlist_sources(project_path: str, sheet_paths: list[str]) -> list[Path]:
-    """Files whose saves make the .NET stale: the .PrjPcb, the sheets it lists, and any
-    other .SchDoc in those folders.
+def netlist_sources(project_path: str, sheet_paths: list[str],
+                    annotation_paths: list[str] | None = None) -> list[Path]:
+    """Files whose saves make the .NET stale: the .PrjPcb, the sheets and .Annotation
+    files it lists, and any other .SchDoc in those folders.
 
     The extra sheets cover a sheet added in Altium and saved before the project itself
     was saved — it is compiled into the .NET but not yet listed in the .PrjPcb on disk.
@@ -104,6 +174,7 @@ def netlist_sources(project_path: str, sheet_paths: list[str]) -> list[Path]:
             sources.extend(folder.glob("*.[Ss][Cc][Hh][Dd][Oo][Cc]"))
         except OSError:
             continue
+    sources.extend(Path(p) for p in annotation_paths or [])
     return sources
 
 
@@ -116,6 +187,33 @@ def _sheet_paths_for(project_path: str) -> list[str]:
     except Exception as e:
         logging.warning("Could not read sheet list from %s: %s", project_path, e)
         return []
+
+
+def _annotation_paths_for(project_path: str) -> list[str]:
+    """Board-level annotation (.Annotation) files listed in the .PrjPcb."""
+    if not Path(project_path).exists():
+        return []
+    try:
+        return parse_prj_pcb(project_path).annotation_paths
+    except Exception as e:
+        logging.warning("Could not read annotation files from %s: %s", project_path, e)
+        return []
+
+
+def _read_annotation(paths: list[str]) -> tuple[list["AnnotationEntry"], list[dict]]:
+    """Entries of every readable .Annotation file, and an error per unreadable one."""
+    entries: list[AnnotationEntry] = []
+    errors: list[dict] = []
+    for path in paths:
+        try:
+            entries.extend(parse_annotation(path))
+        except FileNotFoundError:
+            errors.append({"path": str(path), "error": "file not found"})
+        except Exception as e:
+            errors.append({"path": str(path), "error": f"{type(e).__name__}: {e}"})
+    for error in errors:
+        logging.warning("Annotation file not applied, %s: %s", error["path"], error["error"])
+    return entries, errors
 
 
 def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
@@ -269,14 +367,16 @@ class AltiumClient:
     def __init__(self):
         self._netlist: dict | None = None
 
-    def _enrich_from_schdocs(self, sheet_paths: list[str], netlist: dict) -> None:
+    def _enrich_from_schdocs(self, sheet_paths: list[str], netlist: dict,
+                             annotation_paths: list[str] | None = None) -> None:
         """Parse each .PrjPcb-listed sheet and merge its components into the netlist.
 
         A sheet that fails to parse is recorded in netlist["sheet_errors"] and skipped,
-        so one bad sheet never discards the components of the others.
+        so one bad sheet never discards the components of the others. The project's
+        .Annotation files map sheet designators to the netlist's physical ones; one that
+        cannot be read is recorded in netlist["annotation_errors"].
         """
-        components: dict = {}
-        refdes_to_sheet: dict[str, str] = {}
+        sheets: list[tuple[str, dict]] = []
         sheet_errors: list[dict] = []
         for sch_path in sheet_paths:
             sheet_name = Path(sch_path).stem
@@ -284,24 +384,24 @@ class AltiumClient:
                 error = "file not found"
             else:
                 try:
-                    sheet_comps = parse_sch_doc(str(sch_path))
+                    sheets.append((sheet_name, parse_sch_doc(str(sch_path))))
+                    continue
                 except Exception as e:
                     error = f"{type(e).__name__}: {e}"
-                else:
-                    for r in sheet_comps:
-                        refdes_to_sheet[r] = sheet_name
-                    components.update(sheet_comps)
-                    continue
             logging.warning("SchDoc enrichment failed for %s: %s", sch_path, error)
             sheet_errors.append({"sheet": sheet_name, "path": str(sch_path), "error": error})
-        enrich_netlist(netlist, components, refdes_to_sheet)
+        annotation, annotation_errors = _read_annotation(annotation_paths or [])
+        enrich_netlist_sheets(netlist, sheets, annotation)
         netlist["sheet_errors"] = sheet_errors
+        if annotation_errors:
+            netlist["annotation_errors"] = annotation_errors
 
-    def _load_enriched(self, net_path: str | Path, sheet_paths: list[str]) -> dict:
+    def _load_enriched(self, net_path: str | Path, sheet_paths: list[str],
+                       annotation_paths: list[str] | None = None) -> dict:
         """Parse a .NET file and enrich it from the given sheets. Always returns a new dict."""
         netlist = parse_protel_netlist(str(net_path))
         try:
-            self._enrich_from_schdocs(sheet_paths, netlist)
+            self._enrich_from_schdocs(sheet_paths, netlist, annotation_paths)
         except Exception as e:
             logging.warning("SchDoc enrichment failed: %s", e)
             netlist["components"] = {}
@@ -323,20 +423,25 @@ class AltiumClient:
             result["warning"] = "no_sheet_open"
         return result
 
-    def load_netlist_from_file(self, net_path: str, sheet_paths: list[str]) -> None:
+    def load_netlist_from_file(self, net_path: str, sheet_paths: list[str],
+                               annotation_paths: list[str] | None = None) -> None:
         """Load netlist from an existing .NET file without triggering Altium automation."""
-        self._netlist = self._load_enriched(net_path, sheet_paths)
+        self._netlist = self._load_enriched(net_path, sheet_paths, annotation_paths)
 
-    def generate_netlist(self, project_path: str, sheet_paths: list[str] | None = None) -> bool:
+    def generate_netlist(self, project_path: str, sheet_paths: list[str] | None = None,
+                         annotation_paths: list[str] | None = None) -> bool:
         """Load the project netlist, regenerating it through Altium when it is stale.
 
-        sheet_paths defaults to the sheets listed in the .PrjPcb. Returns True when
-        Altium regenerated the .NET, False when the existing file was fresh.
+        sheet_paths and annotation_paths default to the sheets and .Annotation files listed
+        in the .PrjPcb. Returns True when Altium regenerated the .NET, False when the
+        existing file was fresh.
         """
         project_dir = Path(project_path).parent
         project_name = Path(project_path).stem
         if sheet_paths is None:
             sheet_paths = _sheet_paths_for(project_path)
+        if annotation_paths is None:
+            annotation_paths = _annotation_paths_for(project_path)
 
         def _find_net_file() -> Path | None:
             matches = list(project_dir.rglob(f"{project_name}.NET"))
@@ -349,14 +454,16 @@ class AltiumClient:
         # Cache check — skip GUI automation if .NET is newer than all source files.
         if netlist_path is not None and netlist_path.exists():
             try:
-                fresh = is_netlist_fresh(netlist_path, netlist_sources(project_path, sheet_paths))
+                fresh = is_netlist_fresh(
+                    netlist_path, netlist_sources(project_path, sheet_paths, annotation_paths)
+                )
             except OSError as e:
                 logging.warning("Cache check failed, regenerating: %s", e)
                 fresh = False
             if fresh:
                 logging.info("Netlist cache is fresh — skipping generation")
                 try:
-                    self._netlist = self._load_enriched(netlist_path, sheet_paths)
+                    self._netlist = self._load_enriched(netlist_path, sheet_paths, annotation_paths)
                     return False  # cache hit — nothing regenerated
                 except Exception as e:
                     logging.warning("Cached netlist unreadable, regenerating: %s", e)
@@ -372,7 +479,7 @@ class AltiumClient:
         # Backup housekeeping is best-effort: a sync client or AV holding the .bak must
         # neither turn a successful regeneration into an error nor mask the real failure.
         try:
-            regenerated = self._regenerate(sheet_paths, _find_net_file)
+            regenerated = self._regenerate(sheet_paths, _find_net_file, annotation_paths)
         except BaseException:
             if backup is not None and backup.exists() and _find_net_file() is None:
                 try:
@@ -387,7 +494,8 @@ class AltiumClient:
                 logging.warning("Could not remove %s: %s", backup, e)
         return regenerated
 
-    def _regenerate(self, sheet_paths: list[str], _find_net_file) -> bool:
+    def _regenerate(self, sheet_paths: list[str], _find_net_file,
+                    annotation_paths: list[str] | None = None) -> bool:
         max_attempts = 3
         per_attempt_timeout = 15  # seconds per attempt
 
@@ -408,7 +516,7 @@ class AltiumClient:
             while time.time() - start_time < per_attempt_timeout:
                 found = _find_net_file()
                 if found is not None and found.exists():
-                    self._netlist = self._load_enriched(found, sheet_paths)
+                    self._netlist = self._load_enriched(found, sheet_paths, annotation_paths)
                     return True  # PowerShell ran, netlist regenerated
                 time.sleep(1)
 

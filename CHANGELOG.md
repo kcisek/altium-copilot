@@ -21,6 +21,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   Netlist refdes without schematic metadata now match too
 - `get_board_info` adds `refdes_mapping_unmatched_sample` (up to 10 unmatched
   designators) and `refdes_differs_from_logical` (how many parts the board renames)
+- Schematic metadata (MPN, description, value, pin names, sheet) of board-annotated and
+  multi-channel designs follows the project's `.Annotation` file. The netlist names
+  physical designators and the sheets logical ones, so the netlist's U1 took the metadata
+  of the sheet's U1, another part, and renamed parts got none. Each sheet part is now
+  matched by sheet and UniqueId to its physical designators, one per channel; the same
+  sheet designator on two sheets no longer drops one of the parts. On Altium's
+  Bluetooth_Sentinel example with every sheet read, 72 of 72 parts carry their own
+  metadata (before: 14, with 42 carrying another part's). Parts the file does not list
+  keep their sheet designator unless an annotated part has that name. Projects without
+  an `.Annotation` file are unchanged
+  - `get_component`, `search_components`, `get_sheet_context`, `package_for_xfn` and
+    stale-designator DNP resolution name board designators. `get_component` adds
+    `logical_refdes` when the sheet's designator differs and accepts a sheet designator
+    that no board part has; `get_sheet_context` shows it as `U3 (U1 on sheet)`
+  - `set_project_dir` and `refresh_netlist` report `renamed_by_annotation`, and
+    `annotation_errors` for a listed `.Annotation` file that cannot be read
+  - Saving the `.Annotation` file makes the cached netlist stale
 - Design notes, after a review against 200 real sheets and 48 real Draftsman drawings:
   - Text frames and notes decode Altium's escapes in one pass: `~~` is a `~` (so
     "~10kHz" no longer turns into a line break and "0kHz"), `~2` is a `|`. Labels are
