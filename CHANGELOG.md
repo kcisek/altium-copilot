@@ -97,12 +97,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   text, tables, pictures, view titles, drill table and layer stack notes. One row per item
   with `document_kind`, `document`, `sheet_id`, `page`, `kind`, `title`, `text`, `author`,
   `near_refdes` (JSON) and kind-specific `data` (JSON). Pictures are stored as metadata
-  only (name, size, position, index), never their image data. A document whose notes
-  cannot be read is left out with a warning instead of failing the export
-
-### Changed
-- Snapshot `SCHEMA_VERSION` is now 2 (new `notes` table). pcb-copilot must accept schema
-  2 (`SUPPORTED_SCHEMA_VERSION`) to open snapshots written by this version
+  only (name, size, position, index), never their image data. Paths are reduced to file
+  names (template, linked pictures, the drawing's source board), so a shared snapshot
+  carries no local folders or user names. A document whose notes cannot be read gets one
+  `unreadable` row with the reason and a warning, instead of failing the export
+- The snapshot keeps `SCHEMA_VERSION` 1: the `notes` table is new and no existing table
+  changed, so every released pcb-copilot (which accepts only schema 1 and reads only the
+  tables it knows) still opens it. CONTRIBUTING now asks for a bump only when an existing
+  table or column changes
 
 ## [0.3.0] - 2026-07-19
 

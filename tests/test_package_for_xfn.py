@@ -105,10 +105,11 @@ def test_design_notes_are_exported_and_unreadable_ones_reported(tmp_path):
     counts = dict(conn.execute(
         "SELECT document, COUNT(*) FROM notes GROUP BY document"
     ).fetchall())
+    power = conn.execute("SELECT kind FROM notes WHERE document='Power'").fetchall()
     conn.close()
     assert counts["MotorController"] == 1
     assert counts["MCU"] > 15
-    assert "Power" not in counts
+    assert power == [("unreadable",)]  # marked, not mistaken for a sheet without notes
 
 
 def test_duplicate_refdes_returns_error_json(tmp_path):
