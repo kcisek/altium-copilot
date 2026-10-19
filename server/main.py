@@ -38,6 +38,9 @@ try:
     from services.pcb_compliance import check_compliance
     from services.diff_pair_checks import check_diff_pairs as run_diff_pair_checks
     from services.constraints_review import build_constraints_review
+    from services.impedance import (
+        PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
+    )
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -65,6 +68,9 @@ except ImportError:
     from server.services.pcb_compliance import check_compliance
     from server.services.diff_pair_checks import check_diff_pairs as run_diff_pair_checks
     from server.services.constraints_review import build_constraints_review
+    from server.services.impedance import (
+        PROPAGATION_UNIT_NOTE, impedance_profiles, profile_refs,
+    )
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -257,6 +263,10 @@ component locations, distances):
     length rules right?", "review the diff pairs before fab"): a whole-interface audit
     of rules and copper against each chip's layout guide. For one net use
     get_rules_for_net; for circuit correctness schematic_review.
+
+get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
+calculated impedance per layer, reference layers, the rules using each, and issues. Quote
+these as the design's impedance intent; the fabricator's result is still the final word.
 
 Lengths are measured like Altium's Signal Length: the copper path from pad centre to pad
 centre plus the via barrel over the layers it traverses plus the pin/package length stored
@@ -1480,6 +1490,14 @@ def get_board_info(units: PcbUnits | None = None) -> str:
         "extents_source": extents_source,
         "stackup_source": board.stackup_source,
         "stackup": stackup,
+        **(
+            {
+                "impedance_profiles": impedance_profiles(index),
+                "impedance_note": PROPAGATION_UNIT_NOTE,
+            }
+            if index.pcb.board.impedance_profiles
+            else {}
+        ),
         "netlist_updated_utc": _netlist_last_updated,
         "counts": index.counts(),
         "design_rules": _design_rule_counts(index),
@@ -1849,7 +1867,10 @@ def _rule_stale(index, rule) -> list[str]:
 def _rule_detail(index, rule) -> dict:
     detail = rule_header(rule)
     values = rule_values(
-        rule, index.signal_layers(), index.pcb.board.substacks
+        rule,
+        index.signal_layers(),
+        index.pcb.board.substacks,
+        profile_refs(index.pcb.board),
     )
     if values:
         detail["values"] = values

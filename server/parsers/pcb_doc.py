@@ -425,6 +425,43 @@ class PcbLayer:
     diel_height_mil: float | None = None
     diel_const: float | None = None
     material: str | None = None
+    v7_id: int | None = None
+
+
+@dataclass
+class ImpedanceLayer:
+    """One signal layer of an impedance profile (Layer Stack Manager).
+
+    Lengths in mil; None for unset or unbounded (Altium writes int32 max).
+    """
+
+    layer_v7: int | None
+    ref_top_v7: int | None
+    ref_bottom_v7: int | None
+    substack_id: str | None
+    width_mil: float | None
+    min_width_mil: float | None
+    max_width_mil: float | None
+    gap_mil: float | None
+    min_gap_mil: float | None
+    max_gap_mil: float | None
+    calculated_ohm: float | None
+    error_pct: float | None
+    propagation_speed: float | None  # a delay in ns/inch (= ps/mil), per the stack Dk
+    enabled: bool
+
+
+@dataclass
+class ImpedanceProfile:
+    """A Layer Stack Manager impedance profile and its per-layer solutions."""
+
+    id: str
+    name: str
+    display_name: str | None
+    target_ohm: float | None
+    tolerance_pct: float | None
+    differential: bool
+    layers: list[ImpedanceLayer] = field(default_factory=list)
 
 
 @dataclass
@@ -443,6 +480,7 @@ class BoardInfo:
     outline_vertices: list[tuple[float, float]] = field(
         default_factory=list
     )
+    impedance_profiles: list[ImpedanceProfile] = field(default_factory=list)
     # Layer-stack regions (rigid/flex); each {"id", "name", "is_flex"}.
     substacks: list[dict] = field(default_factory=list)
 
@@ -475,6 +513,82 @@ class PolygonPour:
     layer: int | None
     hatch_style: str | None
     vertices: list[tuple[float, float]]
+
+
+# Altium writes int32 max (214748.3647 mil) for an unbounded max width/gap.
+_UNBOUNDED_MIL = 214748.0
+
+
+def _optional_int(raw: str | None) -> int | None:
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def _optional_float(raw: str | None) -> float | None:
+    try:
+        return float(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def _bounded_mil(raw: str | None) -> float | None:
+    value = parse_dim_mil(raw)
+    return None if value is None or value >= _UNBOUNDED_MIL else value
+
+
+def decode_impedance_profiles(properties: dict[str, str]) -> list[ImpedanceProfile]:
+    """Decode V9_IMPEDANCEPROFILEn_* and their V9_TRACEIMPEDANCEn_* layers."""
+    profiles: dict[str, ImpedanceProfile] = {}
+    index = 0
+    while f"V9_IMPEDANCEPROFILE{index}_ID" in properties:
+        prefix = f"V9_IMPEDANCEPROFILE{index}_"
+        profile_id = properties[f"{prefix}ID"]
+        profiles[profile_id.upper()] = ImpedanceProfile(
+            id=profile_id,
+            # Altium shows DISPLAY_NAME (e.g. "D90 (USB)"); NAME is often empty.
+            name=(
+                properties.get(f"{prefix}DISPLAY_NAME")
+                or properties.get(f"{prefix}NAME")
+                or profile_id
+            ),
+            display_name=properties.get(f"{prefix}DISPLAY_NAME") or None,
+            target_ohm=_optional_float(properties.get(f"{prefix}IMPEDANCE")),
+            tolerance_pct=_optional_float(
+                properties.get(f"{prefix}IMPEDANCE_TOLERANCE")
+            ),
+            differential=properties.get(f"{prefix}ISDIFFPAIR", "").upper() == "TRUE",
+        )
+        index += 1
+    index = 0
+    while f"V9_TRACEIMPEDANCE{index}_PROFILE_ID" in properties:
+        prefix = f"V9_TRACEIMPEDANCE{index}_"
+        index += 1
+        profile = profiles.get(properties[f"{prefix}PROFILE_ID"].upper())
+        if profile is None:
+            continue
+        profile.layers.append(
+            ImpedanceLayer(
+                layer_v7=_optional_int(properties.get(f"{prefix}LAYER_V7ID")),
+                ref_top_v7=_optional_int(properties.get(f"{prefix}REF_TOP_V7ID")),
+                ref_bottom_v7=_optional_int(properties.get(f"{prefix}REF_BOT_V7ID")),
+                substack_id=properties.get(f"{prefix}SUBSTACK_ID") or None,
+                width_mil=_bounded_mil(properties.get(f"{prefix}TRACE_WIDTH")),
+                min_width_mil=_bounded_mil(properties.get(f"{prefix}TRACE_MINWIDTH")),
+                max_width_mil=_bounded_mil(properties.get(f"{prefix}TRACE_MAXWIDTH")),
+                gap_mil=_bounded_mil(properties.get(f"{prefix}DIFF_PAIR_GAP")),
+                min_gap_mil=_bounded_mil(properties.get(f"{prefix}DIFF_PAIR_MINGAP")),
+                max_gap_mil=_bounded_mil(properties.get(f"{prefix}DIFF_PAIR_MAXGAP")),
+                calculated_ohm=_optional_float(properties.get(f"{prefix}CALC_IMPEDANCE")),
+                error_pct=_optional_float(properties.get(f"{prefix}IMPEDANCE_ERR")),
+                propagation_speed=_optional_float(
+                    properties.get(f"{prefix}PROPAGATION_SPEED")
+                ),
+                enabled=properties.get(f"{prefix}ENABLED", "TRUE").upper() != "FALSE",
+            )
+        )
+    return list(profiles.values())
 
 
 def decode_board(records: list[dict[str, str]]) -> BoardInfo:
@@ -525,6 +639,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
                     else None
                 ),
                 material=properties.get(f"{prefix}DIELMATERIAL"),
+                v7_id=_optional_int(properties.get(f"{prefix}LAYERID")),
             )
         )
         order += 1
@@ -599,6 +714,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         stackup_source=stackup_source,
         outline_vertices=outline_vertices,
         substacks=substacks,
+        impedance_profiles=decode_impedance_profiles(properties),
     )
 
 

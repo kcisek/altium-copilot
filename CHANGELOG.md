@@ -131,6 +131,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- Impedance profiles from the Layer Stack Manager: `get_board_info` lists each profile's
+  target and tolerance, its solved trace width/gap, calculated impedance and reference
+  layers per signal layer, a derived propagation delay, the rules that use it, and issues
+  (calculated impedance outside tolerance, profile-driven rule widths that drifted from the
+  profile, unused profiles). Profile-driven rules name their profile in their values, and
+  `constraints_review` uses the profiles instead of calling impedance unverifiable
 - Rule-compliance, length and diff-pair checks on the saved copper, plus a constraints
   review mode. New tools:
   - `check_rule_compliance` — track widths per layer (diff-pair nets against their

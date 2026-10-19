@@ -813,6 +813,7 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MAXIMP": ("", "skip"),
         "IMPEDANCEPROFILEDRIVEN": ("impedance_profile_driven", "bool"),
         "IMPEDANCEPROFILEVALUE": ("impedance_profile_ohm", "ohm"),
+        "IMPEDANCEPROFILEID": ("", "skip"),
     },
     "DiffPairsRouting": {
         "MINLIMIT": ("min_gap_mil", "mil"),
@@ -821,6 +822,7 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MAXUNCOUPLEDLENGTH": ("max_uncoupled_length_mil", "mil"),
         "IMPEDANCEPROFILEDRIVEN": ("impedance_profile_driven", "bool"),
         "IMPEDANCEPROFILEVALUE": ("impedance_profile_ohm", "ohm"),
+        "IMPEDANCEPROFILEID": ("", "skip"),
     },
     "RoutingVias": {
         "MINWIDTH": ("min_diameter_mil", "mil"),
@@ -944,6 +946,7 @@ def rule_values(
     rule: PcbRule,
     signal_layers: dict[int, str],
     substacks: list[dict] | None = None,
+    profiles: dict[str, dict] | None = None,
 ) -> dict:
     """Decode a rule's kind-specific values.
 
@@ -1045,6 +1048,13 @@ def rule_values(
         values["layers_substack"] = substacks[0]["name"]
     if not values.get("impedance_profile_driven"):
         values.pop("impedance_profile_ohm", None)
+    profile_id = props.get("IMPEDANCEPROFILEID", "").strip()
+    if profile_id:
+        profile = (profiles or {}).get(profile_id.upper())
+        if profile:
+            values["impedance_profile"] = profile
+        elif profiles is not None:
+            values["impedance_profile"] = {"id": profile_id, "missing": True}
     if routing_layers:
         values["routing_layers"] = routing_layers
     if rule.kind == ROOM_KIND:
