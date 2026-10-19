@@ -28,6 +28,11 @@ try:
     from parsers.pcb_doc import parse_pcb_doc
     from parsers.sch_doc import read_sch_doc_image
     from services.pcb_index import PcbIndex
+    from services.pcb_rules import (
+        BINARY_KINDS, NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header,
+        rule_values, stale_references,
+    )
+    from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
         draftsman_documents, note_rows, resolve_document, sheet_notes_for_context,
@@ -44,6 +49,11 @@ except ImportError:
     from server.services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
     from server.services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
     from server.services.pcb_index import PcbIndex
+    from server.services.pcb_rules import (
+        BINARY_KINDS, NET_RULE_KINDS, ROOM_KIND, resolve_kind, rule_header,
+        rule_values, stale_references,
+    )
+    from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
         draftsman_documents, note_rows, resolve_document, sheet_notes_for_context,
@@ -219,6 +229,22 @@ component locations, distances):
    termination knowledge — ask the user rather than guessing severity.
 4. query_pcb_region — "what is at/near (x, y)".
 5. get_component_placement — "where is U12, what's around it".
+6. get_rules_for_net — "what width / clearance / via / diff-pair rule applies to X":
+   the effective rule per kind with its values, resolved by priority the way Altium does.
+7. get_design_rules — list or inspect the board's design rules by kind or name.
+8. get_classes / list_diff_pairs — net, component and diff-pair classes; pairs with
+   their routed length skew.
+
+Rule scopes are evaluated per net or pair. A rule marked conditional (with
+"conditions") applies only to some of the net's objects — e.g. only its vias, only on
+one layer, only inside a room, only its pour copper. Quote the condition instead of
+claiming it applies. Binary rules (Clearance, ...) list candidates with orientations:
+which one wins depends on the other object, so name the other object when you quote a
+clearance. Widths and diff-pair gaps are per layer: quote layers_mil for the layer in
+question. A diff-pair net's track width is checked by its DiffPairsRouting rule, not
+the Width rule. stale_references are scope names that match nothing on the board, so
+that part of the rule silently applies to nothing — worth pointing out. Rule values are
+what is stored in the PcbDoc; DRC results are not read, so do not claim the board passes.
 
 Net names are shared between schematic and PCB — pivot freely between query_net
 (connectivity) and get_net_pcb (physical routing). Component refdes may differ on
@@ -1342,6 +1368,7 @@ def get_board_info(units: PcbUnits | None = None) -> str:
         "stackup": stackup,
         "netlist_updated_utc": _netlist_last_updated,
         "counts": index.counts(),
+        "design_rules": _design_rule_counts(index),
         "components_per_side": sides,
         "refdes_mapping_unmatched": index.unmatched_components(),
         "warnings": index.pcb.warnings,
@@ -1483,6 +1510,12 @@ def get_net_pcb(net: str, units: PcbUnits | None = None) -> str:
         )
     summary = index.net_summary(matches[0])
     _annotate_dnp(summary["pads"])
+    classes = index.net_classes_of(summary["net"])
+    if classes:
+        summary["net_classes"] = classes
+    pairs = index.diff_pairs_of(summary["net"])
+    if pairs:
+        summary["diff_pairs"] = pairs
     if summary["pour_count"]:
         summary["geometry_note"] = PCB_POLYGON_GEOMETRY_NOTE
     return json.dumps(_convert_units(summary, to_mm), indent=2)
@@ -1540,6 +1573,13 @@ def get_net_neighbors(
                 ),
             }
         )
+    partners = {
+        pair["partner_net"].lower() for pair in index.diff_pairs_of(net)
+    }
+    if partners:
+        for entry in result.get("neighbors", []) + result.get("broadside", []):
+            if str(entry.get("net", "")).lower() in partners:
+                entry["diff_pair_partner"] = True
     result["geometry_note"] = PCB_POLYGON_GEOMETRY_NOTE
     return json.dumps(_convert_units(result, to_mm), indent=2)
 
@@ -1649,6 +1689,506 @@ def get_component_placement(
         indent=2,
     )
 
+
+
+# ---------- design rules, classes, differential pairs ----------
+
+MAX_RULE_RESULTS = 60
+MAX_CLASS_RESULTS = 200
+MAX_CLASS_MEMBERS = 200
+MAX_DIFF_PAIRS = 100
+
+
+def _design_rule_counts(index) -> dict:
+    rules = index.pcb.rules
+    return {
+        "rules": sum(1 for rule in rules if rule.kind != ROOM_KIND),
+        "disabled_rules": sum(
+            1 for rule in rules if rule.kind != ROOM_KIND and not rule.enabled
+        ),
+        "rooms": sum(1 for rule in rules if rule.kind == ROOM_KIND),
+        "net_classes": sum(
+            1
+            for pcb_class in index.pcb.classes
+            if pcb_class.kind == "net" and not pcb_class.superclass
+        ),
+        "diff_pairs": len(index.pcb.diff_pairs),
+    }
+
+
+def _rule_stale(index, rule) -> list[str]:
+    stale = stale_references(rule.scope1, index.rule_context)
+    if rule.kind in BINARY_KINDS:
+        stale += stale_references(rule.scope2, index.rule_context)
+    return list(dict.fromkeys(stale))
+
+
+def _rule_detail(index, rule) -> dict:
+    detail = rule_header(rule)
+    values = rule_values(
+        rule, index.signal_layers(), index.pcb.board.substacks
+    )
+    if values:
+        detail["values"] = values
+    stale = _rule_stale(index, rule)
+    if stale:
+        detail["stale_references"] = stale
+    return detail
+
+
+def _page(items: list, offset: int, limit: int) -> tuple[list, dict]:
+    offset = max(0, offset)
+    page = items[offset : offset + limit]
+    meta = {"total": len(items), "offset": offset, "has_more": offset + limit < len(items)}
+    if meta["has_more"]:
+        meta["next_offset"] = offset + limit
+    return page, meta
+
+
+def _get_design_rules_impl(index, kind, name, offset, to_mm) -> dict:
+    rules = sorted(index.pcb.rules, key=lambda rule: (rule.kind, rule.priority))
+    if name:
+        matches = [rule for rule in rules if rule.name.lower() == name.lower()]
+        if not matches:
+            suggestions = [
+                rule.name for rule in rules if name.lower() in rule.name.lower()
+            ][:10]
+            return {
+                "error": "rule_not_found",
+                "message": f"No design rule named '{name}'.",
+                "suggestions": suggestions,
+            }
+        return {"rules": [_rule_detail(index, rule) for rule in matches]}
+    if kind:
+        kinds = {rule.kind.lower(): rule.kind for rule in rules}
+        if kind.lower() not in kinds:
+            return {
+                "error": "invalid_rule_kind",
+                "message": f"No rules of kind '{kind}' on this board.",
+                "available_kinds": sorted(set(kinds.values())),
+            }
+        selected = [rule for rule in rules if rule.kind == kinds[kind.lower()]]
+        page, meta = _page(selected, offset, MAX_RULE_RESULTS)
+        return {
+            "kind": kinds[kind.lower()],
+            **meta,
+            "rules": [_rule_detail(index, rule) for rule in page],
+        }
+    listed = [rule for rule in rules if rule.kind != ROOM_KIND]
+    page, meta = _page(listed, offset, MAX_RULE_RESULTS)
+    headers = []
+    for rule in page:
+        header = rule_header(rule)
+        stale = _rule_stale(index, rule)
+        if stale:
+            header["stale_references"] = stale
+        headers.append(header)
+    kinds_count: dict[str, int] = {}
+    for rule in listed:
+        kinds_count[rule.kind] = kinds_count.get(rule.kind, 0) + 1
+    counts = _design_rule_counts(index)
+    return {
+        "rule_count": counts.pop("rules"),
+        **counts,
+        "kinds": kinds_count,
+        **meta,
+        "rules": headers,
+        "hint": (
+            "Pass kind (e.g. 'Width') or name for values. Rooms are "
+            "RoomDefinition rules: kind='RoomDefinition'."
+        ),
+    }
+
+
+@mcp.tool(
+    title="Get Design Rules",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_design_rules(
+    kind: str | None = None,
+    name: str | None = None,
+    offset: int = 0,
+    units: PcbUnits | None = None,
+) -> str:
+    """List the PCB design rules saved in the PcbDoc, or show one kind or rule with values.
+
+    With no arguments: rule counts per kind and every rule's name, priority (1 = highest),
+    enabled flag and scope query. kind (e.g. 'Clearance', 'Width', 'DiffPairsRouting',
+    'RoutingVias', 'RoomDefinition') or name returns full values: widths, gaps, clearances
+    including the object-to-object matrix, per-layer values for the board's signal layers.
+    stale_references lists scope names that match no net, class, pair or room. Lengths use
+    units (default: board display unit). Paginated: pass offset from next_offset."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, _, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    result = _get_design_rules_impl(index, kind, name, offset, to_mm)
+    if "error" in result:
+        return json.dumps(result)
+    return json.dumps(_convert_units(result, to_mm), indent=2)
+
+
+def _net_or_pair_not_found(index, name: str) -> dict:
+    suggestions = [
+        net for net in index.pcb.nets if name.lower() in net.lower()
+    ][:10] + [
+        pair.name
+        for pair in index.pcb.diff_pairs
+        if name.lower() in pair.name.lower()
+    ][:5]
+    return {
+        "error": "net_not_found",
+        "message": f"No PCB net or differential pair named '{name}'.",
+        "suggestions": suggestions,
+    }
+
+
+def _get_rules_for_net_impl(index, net, kinds) -> dict:
+    target = index.rule_target(net)
+    if target is None:
+        return _net_or_pair_not_found(index, net)
+    also_pair = (
+        target.kind == "net" and net.lower() in index.rule_context.pairs
+    )
+    by_kind: dict[str, list] = {}
+    for rule in index.pcb.rules:
+        if rule.kind != ROOM_KIND:
+            by_kind.setdefault(rule.kind, []).append(rule)
+    if kinds:
+        lookup = {kind.lower(): kind for kind in by_kind}
+        wanted = (
+            list(by_kind)
+            if any(kind.lower() == "all" for kind in kinds)
+            else [lookup[kind.lower()] for kind in kinds if kind.lower() in lookup]
+        )
+        unknown = [
+            kind for kind in kinds
+            if kind.lower() != "all" and kind.lower() not in lookup
+        ]
+        if unknown and not wanted:
+            return {
+                "error": "invalid_rule_kind",
+                "message": f"No rules of kind {unknown} on this board.",
+                "available_kinds": sorted(by_kind),
+            }
+    else:
+        wanted = [kind for kind in NET_RULE_KINDS if kind in by_kind]
+        if target.kind == "diff_pair":
+            wanted = [
+                kind for kind in ("DiffPairsRouting", "MatchedLengths")
+                if kind in by_kind
+            ]
+
+    def describe(rule):
+        return _rule_detail(index, rule)
+
+    results = []
+    for kind in wanted:
+        if kind == "DiffPairsRouting" and target.kind == "net":
+            for pair in index.diff_pairs_of(target.name):
+                pair_target = index.rule_target(pair["name"], kind="diff_pair")
+                resolved = resolve_kind(
+                    by_kind[kind], pair_target, index.rule_context, describe
+                )
+                resolved["diff_pair"] = pair["name"]
+                results.append(resolved)
+            continue
+        results.append(
+            resolve_kind(by_kind[kind], target, index.rule_context, describe)
+        )
+    pair_rules = [
+        entry["effective"]["name"]
+        for entry in results
+        if entry["kind"] == "DiffPairsRouting" and entry.get("effective")
+    ]
+    if pair_rules:
+        for entry in results:
+            if entry["kind"] == "Width":
+                entry["note"] = (
+                    "This net is in a differential pair: Altium checks the "
+                    "width of its pair tracks with DiffPairsRouting "
+                    f"{', '.join(pair_rules)} (per-layer widths there), not "
+                    "with this Width rule."
+                )
+    result: dict = {"target": target.name, "type": target.kind}
+    if target.kind == "net":
+        classes = index.net_classes_of(target.name)
+        if classes:
+            result["net_classes"] = classes
+        pairs = index.diff_pairs_of(target.name)
+        if pairs:
+            result["diff_pairs"] = pairs
+    else:
+        _, positive, negative = index.rule_context.pairs[target.name.lower()]
+        result["positive_net"] = positive
+        result["negative_net"] = negative
+        result["pair_classes"] = index.pair_classes_of(target.name)
+        result["hint"] = (
+            "Track widths come from the DiffPairsRouting rule above. Clearance, "
+            "via and length rules apply to the member nets: call "
+            "get_rules_for_net on each net."
+        )
+    result["rules"] = results
+    if also_pair:
+        result["note"] = (
+            f"'{net}' is also a differential pair name; its pair rules are "
+            "listed under DiffPairsRouting when the net belongs to it, or call "
+            "list_diff_pairs."
+        )
+    return result
+
+
+@mcp.tool(
+    title="Get Rules for Net",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_rules_for_net(
+    net: str,
+    kinds: list[str] | None = None,
+    units: PcbUnits | None = None,
+) -> str:
+    """Resolve which PCB design rules apply to a net (or differential pair) and their values.
+
+    Per rule kind, returns the effective rule (first enabled rule by priority whose scope
+    matches), plus higher-priority rules that apply only to some of the net's objects
+    (conditions: only its vias, only on a layer, only in a room...). Binary kinds such as
+    Clearance list candidates in priority order, since the winner depends on the other
+    object; each lists orientations (which side of the rule the net is on, and what the
+    other object must be). Diff-pair routing rules are resolved for the pairs the net
+    belongs to; a pair net's track width comes from them, not from Width.
+    kinds narrows the kinds (default: routing-related kinds; ['all'] for every kind).
+    Lengths use units (default: board display unit)."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, _, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    result = _get_rules_for_net_impl(index, net, kinds)
+    if "error" in result:
+        return json.dumps(result)
+    rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    if len(rendered) > QUERY_NET_MAX_RESULT_SIZE_CHARS:
+        # Keep every rule's identity and the winners' values; drop values of
+        # lower-priority binary candidates, which get_design_rules can show.
+        for entry in result["rules"]:
+            for candidate in entry.get("candidates", [])[1:]:
+                candidate.pop("values", None)
+        result["values_omitted"] = (
+            "Response too large: values are shown only for the first candidate "
+            "of each binary kind. Call get_design_rules(name=...) for the rest."
+        )
+        rendered = json.dumps(_convert_units(result, to_mm), indent=2)
+    return rendered
+
+
+def _class_members(index, pcb_class, offset: int) -> dict:
+    if pcb_class.superclass:
+        return {"members": f"implicit: every {pcb_class.kind} on the board"}
+    members, meta = _page(pcb_class.members, offset, MAX_CLASS_MEMBERS)
+    ctx = index.rule_context
+    unresolved: list[str] = []
+    if pcb_class.kind == "net":
+        rendered = members
+        unresolved = [
+            member for member in pcb_class.members
+            if member.lower() not in ctx.net_names
+        ]
+    elif pcb_class.kind == "diff_pair":
+        rendered = []
+        for member in members:
+            pair = ctx.pairs.get(member.lower())
+            if pair:
+                rendered.append(
+                    {"pair": pair[0], "positive_net": pair[1], "negative_net": pair[2]}
+                )
+            else:
+                rendered.append({"pair": member})
+        unresolved = [
+            member for member in pcb_class.members
+            if member.lower() not in ctx.pairs
+        ]
+    elif pcb_class.kind == "component":
+        rendered = []
+        for member in members:
+            found = index.find_by_designator(member)
+            record = {"refdes": member}
+            if found and found[0].get("sch_refdes"):
+                record["sch_refdes"] = found[0]["sch_refdes"]
+            rendered.append(record)
+        _annotate_dnp(rendered)
+        unresolved = [
+            member for member in pcb_class.members
+            if not index.find_by_designator(member)
+        ]
+    else:
+        rendered = members
+    result = {"member_count": len(pcb_class.members), **meta, "members": rendered}
+    if unresolved:
+        result["unresolved_members"] = unresolved[:MAX_CLASS_MEMBERS]
+    return result
+
+
+@mcp.tool(
+    title="Get Classes",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_classes(
+    kind: str | None = None,
+    name: str | None = None,
+    offset: int = 0,
+) -> str:
+    """List the PCB's object classes, or show one class's members.
+
+    kind filters: net, component, diff_pair, pad, polygon, xsignal, layer, from_to,
+    design_channel. Without name: each class with its member count; superclasses
+    ('All Nets'...) have implicit membership; auto_generated marks Altium's side/board
+    component classes. With name: members (component members are PCB designators, with DNP for
+    the active variant; unresolved_members match no net, pair or designator). Paginated:
+    pass offset from next_offset."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    valid_kinds = sorted(set(CLASS_KINDS.values()))
+    if kind and kind.lower() not in valid_kinds:
+        return json.dumps({
+            "error": "invalid_class_kind",
+            "message": f"Unknown class kind '{kind}'.",
+            "available_kinds": valid_kinds,
+        })
+    classes = [
+        pcb_class for pcb_class in index.pcb.classes
+        if not kind or pcb_class.kind == kind.lower()
+    ]
+    if name:
+        matches = [c for c in classes if c.name.lower() == name.lower()]
+        if not matches:
+            return json.dumps({
+                "error": "class_not_found",
+                "message": f"No class named '{name}'.",
+                "suggestions": [
+                    c.name for c in classes if name.lower() in c.name.lower()
+                ][:10],
+            })
+        return json.dumps(
+            {
+                "classes": [
+                    {
+                        "name": c.name,
+                        "kind": c.kind,
+                        **({"superclass": True} if c.superclass else {}),
+                        **({"auto_generated": True} if c.auto_generated else {}),
+                        **_class_members(index, c, offset),
+                    }
+                    for c in matches
+                ]
+            },
+            indent=2,
+        )
+    listing = []
+    for c in classes:
+        entry = {"name": c.name, "kind": c.kind}
+        if c.superclass:
+            entry["superclass"] = True
+        else:
+            entry["member_count"] = len(c.members)
+        if c.auto_generated:
+            entry["auto_generated"] = True
+        listing.append(entry)
+    page, meta = _page(listing, offset, MAX_CLASS_RESULTS)
+    kinds_count: dict[str, int] = {}
+    for c in classes:
+        kinds_count[c.kind] = kinds_count.get(c.kind, 0) + 1
+    return json.dumps({"kinds": kinds_count, **meta, "classes": page}, indent=2)
+
+
+def _list_diff_pairs_impl(index, pattern, offset) -> dict:
+    pairs = index.pcb.diff_pairs
+    if pattern:
+        if not _safe_regex(pattern):
+            return {"error": "invalid_pattern", "message": f"Invalid regex: {pattern}"}
+        pairs = [
+            pair for pair in pairs
+            if re.search(pattern, pair.name, re.IGNORECASE)
+            or re.search(pattern, pair.positive_net, re.IGNORECASE)
+            or re.search(pattern, pair.negative_net, re.IGNORECASE)
+        ]
+    routing_rules = [
+        rule for rule in index.pcb.rules if rule.kind == "DiffPairsRouting"
+    ]
+    page, meta = _page(pairs, offset, MAX_DIFF_PAIRS)
+    rendered = []
+    for pair in page:
+        positive_length = index.routed_length(pair.positive_net)
+        negative_length = index.routed_length(pair.negative_net)
+        entry: dict = {
+            "name": pair.name,
+            "positive_net": pair.positive_net,
+            "negative_net": pair.negative_net,
+        }
+        classes = index.pair_classes_of(pair.name)
+        if classes:
+            entry["classes"] = classes
+        if positive_length is not None and negative_length is not None:
+            entry["routed_length_mil"] = {
+                "positive": positive_length,
+                "negative": negative_length,
+            }
+            entry["length_skew_mil"] = round(abs(positive_length - negative_length), 1)
+        if routing_rules:
+            resolved = resolve_kind(
+                routing_rules,
+                index.rule_target(pair.name, kind="diff_pair"),
+                index.rule_context,
+                rule_header,
+            )
+            effective = resolved.get("effective")
+            entry["routing_rule"] = effective["name"] if effective else None
+            if resolved.get("overridden_for_some_objects_by"):
+                entry["routing_rule_conditional_overrides"] = [
+                    rule["name"] for rule in resolved["overridden_for_some_objects_by"]
+                ]
+        rendered.append(entry)
+    return {
+        **meta,
+        "diff_pairs": rendered,
+        "note": (
+            "Routed length is track and arc copper on the PcbDoc, excluding via "
+            "barrels and pad-to-pad gaps; 0 means the leg is unrouted. Use "
+            "get_rules_for_net for the routing rule's gap and widths."
+        ),
+    }
+
+
+@mcp.tool(
+    title="List Differential Pairs",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def list_diff_pairs(
+    pattern: str | None = None,
+    offset: int = 0,
+    units: PcbUnits | None = None,
+) -> str:
+    """List the PCB's differential pairs with nets, classes, routed length skew and routing rule.
+
+    pattern is a case-insensitive regex on the pair or net names. Lengths use units
+    (default: board display unit). Paginated: pass offset from next_offset."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, _, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    result = _list_diff_pairs_impl(index, pattern, offset)
+    if "error" in result:
+        return json.dumps(result)
+    return json.dumps(_convert_units(result, to_mm), indent=2)
 
 
 SCHEMATIC_REVIEW_PROMPT = """\

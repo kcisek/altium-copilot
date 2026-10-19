@@ -63,6 +63,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- PCB design rules, classes and differential pairs, read from the `.PcbDoc`
+  (`Rules6`, `Classes6`, `SignalClasses`, `DifferentialPairs6`). New tools:
+  - `get_design_rules` — every rule's kind, priority, enabled flag and scope; per kind
+    or name the values: widths, gaps, clearances with the object-to-object matrix,
+    via sizes, lengths, per-layer values for the board's real signal layers, rooms.
+    Flags `stale_references`: scope names that match no net, class, pair or room
+  - `get_rules_for_net` — which rule of each kind applies to a net or pair, resolved
+    by priority like Altium. Scopes are evaluated with an Altium query-language subset
+    that decides every scope seen on 61 real boards; rules that apply only to some of
+    the net's objects (vias, a layer, a room, a component's pads, its pour copper) are
+    listed with that condition instead of being claimed or dropped. Clearance-type
+    rules list candidates with both orientations and their connective checking.
+    Component and pad scopes use the PCB designator (decoded from `Texts6`), which
+    differs from the schematic designator on multi-channel and board-annotated designs.
+    For a diff-pair net, the note on Width points to the DiffPairsRouting rule that
+    checks its track width
+  - `get_classes` — net, component, diff-pair, pad, polygon and xSignal classes and
+    members, with unresolved members and DNP flags
+  - `list_diff_pairs` — pairs with nets, classes, routed length per leg, skew and the
+    routing rule for each pair
+  - `get_net_pcb` adds the net's classes and pairs; `get_net_neighbors` marks the
+    diff-pair partner; `get_board_info` adds rule, room, class and pair counts
 - Design notes: Claude now reads what designers wrote into the project besides the
   circuit. New tool `get_design_notes` (paginated, or one document by name) returns:
   - project parameters from the `.PrjPcb`
