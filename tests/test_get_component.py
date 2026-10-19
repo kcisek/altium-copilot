@@ -61,3 +61,47 @@ def test_get_component_empty_components_returns_no_components_loaded(default_vs)
     result = json.loads(_get_component_impl(netlist, default_vs, "U1"))
     assert result["error"] == "no_components_loaded"
     assert result["sheet_errors"][0]["sheet"] == "Power"
+
+
+# ---------- board-level annotation ----------
+
+ANNOTATED = {
+    "nets": {},
+    "pin_to_net": {},
+    "components": {
+        "U1": {"mpn": "CSR1010", "sheet": "Bluetooth", "logical_refdes": "U4", "pins": {}},
+        "U3": {"mpn": "LIS331DLTR", "sheet": "Accelerometer", "logical_refdes": "U1", "pins": {}},
+        "C18": {"mpn": "1uF", "sheet": "Accelerometer", "logical_refdes": "C29", "pins": {}},
+        "R3": {"mpn": "200R", "sheet": "Red_LED", "logical_refdes": "R1", "pins": {}},
+        "R4": {"mpn": "200R", "sheet": "Red_LED", "logical_refdes": "R1", "pins": {}},
+        "J1": {"mpn": "CR2032", "sheet": "Power", "pins": {}},
+    },
+}
+
+
+def test_board_designator_comes_with_the_sheet_designator(default_vs):
+    result = json.loads(_get_component_impl(ANNOTATED, default_vs, "U1"))
+    assert (result["refdes"], result["logical_refdes"], result["mpn"]) == ("U1", "U4", "CSR1010")
+    assert list(result)[:2] == ["refdes", "logical_refdes"]
+    assert "logical_refdes" not in json.loads(_get_component_impl(ANNOTATED, default_vs, "J1"))
+
+
+def test_sheet_designator_no_board_part_has_finds_its_part(default_vs):
+    result = json.loads(_get_component_impl(ANNOTATED, default_vs, "c29"))
+    assert (result["refdes"], result["logical_refdes"], result["mpn"]) == ("C18", "C29", "1uF")
+
+
+def test_sheet_designator_placed_several_times_lists_its_parts(default_vs):
+    result = json.loads(_get_component_impl(ANNOTATED, default_vs, "R1"))
+    assert result["error"] == "component_not_found"
+    assert result["board_designators"] == [
+        {"refdes": "R3", "sheet": "Red_LED"},
+        {"refdes": "R4", "sheet": "Red_LED"},
+    ]
+    assert "R3, R4" in result["message"]
+
+
+def test_unknown_designator_is_still_not_found(default_vs):
+    result = json.loads(_get_component_impl(ANNOTATED, default_vs, "U9"))
+    assert result["error"] == "component_not_found"
+    assert "board_designators" not in result

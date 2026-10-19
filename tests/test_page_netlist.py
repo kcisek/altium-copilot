@@ -132,3 +132,16 @@ def test_25_pin_net_is_not_marked_high_fanout():
     )
 
     assert "[HF:25]" not in result
+
+
+def test_board_designator_shows_the_sheet_designator():
+    components = {
+        "U3": {"sheet": "Accel", "logical_refdes": "U1", "mpn": "LIS331",
+               "pins": {"1": {"net": "SDA", "name": "SDA"}}},
+        "C1": {"sheet": "Accel", "mpn": "100n", "pins": {"1": {"net": "SDA"}}},
+    }
+    vs = VariantState([VariantDefinition(name="Default")])
+    result = build_sheet_context({"components": components}, "Accel", vs)
+    assert "\nU3 (U1 on sheet)|LIS331||\n" in result
+    assert "\nC1|100n||\n" in result
+    assert "  1:SDA->U3.1\n" in result  # neighbors name the board designator
