@@ -6,6 +6,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- PCB tools name components by the designator printed on the board (decoded from
+  `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
+  name and differs on multi-channel and board-annotated designs (57 of 73 parts on
+  Altium's Bluetooth_Sentinel example, 8 of 199 on PC4-SODIMM). `get_component_placement`,
+  `query_pcb_region` and the `get_net_pcb` pad list report it as `refdes`.
+  `get_component_placement` adds `logical_refdes` and still accepts the logical name when
+  no designator or netlist refdes matches, returning every channel instance. PCB-only
+  parts (mounting holes, logos) now have a `refdes` instead of `null`
+- `sch_refdes` (the netlist name) matches the PCB designator first, then the schematic
+  UniqueId, then `SOURCEDESIGNATOR`, and a fallback never takes a netlist part that
+  another board designator names. Before, a board-annotated board's U3 (sheet U1) was
+  mapped to the netlist's U1, a different part: 64 wrong mappings on the AD25 examples.
+  Netlist refdes without schematic metadata now match too
+- `get_board_info` adds `refdes_mapping_unmatched_sample` (up to 10 unmatched
+  designators) and `refdes_differs_from_logical` (how many parts the board renames)
 - Design notes, after a review against 200 real sheets and 48 real Draftsman drawings:
   - Text frames and notes decode Altium's escapes in one pass: `~~` is a `~` (so
     "~10kHz" no longer turns into a line break and "0kHz"), `~2` is a `|`. Labels are

@@ -247,9 +247,13 @@ that part of the rule silently applies to nothing — worth pointing out. Rule v
 what is stored in the PcbDoc; DRC results are not read, so do not claim the board passes.
 
 Net names are shared between schematic and PCB — pivot freely between query_net
-(connectivity) and get_net_pcb (physical routing). Component refdes may differ on
-multi-channel designs: tools return both `refdes` (PCB) and `sch_refdes` (netlist);
-a logical refdes like U3 may return multiple physical instances with channel paths.
+(connectivity) and get_net_pcb (physical routing). PCB tools return both `refdes` (the
+designator on the PCB) and `sch_refdes` (the netlist name, used by the schematic tools).
+They differ when the board is out of sync with the schematic; PCB-only parts (mounting
+holes, logos) have no `sch_refdes`. On multi-channel and
+board-annotated designs the schematic sheet's own (logical) refdes is a third name:
+get_component_placement reports it as `logical_refdes` and, when nothing else matches,
+accepts it, returning every physical instance with its channel path.
 
 PCB data reflects the last SAVE of the .PcbDoc in Altium and refreshes automatically —
 if the user made layout changes, ask them to save (Ctrl+S), then call the tool again.
@@ -1374,6 +1378,11 @@ def get_board_info(units: PcbUnits | None = None) -> str:
         "warnings": index.pcb.warnings,
         "skipped_records": index.pcb.skipped_records,
     }
+    if result["refdes_mapping_unmatched"]:
+        result["refdes_mapping_unmatched_sample"] = index.unmatched_refdes(10)
+    renamed = index.renamed_components()
+    if renamed:
+        result["refdes_differs_from_logical"] = renamed
     if result["counts"]["pours"]:
         result["analysis_notes"] = [PCB_POLYGON_GEOMETRY_NOTE]
     if len(project["pcb_doc_paths"]) > 1:
@@ -1651,7 +1660,11 @@ def get_component_placement(
     refdes: str,
     units: PcbUnits | None = None,
 ) -> str:
-    """Return physical placement and nearby-component details."""
+    """Return physical placement and nearby-component details.
+
+    refdes is the designator on the PCB or the netlist refdes; a schematic
+    sheet's logical refdes is accepted when neither matches.
+    """
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)

@@ -9,7 +9,12 @@ from server.main import PcbSession
 from server.parsers.pcb_doc import Primitive
 from server.parsers.prj_pcb import VariantDefinition, VariantState
 from server.services.pcb_index import PcbIndex
-from tests.test_pcb_index import NETLIST, pcb_data  # noqa: F401
+from tests.test_pcb_index import (  # noqa: F401
+    ANNOTATED_NETLIST,
+    NETLIST,
+    annotated_pcb,
+    pcb_data,
+)
 
 
 def test_pcb_session_no_pcb_doc():
@@ -119,9 +124,20 @@ def test_pcb_session_parse_failure(tmp_path: Path, monkeypatch):
 
 @pytest.fixture
 def loaded_pcb(pcb_data, monkeypatch, tmp_path: Path):
+    return _load_index(pcb_data, NETLIST, monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def loaded_annotated_pcb(annotated_pcb, monkeypatch, tmp_path: Path):
+    return _load_index(
+        annotated_pcb, ANNOTATED_NETLIST, monkeypatch, tmp_path
+    )
+
+
+def _load_index(pcb_data, netlist, monkeypatch, tmp_path: Path):
     pcb_file = tmp_path / "Board.PcbDoc"
     pcb_file.write_bytes(b"fake")
-    index = PcbIndex(pcb_data, NETLIST)
+    index = PcbIndex(pcb_data, netlist)
     index.pcb.board.origin_x = 100.0
     index.pcb.board.origin_y = 200.0
     monkeypatch.setattr(
@@ -135,7 +151,7 @@ def loaded_pcb(pcb_data, monkeypatch, tmp_path: Path):
             "pcb_doc_paths": [str(pcb_file)],
         },
     )
-    monkeypatch.setattr(main_mod._altium, "_netlist", NETLIST)
+    monkeypatch.setattr(main_mod._altium, "_netlist", netlist)
     monkeypatch.setattr(
         main_mod,
         "_variant_state",
@@ -400,3 +416,53 @@ def test_server_instructions_include_pcb_workflow():
     assert "Call get_board_info first" in main_mod.SERVER_INSTRUCTIONS
     assert "geometric facts" in main_mod.SERVER_INSTRUCTIONS
     assert "repour" in main_mod.SERVER_INSTRUCTIONS.lower()
+
+
+def test_server_instructions_explain_refdes_names():
+    instructions = main_mod.SERVER_INSTRUCTIONS
+    assert "designator on the PCB" in instructions
+    assert "`sch_refdes` (the netlist name" in instructions
+    assert "`logical_refdes`" in instructions
+
+
+def test_board_info_reports_designator_mapping(loaded_annotated_pcb):
+    result = json.loads(main_mod.get_board_info())
+    assert result["refdes_mapping_unmatched"] == 1
+    assert result["refdes_mapping_unmatched_sample"] == ["MH1"]
+    assert result["refdes_differs_from_logical"] == 3
+
+
+def test_board_info_omits_designator_details_when_in_sync(loaded_pcb):
+    result = json.loads(main_mod.get_board_info())
+    assert result["refdes_mapping_unmatched"] == 0
+    assert "refdes_mapping_unmatched_sample" not in result
+    assert "refdes_differs_from_logical" not in result
+
+
+def test_component_placement_uses_pcb_designator(loaded_annotated_pcb):
+    result = json.loads(main_mod.get_component_placement("U1"))
+    [instance] = result["instances"]
+    assert (
+        instance["refdes"],
+        instance["sch_refdes"],
+        instance["logical_refdes"],
+        instance["channel_path"],
+    ) == ("U1", "U1", "U4", "Top\\Radio")
+    by_logical = json.loads(main_mod.get_component_placement("U4"))
+    assert [item["refdes"] for item in by_logical["instances"]] == ["U1"]
+    missing = json.loads(main_mod.get_component_placement("U[0-9]"))
+    assert missing["suggestions"] == ["U1", "U2", "U3"]
+
+
+def test_pcb_tools_report_pcb_designators(loaded_annotated_pcb):
+    pads = json.loads(main_mod.get_net_pcb("CLK_A"))["pads"]
+    assert [(pad["refdes"], pad["sch_refdes"]) for pad in pads] == [
+        ("U3", "U3")
+    ]
+    region = json.loads(
+        main_mod.query_pcb_region(900.0, 900.0, radius=1.0)
+    )
+    assert [
+        (item["refdes"], item["sch_refdes"])
+        for item in region["components"]
+    ] == [("MH1", None)]

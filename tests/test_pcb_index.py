@@ -600,3 +600,185 @@ def test_component_detail_ambiguous_returns_all(pcb_data):
 def test_component_detail_not_found(pcb_data):
     index = PcbIndex(pcb_data, NETLIST)
     assert index.component_detail("U99") == []
+
+
+# ---------- PCB designator vs SOURCEDESIGNATOR ----------
+
+
+def _component(index, refdes, designator, uid, x, y, channel_path=None):
+    return PcbComponent(
+        index=index,
+        refdes=refdes,
+        source_uid_tail=uid,
+        channel_path=channel_path,
+        x=x,
+        y=y,
+        rotation=0.0,
+        side="top",
+        designator=designator,
+    )
+
+
+@pytest.fixture
+def annotated_pcb(pcb_data):
+    """Board-level annotation: SOURCEDESIGNATOR is the logical name.
+
+    Shaped like Altium's Bluetooth_Sentinel example, where the board's U3
+    is the schematic sheet's U1 and the board's U1 is the sheet's U4.
+    """
+    data = deepcopy(pcb_data)
+    data.components = [
+        _component(0, "U1", "U3", "ACCEL", 100.0, 100.0, "Top\\Accel"),
+        _component(1, "U4", "U1", "RADIO", 500.0, 100.0, "Top\\Radio"),
+        _component(2, "U3", "U2", "EEPROM", 300.0, 300.0, "Top\\Eeprom"),
+        # PCB-only part: a designator but no schematic source.
+        _component(3, None, "MH1", None, 900.0, 900.0),
+    ]
+    data.primitives = [
+        _pad(net=1, component=0, x=100.0, y=100.0),
+        _pad(net=0, component=0, x=100.0, y=110.0, name="2"),
+        _pad(net=2, component=1, x=500.0, y=100.0),
+        _pad(net=0, component=1, x=500.0, y=110.0, name="2"),
+        _pad(net=0, component=2, x=300.0, y=300.0),
+        _pad(net=None, component=3, x=900.0, y=900.0),
+    ]
+    return data
+
+
+# The netlist names physical designators. Its components come from the
+# sheets' logical names, so U1 carries the accelerometer's UniqueId and the
+# sheet's U4 (no physical U4) has no pins: what enrich_netlist produces.
+ANNOTATED_NETLIST = {
+    "pin_to_net": {
+        "U1": {"1": "CLK_B", "2": "GND"},
+        "U2": {"1": "GND"},
+        "U3": {"1": "CLK_A", "2": "GND"},
+    },
+    "components": {
+        "U1": {"unique_id": "ACCEL", "pins": {
+            "1": {"net": "CLK_B"}, "2": {"net": "GND"},
+        }},
+        "U3": {"unique_id": "EEPROM", "pins": {
+            "1": {"net": "CLK_A"}, "2": {"net": "GND"},
+        }},
+        "U4": {"unique_id": "RADIO", "pins": {}},
+    },
+}
+
+
+def test_refdes_is_the_pcb_designator(annotated_pcb):
+    index = PcbIndex(annotated_pcb, ANNOTATED_NETLIST)
+    rows = index.find_components("U1")
+    assert [
+        (row["refdes"], row["logical_refdes"], row["sch_refdes"])
+        for row in rows
+    ] == [("U1", "U4", "U1")]
+    assert index.find_components("U3")[0]["channel_path"] == "Top\\Accel"
+    assert index.find_components("mh1")[0]["refdes"] == "MH1"
+
+
+def test_netlist_matches_pcb_designator_before_source_designator(
+    annotated_pcb,
+):
+    index = PcbIndex(annotated_pcb, ANNOTATED_NETLIST)
+    mapping = {
+        row["logical_refdes"]: row["sch_refdes"]
+        for row in index.db.execute(
+            "SELECT logical_refdes, sch_refdes FROM components "
+            "WHERE logical_refdes IS NOT NULL"
+        )
+    }
+    # Matching SOURCEDESIGNATOR would give U1, U4 and U3: other parts.
+    assert mapping == {"U1": "U3", "U4": "U1", "U3": "U2"}
+    assert index.unmatched_components() == 1
+    assert index.unmatched_refdes(10) == ["MH1"]
+    assert index.renamed_components() == 3
+
+
+def test_logical_refdes_is_a_fallback_lookup(annotated_pcb):
+    index = PcbIndex(annotated_pcb, ANNOTATED_NETLIST)
+    # U4 names no PCB designator or netlist part: the sheet's U4 is found.
+    assert [row["refdes"] for row in index.find_components("U4")] == ["U1"]
+    assert index.find_components("U9") == []
+
+
+def test_tool_outputs_name_pcb_designators(annotated_pcb):
+    index = PcbIndex(annotated_pcb, ANNOTATED_NETLIST)
+    pads = index.net_summary("CLK_A")["pads"]
+    assert [(pad["refdes"], pad["sch_refdes"]) for pad in pads] == [
+        ("U3", "U3")
+    ]
+    region = index.region_query(100.0, 100.0, radius=5.0)
+    assert [item["refdes"] for item in region["components"]] == ["U3"]
+    detail = index.component_detail("U3")
+    assert len(detail) == 1
+    assert (
+        detail[0]["refdes"],
+        detail[0]["sch_refdes"],
+        detail[0]["logical_refdes"],
+    ) == ("U3", "U3", "U1")
+    assert "U1" in [
+        item["refdes"] for item in detail[0]["nearest_components"]
+    ]
+    assert index.find_by_designator("u2") == [
+        {"refdes": "U2", "logical_refdes": "U3", "sch_refdes": "U2"}
+    ]
+
+
+def test_fallbacks_skip_netlist_parts_claimed_by_a_designator(
+    annotated_pcb,
+):
+    # The board's U3 was renamed U7 on the PCB only, so U7 is not in the
+    # netlist. Its SOURCEDESIGNATOR U1 and UniqueId point at the netlist's
+    # U1, which the board's own U1 already is.
+    annotated_pcb.components[0].designator = "U7"
+    netlist = deepcopy(ANNOTATED_NETLIST)
+    index = PcbIndex(annotated_pcb, netlist)
+    assert index.find_components("U7")[0]["sch_refdes"] is None
+    assert index.find_components("U1")[0]["logical_refdes"] == "U4"
+
+
+def test_fallback_to_unique_id_skips_claimed_candidates(annotated_pcb):
+    # The board's U2 was renamed U8 on the PCB only. Its UniqueId names the
+    # netlist's U3 (claimed by the board's U3) and U2: the pad nets pick U2.
+    annotated_pcb.components[2].designator = "U8"
+    netlist = deepcopy(ANNOTATED_NETLIST)
+    netlist["components"]["U2"] = {
+        "unique_id": "EEPROM",
+        "pins": {"1": {"net": "GND"}},
+    }
+    index = PcbIndex(annotated_pcb, netlist)
+    assert index.find_components("U8")[0]["sch_refdes"] == "U2"
+
+
+def test_fallback_to_source_designator_unless_unique_id_differs(
+    annotated_pcb,
+):
+    # Logical U5, renamed U8 on the PCB only; its UniqueId's one netlist
+    # part (U3) is the board's U3, so SOURCEDESIGNATOR U5 is tried.
+    annotated_pcb.components[2].refdes = "U5"
+    annotated_pcb.components[2].designator = "U8"
+    netlist = deepcopy(ANNOTATED_NETLIST)
+    netlist["pin_to_net"]["U5"] = netlist["pin_to_net"].pop("U2")
+    index = PcbIndex(annotated_pcb, netlist)
+    assert index.find_components("U8")[0]["sch_refdes"] == "U5"
+
+    netlist["components"]["U5"] = {"unique_id": "OTHER", "pins": {}}
+    index = PcbIndex(annotated_pcb, netlist)
+    assert index.find_components("U8")[0]["sch_refdes"] is None
+
+
+def test_multichannel_pcb_designators(pcb_data):
+    data = deepcopy(pcb_data)
+    data.components[0].designator = "U3A"
+    data.components[1].designator = "U3B"
+    index = PcbIndex(data, NETLIST)
+    assert [
+        (row["refdes"], row["sch_refdes"])
+        for row in index.find_components("U3B")
+    ] == [("U3B", "U3B")]
+    # The sheet's U3 returns both channel instances.
+    assert sorted(
+        row["refdes"] for row in index.find_components("U3")
+    ) == ["U3A", "U3B"]
+    assert index.renamed_components() == 2
