@@ -35,6 +35,16 @@ def parse_dim_mil(raw: str | None) -> float | None:
     return value
 
 
+def _parse_text_properties(body: bytes) -> dict[str, str]:
+    text = body.rstrip(b"\x00").decode("latin-1", "replace")
+    properties: dict[str, str] = {}
+    for part in text.split("|"):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            properties[key.strip().upper()] = value
+    return properties
+
+
 def read_text_records(data: bytes) -> list[dict[str, str]]:
     """Decode u32-length-prefixed, pipe-delimited text-property records."""
     records: list[dict[str, str]] = []
@@ -43,19 +53,39 @@ def read_text_records(data: bytes) -> list[dict[str, str]]:
         (record_length,) = struct.unpack_from("<I", data, offset)
         if record_length == 0 or offset + 4 + record_length > len(data):
             break
-        text = (
-            data[offset + 4 : offset + 4 + record_length]
-            .rstrip(b"\x00")
-            .decode("latin-1", "replace")
+        records.append(
+            _parse_text_properties(
+                data[offset + 4 : offset + 4 + record_length]
+            )
         )
-        properties: dict[str, str] = {}
-        for part in text.split("|"):
-            if "=" in part:
-                key, _, value = part.partition("=")
-                properties[key.strip().upper()] = value
-        records.append(properties)
         offset += 4 + record_length
     return records
+
+
+def read_kind_prefixed_text_records(
+    data: bytes,
+) -> tuple[list[tuple[int, dict[str, str]]], int]:
+    """Decode Rules6-style records: u16 kind id, u32 length, text properties.
+
+    Returns (records, trailing_bytes). read_text_records cannot read these:
+    it would take the kind id as part of the length and silently stop.
+    """
+    records: list[tuple[int, dict[str, str]]] = []
+    offset = 0
+    while offset + 6 <= len(data):
+        kind_id, record_length = struct.unpack_from("<HI", data, offset)
+        if record_length == 0 or offset + 6 + record_length > len(data):
+            break
+        records.append(
+            (
+                kind_id,
+                _parse_text_properties(
+                    data[offset + 6 : offset + 6 + record_length]
+                ),
+            )
+        )
+        offset += 6 + record_length
+    return records, len(data) - offset
 
 
 @dataclass
@@ -405,6 +435,7 @@ class PcbComponent:
     y: float | None
     rotation: float | None
     side: str
+    footprint: str | None = None
 
 
 @dataclass
@@ -565,6 +596,7 @@ def decode_components(
                     if record.get("LAYER", "").upper() == "BOTTOM"
                     else "top"
                 ),
+                footprint=record.get("PATTERN") or None,
             )
         )
     return components
@@ -621,6 +653,170 @@ def decode_polygons(
 
 
 @dataclass
+class PcbRule:
+    """One Rules6 design rule (rooms are RoomDefinition rules).
+
+    properties keeps the kind-specific keys verbatim; services/pcb_rules
+    turns them into values. Lower priority numbers win within a kind.
+    """
+
+    name: str
+    kind: str
+    kind_id: int
+    enabled: bool
+    priority: int
+    scope1: str
+    scope2: str
+    net_scope: str | None
+    comment: str
+    unique_id: str | None
+    from_schematic: bool
+    properties: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PcbClass:
+    """A Classes6 / SignalClasses object class and its members.
+
+    Superclasses ("All Nets", ...) have implicit membership and no members.
+    Component and pad members use PCB designators ("U1", "U1-5").
+    """
+
+    name: str
+    kind: str
+    members: list[str]
+    superclass: bool
+    auto_generated: bool
+    unique_id: str | None
+
+
+@dataclass
+class DiffPair:
+    """A DifferentialPairs6 pair; nets are Nets6 names."""
+
+    name: str
+    positive_net: str
+    negative_net: str
+    unique_id: str | None
+
+
+# Rules6 keys shared by every rule kind; the rest are kind-specific values.
+# The primitive-base keys (SELECTION ... UNIONINDEX) carry no rule meaning,
+# except LAYER on RoomDefinition, where it is the room's side.
+_RULE_GENERIC_KEYS = frozenset({
+    "SELECTION", "LAYER", "LOCKED", "POLYGONOUTLINE", "USERROUTED",
+    "KEEPOUT", "UNIONINDEX", "RULEKIND", "NETSCOPE", "LAYERKIND",
+    "SCOPE1EXPRESSION", "SCOPE2EXPRESSION", "NAME", "ENABLED", "PRIORITY",
+    "COMMENT", "UNIQUEID", "DEFINEDBYLOGICALDOCUMENT",
+})
+
+# TClassMemberKind ordinals (KIND=); xSignal classes live in SignalClasses.
+CLASS_KINDS = {
+    0: "net",
+    1: "component",
+    2: "from_to",
+    3: "pad",
+    4: "layer",
+    5: "design_channel",
+    6: "diff_pair",
+    7: "polygon",
+    8: "split_plane",
+    9: "object",
+    10: "xsignal",
+    11: "xnet",
+    12: "xnet_class",
+}
+
+_MEMBER_KEY_RE = re.compile(r"M(\d+)")
+
+
+def decode_rules(
+    records: list[tuple[int, dict[str, str]]],
+) -> list[PcbRule]:
+    """Decode Rules6 records into rules, keeping kind values raw."""
+    rules: list[PcbRule] = []
+    for kind_id, record in records:
+        kind = record.get("RULEKIND") or f"Kind{kind_id}"
+        try:
+            priority = int(record.get("PRIORITY", ""))
+        except ValueError:
+            priority = 1_000_000
+        properties = {
+            key: value
+            for key, value in record.items()
+            if key not in _RULE_GENERIC_KEYS
+        }
+        if kind == "RoomDefinition" and "LAYER" in record:
+            properties["LAYER"] = record["LAYER"]
+        rules.append(
+            PcbRule(
+                name=record.get("NAME") or f"{kind} #{len(rules) + 1}",
+                kind=kind,
+                kind_id=kind_id,
+                enabled=record.get("ENABLED", "TRUE").upper() != "FALSE",
+                priority=priority,
+                scope1=record.get("SCOPE1EXPRESSION") or "All",
+                scope2=record.get("SCOPE2EXPRESSION") or "All",
+                net_scope=record.get("NETSCOPE") or None,
+                comment=record.get("COMMENT", ""),
+                unique_id=record.get("UNIQUEID") or None,
+                from_schematic=(
+                    record.get("DEFINEDBYLOGICALDOCUMENT", "").upper()
+                    == "TRUE"
+                ),
+                properties=properties,
+            )
+        )
+    return rules
+
+
+def decode_classes(records: list[dict[str, str]]) -> list[PcbClass]:
+    """Decode Classes6 / SignalClasses records."""
+    classes: list[PcbClass] = []
+    for record in records:
+        kind_raw = record.get("KIND", "")
+        kind = (
+            CLASS_KINDS.get(int(kind_raw), f"unknown_{kind_raw}")
+            if kind_raw.isdigit()
+            else f"unknown_{kind_raw}"
+        )
+        indexed = sorted(
+            (int(match.group(1)), value)
+            for key, value in record.items()
+            if (match := _MEMBER_KEY_RE.fullmatch(key))
+        )
+        # Duplicate members occur in real files; keep the first occurrence.
+        members = list(dict.fromkeys(value for _, value in indexed if value))
+        classes.append(
+            PcbClass(
+                name=record.get("NAME", ""),
+                kind=kind,
+                members=members,
+                superclass=record.get("SUPERCLASS", "").upper() == "TRUE",
+                auto_generated=(
+                    record.get("AUTOGENERATEDCLASS", "").upper() == "TRUE"
+                ),
+                unique_id=record.get("UNIQUEID") or None,
+            )
+        )
+    return classes
+
+
+def decode_diff_pairs(records: list[dict[str, str]]) -> list[DiffPair]:
+    """Decode DifferentialPairs6 records."""
+    return [
+        DiffPair(
+            name=record.get("NAME", ""),
+            positive_net=record.get("POSITIVENETNAME", ""),
+            negative_net=record.get("NEGATIVENETNAME", ""),
+            unique_id=record.get("UNIQUEID") or None,
+        )
+        for record in records
+        if record.get("NAME")
+    ]
+
+
+@dataclass
 class PcbData:
     """Parsed PCB content ready for indexing."""
 
@@ -632,6 +828,9 @@ class PcbData:
     layer_name_to_v6: dict[str, int]
     warnings: list[str] = field(default_factory=list)
     skipped_records: dict[str, int] = field(default_factory=dict)
+    rules: list[PcbRule] = field(default_factory=list)
+    classes: list[PcbClass] = field(default_factory=list)
+    diff_pairs: list[DiffPair] = field(default_factory=list)
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -730,6 +929,39 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
     if invalid_net_count:
         skipped_records["net_range"] = invalid_net_count
 
+    # Rules, classes and pairs are optional: older or simple boards may lack
+    # a stream, and an empty DifferentialPairs6 is normal. Only failures warn.
+    rules: list[PcbRule] = []
+    if "Rules6/Data" in streams:
+        try:
+            rule_records, _ = read_kind_prefixed_text_records(
+                streams["Rules6/Data"]
+            )
+            rules = decode_rules(rule_records)
+            header = streams.get("Rules6/Header", b"")
+            if len(header) >= 4:
+                (declared,) = struct.unpack_from("<I", header, 0)
+                if declared > len(rules):
+                    skipped_records["Rules6"] = declared - len(rules)
+        except Exception as error:
+            warnings.append(f"Rules6 parse failed: {error}")
+    classes: list[PcbClass] = []
+    for stream in ("Classes6/Data", "SignalClasses/Data"):
+        if stream not in streams:
+            continue
+        try:
+            classes.extend(decode_classes(read_text_records(streams[stream])))
+        except Exception as error:
+            warnings.append(f"{stream.split('/')[0]} parse failed: {error}")
+    diff_pairs: list[DiffPair] = []
+    if "DifferentialPairs6/Data" in streams:
+        try:
+            diff_pairs = decode_diff_pairs(
+                read_text_records(streams["DifferentialPairs6/Data"])
+            )
+        except Exception as error:
+            warnings.append(f"DifferentialPairs6 parse failed: {error}")
+
     return PcbData(
         board=board,
         nets=nets,
@@ -739,6 +971,9 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         layer_name_to_v6=layer_aliases,
         warnings=warnings,
         skipped_records=skipped_records,
+        rules=rules,
+        classes=classes,
+        diff_pairs=diff_pairs,
     )
 
 
@@ -751,6 +986,11 @@ _WANTED_STREAMS = (
     "Arcs6/Data",
     "Pads6/Data",
     "Polygons6/Data",
+    "Rules6/Data",
+    "Rules6/Header",
+    "Classes6/Data",
+    "SignalClasses/Data",
+    "DifferentialPairs6/Data",
 )
 
 

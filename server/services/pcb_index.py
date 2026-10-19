@@ -7,6 +7,7 @@ from collections import defaultdict
 
 try:
     from parsers.pcb_doc import PcbData
+    from services.pcb_rules import RuleContext, RuleTarget
     from services.pcb_geometry import (
         parallel_overlap,
         point_in_polygon,
@@ -19,6 +20,7 @@ try:
     )
 except ImportError:
     from server.parsers.pcb_doc import PcbData
+    from server.services.pcb_rules import RuleContext, RuleTarget
     from server.services.pcb_geometry import (
         parallel_overlap,
         point_in_polygon,
@@ -219,6 +221,7 @@ class PcbIndex:
             self._has_rtree = False
         self._insert_static()
         self._resolve_refdes(netlist)
+        self._build_rule_context()
 
     def _insert_static(self) -> None:
         self.db.executemany(
@@ -393,6 +396,147 @@ class PcbIndex:
                     (schematic_refdes, component.index),
                 )
         self.db.commit()
+
+    # ---------- rules, classes, differential pairs ----------
+
+    def _build_rule_context(self) -> None:
+        """Index classes and pairs for scope evaluation and lookups."""
+        ctx = RuleContext()
+        ctx.net_names = {name.lower(): name for name in self.pcb.nets}
+        tables = {
+            "net": ctx.net_classes,
+            "diff_pair": ctx.pair_classes,
+            "component": ctx.component_classes,
+            "pad": ctx.pad_classes,
+        }
+        self._net_to_classes: dict[str, list[str]] = defaultdict(list)
+        self._pair_to_classes: dict[str, list[str]] = defaultdict(list)
+        for pcb_class in self.pcb.classes:
+            if pcb_class.superclass:
+                ctx.superclasses.setdefault(pcb_class.kind, set()).add(
+                    pcb_class.name.lower()
+                )
+                continue
+            table = tables.get(pcb_class.kind)
+            if table is None:
+                continue
+            members = {member.lower() for member in pcb_class.members}
+            table.setdefault(pcb_class.name.lower(), set()).update(members)
+            reverse = {
+                "net": self._net_to_classes,
+                "diff_pair": self._pair_to_classes,
+            }.get(pcb_class.kind)
+            if reverse is not None:
+                for member in members:
+                    if pcb_class.name not in reverse[member]:
+                        reverse[member].append(pcb_class.name)
+        self._net_to_pairs: dict[str, list[tuple[str, str, str]]] = (
+            defaultdict(list)
+        )
+        for pair in self.pcb.diff_pairs:
+            ctx.pairs[pair.name.lower()] = (
+                pair.name,
+                pair.positive_net,
+                pair.negative_net,
+            )
+            self._net_to_pairs[pair.positive_net.lower()].append(
+                (pair.name, "positive", pair.negative_net)
+            )
+            self._net_to_pairs[pair.negative_net.lower()].append(
+                (pair.name, "negative", pair.positive_net)
+            )
+        ctx.rooms = {
+            rule.name.lower()
+            for rule in self.pcb.rules
+            if rule.kind == "RoomDefinition"
+        }
+        self.rule_context = ctx
+
+    def signal_layers(self) -> dict[int, str]:
+        """Routable copper layers in stack order: v6 id -> display name."""
+        return {
+            v6_id: self.layer_name(v6_id)
+            for v6_id in self._copper_layers_in_stack_order()
+            if 1 <= v6_id <= 32
+        }
+
+    def net_classes_of(self, net: str) -> list[str]:
+        return list(self._net_to_classes.get(net.lower(), []))
+
+    def diff_pairs_of(self, net: str) -> list[dict]:
+        return [
+            {"name": name, "polarity": polarity, "partner_net": partner}
+            for name, polarity, partner in self._net_to_pairs.get(
+                net.lower(), []
+            )
+        ]
+
+    def pair_classes_of(self, pair: str) -> list[str]:
+        return list(self._pair_to_classes.get(pair.lower(), []))
+
+    def routed_length(self, net: str) -> float | None:
+        """Total track and arc length of a net (pours excluded), or None."""
+        net_id = self.net_id(net)
+        if net_id is None:
+            return None
+        row = self.db.execute(
+            "SELECT SUM(SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1))) total "
+            "FROM prims WHERE net_id = ? AND kind IN ('track','arc') "
+            "AND pour_id IS NULL",
+            (net_id,),
+        ).fetchone()
+        return round(row["total"] or 0.0, 1)
+
+    def rule_target(self, name: str) -> RuleTarget | None:
+        """Build the scope-evaluation target for a net or diff pair name."""
+        ctx = self.rule_context
+        key = name.lower()
+        if key in ctx.net_names:
+            kind = "net"
+            nets = {key}
+            pairs = {
+                pair_name.lower()
+                for pair_name, _, _ in self._net_to_pairs.get(key, [])
+            }
+            display = ctx.net_names[key]
+        elif key in ctx.pairs:
+            kind = "diff_pair"
+            display, positive, negative = ctx.pairs[key]
+            nets = {positive.lower(), negative.lower()}
+            pairs = {key}
+        else:
+            return None
+        target = RuleTarget(kind=kind, name=display, nets=nets, pairs=pairs)
+        net_ids = [
+            net_id
+            for net_id in (self.net_id(ctx.net_names.get(net, net)) for net in nets)
+            if net_id is not None
+        ]
+        if not net_ids:
+            return target
+        placeholders = ",".join("?" * len(net_ids))
+        rows = self.db.execute(
+            "SELECT DISTINCT p.component, p.pad_name, c.refdes, c.sch_refdes "
+            "FROM prims p JOIN components c ON c.id = p.component "
+            f"WHERE p.kind = 'pad' AND p.net_id IN ({placeholders})",
+            net_ids,
+        ).fetchall()
+        footprints = {
+            component.index: component.footprint
+            for component in self.pcb.components
+        }
+        for row in rows:
+            for designator in (row["refdes"], row["sch_refdes"]):
+                if designator:
+                    target.components.add(designator.lower())
+                    if row["pad_name"]:
+                        target.pads.add(
+                            f"{designator}-{row['pad_name']}".lower()
+                        )
+            footprint = footprints.get(row["component"])
+            if footprint:
+                target.footprints.add(footprint)
+        return target
 
     def counts(self) -> dict:
         row = self.db.execute(
