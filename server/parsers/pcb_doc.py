@@ -89,6 +89,36 @@ def read_kind_prefixed_text_records(
 
 
 @dataclass
+class ViaStack:
+    """A Vias6 record's mask and pad-stack fields (see decode_vias)."""
+
+    tent_top: bool
+    tent_bottom: bool
+    test_fab_top: bool
+    test_fab_bottom: bool
+    # 0 Simple, 1 Top-Middle-Bottom, 2 Full Stack.
+    mode: int = 0
+    # Pad diameter (mil) per v6 layer 1..32; None in records too short to hold it.
+    layer_diameters: tuple[float, ...] | None = None
+    # v6 layers whose pad is removed: Remove Unused Pad Shapes, and the
+    # non-functional pads Altium removes on back-drilled layers.
+    removed_pads: frozenset[int] = frozenset()
+
+    def pad_diameter(self, layer: int, diameter: float) -> float | None:
+        """The via's pad diameter on a v6 layer, None where it has no pad."""
+        if layer in self.removed_pads:
+            return None
+        sizes = self.layer_diameters
+        if self.mode == 0 or sizes is None or not 1 <= layer <= 32:
+            return diameter
+        if self.mode == 1:
+            size = sizes[0] if layer == 1 else sizes[31] if layer == 32 else sizes[1]
+        else:
+            size = sizes[layer - 1]
+        return size if size > 0 else None
+
+
+@dataclass
 class Primitive:
     """One copper or geometry primitive normalized to mils."""
 
@@ -115,6 +145,8 @@ class Primitive:
     # Pad Pin/Package Length (pad to die, mil): 0.0 when unset, None when the
     # pad record is too short to carry it (and for non-pad primitives).
     pin_package: float | None = None
+    # Vias only: tenting and pad stack.
+    via: ViaStack | None = None
 
 
 def iter_binary_records(data: bytes):
@@ -182,6 +214,42 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
     return primitives, skipped
 
 
+# Vias6 record offsets beyond the common primitive header (KiCad's AVIA6 reads
+# the same ones): flags1 at 1 (0x20 tented top, 0x40 tented bottom, 0x80
+# fabrication test point top), flags2 at 2 (0x01 test point bottom), the
+# stack mode at 74 and 32 int32 pad diameters (v6 layers 1..32) from 75.
+# Bytes 209..240 (208 + v6 id) mark layers whose pad is removed: on the MiniPC
+# example they are exactly the layers below its back-drill pair's stop layer on
+# the vias its BackDrilling rule selects, where Altium removes the
+# non-functional pads; elsewhere single layers marked by Remove Unused Pad Shapes.
+_VIA_MODE_AT = 74
+_VIA_DIAMETERS_AT = 75
+_VIA_REMOVED_PADS_AT = 208
+
+
+def _via_stack(payload: bytes) -> ViaStack:
+    flags1, flags2 = payload[1], payload[2]
+    stack = ViaStack(
+        tent_top=bool(flags1 & 0x20),
+        tent_bottom=bool(flags1 & 0x40),
+        test_fab_top=bool(flags1 & 0x80),
+        test_fab_bottom=bool(flags2 & 0x01),
+    )
+    if len(payload) >= _VIA_DIAMETERS_AT + 32 * 4:
+        stack.mode = payload[_VIA_MODE_AT]
+        stack.layer_diameters = tuple(
+            _units_to_mil(value)
+            for value in struct.unpack_from("<32i", payload, _VIA_DIAMETERS_AT)
+        )
+    if len(payload) > _VIA_REMOVED_PADS_AT + 32:
+        stack.removed_pads = frozenset(
+            layer
+            for layer in range(1, 33)
+            if payload[_VIA_REMOVED_PADS_AT + layer]
+        )
+    return stack
+
+
 def decode_vias(data: bytes) -> tuple[list[Primitive], int]:
     """Decode Vias6 records."""
     primitives: list[Primitive] = []
@@ -215,6 +283,7 @@ def decode_vias(data: bytes) -> tuple[list[Primitive], int]:
                 y2=y_mil,
                 width=_units_to_mil(diameter),
                 hole=_units_to_mil(hole),
+                via=_via_stack(payload),
             )
         )
     return primitives, skipped
@@ -465,6 +534,36 @@ class ImpedanceProfile:
 
 
 @dataclass
+class DrillPair:
+    """A Board6 LAYERPAIRn drill pair (Layer Stack Manager drill pairs and
+    back drills). low/high are the stored layer tokens (TOP, MID4, BOTTOM,
+    or a layer name). A back drill starts at its outer layer and stops before
+    the other one."""
+
+    low: str
+    high: str
+    back_drill: bool = False
+    pair_type: int | None = None  # DRILLPAIRTYPE (2 on back drills)
+
+
+def decode_drill_pairs(properties: dict[str, str]) -> list[DrillPair]:
+    pairs: list[DrillPair] = []
+    index = 0
+    while f"LAYERPAIR{index}LOW" in properties:
+        prefix = f"LAYERPAIR{index}"
+        pairs.append(
+            DrillPair(
+                low=properties[f"{prefix}LOW"],
+                high=properties.get(f"{prefix}HIGH", ""),
+                back_drill=properties.get(f"{prefix}BACKDRILL", "").upper() == "TRUE",
+                pair_type=_optional_int(properties.get(f"{prefix}DRILLPAIRTYPE")),
+            )
+        )
+        index += 1
+    return pairs
+
+
+@dataclass
 class BoardInfo:
     """Board coordinate system and layer metadata."""
 
@@ -483,6 +582,7 @@ class BoardInfo:
     impedance_profiles: list[ImpedanceProfile] = field(default_factory=list)
     # Layer-stack regions (rigid/flex); each {"id", "name", "is_flex"}.
     substacks: list[dict] = field(default_factory=list)
+    drill_pairs: list[DrillPair] = field(default_factory=list)
 
 
 @dataclass
@@ -721,6 +821,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         outline_vertices=outline_vertices,
         substacks=substacks,
         impedance_profiles=decode_impedance_profiles(properties),
+        drill_pairs=decode_drill_pairs(properties),
     )
 
 

@@ -52,6 +52,7 @@ try:
     )
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
+    from services.via_checks import page_result as page_via_result, review_vias
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -93,6 +94,7 @@ except ImportError:
     )
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
+    from server.services.via_checks import page_result as page_via_result, review_vias
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -315,6 +317,12 @@ component locations, distances):
     each IC rail's nearest capacitor and a warning above 5 mm (name the IC in ic= for
     its 5 nearest). It is advice: rails come from net and pin names, and the datasheet
     decides how many capacitors a part needs.
+16. check_vias — "what vias does this board use?", a fab or drill review, aspect
+    ratio, annular ring, via-in-pad, tenting, blind/buried/microvias, back drilling or
+    via stubs: via types with counts per type and net class, depth and aspect ratio from
+    the stack, drill pairs and back drills, with findings. Quote via_types for the
+    fabricator's drill questions; back drilling is recomputed the way Altium writes the
+    drill files, and stubs of nets with no back-drill rule are advice.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -2913,6 +2921,102 @@ def check_decoupling(
                     f"'{Path(project['pcb_doc_paths'][0]).name}'."
                 )
         result = _convert_units({**context, **result}, to_mm)
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Check Vias",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_vias(
+    net: str | None = None,
+    checks: list[str] | None = None,
+    max_aspect_ratio: float | None = None,
+    max_microvia_aspect_ratio: float | None = None,
+    min_annular_ring: float | None = None,
+    max_stub: float | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Via inventory and fabrication review of the PcbDoc. Call it for "what vias does
+    this board use?", a fab or drill review, blind/buried/microvias, aspect ratio,
+    annular ring, via-in-pad, tenting, or back drilling and via stubs.
+
+    via_types lists each type (span by stack layers, hole, pad diameter) with count, nets,
+    drilled depth and aspect ratio from the stack heights, smallest annular ring over the
+    layers keeping a pad, tenting, vias in SMD pads and back-drilled vias; net_classes
+    counts types per net class; drill_pairs and back_drill give the stack's drill pairs,
+    back drills (drilled layers, depth, drill sizes) and Max Via Stub Length rules.
+    Findings: aspect_ratio (warning above 10:1, info above 8:1; microvias above 1:1),
+    annular_ring (below the Minimum Annular Ring rule; info below 0.1 mm without one),
+    via_style (sizes outside the Routing Via Style rule; info for a blind/buried via
+    under a through-hole style), drill_pairs (a blind/buried span with no drill pair),
+    via_in_pad (filling/capping needed; warning when ViasUnderSMD forbids it or the pad
+    is another net), tenting (untented or one side only, test points excepted),
+    back_drill (stub after back drilling above the rule's max, rules without back drills;
+    info for differential-pair nets, or the nets in net, with a stub above max_stub,
+    default 10 mil, and no back-drill rule). Back drilling is recomputed like Altium:
+    a via in the rule's scope is drilled by a back drill when it has no connection on
+    the layers it removes.
+
+    net narrows to comma-separated nets, differential pairs or net classes and checks
+    their stubs; checks narrows the findings. Findings are paginated (offset from
+    next_offset), warnings first. min_annular_ring, max_stub and lengths use units
+    (default: board display unit). Plugging and filling are not read; tenting is."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    limits = {}
+    for name, value in (
+        ("max_aspect_ratio", max_aspect_ratio),
+        ("max_microvia_aspect_ratio", max_microvia_aspect_ratio),
+        ("min_annular_ring", min_annular_ring),
+        ("max_stub", max_stub),
+    ):
+        if value is None:
+            continue
+        if not _finite_nonnegative(value) or (value == 0 and name != "min_annular_ring"):
+            return json.dumps({
+                "error": f"invalid_{name}",
+                "message": f"{name} must be a positive number.",
+            })
+        limits[name] = value
+    full = review_vias(
+        index,
+        checks=checks,
+        nets=_split_names(net),
+        max_aspect_ratio=limits.get("max_aspect_ratio"),
+        max_microvia_aspect_ratio=limits.get("max_microvia_aspect_ratio"),
+        min_annular_ring_mil=(
+            _input_to_mil(min_annular_ring, resolved) if "min_annular_ring" in limits else None
+        ),
+        max_stub_mil=_input_to_mil(max_stub, resolved) if "max_stub" in limits else None,
+    )
+    if "error" in full:
+        return json.dumps(full)
+    project, _, _ = _require_project()
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    if paths:
+        context["pcb_doc"] = Path(paths[0]).name
+        if len(paths) > 1:
+            context["note"] = (
+                f"Project lists {len(paths)} PcbDocs; reviewed '{Path(paths[0]).name}'."
+            )
+    for limit, type_limit, class_limit in ((100, 60, 30), (40, 20, 10), (15, 10, 5), (5, 5, 3)):
+        result = _convert_units(
+            {**context, **page_via_result(full, offset, limit, type_limit, class_limit)},
+            to_mm,
+        )
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)

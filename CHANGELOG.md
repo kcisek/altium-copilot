@@ -155,6 +155,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   browser tab
 
 ### Added
+- `check_vias`: via inventory and fabrication review. Via types by span (first and last
+  layer in stack order: through, blind, buried, microvia), hole and pad diameter, with
+  counts per type and per net class, drilled depth and aspect ratio from the stack's
+  copper and dielectric heights, the smallest annular ring over the layers that keep a
+  pad, tenting, vias in SMD pads and the stack's drill pairs. Back drilling is
+  recomputed the way Altium writes the drill files: the Layer Stack Manager's back
+  drills (drilled from the outer layer, stopping before the other one) apply to vias
+  in a Max Via Stub Length (Back Drilling) rule's scope that have no connection on the
+  layers they remove; each back drill lists its drilled layers, depth and drill sizes
+  (hole plus twice the oversize). Findings: aspect ratio above 10:1 (info above 8:1;
+  microvias above 1:1), annular ring below the Minimum Annular Ring rule (info below
+  0.1 mm without one), sizes outside the Routing Via Style rule, blind or buried spans
+  with no drill pair, vias in SMD pads (filling and capping on the drawing; warning when
+  a ViasUnderSMD rule forbids it), untented or one-side tented vias, stubs above the
+  back-drill rule's maximum, and stubs over 10 mil on differential-pair nets without a
+  back-drill rule. On Altium's MiniPC example the recomputed back drill selects the
+  same 16 vias whose pads Altium removed on the drilled layers
+- The PcbDoc parser reads each via's tenting, test-point flags, pad stack mode and per-layer
+  pad diameters, the layers whose pads are removed, and the stack's drill pairs and back
+  drills (Board6 LAYERPAIRn); BackDrilling, ViasUnderSMD, LayerPairs and the stacked
+  microvia flag of HoleToHoleClearance rules show named values in `get_rules_for_net` and
+  `get_design_rules`
 - `check_decoupling`: offline decoupling coverage. From the compiled netlist and pin names
   it finds the rails (nets named like power, or reaching an IC supply, reference or
   capacitor pin; never a net carrying EN, PG or SENSE), the power pins of ICs fitted in

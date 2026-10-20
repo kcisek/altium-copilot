@@ -865,7 +865,22 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "MAXHEIGHT": ("max_height_mil", "mil"),
     },
     "MinimumAnnularRing": {"MINIMUMRING": ("min_ring_mil", "mil")},
-    "HoleToHoleClearance": {"GAP": ("clearance_mil", "mil")},
+    "HoleToHoleClearance": {
+        "GAP": ("clearance_mil", "mil"),
+        "ALLOWSTACKEDMICROVIAS": ("allow_stacked_microvias", "bool"),
+    },
+    # Max Via Stub Length (Back Drilling): oversize is radial (drill = hole +
+    # 2 x oversize); the max stub length is a DRC limit, not the drill depth.
+    "BackDrilling": {
+        "MAXSTUBLENGTH": ("max_stub_length_mil", "mil"),
+        "HOLEOVERSIZE": ("oversize_mil", "mil"),
+        "HOLETOLPLUS": ("tolerance_plus_mil", "mil"),
+        "HOLETOLMINUS": ("tolerance_minus_mil", "mil"),
+        "USETOPBACKDRILL": ("use_top_back_drill", "bool"),
+        "USEBOTTOMBACKDRILL": ("use_bottom_back_drill", "bool"),
+    },
+    "ViasUnderSMD": {"ALLOWED": ("allowed", "bool")},
+    "LayerPairs": {"ENFORCE": ("enforce", "bool")},
     "ComponentClearance": {"GAP": ("clearance_mil", "mil")},
 }
 

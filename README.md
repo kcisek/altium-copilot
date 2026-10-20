@@ -34,6 +34,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
 | *"Give me the BOM for the Lite variant"* | Per-variant BOM from the compiled parts with MPN and manufacturer, variant differences, CSV; `check_bom` for missing or inconsistent part numbers |
 | *"Are my ICs decoupled? Is C12 close enough to U3?"* | Decoupling coverage per rail and IC: rails with no capacitor to ground, only Not Fitted ones, or behind a ferrite without their own; with the PcbDoc, each IC rail's nearest capacitors and their distance, and a warning above 5 mm |
+| *"What vias does this board use? Any fab issues?"* | Via types by span, hole and pad with counts per type and net class, depth and aspect ratio from the stackup, annular ring, vias in pads, tenting, drill pairs and back drilling, with the stubs left on high-speed nets |
 | *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, component or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board |
 | *"Is the PCB in sync with the schematic?"* | Offline Show Differences: missing or extra parts, footprint and comment changes, pads on the wrong net, and pins Update PCB would fail on |
 | *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them |
