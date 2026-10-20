@@ -157,7 +157,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   spot-check, `query_pcb_region`, `get_net_neighbors`, `check_decoupling`, DRC
   violation nets, pad-to-pad length). Altium stores them as round pads with the real
   shape and corner radius in the pad's size-and-shape subrecord; they were modelled as
-  capsules, which cut their corners away. On Altium's MiniPC example U9's 3V3 pads are
+  capsules, which cut their corners away. On Altium's MiniPC example U9's 3V3 pad is
   33.2 mil from C69, pad edge to pad edge (was 37.0), and on its SODIMM board a 1%
   corner pad that read 7.6 mil from a track is 3.97 mil from it (the clearance rule is
   3.937); on real boards pad gaps shrank by up to 14.6 mil. Corner radii were checked

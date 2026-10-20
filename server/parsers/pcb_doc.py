@@ -380,7 +380,6 @@ def _pad_copper(main: bytes, size_shape: bytes) -> tuple[int, int, int, int]:
         own = mid
         if mode == _PAD_MODE_FULL_STACK:
             inner = layer - 3
-            own = (*mid[:3], layer - 1)
             if (
                 0 <= inner < _PAD_INNER_COUNT
                 and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
