@@ -325,17 +325,24 @@ _PAD_MAIN_MIN_LENGTH = 60
 # the corpus.
 _PAD_PIN_PACKAGE_OFFSET = 158
 # Pad stack mode (main subrecord byte 62): simple pads use the top size and
-# shape on every layer; top-middle-bottom and full-stack pads keep one per
-# layer, and a bottom-layer pad then has its copper in the bottom slot (its
-# top slot can be empty).
+# shape on every layer; top-middle-bottom and full-stack pads keep them per
+# layer (top, mid and bottom in the main subrecord at 21/29/37 and 49/50/51,
+# mid layers 2-30 of a full stack in the size-and-shape subrecord), so a pad
+# on the bottom or an inner layer has its copper in that layer's slot, and
+# its top slot can be empty.
 _PAD_MODE_OFFSET = 62
-_PAD_MODE_SIMPLE = 0
+_PAD_MODE_TOP_MID_BOTTOM = 1
+_PAD_MODE_FULL_STACK = 2
 _BOTTOM_LAYER = 32
 # Size-and-shape subrecord (the one after the main subrecord; KiCad's
-# importer reads the same layout): 32 per-layer slots (0 top, 1-30 mid,
-# 31 bottom) of alt shape at 532 and corner radius percent at 564.
+# importer reads the same layout): int32 sizes of mid layers 2-30 (x at 0,
+# y at 116) and their shapes at 232, then 32 per-layer slots (0 top, 1-30
+# mid, 31 bottom) of alt shape at 532 and corner radius percent at 564.
 _PAD_SIZE_SHAPE_INDEX = 4
 _PAD_SIZE_SHAPE_MIN_LENGTH = 596
+_PAD_INNER_COUNT = 29
+_PAD_INNER_SIZE_Y_OFFSET = 116
+_PAD_INNER_SHAPE_OFFSET = 232
 _PAD_ALT_SHAPE_OFFSET = 532
 _PAD_CORNER_RADIUS_OFFSET = 564
 _PAD_BOTTOM_SLOT = 31
@@ -347,6 +354,53 @@ PAD_SHAPE_OCTAGONAL = 3
 # size-and-shape subrecord's alt shape 9 and corner radius (percent of half
 # the shorter side, 100 = oblong) make it one.
 PAD_SHAPE_ROUNDRECT = 9
+
+
+def _pad_copper(main: bytes, size_shape: bytes) -> tuple[int, int, int, int]:
+    """(size x, size y, shape, slot) of a pad's copper on its own layer.
+
+    A per-layer pad whose own slot is empty takes the first filled one of
+    top, mid and bottom instead of being dropped.
+    """
+    top = (*struct.unpack_from("<ii", main, 21), main[49], 0)
+    mode = main[_PAD_MODE_OFFSET] if len(main) > _PAD_MODE_OFFSET else 0
+    if mode not in (_PAD_MODE_TOP_MID_BOTTOM, _PAD_MODE_FULL_STACK):
+        return top
+    mid = (*struct.unpack_from("<ii", main, 29), main[50], 1)
+    bottom = (
+        *struct.unpack_from("<ii", main, 37),
+        main[51],
+        _PAD_BOTTOM_SLOT,
+    )
+    layer = main[0]
+    own = top
+    if layer == _BOTTOM_LAYER:
+        own = bottom
+    elif 1 < layer < _BOTTOM_LAYER:
+        own = mid
+        if mode == _PAD_MODE_FULL_STACK:
+            inner = layer - 3
+            own = (*mid[:3], layer - 1)
+            if (
+                0 <= inner < _PAD_INNER_COUNT
+                and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
+            ):
+                own = (
+                    struct.unpack_from("<i", size_shape, 4 * inner)[0],
+                    struct.unpack_from(
+                        "<i", size_shape, _PAD_INNER_SIZE_Y_OFFSET + 4 * inner
+                    )[0],
+                    size_shape[_PAD_INNER_SHAPE_OFFSET + inner],
+                    layer - 1,
+                )
+    return next(
+        (
+            copper
+            for copper in (own, top, mid, bottom)
+            if copper[0] > 0 and copper[1] > 0
+        ),
+        own,
+    )
 
 
 def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
@@ -394,31 +448,14 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
         net = struct.unpack_from("<H", main, 3)[0]
         component = struct.unpack_from("<H", main, 7)[0]
         x, y = struct.unpack_from("<ii", main, 13)
-        (
-            size_x,
-            size_y,
-            _mid_size_x,
-            _mid_size_y,
-            bottom_size_x,
-            bottom_size_y,
-            hole,
-        ) = struct.unpack_from("<iiiiiii", main, 21)
-        shape = main[49]
-        slot = 0
-        if (
-            main[0] == _BOTTOM_LAYER
-            and len(main) > _PAD_MODE_OFFSET
-            and main[_PAD_MODE_OFFSET] != _PAD_MODE_SIMPLE
-        ):
-            size_x, size_y = bottom_size_x, bottom_size_y
-            shape = main[51]
-            slot = _PAD_BOTTOM_SLOT
+        (hole,) = struct.unpack_from("<i", main, 45)
+        size_shape = subrecords[_PAD_SIZE_SHAPE_INDEX]
+        size_x, size_y, shape, slot = _pad_copper(main, size_shape)
         (rotation,) = struct.unpack_from("<d", main, 52)
         if size_x <= 0 or size_y <= 0 or hole < 0:
             skipped += 1
             continue
         corner_radius = None
-        size_shape = subrecords[_PAD_SIZE_SHAPE_INDEX]
         if (
             shape == PAD_SHAPE_ROUND
             and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
@@ -426,7 +463,9 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
         ):
             shape = PAD_SHAPE_ROUNDRECT
             percent = min(size_shape[_PAD_CORNER_RADIUS_OFFSET + slot], 100)
-            corner_radius = _units_to_mil(min(size_x, size_y)) * percent / 200.0
+            corner_radius = (
+                _units_to_mil(min(size_x, size_y)) / 2.0 * (percent / 100.0)
+            )
         pin_package = None
         if len(main) >= _PAD_PIN_PACKAGE_OFFSET + 4:
             (raw_pin_package,) = struct.unpack_from(

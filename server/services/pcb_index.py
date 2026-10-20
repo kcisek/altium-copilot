@@ -147,12 +147,16 @@ class PcbIndex:
         minor = min(width, height)
         corner = 0.0
         if shape == PAD_SHAPE_ROUNDRECT:
+            # A row without the column (a hand-built one) reads as a sharp
+            # rectangle: more copper, so distances err small.
             try:
                 corner = self._field(primitive, "corner_radius") or 0.0
             except AttributeError:
                 corner = 0.0
             corner = max(0.0, min(corner, minor / 2.0))
-        if shape == PAD_SHAPE_ROUND or (corner > 0 and corner >= minor / 2.0):
+        if shape == PAD_SHAPE_ROUND or (
+            corner > 0 and corner >= minor / 2.0 - 1e-9
+        ):
             major = max(width, height)
             angle = rotation + (90.0 if height > width else 0.0)
             half_centerline = max(0.0, (major - minor) / 2.0)

@@ -154,16 +154,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   window with "Altium Designer" in its title got the keystrokes, which could be a
   browser tab
 - Rounded-rectangle pads keep their corners in every PCB distance (clearance
-  spot-check, `query_pcb_region`, `get_net_neighbors`, decoupling distances, DRC
+  spot-check, `query_pcb_region`, `get_net_neighbors`, `check_decoupling`, DRC
   violation nets, pad-to-pad length). Altium stores them as round pads with the real
-  shape and corner radius in a second subrecord; they were modelled as capsules, which
-  cut their corners away. On Altium's MiniPC example U9/3V3 to C69 now reads 33.2 mil
-  (was 37.0), and on its SODIMM board a 1 % corner pad that read 7.6 mil from a track
-  is 3.97 mil from it (the clearance rule is 3.937); on real boards pad gaps shrank by
-  up to 14.6 mil. Corner radii were checked against the ROUNDEDRECT apertures of
-  Altium's Gerber output. Bottom-layer pads with a per-layer stack take the bottom
-  layer's size and shape: their top slot can be empty, and three such pads on the
-  Bluetooth Sentinel example were dropped
+  shape and corner radius in the pad's size-and-shape subrecord; they were modelled as
+  capsules, which cut their corners away. On Altium's MiniPC example
+  `check_decoupling` measures U9's 3V3 pads to C69 at 33.2 mil (was 37.0), and on its
+  SODIMM board a 1% corner pad that read 7.6 mil from a track is 3.97 mil from it (the
+  clearance rule is 3.937); on real boards pad gaps shrank by up to 14.6 mil. Corner
+  radii were checked against the ROUNDEDRECT apertures of Altium's Gerber output. Pads
+  with a top-middle-bottom or full stack on the bottom or an inner layer take that
+  layer's size and shape, and an empty slot falls back to a filled one: three
+  bottom-layer pads with an empty top slot on the Bluetooth Sentinel example were
+  dropped
 
 ### Added
 - `check_decoupling`: offline decoupling coverage. From the compiled netlist and pin names

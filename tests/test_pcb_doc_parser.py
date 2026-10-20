@@ -253,6 +253,8 @@ def _pad_record(
     mode=0,
     bottom_size=None,
     bottom_shape=None,
+    mid_size=None,
+    mid_shape=None,
 ) -> bytes:
     name_bytes = name.encode("latin-1")
     name_blob = bytes([len(name_bytes)]) + name_bytes
@@ -262,10 +264,12 @@ def _pad_record(
     struct.pack_into("<H", main, 7, component)
     struct.pack_into("<ii", main, 13, x, y)
     bottom_x, bottom_y = bottom_size or (sx, sy)
+    mid_x, mid_y = mid_size or (sx, sy)
     struct.pack_into(
-        "<iiiiiii", main, 21, sx, sy, sx, sy, bottom_x, bottom_y, hole
+        "<iiiiiii", main, 21, sx, sy, mid_x, mid_y, bottom_x, bottom_y, hole
     )
-    main[49] = main[50] = shape
+    main[49] = shape
+    main[50] = shape if mid_shape is None else mid_shape
     main[51] = shape if bottom_shape is None else bottom_shape
     struct.pack_into("<d", main, 52, rotation)
     main[62] = mode
@@ -317,10 +321,15 @@ def test_decode_pads_out_of_range_layer_skipped():
     assert skipped == 1
 
 
-def _size_and_shape(alt=None, radius=None, length=651) -> bytes:
+def _size_and_shape(alt=None, radius=None, length=651, inner=None) -> bytes:
     """A size-and-shape subrecord: {slot: alt shape} at 532 and {slot:
-    corner radius percent} at 564 (slot 0 top, 31 bottom)."""
+    corner radius percent} at 564 (slot 0 top, 31 bottom), and {k: (x, y,
+    shape)} of mid layer k + 2 (x at 4k, y at 116 + 4k, shape at 232 + k)."""
     record = bytearray(length)
+    for k, (size_x, size_y, shape) in (inner or {}).items():
+        struct.pack_into("<i", record, 4 * k, size_x)
+        struct.pack_into("<i", record, 116 + 4 * k, size_y)
+        record[232 + k] = shape
     for slot, value in (alt or {}).items():
         record[532 + slot] = value
     for slot, value in (radius or {}).items():
@@ -356,6 +365,7 @@ def test_decode_pads_rounded_rectangle():
         (1, _size_and_shape(alt={0: 9}, radius={0: 25}, length=595)),
         (1, b""),
     ],
+    ids=["round", "rect", "short-subrecord", "no-subrecord"],
 )
 def test_decode_pads_without_rounded_corners(shape, size_and_shape):
     (pad,), _ = decode_pads(
@@ -375,6 +385,17 @@ def test_decode_pads_corner_radius_capped_at_oblong():
     assert pad.corner_radius == pytest.approx(20.0)
 
 
+def test_decode_pads_full_corner_radius_is_exactly_half_the_short_side():
+    data = _pad_record(
+        sx=78,
+        sy=100,
+        shape=1,
+        extra_sub=_size_and_shape(alt={0: 9}, radius={0: 100}),
+    )
+    (pad,), _ = decode_pads(data)
+    assert pad.corner_radius == pad.width / 2.0
+
+
 def test_decode_pads_bottom_pad_of_full_stack_uses_bottom_slot():
     # Altium leaves the top slot of such a pad empty: it was dropped before.
     data = _pad_record(
@@ -385,7 +406,9 @@ def test_decode_pads_bottom_pad_of_full_stack_uses_bottom_slot():
         mode=2,
         bottom_size=(40_0000, 60_0000),
         bottom_shape=1,
-        extra_sub=_size_and_shape(alt={0: 1, 31: 9}, radius={31: 50}),
+        extra_sub=_size_and_shape(
+            alt={0: 1, 31: 9}, radius={31: 50}, length=596
+        ),
     )
     (pad,), skipped = decode_pads(data)
     assert skipped == 0
@@ -396,6 +419,90 @@ def test_decode_pads_bottom_pad_of_full_stack_uses_bottom_slot():
         PAD_SHAPE_ROUNDRECT,
     )
     assert pad.corner_radius == pytest.approx(10.0)
+
+
+def _stack_pad(layer, mode, sx=2_4000, sy=3_5000, bottom_size=(40_0000, 60_0000)):
+    """A pad whose top slot is a 2.4 x 3.5 mil round pad and whose other
+    slots are rounded rectangles: mid 20 x 30 (50 %), a full stack's layer 4
+    (mid layer 3) 50 x 70 (20 %), bottom 40 x 60 (50 %)."""
+    return _pad_record(
+        layer=layer,
+        sx=sx,
+        sy=sy,
+        shape=1,
+        mode=mode,
+        mid_size=(20_0000, 30_0000),
+        bottom_size=bottom_size,
+        extra_sub=_size_and_shape(
+            alt={0: 1, 1: 9, 3: 9, 31: 9},
+            radius={1: 50, 3: 20, 31: 50},
+            inner={1: (50_0000, 70_0000, 1)},
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "layer, mode, expected",
+    [
+        (32, 1, (40.0, 60.0, PAD_SHAPE_ROUNDRECT, 10.0)),
+        (32, 2, (40.0, 60.0, PAD_SHAPE_ROUNDRECT, 10.0)),
+        # Only modes 1 and 2 keep per-layer copper.
+        (32, 0, (2.4, 3.5, 1, None)),
+        (32, 7, (2.4, 3.5, 1, None)),
+        (1, 2, (2.4, 3.5, 1, None)),
+        (74, 1, (2.4, 3.5, 1, None)),
+        # Inner layers: mid slot (alt slot 1) in mode 1 and for mid layer 1.
+        (5, 1, (20.0, 30.0, PAD_SHAPE_ROUNDRECT, 5.0)),
+        (2, 2, (20.0, 30.0, PAD_SHAPE_ROUNDRECT, 5.0)),
+        # Mid layer 3 of a full stack: inner size 1, alt slot 3.
+        (4, 2, (50.0, 70.0, PAD_SHAPE_ROUNDRECT, 5.0)),
+    ],
+)
+def test_decode_pads_per_layer_stack(layer, mode, expected):
+    (pad,), skipped = decode_pads(_stack_pad(layer, mode))
+    assert skipped == 0
+    assert (pad.width, pad.height, pad.shape) == pytest.approx(expected[:3])
+    if expected[3] is None:
+        assert pad.corner_radius is None
+    else:
+        assert pad.corner_radius == pytest.approx(expected[3])
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize(
+    "top_shape, bottom_shape, expected",
+    [(2, 1, PAD_SHAPE_ROUNDRECT), (1, 2, 2)],
+)
+def test_decode_pads_bottom_pad_takes_the_bottom_shape(
+    mode, top_shape, bottom_shape, expected
+):
+    data = _pad_record(
+        layer=32,
+        shape=top_shape,
+        mode=mode,
+        bottom_size=(40_0000, 60_0000),
+        bottom_shape=bottom_shape,
+        extra_sub=_size_and_shape(alt={0: 9, 31: 9}, radius={0: 50, 31: 50}),
+    )
+    (pad,), _ = decode_pads(data)
+    assert pad.shape == expected
+
+
+def test_decode_pads_per_layer_stack_with_empty_slot_takes_a_filled_one():
+    (bottom,), _ = decode_pads(_stack_pad(32, 1, bottom_size=(0, 0)))
+    assert (bottom.width, bottom.height, bottom.corner_radius) == (
+        2.4,
+        3.5,
+        None,
+    )
+    (multi,), skipped = decode_pads(_stack_pad(74, 2, sx=0, sy=0))
+    assert skipped == 0
+    assert (multi.width, multi.height, multi.shape) == (
+        20.0,
+        30.0,
+        PAD_SHAPE_ROUNDRECT,
+    )
+    assert multi.corner_radius == pytest.approx(5.0)
 
 
 def test_decode_pads_bottom_pad_of_simple_stack_uses_top_slot():

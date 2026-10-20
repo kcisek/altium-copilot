@@ -663,6 +663,40 @@ def test_rounded_rectangle_pad_limits(pcb_data, corner, same_as):
         ) == pytest.approx(index._point_primitive_distance(*point, reference))
 
 
+def test_rounded_rectangle_pad_at_an_angle_and_overlapping(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=10.0, rotation=30.0)
+    cosine, sine = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    # (30, 40) in the pad's own frame, turned with it.
+    x, y = 30.0 * cosine - 40.0 * sine, 30.0 * sine + 40.0 * cosine
+    assert index._point_primitive_distance(x, y, pad) == pytest.approx(
+        math.hypot(20.0, 20.0) - 10.0
+    )
+    # Core 20 x 40 turned 30 degrees, grown by 10.
+    half_x = 10.0 * cosine + 20.0 * sine + 10.0
+    half_y = 10.0 * sine + 20.0 * cosine + 10.0
+    assert index._primitive_bounds(pad) == pytest.approx(
+        (-half_x, -half_y, half_x, half_y)
+    )
+    inside = _rounded_pad(corner=1.0)
+    inside.width = inside.height = 4.0
+    assert index._primitive_distance(pad, inside) == 0.0
+    assert index._primitive_distance(inside, pad) == 0.0
+    overlapping = _rounded_pad(corner=10.0, rotation=30.0)
+    overlapping.x1 = overlapping.x2 = 30.0 * cosine
+    overlapping.y1 = overlapping.y2 = 30.0 * sine
+    assert index._primitive_distance(pad, overlapping) == 0.0
+
+
+def test_full_corner_radius_is_an_oblong(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=20.0 - 1e-12)
+    segment, radius, polygon = index._primitive_geometry(pad)
+    assert polygon is None
+    assert radius == pytest.approx(20.0)
+    assert segment == pytest.approx((0.0, -10.0, 0.0, 10.0))
+
+
 def test_rounded_rectangle_row_without_corner_column(pcb_data):
     index = PcbIndex(pcb_data, NETLIST)
     row = {
