@@ -6,6 +6,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- The PcbDoc parser reads whether a pad's hole is plated, a square or slot hole's
+  angle, whether the hole is offset from the pad, pads that are bare holes (no copper,
+  such as mounting holes; MiniPC has 16 that Altium's drill table lists) and the number
+  of embedded board arrays (panels)
 - `check_pcb_health`: Altium's PCB Health Check Monitor run offline on the saved PcbDoc,
   with Altium's category names, ids and levels (High error, Medium warning, Low info) so
   a saved Batch DRC report's health section compares one to one (`altium_report`).
@@ -363,6 +367,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
+- Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)
+  were read as no-net copper: `get_board_info` counted them as tracks and arcs, and
+  `check_rule_compliance` listed them among the no-net copper it skips. They are now
+  skipped like keepout regions and fills; objects on the Keep-Out layer are unchanged
 - `check_vias` sizes a back drill as the via hole plus the Max Via Stub Length (Back
   Drilling) rule's oversize, matching the drill sizes Altium wrote for the Mini PC
   example. It added the oversize twice, following Altium's help, which calls the

@@ -1,5 +1,6 @@
 import math
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,7 @@ from server.parsers.pcb_doc import (
     PcbData,
     pad_copper_on,
     decode_arcs,
+    decode_bare_holes,
     decode_board,
     decode_components,
     decode_nets,
@@ -292,6 +294,7 @@ def _pad_record(
     bottom_shape=None,
     mid_size=None,
     mid_shape=None,
+    plated=None,
 ) -> bytes:
     name_bytes = name.encode("latin-1")
     name_blob = bytes([len(name_bytes)]) + name_bytes
@@ -309,6 +312,8 @@ def _pad_record(
     main[50] = shape if mid_shape is None else mid_shape
     main[51] = shape if bottom_shape is None else bottom_shape
     struct.pack_into("<d", main, 52, rotation)
+    if plated is not None:
+        main[60] = int(plated)
     main[62] = mode
     subrecords = [b"\x00", b"\x00" * 5, b"\x00", bytes(main), extra_sub]
     body = struct.pack("<I", len(name_blob)) + name_blob
@@ -1511,3 +1516,125 @@ def test_decode_wide_strings_steps_over_a_bodyless_record():
 def test_decode_wide_strings_stops_at_a_malformed_record():
     data = _wide(1, "A") + struct.pack("<II", 9, 0xFFFFFF) + b"junk"
     assert decode_wide_strings(data) == {1: "A"}
+
+
+# ---------- keepouts, plated holes, slots, bare holes, panels ----------
+
+def _keepout(payload: bytes) -> bytes:
+    flagged = bytearray(payload)
+    flagged[2] = 2
+    return bytes(flagged)
+
+
+def test_signal_layer_keepout_tracks_and_arcs_are_not_copper():
+    data = (_bin_record(4, _track_payload(layer=1, net=NO_NET))
+            + _bin_record(4, _keepout(_track_payload(layer=1, net=NO_NET)))
+            + _bin_record(4, _keepout(_track_payload(layer=56, net=NO_NET))))
+    tracks, skipped = decode_tracks(data)
+    assert [track.layer for track in tracks] == [1, 56] and skipped == 0
+    arcs, skipped = decode_arcs(_bin_record(1, _keepout(_arc_payload(layer=1))))
+    assert arcs == [] and skipped == 0
+
+
+def _size_shape(hole_shape=0, slot_length=0, slot_rotation=0.0, offset=(0, 0)) -> bytes:
+    size_shape = bytearray(651)
+    size_shape[262] = hole_shape
+    struct.pack_into("<i", size_shape, 263, slot_length)
+    struct.pack_into("<d", size_shape, 267, slot_rotation)
+    struct.pack_into("<i", size_shape, 275, offset[0])
+    struct.pack_into("<i", size_shape, 403, offset[1])
+    return bytes(size_shape)
+
+
+def test_pad_holes_plated_slots_and_offsets():
+    data = (
+        _pad_record(name="1", layer=74, hole=1_0000, plated=True, extra_sub=_size_shape())
+        + _pad_record(name="2", layer=74, hole=1_0000, plated=False,
+                      extra_sub=_size_shape(offset=(0, 5000)))
+        + _pad_record(name="3", layer=74, hole=1_0000, plated=True,
+                      extra_sub=_size_shape(2, 4_0000, 90.0))
+        + _pad_record(name="4", layer=1)
+    )
+    pads, skipped = decode_pads(data)
+    assert skipped == 0
+    assert [pad.plated for pad in pads] == [True, False, True, None]
+    assert [pad.hole_offset for pad in pads] == [False, True, False, False]
+    assert (pads[2].hole_shape, pads[2].slot_length, pads[2].slot_rotation) == (2, 4.0, 90.0)
+    assert pads[0].slot_rotation is None  # a round hole has no angle
+
+
+def test_bare_holes_are_read_beside_the_pads():
+    bare = _pad_record(name="MH", layer=74, sx=0, sy=0, hole=12_0000, plated=False,
+                       net=NO_NET, component=0xFFFF)
+    data = _pad_record(name="1", layer=74, hole=1_0000, plated=True) + bare
+    pads, skipped = decode_pads(data)
+    assert len(pads) == 1 and skipped == 1  # still counted as skipped
+    (hole,) = decode_bare_holes(data)
+    assert (hole.pad_name, hole.hole, hole.plated, hole.net, hole.component) == (
+        "MH", 12.0, False, None, None)
+    assert (hole.x, hole.y) == (150.0, 250.0)
+    streams = {**_minimal_streams(), "Pads6/Data": data,
+               "EmbeddedBoards6/Data": _stream_text([{"ROWCOUNT": "2"}])}
+    pcb = parse_streams(streams)
+    assert [h.pad_name for h in pcb.bare_holes] == ["MH"]
+    assert pcb.skipped_records["Pads6"] == 1 and pcb.embedded_boards == 1
+    assert parse_streams(_minimal_streams()).embedded_boards == 0
+
+
+def test_bare_hole_selection_and_fields():
+    no_hole = _pad_record(name="X", layer=74, sx=0, sy=0, hole=0)
+    one_side = _pad_record(name="Y", layer=74, sx=0, sy=3_0000, hole=1_0000, plated=True)
+    slot = _pad_record(name="S", layer=74, sx=0, sy=0, hole=1_0000, rotation=30.0,
+                       plated=False, extra_sub=_size_shape(2, 4_0000, 45.0))
+    data = no_hole + one_side + slot
+    pads, skipped = decode_pads(data)
+    assert pads == [] and skipped == 3
+    holes = decode_bare_holes(data)
+    assert [hole.pad_name for hole in holes] == ["Y", "S"]  # a pad with no hole is no hole
+    bare_slot = holes[1]
+    assert (bare_slot.hole_shape, bare_slot.slot_length, bare_slot.slot_rotation) == (2, 4.0, 45.0)
+    assert (bare_slot.rotation, bare_slot.layer, bare_slot.plated) == (30.0, 74, False)
+
+
+def test_pad_hole_fields_at_record_boundaries():
+    short = bytearray(_pad_record_with_main(60, None))
+    long = bytearray(_pad_record_with_main(61, None))
+    for record in (short, long):
+        # hole of 1 mil at offset 45 of the main subrecord (after the 7-byte header,
+        # the 3 leading subrecords and the main's length).
+        main_at = 1 + 4 + 2 + (4 + 1) + (4 + 5) + (4 + 1) + 4
+        struct.pack_into("<i", record, main_at + 45, 1_0000)
+    long[main_at + 60] = 1
+    assert decode_pads(bytes(short))[0][0].plated is None  # 60 bytes: no plated byte
+    assert decode_pads(bytes(long))[0][0].plated is True
+    # A record cut short at the end keeps the pads before it.
+    good = _pad_record(name="1")
+    pads, _ = decode_pads(good + _pad_record(name="2")[:-10])
+    assert [pad.pad_name for pad in pads] == ["1"]
+    # The X offset alone marks the hole offset; a square hole carries its angle.
+    pads, _ = decode_pads(
+        _pad_record(name="3", layer=74, hole=1_0000, extra_sub=_size_shape(offset=(5000, 0)))
+        + _pad_record(name="4", layer=74, hole=1_0000, extra_sub=_size_shape(1, 2_0000, 30.0)))
+    assert pads[0].hole_offset is True
+    assert (pads[1].hole_shape, pads[1].slot_rotation) == (1, 30.0)
+
+
+EXAMPLES = Path(r"C:\Users\Public\Documents\Altium\AD25\Examples")
+
+
+def test_examples_bare_holes_and_panels():
+    minipc = EXAMPLES / "Mini PC" / "Mini PC - Motherboard" / "MiniPC.PcbDoc"
+    panel = EXAMPLES / "Mini PC" / "Mini PC - WiFi" / "WiFi_panel.PcbDoc"
+    if not (minipc.is_file() and panel.is_file()):
+        pytest.skip("Altium example boards not installed")
+    from collections import Counter
+
+    from server.parsers.pcb_doc import parse_pcb_doc
+
+    pcb = parse_pcb_doc(str(minipc))
+    # Altium's drill table (MiniPC_Drill.PCBDwf): 6 plated, 10 non-plated bare holes.
+    rows = Counter((hole.plated, round(hole.hole * 0.0254, 2)) for hole in pcb.bare_holes)
+    assert rows == {(True, 2.6): 2, (True, 2.9): 4, (False, 1.55): 4, (False, 3.25): 4,
+                    (False, 2.35): 2}
+    assert pcb.embedded_boards == 0
+    assert parse_pcb_doc(str(panel)).embedded_boards == 1

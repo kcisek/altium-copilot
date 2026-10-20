@@ -1345,10 +1345,10 @@ def check_compliance(
                     "kind": "Width / RoutingLayers (no-net copper)",
                     "objects": no_net,
                     "reason": (
-                        "No-net tracks and arcs are skipped: keepouts carry no "
-                        "net and cannot be told apart (the keepout flag is not "
-                        "parsed). Hatched-pour tracks and arcs are not among "
-                        "them: they take their pour's net."
+                        "No-net tracks and arcs are skipped: they have no net to "
+                        "resolve a rule for (keepouts on signal layers are not "
+                        "read as copper at all). Hatched-pour tracks and arcs "
+                        "are not among them: they take their pour's net."
                     ),
                 }
             )

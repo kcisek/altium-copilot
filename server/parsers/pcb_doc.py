@@ -208,6 +208,13 @@ class Primitive:
     # hole's length (mil), from the size-and-shape subrecord; None when absent.
     hole_shape: int | None = None
     slot_length: float | None = None
+    # Pads with a hole: plated (main subrecord byte 60), None when the record is
+    # too short to say. The square or slot hole's angle (degrees, relative to the
+    # pad's rotation), None for round holes. hole_offset: the hole is offset from
+    # the pad centre (size-and-shape offsets not zero; their axes are not decoded).
+    plated: bool | None = None
+    slot_rotation: float | None = None
+    hole_offset: bool = False
 
 
 def iter_binary_records(data: bytes):
@@ -235,6 +242,12 @@ def _optional_index(value: int, sentinel: int) -> int | None:
 
 def _valid_layer(layer: int) -> bool:
     return 0 < layer <= 82
+
+
+def _signal_keepout(payload: bytes) -> bool:
+    """A Tracks6 / Arcs6 layer-specific keepout on a signal layer (flags2 at 2
+    is 2, as for regions and fills): a routing barrier, not copper."""
+    return payload[2] == _KEEPOUT and _signal_layer(payload[0])
 
 
 # Tracks6 / Arcs6 u16 at payload offset 5: the Polygons6 index of the pour
@@ -270,6 +283,8 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
         )
         if width <= 0:
             skipped += 1
+            continue
+        if _signal_keepout(payload):
             continue
         primitives.append(
             Primitive(
@@ -464,6 +479,8 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
         if width == 0:
             skipped += 1
             continue
+        if _signal_keepout(payload):
+            continue
         center_x_mil = _units_to_mil(center_x)
         center_y_mil = _units_to_mil(center_y)
         radius_mil = _units_to_mil(radius)
@@ -655,16 +672,15 @@ def _pad_layer_copper(
     return layer_copper or None
 
 
-def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
-    """Decode Pads6 multi-subrecord records."""
-    primitives: list[Primitive] = []
-    skipped = 0
+def _pad_records(data: bytes):
+    """Yield (record type, pad name, five subrecords) per Pads6 record; stop at a
+    record that runs past the stream."""
     offset = 0
     while offset + 5 <= len(data):
         record_type = data[offset]
         (name_length,) = struct.unpack_from("<I", data, offset + 1)
         if offset + 5 + name_length > len(data):
-            break
+            return
         name_blob = data[offset + 5 : offset + 5 + name_length]
         pad_name = (
             name_blob[1 : 1 + name_blob[0]].decode("latin-1", "replace")
@@ -673,28 +689,56 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
         )
         position = offset + 5 + name_length
         subrecords: list[bytes] = []
-        truncated = False
         for _ in range(_PAD_SUBRECORD_COUNT):
             if position + 4 > len(data):
-                truncated = True
-                break
+                return
             (subrecord_length,) = struct.unpack_from("<I", data, position)
             if position + 4 + subrecord_length > len(data):
-                truncated = True
-                break
+                return
             subrecords.append(
                 data[position + 4 : position + 4 + subrecord_length]
             )
             position += 4 + subrecord_length
-        if truncated:
-            break
         offset = position
-        main = subrecords[_PAD_MAIN_INDEX]
-        if (
-            record_type != 2
-            or len(main) < _PAD_MAIN_MIN_LENGTH
-            or not _valid_layer(main[0])
-        ):
+        yield record_type, pad_name, subrecords
+
+
+def _pad_main(record_type: int, subrecords: list[bytes]) -> bytes | None:
+    main = subrecords[_PAD_MAIN_INDEX]
+    if (
+        record_type != 2
+        or len(main) < _PAD_MAIN_MIN_LENGTH
+        or not _valid_layer(main[0])
+    ):
+        return None
+    return main
+
+
+def _hole_fields(main: bytes, size_shape: bytes, hole_shape: int | None) -> dict:
+    """plated, slot_rotation and hole_offset of a pad with a hole."""
+    rotation = None
+    if hole_shape in (1, 2) and len(size_shape) >= _PAD_SLOT_ROTATION_OFFSET + 8:
+        (rotation,) = struct.unpack_from("<d", size_shape, _PAD_SLOT_ROTATION_OFFSET)
+        if not math.isfinite(rotation):
+            rotation = None
+    offset = False
+    if len(size_shape) >= _PAD_HOLE_OFFSET_Y + 4:
+        offset = any(
+            struct.unpack_from("<i", size_shape, at)[0]
+            for at in (_PAD_HOLE_OFFSET_X, _PAD_HOLE_OFFSET_Y)
+        )
+    plated = bool(main[_PAD_PLATED_OFFSET]) if len(main) > _PAD_PLATED_OFFSET else None
+    return {"plated": plated, "slot_rotation": rotation, "hole_offset": offset}
+
+
+def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
+    """Decode Pads6 multi-subrecord records. Pads without copper (hole-only
+    pads) are counted as skipped; decode_bare_holes reads their holes."""
+    primitives: list[Primitive] = []
+    skipped = 0
+    for record_type, pad_name, subrecords in _pad_records(data):
+        main = _pad_main(record_type, subrecords)
+        if main is None:
             skipped += 1
             continue
         net = struct.unpack_from("<H", main, 3)[0]
@@ -743,15 +787,77 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                 ),
                 hole_shape=hole_shape if hole > 0 else None,
                 slot_length=slot_length if hole > 0 else None,
+                **(_hole_fields(main, size_shape, hole_shape) if hole > 0 else {}),
             )
         )
     return primitives, skipped
+
+
+@dataclass
+class BareHole:
+    """A Pads6 pad with a hole and no copper (copper size 0 or less), such as a
+    mounting hole drawn as a bare hole: a drilled hole, not a copper primitive.
+    Lengths in mil, absolute coordinates; fields as on Primitive."""
+
+    x: float
+    y: float
+    hole: float
+    layer: int
+    net: int | None
+    component: int | None
+    pad_name: str
+    rotation: float = 0.0
+    hole_shape: int | None = None
+    slot_length: float | None = None
+    plated: bool | None = None
+    slot_rotation: float | None = None
+    hole_offset: bool = False
+
+
+def decode_bare_holes(data: bytes) -> list[BareHole]:
+    """The holes of Pads6 pads without copper, which decode_pads skips."""
+    holes: list[BareHole] = []
+    for record_type, pad_name, subrecords in _pad_records(data):
+        main = _pad_main(record_type, subrecords)
+        if main is None:
+            continue
+        (hole,) = struct.unpack_from("<i", main, 45)
+        size_shape = subrecords[_PAD_SIZE_SHAPE_INDEX]
+        raw_copper = _pad_copper(main, size_shape)
+        if hole <= 0 or (raw_copper[0] > 0 and raw_copper[1] > 0):
+            continue
+        x, y = struct.unpack_from("<ii", main, 13)
+        net = struct.unpack_from("<H", main, 3)[0]
+        component = struct.unpack_from("<H", main, 7)[0]
+        (rotation,) = struct.unpack_from("<d", main, 52)
+        hole_shape, slot_length = _hole_slot(size_shape)
+        holes.append(BareHole(
+            x=_units_to_mil(x),
+            y=_units_to_mil(y),
+            hole=_units_to_mil(hole),
+            layer=main[0],
+            net=_optional_index(net, NO_NET),
+            component=_optional_index(component, NO_COMPONENT),
+            pad_name=pad_name,
+            rotation=rotation if math.isfinite(rotation) else 0.0,
+            hole_shape=hole_shape,
+            slot_length=slot_length,
+            **_hole_fields(main, size_shape, hole_shape),
+        ))
+    return holes
 
 
 # Size-and-shape subrecord: 29 inner sizes x and y (232 bytes), 29 inner shapes, one
 # byte, then the hole shape (u8: 0 round, 1 square, 2 slot) and the slot length (int32).
 _PAD_HOLE_SHAPE_OFFSET = 262
 _PAD_SLOT_LENGTH_OFFSET = 263
+# Then the square or slot hole's angle relative to the pad (double), and per layer
+# hole offsets: the top layer's x and y (int32) at 275 and 403.
+_PAD_SLOT_ROTATION_OFFSET = 267
+_PAD_HOLE_OFFSET_X = 275
+_PAD_HOLE_OFFSET_Y = 403
+# Main subrecord: 1 for a plated hole (matches Altium's drill tables).
+_PAD_PLATED_OFFSET = 60
 
 
 def _hole_slot(size_shape: bytes) -> tuple[int | None, float | None]:
@@ -2119,6 +2225,11 @@ class PcbData:
     # 'Fills6'), so a missing stream is not mistaken for no area copper.
     areas: list[CopperArea] = field(default_factory=list)
     area_streams: tuple[str, ...] = ()
+    # Pads6 pads without copper (mounting holes drawn as bare holes); decode_pads
+    # counts them under skipped_records["Pads6"].
+    bare_holes: list[BareHole] = field(default_factory=list)
+    # EmbeddedBoards6 records: a panel's board arrays, whose boards are not read.
+    embedded_boards: int = 0
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -2251,6 +2362,18 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         primitives.extend(decoded)
         if skipped:
             skipped_records[stream_name] = skipped
+    bare_holes: list[BareHole] = []
+    if "Pads6/Data" in streams:
+        try:
+            bare_holes = decode_bare_holes(streams["Pads6/Data"])
+        except Exception as error:
+            warnings.append(f"Pads6 bare holes parse failed: {error}")
+    embedded_boards = 0
+    if "EmbeddedBoards6/Data" in streams:
+        try:
+            embedded_boards = len(read_text_records(streams["EmbeddedBoards6/Data"]))
+        except Exception as error:
+            warnings.append(f"EmbeddedBoards6 parse failed: {error}")
 
     pours: list[PolygonPour] = []
     if "Polygons6/Data" in streams:
@@ -2384,6 +2507,8 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         raw={stream: streams[stream] for stream in LAZY_STREAMS if stream in streams},
         areas=valid_areas,
         area_streams=tuple(area_streams),
+        bare_holes=bare_holes,
+        embedded_boards=embedded_boards,
     )
 
 
@@ -2406,6 +2531,7 @@ _WANTED_STREAMS = (
     "SignalClasses/Data",
     "DifferentialPairs6/Data",
     "Design Rule Checker Options6/Data",
+    "EmbeddedBoards6/Data",
 )
 
 
