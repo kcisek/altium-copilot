@@ -378,6 +378,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   Sentinel's round GND pours have 3 to 5 vertices and arcs of up to 315 degrees.
   Read straight, 13,468 of their 20,340 poured track and arc ends lay more than
   0.3 mil outside them; now none do. On 83 real boards, 116 pours have arc edges
+- `check_pcb_health` read a Regions6 or BoardRegions record whose vertices are not
+  finite coordinates, or whose hole list runs past the record, as a region. It now
+  counts it as unread, as `check_connectivity` already did: both decode Regions6 and
+  Fills6 with one record reader. No region changes on Altium's examples or 83 real boards
 - `get_drc_report`: a report where several tables list a different number of rows
   than their counts ("3 tables list ...") was called incomplete instead of having counts
   that differ
