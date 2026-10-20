@@ -1482,8 +1482,9 @@ def _finite_nonnegative(value: float) -> bool:
 
 PCB_POLYGON_GEOMETRY_NOTE = (
     "Repour polygons in Altium and save the PcbDoc before relying on polygon "
-    "results. These tools model saved nominal polygon outlines, not final "
-    "region/fill copper; verify voids, cutouts, removed islands, and "
+    "results. These tools model saved nominal polygon outlines and the tracks "
+    "and arcs of hatched pours, not solid pours' region/fill copper; shelved "
+    "pours have no copper. Verify voids, cutouts, removed islands, and "
     "clearances in Altium."
 )
 
@@ -1503,6 +1504,9 @@ def _annotate_dnp(records: list[dict]) -> None:
 )
 def get_board_info(units: PcbUnits | None = None) -> str:
     """Return board geometry, stackup, counts, and data freshness.
+
+    counts: tracks and arcs are routing; pour_copper is the tracks and arcs of
+    hatched pours; shelved_pours are pours without copper.
 
     units controls returned coordinates and lengths; it defaults to the
     board's display unit.
@@ -1659,7 +1663,12 @@ def _safe_regex(pattern: str) -> bool:
     meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
 )
 def get_net_pcb(net: str, units: PcbUnits | None = None) -> str:
-    """Return physical PCB routing details for exact or regex-matched nets."""
+    """Return physical PCB routing details for exact or regex-matched nets.
+
+    layers are routing: a hatched pour's tracks and arcs are not counted.
+    pours lists the net's polygon pours, shelved ones (no copper) with
+    shelved true.
+    """
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)
@@ -1766,11 +1775,14 @@ def get_net_neighbors(
 ) -> str:
     """Return same-layer proximity and adjacent-layer overlap for a PCB net.
 
-    neighbors are copper-to-copper edge distances (tracks, arcs, vias, pads).
+    neighbors are copper-to-copper edge distances (tracks, arcs, vias, pads,
+    and a hatched pour's tracks and arcs: pour_copper_segments counts those;
+    they add no close_segments or parallel run).
     pours lists other nets' polygon pours on the net's layers, by their drawn
     outline only: inside_pour when the net's copper lies within the outline,
     min_outline_distance_mil when the outline comes within distance. An outline
     is not copper, and poured copper keeps the pour's clearance from the net.
+    Shelved pours have no copper and are left out.
 
     An explicit distance is expressed in units (default: board display unit).
     Omitting distance uses a physical default of 10 mil.
@@ -1836,9 +1848,10 @@ def query_pcb_region(
 ) -> str:
     """Return nets, components, and pours near a board coordinate.
 
-    nets holds copper only (tracks, arcs, vias, pads). pours are polygon pours
-    by their drawn outline: inside_pour, or the distance to the outline, which
-    is not copper.
+    nets holds copper only (tracks, arcs, vias, pads; a hatched pour's tracks
+    and arcs are kind "pour"). pours are polygon pours by their drawn outline:
+    inside_pour, or the distance to the outline, which is not copper. Shelved
+    pours have no copper and are left out.
 
     x, y, and an explicit radius are expressed in units (default: board
     display unit). Omitting radius uses a physical default of 50 mil.

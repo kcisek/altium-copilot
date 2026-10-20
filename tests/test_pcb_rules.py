@@ -571,6 +571,15 @@ PAD_U3 = dict(kind="pad", layer=1, span=frozenset({1}), points=((300, 300),),
     ("InNetClass('Clocks') and Not IsVia", TRACK_TOP_IN_ROOM, "yes"),
     ("InNetClass('Clocks') and Not IsVia", VIA, "no"),
     ("OnLayer('No Such Layer')", TRACK_TOP_IN_ROOM, "conditional"),
+    # A hatched pour's track is in its polygon; routing is not.
+    ("InPolygon", dict(TRACK_TOP_IN_ROOM, in_pour=True), "yes"),
+    ("InNetClass('Clocks') and Not InPolygon", dict(TRACK_TOP_IN_ROOM, in_pour=True), "no"),
+    ("InNetClass('Clocks') and Not InPolygon", TRACK_TOP_IN_ROOM, "yes"),
+    # IsPolygon and IsNamedPolygon return the polygon object, not its copper.
+    ("IsPolygon", dict(TRACK_TOP_IN_ROOM, in_pour=True), "no"),
+    ("IsNamedPolygon('GND')", dict(TRACK_TOP_IN_ROOM, in_pour=True), "no"),
+    ("IsPolygon", TRACK_TOP_IN_ROOM, "no"),
+    ("InNamedPolygon('GND')", dict(TRACK_TOP_IN_ROOM, in_pour=True), "conditional"),
 ])
 def test_object_scopes_are_decided(obj_ctx, scope, facts, expected):
     assert _matches(scope, _on(CLK_A, **facts), obj_ctx) == expected

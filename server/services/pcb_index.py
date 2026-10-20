@@ -78,6 +78,7 @@ CREATE TABLE prims (
     layer_to INTEGER,
     component INTEGER,
     pour_id INTEGER,
+    poured_by INTEGER,
     x1 REAL,
     y1 REAL,
     x2 REAL,
@@ -106,6 +107,7 @@ CREATE TABLE pours (
     net_id INTEGER,
     layer INTEGER,
     hatch_style TEXT,
+    shelved INTEGER,
     vertices TEXT,
     minx REAL,
     miny REAL,
@@ -393,12 +395,12 @@ class PcbIndex:
             )
             cursor = self.db.execute(
                 "INSERT INTO prims ("
-                "kind, net_id, layer, layer_to, component, pour_id, "
+                "kind, net_id, layer, layer_to, component, pour_id, poured_by, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
                 "corner_radius, layer_copper, source_id, "
                 "hole, pad_name, length, pin_package, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -406,6 +408,7 @@ class PcbIndex:
                     primitive.layer_to,
                     primitive.component,
                     primitive.pour_id,
+                    primitive.poured_by,
                     primitive.x1,
                     primitive.y1,
                     primitive.x2,
@@ -436,12 +439,13 @@ class PcbIndex:
             x_values = [vertex[0] for vertex in pour.vertices] or [0.0]
             y_values = [vertex[1] for vertex in pour.vertices] or [0.0]
             self.db.execute(
-                "INSERT INTO pours VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO pours VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     pour.pour_id,
                     pour.net,
                     pour.layer,
                     pour.hatch_style,
+                    int(pour.shelved),
                     json.dumps(pour.vertices),
                     min(x_values),
                     min(y_values),
@@ -733,11 +737,16 @@ class PcbIndex:
             if kind == "pad" and designator and row["pad_name"]
             else None
         )
+        try:
+            in_pour = row["poured_by"] is not None
+        except (IndexError, KeyError):  # a hand-built row without the column
+            in_pour = False
         return ObjectFacts(
             kind=kind,
             layer=layer,
             span=span,
             points=points,
+            in_pour=in_pour,
             component=designator.lower() if designator else None,
             footprint=footprint,
             pad=pad,
@@ -774,7 +783,7 @@ class PcbIndex:
         row = self.db.execute(
             "SELECT SUM(COALESCE(length, SQRT((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1)))) total "
             "FROM prims WHERE net_id = ? AND kind IN ('track','arc') "
-            "AND pour_id IS NULL",
+            "AND pour_id IS NULL AND poured_by IS NULL",
             (net_id,),
         ).fetchone()
         return round(row["total"] or 0.0, 1)
@@ -847,7 +856,8 @@ class PcbIndex:
             return target
         placeholders = ",".join("?" * len(net_ids))
         target.has_pours = self.db.execute(
-            f"SELECT 1 FROM pours WHERE net_id IN ({placeholders}) LIMIT 1",
+            f"SELECT 1 FROM pours WHERE net_id IN ({placeholders}) "
+            "AND NOT shelved LIMIT 1",
             net_ids,
         ).fetchone() is not None
         rows = self.db.execute(
@@ -872,23 +882,30 @@ class PcbIndex:
         return target
 
     def counts(self) -> dict:
+        """Tracks and arcs are routing; a hatched pour's are pour_copper."""
         row = self.db.execute(
             "SELECT "
-            "SUM(kind='track' AND pour_id IS NULL) tracks, "
-            "COUNT(DISTINCT CASE WHEN kind='arc' "
+            "SUM(kind='track' AND pour_id IS NULL AND poured_by IS NULL) tracks, "
+            "COUNT(DISTINCT CASE WHEN kind='arc' AND poured_by IS NULL "
             "THEN source_id END) arcs, "
+            "SUM(kind='track' AND poured_by IS NOT NULL) + "
+            "COUNT(DISTINCT CASE WHEN kind='arc' AND poured_by IS NOT NULL "
+            "THEN source_id END) pour_copper, "
             "SUM(kind='via') vias, "
             "SUM(kind='pad') pads "
             "FROM prims"
         ).fetchone()
+        pours = self.db.execute(
+            "SELECT COUNT(*) c, SUM(shelved) shelved FROM pours"
+        ).fetchone()
         return {
             "tracks": row["tracks"] or 0,
             "arcs": row["arcs"] or 0,
+            "pour_copper": row["pour_copper"] or 0,
             "vias": row["vias"] or 0,
             "pads": row["pads"] or 0,
-            "pours": self.db.execute(
-                "SELECT COUNT(*) c FROM pours"
-            ).fetchone()["c"],
+            "pours": pours["c"],
+            "shelved_pours": pours["shelved"] or 0,
             "nets": self.db.execute(
                 "SELECT COUNT(*) c FROM nets"
             ).fetchone()["c"],
@@ -996,7 +1013,7 @@ class PcbIndex:
             "MIN(minx) a, MIN(miny) b, MAX(maxx) c, MAX(maxy) d "
             "FROM prims "
             "WHERE net_id = ? AND kind IN ('track','arc') "
-            "AND pour_id IS NULL "
+            "AND pour_id IS NULL AND poured_by IS NULL "
             "GROUP BY layer ORDER BY layer",
             (net_id,),
         )
@@ -1051,10 +1068,13 @@ class PcbIndex:
                 (net_id,),
             )
         ]
+        # A shelved pour has no copper but is listed (labelled) here: the
+        # net's pour inventory, not its copper.
         pours = [
             {
                 "layer": self.layer_name(row["layer"]),
                 "hatch": row["hatch_style"],
+                **({"shelved": True} if row["shelved"] else {}),
                 "bbox_mil": {
                     "minx_mil": row["minx"],
                     "miny_mil": row["miny"],
@@ -1215,8 +1235,34 @@ class PcbIndex:
                             edge_distance,
                         )
                         continue
-                    overlap = (
-                        parallel_overlap(
+                    key = (candidate["net_id"], target_layer)
+                    aggregate = aggregates.setdefault(
+                        key,
+                        {
+                            "min_edge": edge_distance,
+                            "close_segments": 0,
+                            "pour_segments": 0,
+                            "run": 0.0,
+                        },
+                    )
+                    aggregate["min_edge"] = min(
+                        aggregate["min_edge"],
+                        edge_distance,
+                    )
+                    # A hatched pour's tracks are copper (distance) but not
+                    # routing: a hatch beside a track is no parallel run.
+                    if (
+                        candidate["poured_by"] is not None
+                        or target["poured_by"] is not None
+                    ):
+                        aggregate["pour_segments"] += 1
+                        continue
+                    aggregate["close_segments"] += 1
+                    if (
+                        target["kind"] in {"track", "arc"}
+                        and candidate["kind"] in {"track", "arc"}
+                    ):
+                        aggregate["run"] += parallel_overlap(
                             target["x1"],
                             target["y1"],
                             target["x2"],
@@ -1226,27 +1272,6 @@ class PcbIndex:
                             candidate["x2"],
                             candidate["y2"],
                         )
-                        if (
-                            target["kind"] in {"track", "arc"}
-                            and candidate["kind"] in {"track", "arc"}
-                        )
-                        else 0.0
-                    )
-                    key = (candidate["net_id"], target_layer)
-                    aggregate = aggregates.setdefault(
-                        key,
-                        {
-                            "min_edge": edge_distance,
-                            "close_segments": 0,
-                            "run": 0.0,
-                        },
-                    )
-                    aggregate["min_edge"] = min(
-                        aggregate["min_edge"],
-                        edge_distance,
-                    )
-                    aggregate["close_segments"] += 1
-                    aggregate["run"] += overlap
 
         neighbors = []
         for (other_net_id, on_layer), aggregate in aggregates.items():
@@ -1264,6 +1289,11 @@ class PcbIndex:
                     ),
                     "close_segments": aggregate["close_segments"],
                     "parallel_run_mil": round(aggregate["run"], 1),
+                    **(
+                        {"pour_copper_segments": aggregate["pour_segments"]}
+                        if aggregate["pour_segments"]
+                        else {}
+                    ),
                 }
             )
         neighbors.sort(key=lambda neighbor: -neighbor["parallel_run_mil"])
@@ -1306,7 +1336,7 @@ class PcbIndex:
                     "UNION "
                     "SELECT DISTINCT n.name "
                     "FROM pours po JOIN nets n ON n.id = po.net_id "
-                    "WHERE po.layer = ? AND po.net_id != ? "
+                    "WHERE po.layer = ? AND po.net_id != ? AND NOT po.shelved "
                     "AND po.maxx >= ? AND po.minx <= ? "
                     "AND po.maxy >= ? AND po.miny <= ?",
                     (
@@ -1367,7 +1397,9 @@ class PcbIndex:
         within the outline. min_outline_distance_mil: the closest approach of the net's
         copper to the outline when within the search distance, else None. The
         outline is the drawn polygon boundary, not copper: poured copper keeps
-        the pour's clearance from the net and is not measured here.
+        the pour's clearance from the net and is not measured here (a hatched
+        pour's tracks and arcs are, among the neighbors). Shelved pours have
+        no copper and are left out.
         """
         points: dict[int, set[tuple[float, float]]] = defaultdict(set)
         for target in targets:
@@ -1381,7 +1413,7 @@ class PcbIndex:
         rows = self.db.execute(
             "SELECT po.*, n.name AS net_name "
             "FROM pours po JOIN nets n ON n.id = po.net_id "
-            "WHERE po.net_id != ?",
+            "WHERE po.net_id != ? AND NOT po.shelved",
             (net_id,),
         )
         for row in rows:
@@ -1433,7 +1465,8 @@ class PcbIndex:
             y - radius,
             y + radius,
         ]
-        # Copper only: pour outline rows are reported under pours instead.
+        # Copper only: pour outline rows are reported under pours instead. A
+        # hatched pour's tracks and arcs are copper, of kind "pour".
         if self._has_rtree:
             rows = self.db.execute(
                 "SELECT p.* FROM prims p "
@@ -1482,7 +1515,9 @@ class PcbIndex:
                 },
             )
             entry["min"] = min(entry["min"], edge_distance)
-            entry["kinds"].add(row["kind"])
+            entry["kinds"].add(
+                "pour" if row["poured_by"] is not None else row["kind"]
+            )
             entry["layers"].update(
                 self.layer_name(occupied_layer)
                 for occupied_layer in occupied_layers
@@ -1543,7 +1578,7 @@ class PcbIndex:
             "SELECT po.*, n.name AS net_name "
             "FROM pours po LEFT JOIN nets n ON n.id = po.net_id "
             "WHERE po.maxx >= ? AND po.minx <= ? "
-            "AND po.maxy >= ? AND po.miny <= ?"
+            "AND po.maxy >= ? AND po.miny <= ? AND NOT po.shelved"
             + (" AND po.layer = ?" if layer is not None else ""),
             pour_parameters,
         )

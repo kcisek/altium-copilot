@@ -91,11 +91,11 @@ def _track_payload(
     x2=1050_0000,
     y2=1000_0000,
     width=6_0000,
+    polygon=0xFFFF,
 ) -> bytes:
     payload = bytearray(49)
     payload[0] = layer
-    struct.pack_into("<H", payload, 3, net)
-    struct.pack_into("<H", payload, 7, component)
+    struct.pack_into("<HHH", payload, 3, net, polygon, component)
     struct.pack_into("<iiiii", payload, 13, x1, y1, x2, y2, width)
     return bytes(payload)
 
@@ -117,10 +117,10 @@ def _via_payload(layer_from=1, layer_to=32) -> bytes:
     return bytes(payload)
 
 
-def _arc_payload(layer=1, radius=1_0000) -> bytes:
+def _arc_payload(layer=1, radius=1_0000, net=2, polygon=0xFFFF) -> bytes:
     payload = bytearray(45)
     payload[0] = layer
-    struct.pack_into("<H", payload, 3, 2)
+    struct.pack_into("<HH", payload, 3, net, polygon)
     struct.pack_into("<ii", payload, 13, 100_0000, 100_0000)
     struct.pack_into("<i", payload, 21, radius)
     struct.pack_into("<dd", payload, 25, 0.0, 90.0)
@@ -179,6 +179,26 @@ def test_decode_tracks_rejects_wrong_type_and_nonpositive_width():
     primitives, skipped = decode_tracks(wrong_type + negative_width)
     assert primitives == []
     assert skipped == 2
+
+
+def test_decode_tracks_reads_the_polygon_index():
+    # Offset 5: the Polygons6 index of a hatched pour the track is copper of;
+    # 0xFFFF is routing, 0xFFFE (board outline, as KiCad reads it) is too.
+    data = b"".join(
+        _bin_record(4, _track_payload(net=NO_NET, polygon=polygon))
+        for polygon in (3, 0xFFFF, 0xFFFE)
+    )
+    primitives, skipped = decode_tracks(data)
+    assert skipped == 0
+    assert [track.poured_by for track in primitives] == [3, None, None]
+    assert all(track.pour_id is None for track in primitives)
+
+
+def test_decode_arcs_reads_the_polygon_index():
+    poured, _ = decode_arcs(_bin_record(1, _arc_payload(net=NO_NET, polygon=2)))
+    routed, _ = decode_arcs(_bin_record(1, _arc_payload()))
+    assert poured and {chord.poured_by for chord in poured} == {2}
+    assert {chord.poured_by for chord in routed} == {None}
 
 
 def test_decode_vias():
@@ -815,6 +835,22 @@ def test_decode_polygons():
     )
 
 
+def test_decode_polygons_shelved_pour_keeps_its_outline_but_no_rows():
+    outline = {
+        "LAYER": "TOP", "NET": "5", "HATCHSTYLE": "Solid",
+        "VX0": "0mil", "VY0": "0mil", "VX1": "100mil", "VY1": "0mil",
+        "VX2": "100mil", "VY2": "50mil",
+    }
+    pours, edges = decode_polygons(
+        [{**outline, "SHELVED": "TRUE"}, {**outline, "SHELVED": "FALSE"}],
+        layer_name_to_v6={"top": 1},
+    )
+    assert [pour.shelved for pour in pours] == [True, False]
+    assert len(pours[0].vertices) == 3
+    # The shelved pour has no copper: its outline gets no proximity rows.
+    assert {edge.pour_id for edge in edges} == {1}
+
+
 def test_build_layer_aliases_resolves_mid_layer_positional_names():
     # Polygons6 (and other text streams) reference inner copper layers by
     # Altium's fixed positional alias (MID1, MID2, ...), not by LAYERnNAME —
@@ -943,6 +979,64 @@ def test_parse_streams_drops_out_of_range_net_references():
     pcb = parse_streams(streams)
     assert pcb.primitives == []
     assert pcb.skipped_records["net_range"] == 1
+
+
+def test_parse_streams_gives_pour_copper_its_pour_net():
+    # Altium saves a hatched pour's tracks and arcs without a net; they are
+    # the pour's copper. A pour index past the Polygons6 records keeps none.
+    streams = {
+        "Board6/Data": _stream_text([BOARD_PROPS]),
+        "Nets6/Data": _stream_text([{"NAME": "GND"}, {"NAME": "SIG"}]),
+        "Components6/Data": b"",
+        "Tracks6/Data": b"".join(
+            _bin_record(4, _track_payload(net=net, polygon=polygon))
+            for net, polygon in ((NO_NET, 0), (1, 0xFFFF), (NO_NET, 5))
+        ),
+        "Vias6/Data": b"",
+        "Arcs6/Data": _bin_record(1, _arc_payload(net=NO_NET, polygon=0)),
+        "Pads6/Data": b"",
+        "Polygons6/Data": _stream_text(
+            [
+                {
+                    "LAYER": "TOP", "NET": "0", "HATCHSTYLE": "Horizontal",
+                    "VX0": "0mil", "VY0": "0mil", "VX1": "10mil",
+                    "VY1": "0mil", "VX2": "10mil", "VY2": "10mil",
+                }
+            ]
+        ),
+    }
+    pcb = parse_streams(streams)
+    tracks = [p for p in pcb.primitives if p.kind == "track" and p.pour_id is None]
+    assert [(track.net, track.poured_by) for track in tracks] == [
+        (0, 0), (1, None), (None, 5),
+    ]
+    arcs = [p for p in pcb.primitives if p.kind == "arc"]
+    assert arcs and {(arc.net, arc.poured_by) for arc in arcs} == {(0, 0)}
+
+
+def test_parse_streams_drops_a_shelved_pours_copper():
+    # Altium keeps a shelved pour's copper in the file, hidden from DRC and
+    # connectivity: not copper for these tools either.
+    pour = {
+        "LAYER": "TOP", "NET": "0", "HATCHSTYLE": "Horizontal", "SHELVED": "TRUE",
+        "VX0": "0mil", "VY0": "0mil", "VX1": "10mil", "VY1": "0mil",
+        "VX2": "10mil", "VY2": "10mil",
+    }
+    streams = {
+        "Board6/Data": _stream_text([BOARD_PROPS]),
+        "Nets6/Data": _stream_text([{"NAME": "GND"}, {"NAME": "SIG"}]),
+        "Components6/Data": b"",
+        "Tracks6/Data": _bin_record(4, _track_payload(net=NO_NET, polygon=0))
+        + _bin_record(4, _track_payload(net=1)),
+        "Vias6/Data": b"",
+        "Arcs6/Data": _bin_record(1, _arc_payload(net=NO_NET, polygon=0)),
+        "Pads6/Data": b"",
+        "Polygons6/Data": _stream_text([pour]),
+    }
+    pcb = parse_streams(streams)
+    assert pcb.pours[0].shelved is True
+    assert [(p.kind, p.net) for p in pcb.primitives] == [("track", 1)]
+    assert pcb.skipped_records == {"shelved_pour_copper": 2}  # a track, an arc
 
 
 # ---------- Rules6 / Classes6 / SignalClasses / DifferentialPairs6 ----------

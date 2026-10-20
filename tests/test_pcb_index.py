@@ -1,5 +1,6 @@
 import math
 from copy import deepcopy
+from dataclasses import replace
 
 import pytest
 
@@ -499,9 +500,9 @@ def test_region_query_excludes_pour_when_only_bbox_is_near(pcb_data):
     assert result["pours"] == []
 
 
-def _add_pour(data, net, layer, vertices):
+def _add_pour(data, net, layer, vertices, **props):
     """Add a pour and its zero-width outline rows the way parse_streams does."""
-    record = {"NET": str(net), "LAYER": layer, "HATCHSTYLE": "Solid"}
+    record = {"NET": str(net), "LAYER": layer, "HATCHSTYLE": "Solid", **props}
     for vertex, (x, y) in enumerate(vertices):
         record[f"VX{vertex}"] = f"{x}mil"
         record[f"VY{vertex}"] = f"{y}mil"
@@ -584,18 +585,81 @@ def test_pour_outline_respects_the_layer_filter(outline_data):
     assert index.net_neighbors("SIG", distance=10.0, layer=3)["pours"] == []
 
 
+def _hatch(net, x1, y1, x2, y2, width=8.0, pour=1):
+    """A hatched pour's track: Tracks6 copper with the pour's index (PLANE's
+    pour is index 1 in outline_data)."""
+    return replace(_track(net, 1, x1, y1, x2, y2, width=width), poured_by=pour)
+
+
 def test_poured_copper_stays_a_neighbor(outline_data):
-    # A hatched pour's tracks come from Tracks6 with their width and no
-    # pour_id: real copper, measured edge to edge (608 - 603 = 5 mil).
-    outline_data.primitives.append(
-        _track(net=4, layer=1, x1=660, y1=612, x2=900, y2=612, width=8.0)
-    )
+    # A hatched pour's tracks come from Tracks6 with their width and the
+    # pour's index: real copper, measured edge to edge (608 - 603 = 5 mil),
+    # but no routing segment and no parallel run beside SIG's track.
+    outline_data.primitives.append(_hatch(4, 660, 612, 900, 612))
     index = PcbIndex(outline_data, NETLIST)
     result = index.net_neighbors("SIG", distance=10.0)
     plane = next(n for n in result["neighbors"] if n["net"] == "PLANE")
     assert plane["min_edge_distance_mil"] == pytest.approx(5.0)
-    assert plane["close_segments"] == 1
+    assert plane["close_segments"] == 0
+    assert plane["parallel_run_mil"] == 0.0
+    assert plane["pour_copper_segments"] == 1
     assert result["pours"][0]["min_outline_distance_mil"] == 0.0
+    # As a target too: PLANE's hatch is near SIG's track.
+    reverse = index.net_neighbors("PLANE", distance=10.0)
+    sig = next(n for n in reverse["neighbors"] if n["net"] == "SIG")
+    assert (sig["close_segments"], sig["pour_copper_segments"]) == (0, 1)
+    # A routed PLANE track in the same place is routing: segment and run.
+    outline_data.primitives[-1] = _track(4, 1, 660, 612, 900, 612, width=8.0)
+    routed = PcbIndex(outline_data, NETLIST).net_neighbors("SIG", distance=10.0)
+    plane = next(n for n in routed["neighbors"] if n["net"] == "PLANE")
+    assert plane["close_segments"] == 1 and plane["parallel_run_mil"] == 40.0
+    assert "pour_copper_segments" not in plane
+
+
+def test_poured_copper_is_not_routing(outline_data):
+    outline_data.primitives.extend([
+        _hatch(4, 660, 612, 900, 612),
+        _track(4, 1, 950, 950, 1000, 950),  # PLANE's only routing, 50 mil
+    ])
+    index = PcbIndex(outline_data, NETLIST)
+    assert index.routed_length("PLANE") == 50.0
+    (layer,) = index.net_summary("PLANE")["layers"]
+    assert (layer["segment_count"], layer["length_mil"]) == (1, 50.0)
+    counts = index.counts()
+    # pcb_data's 3 tracks, SIG, NEAR and PLANE's routing; outlines excluded.
+    assert (counts["tracks"], counts["pour_copper"]) == (6, 1)
+    # Region queries see it as copper of kind pour.
+    region = index.region_query(700.0, 612.0, radius=5.0, layer=1)
+    plane = next(n for n in region["nets"] if n["net"] == "PLANE")
+    assert plane["kinds"] == ["pour"] and plane["min_distance_mil"] == 0.0
+
+
+def test_shelved_pour_has_no_copper_but_is_listed(pcb_data):
+    # CLK_B pours Top around CLK_A's track (100..200, y 100).
+    square = [(50, 50), (250, 50), (250, 150), (50, 150)]
+    shelved = deepcopy(pcb_data)
+    _add_pour(shelved, 2, "TOP", square, SHELVED="TRUE")
+    poured = deepcopy(pcb_data)
+    _add_pour(poured, 2, "TOP", square, SHELVED="FALSE")
+    for data, expected in ((poured, True), (shelved, False)):
+        index = PcbIndex(data, NETLIST)
+        neighbors = index.net_neighbors("CLK_A", distance=10.0)
+        assert ("CLK_B" in [p["net"] for p in neighbors["pours"]]) is expected
+        region = index.region_query(150.0, 100.0, radius=10.0, layer=1)
+        assert ("CLK_B" in [p["net"] for p in region["pours"]]) is expected
+        assert index.rule_target("CLK_B").has_pours is expected
+        outline_rows = index.db.execute(
+            "SELECT COUNT(*) c FROM prims WHERE pour_id = 1"
+        ).fetchone()["c"]
+        assert (outline_rows == 4) is expected
+    index = PcbIndex(shelved, NETLIST)
+    # The net's pour inventory still lists it, labelled.
+    summary = index.net_summary("CLK_B")
+    assert summary["pour_count"] == 1
+    assert summary["pours"][0]["shelved"] is True
+    assert "shelved" not in index.net_summary("GND")["pours"][0]
+    counts = index.counts()
+    assert (counts["pours"], counts["shelved_pours"]) == (2, 1)
 
 
 def test_region_query_lists_pour_outline_only_under_pours(outline_data):

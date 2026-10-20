@@ -171,7 +171,14 @@ class Primitive:
     layer_to: int | None = None
     hole: float | None = None
     pad_name: str | None = None
+    # Set on a pour's outline rows (decode_polygons): the drawn polygon
+    # boundary as zero-width edges, not copper. Polygons6 record index.
     pour_id: int | None = None
+    # Polygons6 record index of the pour this track or arc is poured copper
+    # of: hatched and outline-only pours are stored as tracks and arcs (solid
+    # pours as regions, not read). Real copper, but not routing. None for
+    # routing and every other primitive.
+    poured_by: int | None = None
     # True copper length of an arc chord (r * sweep / steps); the chord itself
     # is shorter. None for other primitives: their length is the segment's.
     length: float | None = None
@@ -218,6 +225,18 @@ def _valid_layer(layer: int) -> bool:
     return 0 < layer <= 82
 
 
+# Tracks6 / Arcs6 u16 at payload offset 5: the Polygons6 index of the pour
+# the primitive belongs to (KiCad's ATRACK6/AARC6 `polygon`). 0xFFFF is none;
+# 0xFFFE, which KiCad also skips, seems to mark board-outline primitives.
+_POLYGON_INDEX_OFFSET = 5
+_NO_POLYGON = (0xFFFF, 0xFFFE)
+
+
+def _poured_by(payload: bytes) -> int | None:
+    (polygon,) = struct.unpack_from("<H", payload, _POLYGON_INDEX_OFFSET)
+    return None if polygon in _NO_POLYGON else polygon
+
+
 def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
     """Decode Tracks6 records."""
     primitives: list[Primitive] = []
@@ -251,6 +270,7 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
                 x2=_units_to_mil(x2),
                 y2=_units_to_mil(y2),
                 width=_units_to_mil(width),
+                poured_by=_poured_by(payload),
             )
         )
     return primitives, skipped
@@ -428,6 +448,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
             for index in range(steps + 1)
         ]
         chord_length = radius_mil * math.radians(sweep) / steps
+        poured_by = _poured_by(payload)
         for (x1, y1), (x2, y2) in zip(points, points[1:]):
             primitives.append(
                 Primitive(
@@ -442,6 +463,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
                     width=_units_to_mil(width),
                     source_id=arc_id,
                     length=chord_length,
+                    poured_by=poured_by,
                 )
             )
     return primitives, skipped
@@ -833,6 +855,9 @@ class PolygonPour:
     layer: int | None
     hatch_style: str | None
     vertices: list[tuple[float, float]]
+    # Shelved (Polygon Manager): kept in the file, with any copper, but hidden
+    # from DRC and connectivity until restored. No copper for these tools.
+    shelved: bool = False
 
 
 # Altium writes int32 max (214748.3647 mil) for an unbounded max width/gap.
@@ -1136,7 +1161,11 @@ def decode_polygons(
     records: list[dict[str, str]],
     layer_name_to_v6: dict[str, int],
 ) -> tuple[list[PolygonPour], list[Primitive]]:
-    """Decode pour outlines for containment and proximity queries."""
+    """Decode pour outlines for containment and proximity queries.
+
+    A shelved pour gets no outline rows: it has no copper for the proximity
+    queries those rows serve.
+    """
     pours: list[PolygonPour] = []
     edges: list[Primitive] = []
     for pour_id, record in enumerate(records):
@@ -1159,9 +1188,10 @@ def decode_polygons(
             layer=layer,
             hatch_style=record.get("HATCHSTYLE"),
             vertices=vertices,
+            shelved=record.get("SHELVED", "").strip().upper() == "TRUE",
         )
         pours.append(pour)
-        if layer is None or len(vertices) < 3:
+        if layer is None or len(vertices) < 3 or pour.shelved:
             continue
         closed = vertices + [vertices[0]]
         for (x1, y1), (x2, y2) in zip(closed, closed[1:]):
@@ -1572,6 +1602,35 @@ def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
     return aliases
 
 
+def _resolve_pour_copper(
+    primitives: list[Primitive], pours: list[PolygonPour]
+) -> tuple[list[Primitive], int]:
+    """(primitives, dropped records): poured copper gets its pour's net, and
+    a shelved pour's is dropped (an arc, all its chords, is one record).
+
+    Altium saves a hatched pour's tracks and arcs without a net (the pour
+    holds it); they are that net's copper. A shelved pour keeps its copper in
+    the file but hidden from DRC and connectivity. A pour index past the
+    Polygons6 records keeps no net.
+    """
+    kept: list[Primitive] = []
+    dropped: set = set()
+    for primitive in primitives:
+        if primitive.poured_by is not None and primitive.poured_by < len(pours):
+            pour = pours[primitive.poured_by]
+            if pour.shelved:
+                dropped.add(
+                    ("arc", primitive.source_id)
+                    if primitive.kind == "arc"
+                    else ("track", id(primitive))
+                )
+                continue
+            if primitive.net is None:
+                primitive.net = pour.net
+        kept.append(primitive)
+    return kept, len(dropped)
+
+
 def parse_streams(streams: dict[str, bytes]) -> PcbData:
     """Assemble parsed PCB data from raw OLE stream bytes."""
     warnings: list[str] = []
@@ -1645,6 +1704,9 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
             warnings.append(f"Polygons6 parse failed: {error}")
     else:
         warnings.append("Polygons6 stream missing")
+    primitives, shelved_copper = _resolve_pour_copper(primitives, pours)
+    if shelved_copper:
+        skipped_records["shelved_pour_copper"] = shelved_copper
 
     valid_primitives = []
     invalid_net_count = 0

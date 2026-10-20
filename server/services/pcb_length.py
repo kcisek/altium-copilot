@@ -1,9 +1,10 @@
 """Signal lengths over a per-net copper graph, and Length / MatchedLengths checks.
 
-Each net's copper (tracks, true-length arcs, vias, pads; pours excluded) is a
-graph. Track endpoints merge when they overlap, an endpoint landing on another
-track's body splits it (T-junction), and endpoints inside a pad or via attach
-to its centre with an edge as long as the distance to that centre. Vias and
+Each net's copper (tracks, true-length arcs, vias, pads; pours excluded, a
+hatched pour's tracks and arcs too) is a graph. Track endpoints merge when they
+overlap, an endpoint landing on another track's body splits it (T-junction),
+and endpoints inside a pad or via attach to its centre with an edge as long as
+the distance to that centre. Vias and
 through-hole pads get one node per copper layer they connect on, joined by
 barrel edges as long as the stackup z distance between those layers.
 
@@ -83,8 +84,8 @@ APPROXIMATIONS = [
     "multi-pad nets; it is read from one pad-record field, and pad records "
     "too old to carry it count 0.",
     "A series part between xSignal legs counts 0 length.",
-    "Polygon pours, fills and regions are not part of the copper graph; a "
-    "connection made only through them is reported incomplete.",
+    "Polygon pours (solid or hatched), fills and regions are not part of the "
+    "copper graph; a connection made only through them is reported incomplete.",
     "Pad shapes: round/oblong pads are capsules, rounded rectangles keep their "
     "corners, octagonal pads are rectangles, and through-hole pads have each "
     "layer's size and shape; paths run to the pad or via centre, so "
@@ -101,7 +102,7 @@ _GRAPH_SQL = (
     "height, rotation, shape, corner_radius, layer_copper, hole, pad_name, "
     "length, pin_package FROM prims "
     "WHERE net_id = ? AND kind IN ('track', 'arc', 'via', 'pad') "
-    "AND pour_id IS NULL ORDER BY id"
+    "AND pour_id IS NULL AND poured_by IS NULL ORDER BY id"
 )
 _SPLIT_EPS_MIL = 0.01
 _MERGE_MIN_MIL = 0.01
@@ -993,7 +994,7 @@ def _net_measure(index, net_id: int) -> dict:
                     if gap is not None:
                         result["unrouted_manhattan_mil"] = _r(gap)
     if result["status"] != "ok" and index.db.execute(
-        "SELECT 1 FROM pours WHERE net_id = ? LIMIT 1", (net_id,)
+        "SELECT 1 FROM pours WHERE net_id = ? AND NOT shelved LIMIT 1", (net_id,)
     ).fetchone():
         result["note"] = (
             "The net has polygon pours, which are not part of the copper "

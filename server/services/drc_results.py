@@ -582,7 +582,12 @@ class DrcLinker:
         layer = self.index.resolve_layer(match[1].strip())
         nets = []
         for pour in self.index.pcb.pours:
-            if pour.layer != layer or pour.net is None or len(pour.vertices) < 3:
+            if (
+                pour.layer != layer
+                or pour.net is None
+                or pour.shelved
+                or len(pour.vertices) < 3
+            ):
                 continue
             vertices = list(pour.vertices)
             if _inside(point, vertices) or (reach and _edge_distance(point, vertices) <= reach):
