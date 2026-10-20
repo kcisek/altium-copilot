@@ -749,7 +749,11 @@ def _hole_slot(size_shape: bytes) -> tuple[int | None, float | None]:
         return None, None
     shape = size_shape[_PAD_HOLE_SHAPE_OFFSET]
     (length,) = struct.unpack_from("<i", size_shape, _PAD_SLOT_LENGTH_OFFSET)
-    return shape, _units_to_mil(length) if length > 0 else None
+    if length > 0:
+        return shape, _units_to_mil(length)
+    # A square or slot hole of length 0 is a real (degenerate) slot; round holes
+    # store 0 there too, and carry no slot length.
+    return shape, 0.0 if shape in (1, 2) else None
 
 
 @dataclass
@@ -1439,6 +1443,8 @@ class PcbRule:
     unique_id: str | None
     from_schematic: bool
     properties: dict[str, str] = field(default_factory=dict)
+    # The record had no NAME (name above is then '<kind> #n').
+    unnamed: bool = False
 
 
 @dataclass
@@ -1518,6 +1524,7 @@ def decode_rules(
         rules.append(
             PcbRule(
                 name=record.get("NAME") or f"{kind} #{len(rules) + 1}",
+                unnamed=not (record.get("NAME") or "").strip(),
                 kind=kind,
                 kind_id=kind_id,
                 enabled=record.get("ENABLED", "TRUE").upper() != "FALSE",
@@ -1730,13 +1737,19 @@ def decode_regions(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int
                         if round_flag and radius > 0 else None
                     )
                     vertices.append(ShapeVertex(_units_to_mil(x), _units_to_mil(y), arc))
-                if len(vertices) > 1 and vertices[-1] == vertices[0]:
-                    vertices.pop()  # the closing copy of the first vertex
+                # The closing copy of the first vertex (written without its arc
+                # when the first vertex is one).
+                if len(vertices) > 1 and (vertices[-1].x, vertices[-1].y) == (
+                    vertices[0].x, vertices[0].y
+                ) and vertices[-1].arc in (None, vertices[0].arc):
+                    vertices.pop()
             else:
                 for _ in range(count):
                     x, y = struct.unpack_from("<dd", payload, position)
                     position += 16
                     vertices.append(ShapeVertex(x / ALTIUM_UNITS_PER_MIL, y / ALTIUM_UNITS_PER_MIL))
+                if len(vertices) > 1 and vertices[-1] == vertices[0]:
+                    vertices.pop()  # the closing copy of the first vertex
             holes = []
             for _ in range(hole_count):
                 (points,) = struct.unpack_from("<I", payload, position)

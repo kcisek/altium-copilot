@@ -17,10 +17,10 @@ from collections import defaultdict
 
 try:
     from parsers.pcb_doc import decode_fills, decode_regions
-    from services.pcb_geometry import point_in_polygon
+    from services.pcb_geometry import point_in_polygon, point_seg_distance
 except ImportError:
     from server.parsers.pcb_doc import decode_fills, decode_regions
-    from server.services.pcb_geometry import point_in_polygon
+    from server.services.pcb_geometry import point_in_polygon, point_seg_distance
 
 MICRO_SEGMENT_MIL = 0.03  # 300 internal units, Altium's GetSmallSegments(300)
 ZERO_AREA_SQ_MIL = 1e-8  # one square internal unit
@@ -84,35 +84,46 @@ _KEEPOUT_LAYER = 56
 
 # ---------- shapes ----------
 
+SNAP_MIL = 1e-3  # points closer than this (10 internal units) are one point
+
+
 def _arc_points(vertex, step_deg: float = 10.0) -> list[tuple[float, float]]:
+    """The arc of an arc vertex as points, run from the end nearer the vertex (as
+    Altium draws it), its first point snapped to the stored vertex."""
     cx, cy, radius, start, end = vertex.arc
     sweep = (end - start) % 360.0 or 360.0
-    begin = (cx + radius * math.cos(math.radians(start)), cy + radius * math.sin(math.radians(start)))
-    finish = (cx + radius * math.cos(math.radians(end)), cy + radius * math.sin(math.radians(end)))
     steps = max(2, int(math.ceil(sweep / step_deg)))
     points = [
         (cx + radius * math.cos(math.radians(start + sweep * i / steps)),
          cy + radius * math.sin(math.radians(start + sweep * i / steps)))
         for i in range(steps + 1)
     ]
-    # Run the arc from the end nearer the vertex, as Altium draws it.
-    if math.dist(finish, (vertex.x, vertex.y)) < math.dist(begin, (vertex.x, vertex.y)):
+    here = (vertex.x, vertex.y)
+    if math.dist(points[-1], here) < math.dist(points[0], here):
         points.reverse()
+    if math.dist(points[0], here) < max(SNAP_MIL, radius * 1e-6):
+        points[0] = here
     return points
 
 
 def contour(vertices) -> list[tuple[float, float]]:
-    """The shape as points, arcs flattened."""
+    """The shape as points, arcs flattened. A stored vertex within SNAP_MIL of the
+    flattened arc's end replaces it (Altium stores both rounded to its grid), and the
+    last point is dropped when it repeats the first."""
     points: list[tuple[float, float]] = []
     for vertex in vertices:
-        if vertex.arc:
-            points.extend(_arc_points(vertex))
-        else:
-            points.append((vertex.x, vertex.y))
+        new = _arc_points(vertex) if vertex.arc else [(vertex.x, vertex.y)]
+        if points and math.dist(points[-1], new[0]) < SNAP_MIL:
+            points[-1] = new[0]
+            new = new[1:]
+        points.extend(new)
+    if len(points) > 1 and math.dist(points[-1], points[0]) < SNAP_MIL:
+        points.pop()
     return points
 
 
 def area(points: list[tuple[float, float]]) -> float:
+    """The shoelace area (lobes of a self-crossing shape cancel)."""
     if len(points) < 3:
         return 0.0
     total = 0.0
@@ -121,9 +132,10 @@ def area(points: list[tuple[float, float]]) -> float:
     return abs(total) / 2.0
 
 
-def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL) -> list[tuple]:
+def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL, skip_zero: bool = False) -> list[tuple]:
     """Edges shorter than limit: (length, (x1, y1), (x2, y2)). An arc edge measures its
-    arc length; a repeated vertex is an edge of length 0."""
+    arc length; a repeated vertex is an edge of length 0 (skip_zero leaves those out,
+    for shapes stored flattened, where they are an artifact)."""
     edges = []
     count = len(vertices)
     if count < 2:
@@ -135,36 +147,102 @@ def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL) -> list[tuple]:
             length = radius * math.radians((end - start) % 360.0 or 360.0)
         else:
             length = math.dist((vertex.x, vertex.y), (following.x, following.y))
-            if following.arc and length < 1e-9:
+            if length < 1e-9 and (following.arc or skip_zero):
                 continue  # the arc starts here: no edge in Altium's shape
         if length < limit:
             edges.append((length, (vertex.x, vertex.y), (following.x, following.y)))
     return edges
 
 
-def _orient(a, b, c) -> int:
-    value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    return 0 if abs(value) < 1e-12 else (1 if value > 0 else -1)
+def _side(a, b, c, tolerance: float) -> int:
+    """Which side of line a-b point c lies on, 0 within tolerance (a distance)."""
+    length = math.dist(a, b)
+    if length == 0:
+        return 0
+    value = ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / length
+    return 0 if abs(value) < tolerance else (1 if value > 0 else -1)
 
 
-def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS) -> list | None:
-    """Crossing points of non-adjacent edges; None when the shape is too large to test."""
+def _on_segment(a, b, p, tolerance: float) -> bool:
+    """p lies on segment a-b, away from its ends."""
+    length = math.dist(a, b)
+    if length < 2 * tolerance or _side(a, b, p, tolerance):
+        return False
+    along = ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / length
+    return tolerance < along < length - tolerance
+
+
+def _angle(origin, point) -> float:
+    return math.atan2(point[1] - origin[1], point[0] - origin[0])
+
+
+def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS,
+                       tolerance: float = SNAP_MIL) -> list | None:
+    """Points where the outline crosses itself: proper crossings of non-adjacent edges,
+    a vertex the outline passes through another edge at, and a vertex visited twice
+    with the two passes crossing. Touching without crossing, and crossings within
+    tolerance of an edge's end (grid rounding), are not crossings. None when the shape
+    has more than cap points."""
     count = len(points)
     if count > cap:
         return None
+    if count < 4:
+        return []
     found = []
     edges = [(points[i], points[(i + 1) % count]) for i in range(count)]
-    for i in range(count):
-        a, b = edges[i]
-        for j in range(i + 2, count):
-            if i == 0 and j == count - 1:
-                continue
-            c, d = edges[j]
-            if _orient(a, b, c) * _orient(a, b, d) < 0 and _orient(c, d, a) * _orient(c, d, b) < 0:
-                denominator = (a[0] - b[0]) * (c[1] - d[1]) - (a[1] - b[1]) * (c[0] - d[0])
-                t = ((a[0] - c[0]) * (c[1] - d[1]) - (a[1] - c[1]) * (c[0] - d[0])) / denominator
-                found.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
-    return found
+    boxes = [(min(a[0], b[0]) - tolerance, min(a[1], b[1]) - tolerance,
+              max(a[0], b[0]) + tolerance, max(a[1], b[1]) + tolerance) for a, b in edges]
+    # Only edges whose boxes overlap can meet: sort by left edge and sweep.
+    order = sorted(range(count), key=lambda index: boxes[index][0])
+    candidates = []
+    active: list[int] = []
+    for i in order:
+        left = boxes[i][0]
+        active = [j for j in active if boxes[j][2] >= left]
+        for j in active:
+            if boxes[j][1] <= boxes[i][3] and boxes[i][1] <= boxes[j][3]:
+                candidates.append((min(i, j), max(i, j)))
+        active.append(i)
+    for i, j in candidates:
+        if j - i < 2 or (i == 0 and j == count - 1):
+            continue  # neighbours share a vertex
+        (a, b), (c, d) = edges[i], edges[j]
+        if _side(a, b, c, tolerance) * _side(a, b, d, tolerance) < 0 \
+                and _side(c, d, a, tolerance) * _side(c, d, b, tolerance) < 0:
+            denominator = (a[0] - b[0]) * (c[1] - d[1]) - (a[1] - b[1]) * (c[0] - d[0])
+            t = ((a[0] - c[0]) * (c[1] - d[1]) - (a[1] - c[1]) * (c[0] - d[0])) / denominator
+            found.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+    # A vertex the outline passes through another edge at: test each vertex against
+    # the edges whose box holds it.
+    for i, j in candidates:
+        for edge, other in ((i, j), (j, i)):
+            for k in (other, (other + 1) % count):
+                if edge in (k, (k - 1) % count):
+                    continue
+                here = points[k]
+                c, d = edges[edge]
+                if _on_segment(c, d, here, tolerance) and _side(
+                    c, d, points[k - 1], tolerance
+                ) * _side(c, d, points[(k + 1) % count], tolerance) < 0:
+                    found.append(here)
+    # A point the outline visits twice: a crossing when the two passes interleave
+    # around it, not when they only touch.
+    seen: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for k, here in enumerate(points):
+        seen[(round(here[0] / tolerance), round(here[1] / tolerance))].append(k)
+    for group in seen.values():
+        for first_index in range(len(group)):
+            for second_index in range(first_index + 1, len(group)):
+                k, m = group[first_index], group[second_index]
+                if m - k < 2 or (k == 0 and m == count - 1):
+                    continue
+                here = points[k]
+                first = sorted((_angle(here, points[k - 1]), _angle(here, points[(k + 1) % count])))
+                second = [_angle(here, points[m - 1]), _angle(here, points[(m + 1) % count])]
+                inside = [first[0] < angle < first[1] for angle in second]
+                if inside[0] != inside[1]:
+                    found.append(here)
+    return list(dict.fromkeys(found))
 
 
 # ---------- the board ----------
@@ -175,12 +253,14 @@ class _Board:
         board = pcb.board
         self.origin = (board.origin_x or 0.0, board.origin_y or 0.0)
         raw = pcb.raw or {}
-        shape_based = "ShapeBasedRegions6/Data" in raw
+        # ShapeBasedRegions6 keeps arcs; Regions6 (read only without it) flattens them.
+        self.shape_based = "ShapeBasedRegions6/Data" in raw
+        self.region_stream = self.shape_based or "Regions6/Data" in raw
         data = raw.get("ShapeBasedRegions6/Data") or raw.get("Regions6/Data") or b""
-        self.regions, self.bad_regions = decode_regions(data, shape_based) if data else ([], 0)
-        self.region_stream = bool(data)
-        self.board_regions = decode_regions(raw.get("BoardRegions/Data", b""), False)[0]
-        self.fills = decode_fills(raw.get("Fills6/Data", b""))[0]
+        self.regions, bad_regions = decode_regions(data, self.shape_based)
+        self.board_regions, bad_board = decode_regions(raw.get("BoardRegions/Data", b""), False)
+        self.fills, bad_fills = decode_fills(raw.get("Fills6/Data", b""))
+        self.unread = {"region": bad_regions, "board region": bad_board, "fill": bad_fills}
         self.designators = {
             component.index: component.designator or component.refdes or f"#{component.index}"
             for component in pcb.components
@@ -292,9 +372,11 @@ def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], 
     items: dict[str, list[dict]] = defaultdict(list)
     notes: list[str] = []
 
-    def add(check, label, at=None, **fields):
+    def add(check, label, at=None, weight=1, **fields):
+        """weight: how many rows Altium writes for the object (one per short segment
+        or crossing point for the region checks)."""
         if check in wanted:
-            items[check].append({"label": label, "at": at, **fields})
+            items[check].append({"label": label, "at": at, "weight": weight, **fields})
 
     for pour in pcb.pours:
         centre = _centre(pour.vertices)
@@ -343,26 +425,36 @@ def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], 
             continue  # pour copper: Altium checks only user regions
         points = contour(region.vertices)
         label = board.region_label(region)
-        if area(points) < ZERO_AREA_SQ_MIL:
+        crossings = self_intersections(points)
+        if crossings is None:
+            notes.append(f"{label}: too many vertices ({len(points)}) to test for "
+                         "self-intersections.")
+        elif crossings:
+            add("self_intersecting_regions", label, crossings[0], weight=len(crossings),
+                crossings=len(crossings))
+        # A self-crossing shape's lobes cancel in the shoelace area; it is not empty.
+        if area(points) < ZERO_AREA_SQ_MIL and not crossings:
             add("zero_area_regions", label, _centre(points))
-            continue
-        if "self_intersecting_regions" in wanted:
-            crossings = self_intersections(points)
-            if crossings is None:
-                notes.append(f"{label}: too many vertices ({len(points)}) to test for "
-                             "self-intersections.")
-            elif crossings:
-                add("self_intersecting_regions", label, crossings[0], crossings=len(crossings))
-        short = short_edges(region.vertices)
+        short = short_edges(region.vertices, skip_zero=not board.shape_based)
         if short:
-            add(_region_category(region), label, short[0][1], segments=len(short),
-                shortest_mil=round(min(edge[0] for edge in short), 5))
+            add(_region_category(region), label, short[0][1], weight=len(short),
+                segments=len(short), shortest_um=round(min(edge[0] for edge in short) * 25.4, 4))
     if not board.region_stream:
         notes.append("The PcbDoc has no region stream: region checks found nothing to check.")
+    elif not board.regions and not any(board.unread.values()):
+        notes.append("The board has no regions.")
+    elif not board.shape_based:
+        notes.append("Regions were read from Regions6, where arcs are flattened: "
+                     "micro-segments there leave out repeated vertices.")
+    unread = [f"{count} {kind} records" for kind, count in board.unread.items() if count]
+    if unread:
+        notes.append(f"Could not read {', '.join(unread)}: the checks that use them may be "
+                     "incomplete.")
 
     outline_short = short_edges(pcb.board.outline_shape)
     for length, start, _ in outline_short:
-        add("outline_micro_segments", "Board outline edge", start, length_mil=round(length, 5))
+        add("outline_micro_segments", "Board outline edge", start,
+            length_um=round(length * 25.4, 4))
 
     pads = defaultdict(set)
     for prim in pcb.primitives:
@@ -370,7 +462,7 @@ def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], 
             continue
         if prim.component is not None:
             pads[board.designators.get(prim.component)].add(prim.pad_name)
-        if prim.hole_shape in (1, 2) and prim.slot_length and prim.hole \
+        if prim.hole_shape in (1, 2) and prim.slot_length is not None and prim.hole \
                 and prim.slot_length < prim.hole:
             owner = board.designators.get(prim.component)
             add("slot_holes", f"{owner}-{prim.pad_name}" if owner else f"Pad {prim.pad_name}",
@@ -394,8 +486,9 @@ def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], 
         names[(rule.name or "").strip().lower()] += 1
     for rule in pcb.rules:
         key = (rule.name or "").strip().lower()
-        if not key:
-            add("invalid_rules", f"A {rule.kind} rule has no name")
+        if getattr(rule, "unnamed", False) or not key:
+            add("invalid_rules", f"A {rule.kind} rule has no name", kind=rule.kind)
+            continue
         elif names[key] > 1:
             add("invalid_rules", f"Rule name '{rule.name}' is used by {names[key]} rules",
                 kind=rule.kind)
@@ -440,6 +533,11 @@ def _used_xsignals(pcb):
     return used
 
 
+def _on_boundary(x: float, y: float, shape, tolerance: float = SNAP_MIL) -> bool:
+    return any(point_seg_distance(x, y, *a, *b) < tolerance
+               for a, b in zip(shape, shape[1:] + shape[:1]))
+
+
 def _outside_board(board: _Board, add, notes: list[str]) -> None:
     shapes, source = _board_shape(board)
     if not shapes:
@@ -452,8 +550,9 @@ def _outside_board(board: _Board, add, notes: list[str]) -> None:
     for component in board.pcb.components:
         if component.x is None or component.y is None:
             continue
-        if any(point_in_polygon(component.x, component.y, shape) for shape in shapes):
-            continue
+        if any(point_in_polygon(component.x, component.y, shape)
+               or _on_boundary(component.x, component.y, shape) for shape in shapes):
+            continue  # on the edge counts as on the board (edge-launch parts)
         add("components_outside_board", board.designators[component.index],
             (component.x, component.y), severity="warning" if netted[component.index] else "info",
             with_nets=netted[component.index], shape=source)
@@ -484,7 +583,28 @@ def _duplicate_copper(board: _Board, add) -> None:
 # ---------- result ----------
 
 def _fmt(value_mil: float, to_mm: bool) -> str:
-    return f"{value_mil * 0.0254:.4g} mm" if to_mm else f"{value_mil:.4g} mil"
+    """A length in the output unit with fixed decimals (0.01 mil, 0.0001 mm)."""
+    text = f"{value_mil * 0.0254:.4f}" if to_mm else f"{value_mil:.2f}"
+    text = text.rstrip("0").rstrip(".") if "." in text else text
+    return f"{'0' if text in ('-0', '') else text} {'mm' if to_mm else 'mil'}"
+
+
+def _detail(member: dict, to_mm: bool) -> str:
+    if "distance_mil" in member:
+        return f", {_fmt(member['distance_mil'], to_mm)} outside its pads and outline"
+    if "shortest_um" in member:
+        return (f", {member['segments']} edge(s) shorter than {_fmt(MICRO_SEGMENT_MIL, to_mm)} "
+                f"({MICRO_SEGMENT_MIL * 25.4:.3f} um), the shortest {member['shortest_um']} um")
+    if "length_um" in member:
+        return f", {member['length_um']} um long"
+    if "slot_length_mil" in member:
+        return (f", slot length {_fmt(member['slot_length_mil'], to_mm)} under the hole size "
+                f"{_fmt(member['hole_mil'], to_mm)}")
+    if "missing_pins" in member:
+        return f", pins not on the board: {', '.join(member['missing_pins'])}"
+    if "crossings" in member:
+        return f", {member['crossings']} crossing point(s)"
+    return ""
 
 
 def _findings(board: _Board, check: str, items: list[dict], to_mm: bool) -> list[dict]:
@@ -499,9 +619,16 @@ def _findings(board: _Board, check: str, items: list[dict], to_mm: bool) -> list
         if altium_id is not None:
             base["altium_id"] = altium_id
         if len(members) > GROUP_ABOVE:
+            objects = []
+            for member in members[:LISTED]:
+                entry = {"object": member["label"]}
+                if member.get("at") is not None:
+                    entry["at_mil"] = board.at(*member["at"])
+                objects.append(entry)
             out.append({
                 **base, "count": len(members),
-                "objects": [member["label"] for member in members[:LISTED]],
+                "rows": sum(member["weight"] for member in members),
+                "objects": objects,
                 "issue": f"{category}: {len(members)} objects"
                 + (f" (the first {LISTED} listed)." if len(members) > LISTED else "."),
             })
@@ -509,24 +636,15 @@ def _findings(board: _Board, check: str, items: list[dict], to_mm: bool) -> list
         for member in members:
             at = member.pop("at", None)
             label = member.pop("label")
+            weight = member.pop("weight")
             finding = {**base, "object": label}
             if at is not None:
                 finding["at_mil"] = board.at(*at)
             finding.update(member)
+            finding["rows"] = weight
             where = (f" ({_fmt(at[0] - board.origin[0], to_mm)}, "
                      f"{_fmt(at[1] - board.origin[1], to_mm)})") if at is not None else ""
-            extra = ""
-            if "distance_mil" in member:
-                extra = f", {_fmt(member['distance_mil'], to_mm)} outside its pads and outline"
-            elif "shortest_mil" in member:
-                extra = (f", {member['segments']} edge(s) shorter than "
-                         f"{_fmt(MICRO_SEGMENT_MIL, to_mm)}")
-            elif "slot_length_mil" in member:
-                extra = (f", slot length {_fmt(member['slot_length_mil'], to_mm)} under the hole "
-                         f"size {_fmt(member['hole_mil'], to_mm)}")
-            elif "missing_pins" in member:
-                extra = f", pins not on the board: {', '.join(member['missing_pins'])}"
-            finding["issue"] = f"{category}: {label}{where}{extra}."
+            finding["issue"] = f"{category}: {label}{where}{_detail(member, to_mm)}."
             out.append(finding)
     return out
 
@@ -540,7 +658,11 @@ def run_health_check(
     report_health: dict[str, int] | None = None,
 ) -> dict:
     """The health findings for a parsed board (PcbData). report_health holds the
-    category counts of the last saved Batch DRC report's health section, if any."""
+    category counts of the last saved Batch DRC report's health section, if any.
+
+    summary counts what Altium's report would count per check: one row per object,
+    except micro-segments (one per short edge) and self-intersections (one per
+    crossing point); severity_counts counts findings."""
     requested = [check.strip().lower() for check in checks or [] if check.strip()]
     known = set(CHECKS) | {entry[0] for entry in NOT_CHECKED.values()}
     invalid = [check for check in requested if check not in known]
@@ -553,6 +675,10 @@ def run_health_check(
                 if entry[0] is not None and settings.get(entry[0]) is False}
     wanted = set(requested) if requested else set(CHECKS) - OPT_IN - disabled
     items, notes = _check_all(board, wanted & set(CHECKS))
+    counts = {
+        check: sum(item["weight"] for item in items.get(check, []))
+        for check in sorted(wanted & set(CHECKS), key=_ORDER.get)
+    }
     findings: list[dict] = []
     for check in sorted(wanted & set(CHECKS), key=_ORDER.get):
         findings += _findings(board, check, items.get(check, []), to_mm)
@@ -566,10 +692,6 @@ def run_health_check(
     if not requested:
         for key in OPT_IN:
             not_checked[key] = "Altium runs it only in debug mode; name it in checks to run it."
-    counts = {
-        check: sum(f.get("count", 1) for f in findings if f["check"] == check)
-        for check in sorted(wanted & set(CHECKS), key=_ORDER.get)
-    }
     offset = max(0, int(offset or 0))
     result: dict = {
         "checks_run": sorted(wanted & set(CHECKS), key=_ORDER.get),

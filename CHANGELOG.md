@@ -18,6 +18,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   outside the board shape, duplicate copper tracks and vias, and board-outline
   micro-segments. Checks turned off in the board's saved Health Check settings are
   skipped; mirrored footprints, panels, fonts and From-Tos are listed as not checked.
+  Counts follow Altium's report: one row per object, per short edge for micro-segments
+  and per crossing point for self-intersecting regions.
   On real boards it matched every saved report's health section (reference points
   outside the component on 11 of 11 boards). The PcbDoc parser now also reads region
   shapes (ShapeBasedRegions6, Regions6), fills, board regions, pour and outline arcs,

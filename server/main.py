@@ -3293,21 +3293,29 @@ def check_pcb_health(
                 f"Project lists {len(paths)} PcbDocs; checked '{pcb_path.name}'."
             )
         try:
-            report, report_path, _, _, _ = load_report(project, pcb_path)
+            report, report_path, _, _, report_notes = load_report(project, pcb_path)
         except Exception:  # a broken report must not stop the health check
-            report, report_path = None, None
+            report, report_path, report_notes = None, None, []
         if report is not None:
+            context["altium_report_file"] = report_path.name
+            report_saved = report_path.stat().st_mtime
+            context["altium_report_saved_utc"] = _utc(report_saved)
+            cautions = [note["detail"] for note in report_notes if note.get("detail")]
             tables = [table for table in report.tables if table.type == "health"]
             if tables or "health_issues" in report.totals:
                 report_health = {table.title: table.count for table in tables}
-                report_saved = report_path.stat().st_mtime
-                context["altium_report_file"] = report_path.name
-                context["altium_report_saved_utc"] = _utc(report_saved)
                 if report_saved < pcb_path.stat().st_mtime:
-                    context["altium_report_note"] = (
+                    cautions.append(
                         "The report is older than the saved board: its counts may be out "
                         "of date."
                     )
+            else:
+                cautions.append(
+                    "The report has no PCB health section ('Report PCB Health Issues' was "
+                    "off in the Batch DRC report options), so there is nothing to compare."
+                )
+            if cautions:
+                context["altium_report_notes"] = cautions
     for limit in (100, 40, 15, 5):
         result = run_health_check(
             index.pcb, checks=checks, to_mm=to_mm, offset=offset, limit=limit,

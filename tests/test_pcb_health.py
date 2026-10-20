@@ -37,17 +37,22 @@ def _region(layer, vertices, *, net=0xFFFF, polygon=0xFFFF, component=0xFFFF,
     head = (bytes([layer, 0, 2 if keepout else 0])
             + struct.pack("<HHH", net, polygon, component) + b"\x00" * 5
             + struct.pack("<H", 0) + b"\x00\x00" + struct.pack("<I", len(text)) + text)
-    body = struct.pack("<I", len(vertices))
     if shape_based:
-        for vertex in [*vertices, vertices[0]]:
+        # count + 1 entries: Altium closes the shape with a copy of the first vertex,
+        # written as a straight vertex even when the first one is an arc.
+        body = struct.pack("<I", len(vertices))
+        for index, vertex in enumerate([*vertices, vertices[0]]):
             x, y = vertex[0], vertex[1]
             arc = vertex[2] if len(vertex) > 2 else None
             cx, cy, radius, start, end = arc or (0, 0, 0, 0.0, 0.0)
-            body += struct.pack("<B5i2d", 1 if arc else 0, round(x * UNITS), round(y * UNITS),
+            round_flag = 1 if arc and index < len(vertices) else 0
+            body += struct.pack("<B5i2d", round_flag, round(x * UNITS), round(y * UNITS),
                                 round(cx * UNITS), round(cy * UNITS), round(radius * UNITS),
                                 start, end)
     else:
-        body += b"".join(struct.pack("<dd", x * UNITS, y * UNITS) for x, y, *_ in vertices)
+        closed = [*vertices, vertices[0]]  # Regions6 also repeats the first vertex
+        body = struct.pack("<I", len(closed)) + b"".join(
+            struct.pack("<dd", x * UNITS, y * UNITS) for x, y, *_ in closed)
     payload = head + body
     return bytes([11]) + struct.pack("<I", len(payload)) + payload
 
@@ -311,3 +316,119 @@ def test_examples(folder, name, expected):
     if not paths:
         pytest.skip("Altium example boards not installed")
     assert run_health_check(parse_pcb_doc(str(paths[0])))["summary"] == expected
+
+
+# ---------- review regressions ----------
+
+def _regions(*records, shape_based=True):
+    key = "ShapeBasedRegions6/Data" if shape_based else "Regions6/Data"
+    return _pcb(raw={key: b"".join(records)}, components=[], primitives=[], pours=[],
+                xsignals=[], rules=[])
+
+
+def _summary(pcb, checks):
+    return run_health_check(pcb, checks=checks)["summary"]
+
+
+REGION_CHECKS = ["self_intersecting_regions", "zero_area_regions", "micro_segments_copper",
+                 "micro_segments_board"]
+
+
+def test_arc_first_vertex_and_rounded_corners_are_clean():
+    # The first vertex is an arc (Altium closes with a straight copy), its angles a hair
+    # off and its centre one internal unit away: a pie slice, not a crossing shape.
+    pie = _region(1, [(10, 0, (0.0001, 0.0001, 10, 0.0003, 89.9997)), (0, 10), (0, 0)])
+    regions, _ = decode_regions(pie, True)
+    assert len(regions[0].vertices) == 3
+    corner = _region(1, [(0, 2, (2.0001, 2.0001, 2, 179.9998, 270.0002)), (2, 0), (100, 0),
+                         (100, 50), (0, 50)])
+    assert _summary(_regions(pie, corner), REGION_CHECKS) == {}
+
+
+def test_self_intersections_through_vertices_and_cancelling_lobes():
+    figure_eight = [(0, 0), (5, 0), (10, 0), (10, 10), (5, 10), (5, -4), (0, -4)]
+    touching = [(0, 0), (10, 0), (5, 5), (0, 12), (10, 12), (5, 5)]
+    bow_tie = [(0, 0), (20, 20), (20, 0), (0, 20)]  # lobes cancel in the shoelace area
+    result = run_health_check(_regions(*(_region(1, shape) for shape in
+                                         (figure_eight, touching, bow_tie))),
+                              checks=REGION_CHECKS)
+    assert [f["check"] for f in result["findings"]] == ["self_intersecting_regions"] * 3
+    # Two lobes that only touch at a shared vertex do not cross.
+    kissing = [(0, 0), (10, 0), (5, 5), (10, 10), (0, 10), (5, 5)]
+    assert _summary(_regions(_region(1, kissing)), ["self_intersecting_regions"]) == {}
+
+
+def test_region_counts_follow_altium_rows():
+    three = _region(1, [(0, 0), (0.01, 0), (0.02, 0), (0.03 - 1e-4, 0), (40, 0), (40, 40)])
+    result = run_health_check(_regions(three), checks=["micro_segments_copper"],
+                              report_health={"Micro-Segments (Copper)": 3})
+    (finding,) = result["findings"]
+    assert (finding["segments"], finding["rows"]) == (3, 3)
+    assert result["summary"] == {"micro_segments_copper": 3}
+    assert result["altium_report"]["categories"][0]["offline"] == 3
+    assert finding["shortest_um"] == pytest.approx(0.0099 * 25.4, abs=1e-3)
+    assert "um" in finding["issue"]
+
+
+def test_flattened_regions_and_unreadable_records():
+    keepout = _region(56, _square(0, 0, 40), shape_based=False)
+    result = run_health_check(_regions(keepout, shape_based=False), checks=REGION_CHECKS)
+    assert result["summary"] == {}
+    assert any("Regions6" in note for note in result["notes"])
+    payload = _region(1, [(0, 0), (10, 10), (10, 0), (0, 20)])[5:-20]  # cut short
+    broken = bytes([11]) + struct.pack("<I", len(payload)) + payload
+    result = run_health_check(_regions(broken), checks=REGION_CHECKS)
+    assert any("Could not read 1 region records" in note for note in result["notes"])
+    empty = run_health_check(_regions(), checks=REGION_CHECKS)
+    assert "The board has no regions." in empty["notes"]
+    missing = run_health_check(_pcb(raw={}), checks=REGION_CHECKS)
+    assert any("no region stream" in note for note in missing["notes"])
+
+
+def test_zero_length_slot_and_unnamed_rules():
+    slot = Primitive(kind="pad", layer=74, net=1, component=None, x1=0, y1=0, x2=0, y2=0,
+                     width=60, height=60, shape=1, hole=40.0, pad_name="1", hole_shape=2,
+                     slot_length=0.0)
+    assert _summary(_pcb(primitives=[slot]), ["slot_holes"]) == {"slot_holes": 1}
+    from server.parsers.pcb_doc import decode_rules
+    rules = decode_rules([(7, {"RULEKIND": "Width", "NAME": ""}), (7, {"RULEKIND": "Width"})])
+    findings = run_health_check(_pcb(rules=rules), checks=["invalid_rules"])["findings"]
+    assert [f["object"] for f in findings] == ["A Width rule has no name"] * 2
+
+
+def test_edges_groups_and_number_formats():
+    edge_parts = [_component(i, f"J{i}", x, y, f"E{i}")
+                  for i, (x, y) in enumerate([(1000, 500), (500, 1000), (0, 500), (500, 0)])]
+    assert _summary(_pcb(components=edge_parts, primitives=[]),
+                    ["components_outside_board"]) == {}
+    tracks = [_track(0, 1, 0, 10 * i, 100, 10 * i) for i in range(30)] * 2
+    (group,) = run_health_check(_pcb(primitives=tracks), checks=["duplicate_copper"])["findings"]
+    assert group["count"] == 30 and group["objects"][0]["at_mil"] == [0.0, 0.0]
+    parked = [_component(0, "J9", 12345.6, -15012.3, "P")]
+    (finding,) = run_health_check(_pcb(components=parked, primitives=[]),
+                                  checks=["components_outside_board"])["findings"]
+    assert "(12345.6 mil, -15012.3 mil)" in finding["issue"]
+    board = _board()
+    board.outline_shape = [ShapeVertex(0, 0), ShapeVertex(0.001, 0), ShapeVertex(100, 0),
+                           ShapeVertex(100, 100)]
+    (edge,) = run_health_check(_pcb(board=board), checks=["outline_micro_segments"])["findings"]
+    assert edge["length_um"] == pytest.approx(0.0254) and "0.0254 um long" in edge["issue"]
+
+
+def test_report_notes_reach_the_tool(board):
+    archive = board / "Archive" / "Old"
+    archive.mkdir(parents=True)
+    text = DRC_FIXTURE.read_text(encoding="utf-8", errors="replace")
+    (archive / DRC_FIXTURE.name).write_text(text, encoding="utf-8")
+    result = json.loads(main_mod.check_pcb_health())
+    assert result["altium_report"]["categories"][0]["report"] == 2
+    assert any("output folder" in note for note in result["altium_report_notes"])
+    start = text.index("PCB Health Issue Category")
+    stripped = text[:start] + text[text.index("Violations Detected"):]
+    stripped = stripped.replace("PCB Health Issues : 2\n", "")
+    outputs = board / "Project Outputs for Demo"
+    outputs.mkdir()
+    (outputs / DRC_FIXTURE.name).write_text(stripped, encoding="utf-8")
+    result = json.loads(main_mod.check_pcb_health())
+    assert "altium_report" not in result
+    assert any("no PCB health section" in note for note in result["altium_report_notes"])
