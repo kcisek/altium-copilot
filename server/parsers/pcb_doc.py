@@ -88,6 +88,36 @@ def read_kind_prefixed_text_records(
     return records, len(data) - offset
 
 
+@dataclass(frozen=True)
+class PadCopper:
+    """A pad's copper on one layer, in mils (corner radius as on Primitive)."""
+
+    width: float
+    height: float
+    shape: int
+    corner_radius: float | None = None
+
+
+# Primitive.layer_copper key for the inner layers without an entry of their
+# own: every mid layer of a top-middle-bottom stack, Mid-Layer 1 and the
+# internal planes of a full stack.
+PAD_INNER_LAYERS = 0
+
+
+def pad_copper_on(
+    layer_copper: dict[int, PadCopper] | None, layer: int
+) -> PadCopper | None:
+    """A multi-layer pad's copper on v6 layer `layer` from its layer_copper;
+    None when the layer has the pad's main (top-layer) copper."""
+    if not layer_copper:
+        return None
+    if layer in layer_copper:
+        return layer_copper[layer]
+    if layer in (1, _BOTTOM_LAYER):
+        return None
+    return layer_copper.get(PAD_INNER_LAYERS)
+
+
 @dataclass
 class ViaStack:
     """A Vias6 record's mask and pad-stack fields (see decode_vias)."""
@@ -148,6 +178,15 @@ class Primitive:
     # Pad Pin/Package Length (pad to die, mil): 0.0 when unset, None when the
     # pad record is too short to carry it (and for non-pad primitives).
     pin_package: float | None = None
+    # Corner radius (mil) of a rounded-rectangle pad (shape PAD_SHAPE_ROUNDRECT);
+    # None for every other shape and primitive.
+    corner_radius: float | None = None
+    # Copper of a multi-layer pad whose stack (top-middle-bottom or full
+    # stack) differs between layers: v6 layer -> PadCopper where it is not
+    # the main copper above (the top layer's), with PAD_INNER_LAYERS for the
+    # inner layers without an entry; read it with pad_copper_on. None for
+    # every other primitive and for pads with one copper on every layer.
+    layer_copper: dict[int, PadCopper] | None = None
     # Vias only: tenting and pad stack.
     via: ViaStack | None = None
 
@@ -417,6 +456,154 @@ _PAD_MAIN_MIN_LENGTH = 60
 # groups at the FPGA); 171-, 185- and 186-byte records hold 0 there throughout
 # the corpus.
 _PAD_PIN_PACKAGE_OFFSET = 158
+# Pad stack mode (main subrecord byte 62): simple pads use the top size and
+# shape on every layer; top-middle-bottom and full-stack pads keep them per
+# layer (top, mid and bottom in the main subrecord at 21/29/37 and 49/50/51,
+# mid layers 2-30 of a full stack in the size-and-shape subrecord), so a pad
+# on the bottom or an inner layer has its copper in that layer's slot, and
+# its top slot can be empty. A multi-layer pad has copper in every slot
+# (Primitive.layer_copper).
+_PAD_MODE_OFFSET = 62
+_PAD_MODE_TOP_MID_BOTTOM = 1
+_PAD_MODE_FULL_STACK = 2
+_BOTTOM_LAYER = 32
+MULTI_LAYER = 74
+# Size-and-shape subrecord (the one after the main subrecord; KiCad's
+# importer reads the same layout): int32 sizes of mid layers 2-30 (x at 0,
+# y at 116) and their shapes at 232, then 32 per-layer slots (0 top, 1-30
+# mid, 31 bottom) of alt shape at 532 and corner radius percent at 564.
+_PAD_SIZE_SHAPE_INDEX = 4
+_PAD_SIZE_SHAPE_MIN_LENGTH = 596
+_PAD_INNER_COUNT = 29
+_PAD_INNER_SIZE_Y_OFFSET = 116
+_PAD_INNER_SHAPE_OFFSET = 232
+_PAD_ALT_SHAPE_OFFSET = 532
+_PAD_CORNER_RADIUS_OFFSET = 564
+_PAD_BOTTOM_SLOT = 31
+
+PAD_SHAPE_ROUND = 1  # round, or oblong when not square
+PAD_SHAPE_RECT = 2
+PAD_SHAPE_OCTAGONAL = 3
+# Altium writes a rounded rectangle as round in the main subrecord; the
+# size-and-shape subrecord's alt shape 9 and corner radius (percent of half
+# the shorter side, 100 = oblong) make it one.
+PAD_SHAPE_ROUNDRECT = 9
+
+
+def _pad_mode(main: bytes) -> int:
+    return main[_PAD_MODE_OFFSET] if len(main) > _PAD_MODE_OFFSET else 0
+
+
+def _main_slots(main: bytes) -> tuple[tuple, tuple, tuple]:
+    """Raw (size x, size y, shape, slot) of top, mid and bottom."""
+    return (
+        (*struct.unpack_from("<ii", main, 21), main[49], 0),
+        (*struct.unpack_from("<ii", main, 29), main[50], 1),
+        (*struct.unpack_from("<ii", main, 37), main[51], _PAD_BOTTOM_SLOT),
+    )
+
+
+def _inner_slot(size_shape: bytes, layer: int) -> tuple | None:
+    """Raw (size x, size y, shape, slot) of a full stack's v6 layer 3-31,
+    or None when the size-and-shape subrecord is too short to hold it."""
+    inner = layer - 3
+    if not (
+        0 <= inner < _PAD_INNER_COUNT
+        and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
+    ):
+        return None
+    return (
+        struct.unpack_from("<i", size_shape, 4 * inner)[0],
+        struct.unpack_from(
+            "<i", size_shape, _PAD_INNER_SIZE_Y_OFFSET + 4 * inner
+        )[0],
+        size_shape[_PAD_INNER_SHAPE_OFFSET + inner],
+        layer - 1,
+    )
+
+
+def _pad_copper(main: bytes, size_shape: bytes) -> tuple[int, int, int, int]:
+    """(size x, size y, shape, slot) of a pad's copper on its own layer.
+
+    A per-layer pad whose own slot is empty takes the first filled one of
+    top, mid and bottom instead of being dropped.
+    """
+    top, mid, bottom = _main_slots(main)
+    mode = _pad_mode(main)
+    if mode not in (_PAD_MODE_TOP_MID_BOTTOM, _PAD_MODE_FULL_STACK):
+        return top
+    layer = main[0]
+    own = top
+    if layer == _BOTTOM_LAYER:
+        own = bottom
+    elif 1 < layer < _BOTTOM_LAYER:
+        own = mid
+        if mode == _PAD_MODE_FULL_STACK:
+            own = _inner_slot(size_shape, layer) or mid
+    return next(
+        (
+            copper
+            for copper in (own, top, mid, bottom)
+            if copper[0] > 0 and copper[1] > 0
+        ),
+        own,
+    )
+
+
+def _slot_copper(raw: tuple, size_shape: bytes) -> PadCopper:
+    """Copper of a raw (size x, size y, shape, slot) in mils: a round shape
+    whose slot has alt shape 9 in the size-and-shape subrecord is a rounded
+    rectangle."""
+    size_x, size_y, shape, slot = raw
+    corner_radius = None
+    if (
+        shape == PAD_SHAPE_ROUND
+        and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
+        and size_shape[_PAD_ALT_SHAPE_OFFSET + slot] == PAD_SHAPE_ROUNDRECT
+    ):
+        shape = PAD_SHAPE_ROUNDRECT
+        percent = min(size_shape[_PAD_CORNER_RADIUS_OFFSET + slot], 100)
+        corner_radius = (
+            _units_to_mil(min(size_x, size_y)) / 2.0 * (percent / 100.0)
+        )
+    return PadCopper(
+        _units_to_mil(size_x), _units_to_mil(size_y), shape, corner_radius
+    )
+
+
+def _pad_layer_copper(
+    main: bytes, size_shape: bytes, own: PadCopper
+) -> dict[int, PadCopper] | None:
+    """Primitive.layer_copper of a multi-layer pad whose main copper is own.
+
+    A top-middle-bottom stack has one mid copper on every inner layer; a
+    full stack keeps Mid-Layer 1 in the main subrecord and Mid-Layers 2-30
+    in the size-and-shape subrecord. An empty slot (not seen in files) keeps
+    the main copper, or for Mid-Layers 2-30 the mid copper.
+    """
+    mode = _pad_mode(main)
+    if mode not in (_PAD_MODE_TOP_MID_BOTTOM, _PAD_MODE_FULL_STACK):
+        return None
+
+    def copper(raw: tuple, empty: PadCopper) -> PadCopper:
+        if raw[0] <= 0 or raw[1] <= 0:
+            return empty
+        return _slot_copper(raw, size_shape)
+
+    _, mid_slot, bottom_slot = _main_slots(main)
+    layer_copper: dict[int, PadCopper] = {}
+    bottom = copper(bottom_slot, own)
+    if bottom != own:
+        layer_copper[_BOTTOM_LAYER] = bottom
+    mid = copper(mid_slot, own)
+    if mid != own:
+        layer_copper[PAD_INNER_LAYERS] = mid
+    if mode == _PAD_MODE_FULL_STACK:
+        for layer in range(3, _BOTTOM_LAYER):
+            raw = _inner_slot(size_shape, layer)
+            if raw is not None and (inner := copper(raw, mid)) != mid:
+                layer_copper[layer] = inner
+    return layer_copper or None
 
 
 def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
@@ -464,20 +651,14 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
         net = struct.unpack_from("<H", main, 3)[0]
         component = struct.unpack_from("<H", main, 7)[0]
         x, y = struct.unpack_from("<ii", main, 13)
-        (
-            size_x,
-            size_y,
-            _mid_size_x,
-            _mid_size_y,
-            _bottom_size_x,
-            _bottom_size_y,
-            hole,
-        ) = struct.unpack_from("<iiiiiii", main, 21)
-        shape = main[49]
+        (hole,) = struct.unpack_from("<i", main, 45)
+        size_shape = subrecords[_PAD_SIZE_SHAPE_INDEX]
+        raw_copper = _pad_copper(main, size_shape)
         (rotation,) = struct.unpack_from("<d", main, 52)
-        if size_x <= 0 or size_y <= 0 or hole < 0:
+        if raw_copper[0] <= 0 or raw_copper[1] <= 0 or hole < 0:
             skipped += 1
             continue
+        copper = _slot_copper(raw_copper, size_shape)
         pin_package = None
         if len(main) >= _PAD_PIN_PACKAGE_OFFSET + 4:
             (raw_pin_package,) = struct.unpack_from(
@@ -497,13 +678,19 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                 y1=y_mil,
                 x2=x_mil,
                 y2=y_mil,
-                width=_units_to_mil(size_x),
-                height=_units_to_mil(size_y),
+                width=copper.width,
+                height=copper.height,
                 rotation=rotation if math.isfinite(rotation) else 0.0,
-                shape=shape,
+                shape=copper.shape,
                 hole=_units_to_mil(hole),
                 pad_name=pad_name,
                 pin_package=pin_package,
+                corner_radius=copper.corner_radius,
+                layer_copper=(
+                    _pad_layer_copper(main, size_shape, copper)
+                    if main[0] == MULTI_LAYER
+                    else None
+                ),
             )
         )
     return primitives, skipped

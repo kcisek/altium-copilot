@@ -1766,6 +1766,12 @@ def get_net_neighbors(
 ) -> str:
     """Return same-layer proximity and adjacent-layer overlap for a PCB net.
 
+    neighbors are copper-to-copper edge distances (tracks, arcs, vias, pads).
+    pours lists other nets' polygon pours on the net's layers, by their drawn
+    outline only: inside_pour when the net's copper lies within the outline,
+    min_outline_distance_mil when the outline comes within distance. An outline
+    is not copper, and poured copper keeps the pour's clearance from the net.
+
     An explicit distance is expressed in units (default: board display unit).
     Omitting distance uses a physical default of 10 mil.
     """
@@ -1829,6 +1835,10 @@ def query_pcb_region(
     units: PcbUnits | None = None,
 ) -> str:
     """Return nets, components, and pours near a board coordinate.
+
+    nets holds copper only (tracks, arcs, vias, pads). pours are polygon pours
+    by their drawn outline: inside_pour, or the distance to the outline, which
+    is not copper.
 
     x, y, and an explicit radius are expressed in units (default: board
     display unit). Omitting radius uses a physical default of 50 mil.

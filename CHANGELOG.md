@@ -339,6 +339,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   stays by name, and the response says so when it was renamed or deleted
 - Stale-designator DNP UniqueIds that could not be resolved at load are kept and
   resolved by the next `refresh_netlist`
+- `get_net_neighbors` and `query_pcb_region` no longer measure polygon-pour outlines as
+  copper. A pour's outline (the boundary drawn in `Polygons6`, kept as zero-width edges)
+  was matched like a track: on Altium's PC4-SODIMM example DQ09 read GND at 1.13 mil
+  with an 81.6 mil parallel run, where the nearest GND copper is 4.92 mil away, and 22 of
+  the 25 neighbours listed for GND were at 0.0 mil (now 3.94 mil at the closest, against
+  a 3.937 mil clearance rule). Copper distances come from tracks, arcs, vias and pads
+  only; a hatched pour's tracks are real copper and still count. `get_net_neighbors`
+  adds `pours`: other nets' pours on the net's layers, by outline, with `inside_pour`
+  when the net's copper lies within the outline and `min_outline_distance_mil` when the
+  outline comes within the search distance. The net's own outlines are not measured.
+  `query_pcb_region` lists outlines only under `pours`. Solid pour copper is still not
+  parsed. The clearance spot-check, DRC violation nets and `check_decoupling` already
+  left outlines out
 - PCB tools name components by the designator printed on the board (decoded from
   `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
   name and differs on multi-channel and board-annotated designs (57 of 73 parts on
@@ -352,6 +365,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   another board designator names. Before, a board-annotated board's U3 (sheet U1) was
   mapped to the netlist's U1, a different part: 64 wrong mappings on the AD25 examples.
   Netlist refdes without schematic metadata now match too
+- Rounded-rectangle pads keep their corners in every PCB distance (clearance
+  spot-check, `query_pcb_region`, `get_net_neighbors`, `check_decoupling`, DRC
+  violation nets, pad-to-pad length). Altium stores them as round pads with the real
+  shape and corner radius in the pad's size-and-shape subrecord; they were modelled as
+  capsules, which cut their corners away. On Altium's MiniPC example U9's 3V3 pad is
+  33.2 mil from C69, pad edge to pad edge (was 37.0), and on its SODIMM board a 1%
+  corner pad that read 7.6 mil from a track is 3.97 mil from it (the clearance rule is
+  3.937); on real boards pad gaps shrank by up to 14.6 mil. Corner radii were checked
+  against the ROUNDEDRECT apertures of Altium's Gerber output. Pads with a
+  top-middle-bottom or full stack on the bottom or an inner layer take that layer's
+  size and shape, and an empty slot falls back to a filled one: three bottom-layer
+  pads with an empty top slot on the Bluetooth Sentinel example were dropped
+- Through-hole pads with a top-middle-bottom or full pad stack keep their size and
+  shape per layer in every PCB distance (clearance spot-check, `query_pcb_region`,
+  `get_net_neighbors`, DRC violation nets, pad-to-pad length): two objects are measured
+  on the layers they share, each pad with its copper there. They had the top-layer size
+  on every layer. On 83 real boards (aggregate) 3,255 through-hole pads have other
+  copper on the inner layers: 21 gaps to inner-layer tracks grew (by up to 12.4 mil),
+  450 pad pairs with larger inner copper came within 20 mil (the closest 9.8 mil), and
+  spot checks of 395 nets lost 6 THPad-Track clearance violations that only the
+  top-layer size caused, with none new; the length of the 1,447 nets with such pads is
+  unchanged. `query_pcb_region` lists only the layers a pad's copper reaches, and a
+  clearance violation names the layer its gap is on. Altium's examples have no such
+  pads and measure the same
 - Stack layers get their layer ids from the stack's LAYERID, not from the layer name.
   Boards keep stale names in old layer slots (e.g. internal planes once named like a
   signal layer), and the name lookup put those signal layers on the plane ids: on
