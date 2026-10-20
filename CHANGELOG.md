@@ -299,6 +299,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
+- `get_drc_report`: a report where several tables list a different number of rows
+  than their counts ("3 tables list ...") was called incomplete instead of having counts
+  that differ
 - `requirements.txt` pins `mcp<2`: mcp 2.x removed `mcp.server.fastmcp`, so a fresh
   install failed to start the server. `httpx`, which the update check imports, is now a
   declared dependency instead of arriving through mcp

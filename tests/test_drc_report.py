@@ -601,6 +601,9 @@ def test_an_incomplete_report_names_no_other_cause(tmp_path):
     issues = _assess(tmp_path, counts, pcb)
     assert "report_incomplete" not in issues
     assert issues["report_counts_differ"]["severity"] == "warning"
+    counts.problems = ["3 tables list a different number of rows than its count (e.g. X)"]
+    issues = _assess(tmp_path, counts, pcb)
+    assert "report_incomplete" not in issues and "report_counts_differ" in issues
 
 
 def test_box_nets_follow_the_named_layer():

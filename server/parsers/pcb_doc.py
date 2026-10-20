@@ -1714,7 +1714,9 @@ def decode_regions(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int
     (u32 count + double x, y)."""
     regions: list[PcbRegion] = []
     skipped = 0
+    consumed = 0
     for index, (record_type, payload) in enumerate(iter_binary_records(data)):
+        consumed += 5 + len(payload)
         try:
             if record_type != 11 or len(payload) < 22:
                 raise ValueError
@@ -1779,6 +1781,8 @@ def decode_regions(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int
             holes=holes,
             name=properties.get("NAME", ""),
         ))
+    if consumed < len(data):
+        skipped += 1  # a record cut short at the end of the stream
     return regions, skipped
 
 
@@ -1787,7 +1791,9 @@ def decode_fills(data: bytes) -> tuple[list[PcbFill], int]:
     corners int32 at 13 and 21, rotation double at 29."""
     fills: list[PcbFill] = []
     skipped = 0
+    consumed = 0
     for record_type, payload in iter_binary_records(data):
+        consumed += 5 + len(payload)
         if record_type != 6 or len(payload) < 37 or not _valid_layer(payload[0]):
             skipped += 1
             continue
@@ -1804,6 +1810,8 @@ def decode_fills(data: bytes) -> tuple[list[PcbFill], int]:
             x2=_units_to_mil(x2), y2=_units_to_mil(y2),
             rotation=rotation if math.isfinite(rotation) else 0.0,
         ))
+    if consumed < len(data):
+        skipped += 1  # a record cut short at the end of the stream
     return fills, skipped
 
 

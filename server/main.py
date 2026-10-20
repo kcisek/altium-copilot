@@ -43,7 +43,7 @@ try:
     )
     from services.sch_pcb_sync import net_matching_options, run_sync_check
     from services.drc_results import (
-        load_report, assess, summarize, other_sections, DrcLinker,
+        load_report, assess, summarize, other_sections, DrcLinker, count_problem,
     )
     from services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
@@ -87,7 +87,7 @@ except ImportError:
     )
     from server.services.sch_pcb_sync import net_matching_options, run_sync_check
     from server.services.drc_results import (
-        load_report, assess, summarize, other_sections, DrcLinker,
+        load_report, assess, summarize, other_sections, DrcLinker, count_problem,
     )
     from server.services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
@@ -3302,17 +3302,33 @@ def check_pcb_health(
             context["altium_report_saved_utc"] = _utc(report_saved)
             cautions = [note["detail"] for note in report_notes if note.get("detail")]
             tables = [table for table in report.tables if table.type == "health"]
-            if tables or "health_issues" in report.totals:
+            broken = [problem for problem in report.problems if not count_problem(problem)]
+            listed = sum(table.count for table in tables)
+            if broken:
+                cautions.append(
+                    "The report is incomplete (empty or cut short), so it is not compared: "
+                    "run the Batch DRC again. " + "; ".join(broken[:3])
+                )
+            elif tables or "health_issues" in report.totals:
                 report_health = {table.title: table.count for table in tables}
+                if report.totals.get("health_issues", listed) > listed:
+                    cautions.append(
+                        f"The report counts {report.totals['health_issues']} health issues "
+                        f"but its tables list {listed}: the comparison may be incomplete."
+                    )
                 if report_saved < pcb_path.stat().st_mtime:
                     cautions.append(
                         "The report is older than the saved board: its counts may be out "
                         "of date."
                     )
             else:
+                option = index.pcb.drc_options.include_health if index.pcb.drc_options else None
                 cautions.append(
-                    "The report has no PCB health section ('Report PCB Health Issues' was "
-                    "off in the Batch DRC report options), so there is nothing to compare."
+                    "The report has no PCB health section, so there is nothing to compare: "
+                    + ("'Report PCB Health Issues' is off in the Batch DRC report options."
+                       if option is False else
+                       "'Report PCB Health Issues' was off, or the Altium version that ran "
+                       "it does not offer it.")
                 )
             if cautions:
                 context["altium_report_notes"] = cautions

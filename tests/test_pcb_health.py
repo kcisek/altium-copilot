@@ -2,6 +2,7 @@
 fields it reads: region shapes, fills, board regions, pour and outline arcs, settings."""
 
 import json
+import math
 import shutil
 import struct
 from pathlib import Path
@@ -10,7 +11,7 @@ import pytest
 
 import server.main as main_mod
 from server.parsers.pcb_doc import (
-    PcbComponent, PcbData, PcbRule, PolygonPour, Primitive, ShapeVertex, XSignal,
+    DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour, Primitive, ShapeVertex, XSignal,
     _health_check_storage, _hole_slot, decode_components, decode_fills, decode_polygons,
     decode_regions, parse_pcb_doc, shape_from_properties,
 )
@@ -432,3 +433,91 @@ def test_report_notes_reach_the_tool(board):
     result = json.loads(main_mod.check_pcb_health())
     assert "altium_report" not in result
     assert any("no PCB health section" in note for note in result["altium_report_notes"])
+
+
+# ---------- verification regressions ----------
+
+def _turned(points, degrees):
+    c, s = math.cos(math.radians(degrees)), math.sin(math.radians(degrees))
+    return [(x * c - y * s, x * s + y * c) for x, y in points]
+
+
+SPIKE = [(0, 0), (10, 0), (10, 5), (15, 5), (10, 5), (10, 10), (0, 10)]
+KEYHOLE = [(0, 0), (20, 0), (20, 20), (0, 20), (0, 10), (5, 10), (5, 15), (15, 15), (15, 5),
+           (5, 5), (5, 10), (0, 10)]  # a hole joined to the outline by a zero-width cut
+LINE = [(0, 0), (10, 0), (20, 0), (10, 0)]
+ALONG_AN_EDGE = [(0, 0), (20, 0), (20, 10), (12, 10), (12, 0), (8, 0), (8, -10), (0, -10)]
+THROUGH_AN_EDGE = [(0, 0), (20, 0), (20, 10), (10, 0), (5, -10), (0, -10)]
+TOUCHING_AN_EDGE = [(0, 0), (20, 0), (20, 10), (10, 0), (5, 10), (0, 10)]
+
+
+@pytest.mark.parametrize("degrees", [0, 30, 45, 90, 137.5, 210])
+def test_crossings_at_any_rotation(degrees):
+    for shape in (SPIKE, KEYHOLE, LINE, TOUCHING_AN_EDGE):
+        assert self_intersections(_turned(shape, degrees)) == [], shape
+    # The outline runs along an edge, then leaves on its other side: one crossing, once.
+    for shape in (ALONG_AN_EDGE, THROUGH_AN_EDGE):
+        assert len(self_intersections(_turned(shape, degrees))) == 1, shape
+
+
+def test_parts_on_a_curved_board_edge_are_on_the_board():
+    board = _board()
+    # A 2000 mil radius edge: at MAX_ARC_CHORDS chords each cuts ~0.005 mil inside the arc.
+    board.outline_shape = [ShapeVertex(0, 0), ShapeVertex(1000, 0, (1000, 2000, 2000, 270, 90)),
+                           ShapeVertex(1000, 4000), ShapeVertex(0, 4000)]
+
+    def at(angle, radius):  # midway between two chords
+        return (1000 + radius * math.cos(math.radians(angle)),
+                2000 + radius * math.sin(math.radians(angle)))
+
+    spots = [at(295.125, 2000), at(295.125, 2000 - 0.003), at(15.125, 2000.01),
+             at(15.125, 2001)]
+    parts = [_component(i, f"J{i}", x, y, f"A{i}") for i, (x, y) in enumerate(spots)]
+    result = run_health_check(_pcb(board=board, components=parts, primitives=[], raw={}),
+                              checks=["components_outside_board"])
+    assert sorted(f["object"] for f in result["findings"]) == ["J2", "J3"]
+
+
+def test_cut_short_streams_and_flattened_micro_segments():
+    square = _region(1, _square(0, 0, 40))
+    result = run_health_check(_regions(square + square[:30]), checks=REGION_CHECKS)
+    assert result["summary"] == {}
+    assert any("Could not read 1 region records" in note for note in result["notes"])
+    fill = _fill(1, 0, 0, 20, 10)
+    assert decode_fills(fill + fill[:10])[1] == 1
+    tiny = _region(1, [(0, 0), (0.01, 0), (40, 0), (40, 40)], shape_based=False)
+    result = run_health_check(_regions(tiny, shape_based=False), checks=REGION_CHECKS)
+    assert result["summary"] == {}
+    assert any("micro-segments were not checked" in note for note in result["notes"])
+
+
+def test_broken_or_partial_reports(board):
+    text = DRC_FIXTURE.read_text(encoding="utf-8", errors="replace")
+    report = board / DRC_FIXTURE.name
+    report.write_text(text[:text.index("Violations Detected")], encoding="utf-8")
+    result = json.loads(main_mod.check_pcb_health())
+    assert "altium_report" not in result
+    assert any("incomplete" in note for note in result["altium_report_notes"])
+    report.write_text(text.replace("PCB Health Issues : 2", "PCB Health Issues : 5"),
+                      encoding="utf-8")
+    result = json.loads(main_mod.check_pcb_health())
+    assert result["altium_report"]["categories"][0]["report"] == 2
+    assert any("counts 5 health issues but its tables list 2" in note
+               for note in result["altium_report_notes"])
+
+
+def test_missing_health_section_names_the_cause(board, monkeypatch):
+    text = DRC_FIXTURE.read_text(encoding="utf-8", errors="replace")
+    start = text.index("PCB Health Issue Category")
+    stripped = text[:start] + text[text.index("Violations Detected"):]
+    (board / DRC_FIXTURE.name).write_text(stripped.replace("PCB Health Issues : 2\n", ""),
+                                          encoding="utf-8")
+
+    def notes():
+        main_mod._pcb_session._index = None
+        return " ".join(json.loads(main_mod.check_pcb_health())["altium_report_notes"])
+
+    assert "or the Altium version that ran it" in notes()
+    index = PcbIndex(_pcb(drc_options=DrcOptions(include_health=False)), None)
+    monkeypatch.setattr(main_mod._pcb_session, "_load", lambda path, netlist: index)
+    assert "'Report PCB Health Issues' is off" in notes()

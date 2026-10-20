@@ -85,14 +85,20 @@ _KEEPOUT_LAYER = 56
 # ---------- shapes ----------
 
 SNAP_MIL = 1e-3  # points closer than this (10 internal units) are one point
+MAX_ARC_CHORDS = 720
 
 
-def _arc_points(vertex, step_deg: float = 10.0) -> list[tuple[float, float]]:
+def _arc_points(vertex, step_deg: float = 10.0,
+                max_sagitta: float | None = None) -> list[tuple[float, float]]:
     """The arc of an arc vertex as points, run from the end nearer the vertex (as
-    Altium draws it), its first point snapped to the stored vertex."""
+    Altium draws it), its first point snapped to the stored vertex. max_sagitta (mil)
+    bounds how far a chord may cut inside the arc (up to MAX_ARC_CHORDS chords)."""
     cx, cy, radius, start, end = vertex.arc
     sweep = (end - start) % 360.0 or 360.0
     steps = max(2, int(math.ceil(sweep / step_deg)))
+    if max_sagitta and radius > max_sagitta:
+        chord_deg = math.degrees(2 * math.acos(1 - max_sagitta / radius))
+        steps = min(MAX_ARC_CHORDS, max(steps, int(math.ceil(sweep / chord_deg))))
     points = [
         (cx + radius * math.cos(math.radians(start + sweep * i / steps)),
          cy + radius * math.sin(math.radians(start + sweep * i / steps)))
@@ -106,13 +112,14 @@ def _arc_points(vertex, step_deg: float = 10.0) -> list[tuple[float, float]]:
     return points
 
 
-def contour(vertices) -> list[tuple[float, float]]:
+def contour(vertices, max_sagitta: float | None = None) -> list[tuple[float, float]]:
     """The shape as points, arcs flattened. A stored vertex within SNAP_MIL of the
     flattened arc's end replaces it (Altium stores both rounded to its grid), and the
     last point is dropped when it repeats the first."""
     points: list[tuple[float, float]] = []
     for vertex in vertices:
-        new = _arc_points(vertex) if vertex.arc else [(vertex.x, vertex.y)]
+        new = (_arc_points(vertex, max_sagitta=max_sagitta) if vertex.arc
+               else [(vertex.x, vertex.y)])
         if points and math.dist(points[-1], new[0]) < SNAP_MIL:
             points[-1] = new[0]
             new = new[1:]
@@ -132,10 +139,9 @@ def area(points: list[tuple[float, float]]) -> float:
     return abs(total) / 2.0
 
 
-def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL, skip_zero: bool = False) -> list[tuple]:
+def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL) -> list[tuple]:
     """Edges shorter than limit: (length, (x1, y1), (x2, y2)). An arc edge measures its
-    arc length; a repeated vertex is an edge of length 0 (skip_zero leaves those out,
-    for shapes stored flattened, where they are an artifact)."""
+    arc length; a repeated vertex is an edge of length 0."""
     edges = []
     count = len(vertices)
     if count < 2:
@@ -147,7 +153,7 @@ def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL, skip_zero: bool = Fa
             length = radius * math.radians((end - start) % 360.0 or 360.0)
         else:
             length = math.dist((vertex.x, vertex.y), (following.x, following.y))
-            if length < 1e-9 and (following.arc or skip_zero):
+            if length < 1e-9 and following.arc:
                 continue  # the arc starts here: no edge in Altium's shape
         if length < limit:
             edges.append((length, (vertex.x, vertex.y), (following.x, following.y)))
@@ -174,6 +180,11 @@ def _on_segment(a, b, p, tolerance: float) -> bool:
 
 def _angle(origin, point) -> float:
     return math.atan2(point[1] - origin[1], point[0] - origin[0])
+
+
+def _same_direction(first: float, second: float) -> bool:
+    difference = abs(first - second) % (2 * math.pi)
+    return min(difference, 2 * math.pi - difference) < 1e-6
 
 
 def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS,
@@ -213,7 +224,16 @@ def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS,
             t = ((a[0] - c[0]) * (c[1] - d[1]) - (a[1] - c[1]) * (c[0] - d[0])) / denominator
             found.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
     # A vertex the outline passes through another edge at: test each vertex against
-    # the edges whose box holds it.
+    # the edges whose box holds it. Points on the edge's line (a run along the edge, or
+    # points within tolerance of it) are walked past to where the outline leaves it,
+    # and the crossing is counted once, at the vertex where the outline arrives.
+    def leaving_side(c, d, k, step):
+        for offset in range(1, count):
+            side = _side(c, d, points[(k + step * offset) % count], tolerance)
+            if side:
+                return side
+        return 0
+
     for i, j in candidates:
         for edge, other in ((i, j), (j, i)):
             for k in (other, (other + 1) % count):
@@ -221,9 +241,9 @@ def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS,
                     continue
                 here = points[k]
                 c, d = edges[edge]
-                if _on_segment(c, d, here, tolerance) and _side(
-                    c, d, points[k - 1], tolerance
-                ) * _side(c, d, points[(k + 1) % count], tolerance) < 0:
+                if not _on_segment(c, d, here, tolerance) or _side(c, d, points[k - 1], tolerance) == 0:
+                    continue
+                if _side(c, d, points[k - 1], tolerance) * leaving_side(c, d, k, 1) < 0:
                     found.append(here)
     # A point the outline visits twice: a crossing when the two passes interleave
     # around it, not when they only touch.
@@ -239,6 +259,8 @@ def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS,
                 here = points[k]
                 first = sorted((_angle(here, points[k - 1]), _angle(here, points[(k + 1) % count])))
                 second = [_angle(here, points[m - 1]), _angle(here, points[(m + 1) % count])]
+                if any(_same_direction(a, b) for a in first for b in second):
+                    continue  # the passes share a ray (spike, slit, keyhole): a touch
                 inside = [first[0] < angle < first[1] for angle in second]
                 if inside[0] != inside[1]:
                     found.append(here)
@@ -257,6 +279,7 @@ class _Board:
         self.shape_based = "ShapeBasedRegions6/Data" in raw
         self.region_stream = self.shape_based or "Regions6/Data" in raw
         data = raw.get("ShapeBasedRegions6/Data") or raw.get("Regions6/Data") or b""
+        self.region_bytes = len(data)
         self.regions, bad_regions = decode_regions(data, self.shape_based)
         self.board_regions, bad_board = decode_regions(raw.get("BoardRegions/Data", b""), False)
         self.fills, bad_fills = decode_fills(raw.get("Fills6/Data", b""))
@@ -356,11 +379,13 @@ def _component_boxes(board: _Board) -> dict[int, list[float]]:
 
 def _board_shape(board: _Board) -> tuple[list[list[tuple[float, float]]], str]:
     """The board's shape as polygons, and where it came from."""
-    shapes = [contour(region.vertices) for region in board.board_regions]
+    # Fine chords on curved edges, so a part on or just inside one is on the board.
+    shapes = [contour(region.vertices, max_sagitta=SNAP_MIL) for region in board.board_regions]
     shapes = [shape for shape in shapes if len(shape) >= 3]
     if shapes:
         return shapes, "board regions"
-    outline = contour(board.pcb.board.outline_shape) or list(board.pcb.board.outline_vertices)
+    outline = (contour(board.pcb.board.outline_shape, max_sagitta=SNAP_MIL)
+               or list(board.pcb.board.outline_vertices))
     return ([outline], "board outline") if len(outline) >= 3 else ([], "none")
 
 
@@ -435,17 +460,19 @@ def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], 
         # A self-crossing shape's lobes cancel in the shoelace area; it is not empty.
         if area(points) < ZERO_AREA_SQ_MIL and not crossings:
             add("zero_area_regions", label, _centre(points))
-        short = short_edges(region.vertices, skip_zero=not board.shape_based)
+        # Regions6 (read only without ShapeBasedRegions6) stores arcs as short chords:
+        # its edges are no measure of Altium's micro-segments.
+        short = short_edges(region.vertices) if board.shape_based else []
         if short:
             add(_region_category(region), label, short[0][1], weight=len(short),
                 segments=len(short), shortest_um=round(min(edge[0] for edge in short) * 25.4, 4))
     if not board.region_stream:
         notes.append("The PcbDoc has no region stream: region checks found nothing to check.")
-    elif not board.regions and not any(board.unread.values()):
+    elif not board.region_bytes:
         notes.append("The board has no regions.")
     elif not board.shape_based:
-        notes.append("Regions were read from Regions6, where arcs are flattened: "
-                     "micro-segments there leave out repeated vertices.")
+        notes.append("Regions were read from Regions6, where arcs are stored as short "
+                     "chords: micro-segments were not checked.")
     unread = [f"{count} {kind} records" for kind, count in board.unread.items() if count]
     if unread:
         notes.append(f"Could not read {', '.join(unread)}: the checks that use them may be "
@@ -538,8 +565,26 @@ def _on_boundary(x: float, y: float, shape, tolerance: float = SNAP_MIL) -> bool
                for a, b in zip(shape, shape[1:] + shape[:1]))
 
 
+def _on_arc_edge(x: float, y: float, vertices) -> bool:
+    """(x, y) lies on one of the shape's arc edges, or between it and the chords that
+    stand in for it (a large arc at MAX_ARC_CHORDS chords cuts more than SNAP_MIL)."""
+    for vertex in vertices:
+        if not vertex.arc:
+            continue
+        cx, cy, radius, start, end = vertex.arc
+        sweep = (end - start) % 360.0 or 360.0
+        sagitta = radius * (1 - math.cos(math.radians(sweep / MAX_ARC_CHORDS) / 2))
+        distance = math.dist((x, y), (cx, cy))
+        if not radius - max(sagitta, SNAP_MIL) - SNAP_MIL <= distance <= radius + SNAP_MIL:
+            continue
+        if (math.degrees(math.atan2(y - cy, x - cx)) - start) % 360.0 <= sweep:
+            return True
+    return False
+
+
 def _outside_board(board: _Board, add, notes: list[str]) -> None:
     shapes, source = _board_shape(board)
+    curved = board.pcb.board.outline_shape if source == "board outline" else []
     if not shapes:
         notes.append("The board has no outline: components outside the board were not checked.")
         return
@@ -550,8 +595,10 @@ def _outside_board(board: _Board, add, notes: list[str]) -> None:
     for component in board.pcb.components:
         if component.x is None or component.y is None:
             continue
-        if any(point_in_polygon(component.x, component.y, shape)
-               or _on_boundary(component.x, component.y, shape) for shape in shapes):
+        x, y = component.x, component.y
+        if any(point_in_polygon(x, y, shape) or _on_boundary(x, y, shape) for shape in shapes):
+            continue
+        if _on_arc_edge(x, y, curved):
             continue  # on the edge counts as on the board (edge-launch parts)
         add("components_outside_board", board.designators[component.index],
             (component.x, component.y), severity="warning" if netted[component.index] else "info",
