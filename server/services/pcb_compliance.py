@@ -8,9 +8,12 @@ the object against it.
 Calibration against Altium batch-DRC reports (see the compliance mapping
 notes): Width on nets outside differential pairs, DiffPairsRouting per-layer
 widths on pair-member tracks and RoutingVias matched Altium exactly on every
-fresh report. HoleSize and MinimumAnnularRing are exact for vias (pads are not
-checked here). RoutingLayers agrees on every report (all clean). Length and
-the clearance spot-check are approximate.
+fresh report. HoleSize is exact for vias, and so is MinimumAnnularRing for
+simple-stack vias (pads are not checked here). A top-middle-bottom or
+full-stack via's ring is the smallest (pad - hole) / 2 over the signal layers
+of its span that keep a pad, as check_vias measures it; no batch-DRC report
+has confirmed that for such vias. RoutingLayers agrees on every report (all
+clean). Length and the clearance spot-check are approximate.
 
 All lengths are mils under *_mil keys, so callers can convert units.
 """
@@ -385,6 +388,31 @@ def _margin_fields(record: dict, margin: float) -> dict:
     return record
 
 
+def smallest_via_pad(prim, layers) -> tuple[float, int | None]:
+    """(diameter, v6 layer) of a via's smallest pad over the signal layers
+    (v6 1..32) in layers that keep a pad; its annular ring there is
+    (diameter - hole) / 2. The layer is None when every such layer has the
+    same pad (a simple stack). With no layer that keeps a pad, the via's
+    nominal diameter and None. Shared by check_rule_compliance and check_vias
+    so both report the same ring."""
+    stack = getattr(prim, "via", None)
+    pads = []
+    for layer in layers:
+        if not 1 <= layer <= 32:
+            continue
+        diameter = (
+            stack.pad_diameter(layer, prim.width) if stack is not None else prim.width
+        )
+        if diameter:
+            pads.append((diameter, layer))
+    if not pads:
+        return prim.width, None
+    diameter, layer = min(pads, key=lambda pad: pad[0])
+    if all(abs(size - diameter) <= EPS_MIL for size, _ in pads):
+        return diameter, None
+    return diameter, layer
+
+
 # ---------- checker ----------
 
 
@@ -402,6 +430,8 @@ class _Checker:
         self._targets: dict = {}
         self._resolvers: dict = {}
         self._pairs: dict = {}
+        self._copper_order: list[int] = []
+        self._copper_position: dict[int, int] | None = None
         # No-net objects (free vias): a target without nets, whose scopes the
         # resolver decides on each object.
         self._free = RuleTarget(kind="net", name="", nets=set(), pairs=set())
@@ -519,6 +549,34 @@ class _Checker:
         )
         for row in self._rows(sql, [], net_ids):
             yield row, self.index.object_facts(row)
+
+    def via_pad(self, row) -> tuple[float, int | None]:
+        """smallest_via_pad of a via row over the copper layers of its span
+        (no layers, so the nominal diameter, when an end is not in the stack,
+        as in check_vias); the row's diameter and None when its Primitive is
+        not found."""
+        # PcbIndex inserts pcb.primitives in order, so prims row N holds
+        # primitive N - 1.
+        primitives = self.index.pcb.primitives
+        number = row["id"] - 1
+        prim = primitives[number] if 0 <= number < len(primitives) else None
+        if (
+            prim is None
+            or prim.kind != "via"
+            or (prim.x1, prim.y1) != (row["x1"], row["y1"])
+        ):
+            return row["width"], None
+        if self._copper_position is None:
+            self._copper_order = self.index._copper_layers_in_stack_order()
+            self._copper_position = {
+                layer: position for position, layer in enumerate(self._copper_order)
+            }
+        ends = [self._copper_position.get(layer) for layer in (prim.layer, prim.layer_to)]
+        layers = []
+        if None not in ends:
+            low, high = sorted(ends)
+            layers = self._copper_order[low : high + 1]
+        return smallest_via_pad(prim, layers)
 
     # --- Width / DiffPairsRouting / RoutingLayers ---
 
@@ -739,12 +797,16 @@ class _Checker:
         report.violation(rule, key, record)
 
     def _via_ring(self, report, rule, row, base) -> None:
+        """The smallest ring over the span's layers that keep a pad; a
+        top-middle-bottom or full-stack via names the layer and its pad."""
         minimum = self.values(rule).get("min_ring_mil")
         diameter, hole = row["width"], row["hole"] or 0.0
-        ring = (diameter - hole) / 2.0
+        pad, layer = self.via_pad(row)
+        ring = (pad - hole) / 2.0
         outside = _limit_check(ring, minimum, None)
         if outside is None:
             return
+        layer_name = self.layer_label(layer) if layer is not None else None
         record = {"net": base["net"], "rule": rule.name}
         record.update(
             {
@@ -757,10 +819,13 @@ class _Checker:
                 "side": outside[0],
             }
         )
+        if layer_name is not None:
+            record["layer"] = layer_name
+            record["pad_diameter_mil"] = _round(pad)
         _margin_fields(record, outside[1])
         record["x_mil"] = base["x_mil"]
         record["y_mil"] = base["y_mil"]
-        key = (base["net"], rule.name, _round(ring))
+        key = (base["net"], rule.name, _round(ring), layer_name)
         report.violation(rule, key, record)
 
     # --- Length ---

@@ -43,10 +43,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 try:
-    from services.pcb_compliance import _Checker as RuleChecker
+    from services.pcb_compliance import _Checker as RuleChecker, smallest_via_pad
     from services.pcb_geometry import point_in_polygon, point_seg_distance
 except ImportError:
-    from server.services.pcb_compliance import _Checker as RuleChecker
+    from server.services.pcb_compliance import _Checker as RuleChecker, smallest_via_pad
     from server.services.pcb_geometry import point_in_polygon, point_seg_distance
 
 CHECKS = (
@@ -355,24 +355,11 @@ class _Review:
 
     def _ring(self, via: _Via) -> float:
         """Smallest (pad - hole) / 2 over the signal layers in the span that
-        keep a pad; the via's diameter when no layer is known."""
-        prim = via.prim
-        hole = prim.hole or 0.0
-        layers = (
-            [layer for layer in self.stack.order[via.low : via.high + 1] if 1 <= layer <= 32]
-            if via.low is not None
-            else []
-        )
-        sizes = []
-        for layer in layers:
-            diameter = (
-                via.stack.pad_diameter(layer, prim.width)
-                if via.stack is not None
-                else prim.width
-            )
-            if diameter:
-                sizes.append(diameter)
-        return (min(sizes or [prim.width]) - hole) / 2.0
+        keep a pad (smallest_via_pad, as check_rule_compliance measures it);
+        the via's diameter when no layer is known."""
+        layers = self.stack.order[via.low : via.high + 1] if via.low is not None else []
+        diameter, _ = smallest_via_pad(via.prim, layers)
+        return (diameter - (via.prim.hole or 0.0)) / 2.0
 
     def _span_label(self, via: _Via) -> str:
         if via.low is None:
