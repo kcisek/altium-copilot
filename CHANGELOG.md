@@ -364,12 +364,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ### Fixed
 - `check_vias` sizes a back drill as the via hole plus the Max Via Stub Length (Back
-  Drilling) rule's oversize, as Altium does. It added the oversize twice, following
-  Altium's help, which calls the oversize radial and gives hole + 2 x oversize. Altium
-  itself adds it once: on the Mini PC example (0.2 mm holes, 0.3 mm oversize) the
-  drill table in MiniPC_Drill.PCBDwf and the board's own hole list (Board6
-  `HASHKEY` entries marked `[Backdrill]`) both give 0.5 mm for the 16 back drills,
-  where `check_vias` gave 0.8 mm. `drill_diameters_mil` now matches them
+  Drilling) rule's oversize, matching the drill sizes Altium wrote for the Mini PC
+  example. It added the oversize twice, following Altium's help, which calls the
+  oversize radial and gives hole + 2 x oversize. On Mini PC (0.2 mm holes, 0.3 mm
+  oversize, saved by Altium Designer 22) the drill table cached in MiniPC_Drill.PCBDwf
+  lists the 16 back drills at 0.5 mm, and the board's own hole list (the Board6
+  `HASHKEY` entry marked `[Backdrill]`) holds the same 0.5 mm; `check_vias` gave
+  0.8 mm. `drill_diameters_mil` now matches them
 - Pour outlines follow their arc edges (Polygons6 `KINDn=1` with `CXn`, `CYn`, `Rn`,
   `SAn`, `EAn`). They were read as straight lines between the vertices, so a point
   near a rounded pour edge was outside the pour. Each arc now becomes chords at most
