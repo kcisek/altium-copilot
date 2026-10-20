@@ -51,6 +51,7 @@ try:
         to_csv as bom_csv,
     )
     from services.bom_checks import run_bom_checks
+    from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -91,6 +92,7 @@ except ImportError:
         to_csv as bom_csv,
     )
     from server.services.bom_checks import run_bom_checks
+    from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -307,6 +309,11 @@ component locations, distances):
     length rules right?", "review the diff pairs before fab"): a whole-interface audit
     of rules and copper against each chip's layout guide. For one net use
     get_rules_for_net; for circuit correctness schematic_review.
+15. check_decoupling — "are my ICs decoupled?", "is C12 close enough to U3?", decoupling
+    or bypass capacitors in a schematic or layout review: rails with no capacitor to
+    ground, only Not Fitted ones, or fed through a ferrite without their own; with the
+    PcbDoc, capacitors farther than 5 mm from IC power pads. It is advice: rails come
+    from net and pin names, and the datasheet decides how many capacitors a part needs.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -2820,6 +2827,90 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
                 f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; compared with "
                 f"'{pcb_path.name}'."
             )
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Check Decoupling",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_decoupling(
+    ic: str | None = None,
+    rail: str | None = None,
+    checks: list[str] | None = None,
+    max_distance: float | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Check decoupling offline: which capacitors decouple each IC's power pins, and the
+    gaps. Call it when the user asks about decoupling or bypass capacitors, whether an
+    IC's power pins are decoupled, or for a design or layout review. Per rail: no
+    capacitor to ground, only capacitors Not Fitted in the active variant, a rail fed
+    through a ferrite or resistor with no capacitor of its own (warnings); only
+    capacitors to other nets (bootstrap, reference), no small (<1 uF) capacitor,
+    unreadable values (info); no_bulk_capacitor only when named in checks (bulk is often
+    upstream; each rail's counts are in rails). With a PcbDoc, per IC and rail: the nearest
+    fitted capacitor farther than max_distance (default 5 mm; straight line, pad edge to
+    pad edge), power pads far from every capacitor, and an opposite-side capacitor with
+    no via found near its pad.
+
+    It is advice, not DRC: rails are inferred from net and pin names, ICs are U and IC
+    parts (ic also takes others, e.g. a connector), the datasheet decides how many
+    capacitors a part needs, and pours, regions and planes are not read. ic and rail take
+    comma-separated names; checks narrows to the names in summary. Findings are
+    paginated (offset from next_offset), warnings first; distances in units (default:
+    the board's)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ValueError as error:
+        return json.dumps({"error": "no_project", "message": str(error)})
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    index, pcb_unavailable = None, None
+    to_mm, resolved = units == "mm", units or "mm"
+    if project.get("pcb_doc_paths"):
+        index, error = _pcb_session.get(project, netlist)
+        if error:
+            pcb_unavailable = f"{error['error']}: {error.get('message', '')}".strip(": ")
+    else:
+        pcb_unavailable = "the project lists no PcbDoc"
+    if index is not None:
+        to_mm, resolved, error = _pcb_units_or_error(index, units)
+        if error:
+            return json.dumps(error)
+    max_mil = DEFAULT_MAX_DISTANCE_MIL
+    if max_distance is not None:
+        if not _finite_nonnegative(max_distance) or max_distance == 0:
+            return json.dumps({"error": "invalid_max_distance",
+                               "message": "max_distance must be a positive number."})
+        max_mil = _input_to_mil(max_distance, resolved)
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    for limit, rail_limit in ((100, 60), (40, 20), (15, 5)):
+        result = run_decoupling_check(
+            netlist, plan, project.get("parameters") or {}, index=index,
+            pcb_unavailable=pcb_unavailable, checks=checks, ics=_split_names(ic),
+            rails=_split_names(rail), max_distance_mil=max_mil, offset=offset,
+            limit=limit, rail_limit=rail_limit,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        context: dict = {"netlist_updated_utc": _netlist_last_updated}
+        if index is not None:
+            context.update({"pcb_doc": Path(project["pcb_doc_paths"][0]).name,
+                            "units": resolved})
+            if len(project["pcb_doc_paths"]) > 1:
+                context["note"] = (
+                    f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; measured on "
+                    f"'{Path(project['pcb_doc_paths'][0]).name}'."
+                )
+        result = _convert_units({**context, **result}, to_mm)
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)
