@@ -239,6 +239,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   use_bottom_back_drill), ViasUnderSMD (allowed), LayerPairs (enforce) and the stacked
   microvia flag of Hole To Hole Clearance (allow_stacked_microvias); they were under
   other / other_mil. Only Back Drilling is among get_rules_for_net's default kinds
+- `check_rule_compliance` checks a via's Minimum Annular Ring on each signal layer of its
+  span that keeps a pad, like `check_vias`: a top-middle-bottom or full-stack via whose
+  pad is smaller on some layer than its nominal diameter is measured there, and the
+  violation names that `layer` and its `pad_diameter_mil`. Before, the ring came from
+  the nominal diameter, so the two tools could disagree. Simple-stack vias keep their
+  ring; no ring changes on 83 real boards (all simple stack) or on Altium's examples
+  (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
 - `requirements.txt` pins `mcp<2`: mcp 2.x removed `mcp.server.fastmcp`, so a fresh

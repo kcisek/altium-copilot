@@ -16,6 +16,7 @@ from server.parsers.pcb_doc import (
     PcbClass,
     PcbRule,
     Primitive,
+    ViaStack,
 )
 from server.services.pcb_compliance import (
     CLEARANCE_MAX_NETS,
@@ -24,6 +25,7 @@ from server.services.pcb_compliance import (
 )
 from server.services.pcb_index import PcbIndex
 from server.services.pcb_rules import MULTI_LAYER, ObjectFacts
+from server.services.via_checks import run_via_check
 from tests.test_pcb_index import NETLIST, pcb_data  # noqa: F401
 
 
@@ -209,6 +211,43 @@ def test_via_hole_percent_mode_routing_vias_and_annular_ring(pcb_data):
     passing = check_compliance(_index(pcb_data, absolute), kinds=["HoleSize"])
     assert _kind(passing, "HoleSize")["violation_count"] == 0
     assert _kind(passing, "HoleSize")["objects_checked"] == 1
+
+
+def test_annular_ring_of_a_full_stack_via_is_its_smallest_pad(pcb_data):
+    # 20 mil nominal, 8 mil hole; pads per layer: Top 20, L2-GND none,
+    # L3-SIG 14, Bottom 20 mil.
+    sizes = (20.0, 0.0, 14.0) + (0.0,) * 28 + (20.0,)
+    full = ViaStack(True, True, False, False, mode=2, layer_diameters=sizes)
+    primitives = [
+        replace(_via(1, 0.0, 0.0), via=full),
+        # The same stack with its L3-SIG pad removed: 20 mil on every layer
+        # left, so the nominal ring.
+        replace(_via(1, 100.0, 0.0), via=replace(full, removed_pads=frozenset({3}))),
+        # A simple stack keeps its nominal ring and names no layer.
+        replace(_via(2, 200.0, 0.0, diameter=14.0),
+                via=ViaStack(True, True, False, False, removed_pads=frozenset({3}))),
+    ]
+    rules = [_rule("MinimumAnnularRing", 1, name="Ring", MINIMUMRING="4mil")]
+    index = _index(pcb_data, rules, primitives=primitives)
+    ring = _kind(check_compliance(index, kinds=["MinimumAnnularRing"]),
+                 "MinimumAnnularRing")
+    assert (ring["objects_checked"], ring["violation_count"]) == (3, 2)
+    by_net = {violation["net"]: violation for violation in ring["violations"]}
+    stacked = by_net["CLK_A"]
+    assert (stacked["actual_mil"], stacked["layer"], stacked["pad_diameter_mil"]) == (
+        3.0, "L3-SIG", 14.0,
+    )
+    assert (stacked["diameter_mil"], stacked["hole_mil"]) == (20.0, 8.0)
+    assert (stacked["x_mil"], stacked["count"]) == (0.0, 1)
+    simple = by_net["CLK_B"]
+    assert (simple["actual_mil"], simple["diameter_mil"]) == (3.0, 14.0)
+    assert "layer" not in simple and "pad_diameter_mil" not in simple
+
+    # check_vias measures the same ring.
+    types = run_via_check(index, checks=["annular_ring"])["via_types"]
+    assert {entry["diameter_mil"]: entry["min_annular_ring_mil"] for entry in types} == {
+        20.0: 3.0, 14.0: 3.0,
+    }
 
 
 def test_routing_layer_violation(pcb_data):

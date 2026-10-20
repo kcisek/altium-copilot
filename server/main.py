@@ -2550,7 +2550,8 @@ def check_rule_compliance(
 ) -> str:
     """Check the saved copper against the design rules: track widths per layer (pair
     nets against their DiffPairsRouting widths), via diameter/hole, via hole size and
-    annular ring, routing layers and Length windows, resolving the rule for EACH object
+    annular ring (smallest over a full-stack via's pads, naming the layer), routing
+    layers and Length windows, resolving the rule for EACH object
     (room, layer and via scopes decided per object).
 
     net is a net or diff-pair name (comma-separated for several); omit for the whole
