@@ -1,4 +1,5 @@
 import math
+import struct
 from copy import deepcopy
 from dataclasses import replace
 
@@ -18,7 +19,7 @@ from server.parsers.pcb_doc import (
     Primitive,
 )
 from server.services.pcb_index import PcbIndex
-from server.parsers.pcb_doc import decode_polygons
+from server.parsers.pcb_doc import decode_arcs, decode_polygons
 
 
 def _layer(v6, name, order, kind="copper", **kwargs):
@@ -872,8 +873,8 @@ def test_rounded_rectangle_pad_at_an_angle_and_overlapping(pcb_data):
 def test_full_corner_radius_is_an_oblong(pcb_data):
     index = PcbIndex(pcb_data, NETLIST)
     pad = _rounded_pad(corner=20.0 - 1e-12)
-    segment, radius, polygon = index._primitive_geometry(pad)
-    assert polygon is None
+    segment, radius, polygon, arc = index._primitive_geometry(pad)
+    assert polygon is None and arc is None
     assert radius == pytest.approx(20.0)
     assert segment == pytest.approx((0.0, -10.0, 0.0, 10.0))
 
@@ -1242,3 +1243,91 @@ def test_multichannel_pcb_designators(pcb_data):
         row["refdes"] for row in index.find_components("U3")
     ) == ["U3A", "U3B"]
     assert index.renamed_components() == 2
+
+
+def decoded_arc(net, cx, cy, radius, start, end, width, layer=1):
+    """The chord rows decode_arcs makes of one Arcs6 record."""
+    payload = bytearray(45)
+    payload[0] = layer
+    struct.pack_into("<HHH", payload, 3, net, 0xFFFF, 0xFFFF)
+    struct.pack_into(
+        "<iii", payload, 13, round(cx * 1e4), round(cy * 1e4), round(radius * 1e4)
+    )
+    struct.pack_into("<dd", payload, 25, start, end)
+    struct.pack_into("<i", payload, 41, round(width * 1e4))
+    chords, _ = decode_arcs(b"\x01" + struct.pack("<I", len(payload)) + bytes(payload))
+    return chords
+
+
+def _closest(index, first, second):
+    return min(index._primitive_distance(a, b) for a in first for b in second)
+
+
+def _as_chords(rows):
+    return [replace(row, arc_radius=None) for row in rows]
+
+
+# A GND bend: radius 30 mil, 8 mil wide, over the top half of a circle about
+# (500, 500). Its copper spans radii 26 to 34; the chords lie up to ~0.2 mil
+# inside it.
+def _bend():
+    return decoded_arc(0, 500.0, 500.0, 30.0, 0.0, 180.0, 8.0)
+
+
+def test_via_inside_a_bend_measures_exactly(pcb_data):
+    bend = _bend()
+    via = Primitive(kind="via", layer=1, layer_to=32, net=1, component=None,
+                    x1=500.0, y1=500.0, x2=500.0, y2=500.0, width=20.0, hole=8.0)
+    data = replace(pcb_data, primitives=bend + [via])
+    index = PcbIndex(data, NETLIST)
+    assert _closest(index, bend, [via]) == pytest.approx(16.0, abs=1e-9)
+    assert _closest(index, _as_chords(bend), [via]) < 15.8
+    (gnd,) = index.net_neighbors("CLK_A", 20.0)["neighbors"]
+    assert (gnd["net"], gnd["min_edge_distance_mil"]) == ("GND", 16.0)
+    near = {
+        entry["net"]: entry["min_distance_mil"]
+        for entry in index.region_query(500.0, 500.0, 30.0)["nets"]
+    }
+    assert near == {"CLK_A": 0.0, "GND": 26.0}
+
+
+def test_tracks_and_pads_measure_to_the_arc(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    bend = _bend()
+    # Above the apex (the chord through it is lower): 40 - 30 - 4 - 3.
+    above = _track(1, 1, 490.0, 540.0, 510.0, 540.0)
+    assert _closest(index, bend, [above]) == pytest.approx(3.0)
+    assert _closest(index, _as_chords(bend), [above]) > 3.1
+    # In the bend: its ends are closest, radially.
+    inside = _track(1, 1, 490.0, 520.0, 510.0, 520.0)
+    assert _closest(index, bend, [inside]) == pytest.approx(30 - math.sqrt(500) - 7)
+    # A rectangular pad above the apex and a turned square one in the bend.
+    pad = _pad(1, None, 500.0, 545.0, shape=PAD_SHAPE_RECT)
+    assert _closest(index, bend, [pad]) == pytest.approx(6.0)
+    turned = _pad(1, None, 500.0, 500.0, width=20.0, shape=PAD_SHAPE_RECT, rotation=45.0)
+    assert _closest(index, bend, [turned]) == pytest.approx(26 - 10 * math.sqrt(2))
+    assert _closest(index, _as_chords(bend), [turned]) < 26 - 10 * math.sqrt(2) - 0.1
+
+
+def test_arc_to_arc_measures_exactly(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    bend = _bend()
+    # Concentric, 15 mil further out and 6 mil wide: 15 - 4 - 3. Its chords
+    # are split differently, so chord-to-chord reads anything near that.
+    outer = decoded_arc(1, 500.0, 500.0, 45.0, 0.0, 180.0, 6.0)
+    assert _closest(index, bend, outer) == pytest.approx(8.0)
+    assert _closest(index, _as_chords(bend), _as_chords(outer)) != pytest.approx(8.0)
+    # Facing it apex to apex: 100 - 2 * 30 - 4 - 4.
+    facing = decoded_arc(1, 500.0, 600.0, 30.0, 180.0, 360.0, 8.0)
+    assert _closest(index, bend, facing) == pytest.approx(32.0)
+
+
+def test_arc_rows_are_bounded_by_the_arc(pcb_data):
+    data = replace(pcb_data, primitives=_bend())
+    index = PcbIndex(data, NETLIST)
+    top = index.db.execute("SELECT MAX(maxy) FROM prims WHERE kind = 'arc'").fetchone()[0]
+    assert top == pytest.approx(534.0)
+    centre = index.db.execute(
+        "SELECT DISTINCT arc_x, arc_y, arc_radius FROM prims WHERE kind = 'arc'"
+    ).fetchall()
+    assert [tuple(row) for row in centre] == [(500.0, 500.0, 30.0)]

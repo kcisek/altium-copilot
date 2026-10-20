@@ -44,10 +44,10 @@ from dataclasses import dataclass, field
 
 try:
     from services.pcb_compliance import _Checker as RuleChecker, smallest_via_pad
-    from services.pcb_geometry import point_in_polygon, point_seg_distance
+    from services.pcb_geometry import point_in_polygon
 except ImportError:
     from server.services.pcb_compliance import _Checker as RuleChecker, smallest_via_pad
-    from server.services.pcb_geometry import point_in_polygon, point_seg_distance
+    from server.services.pcb_geometry import point_in_polygon
 
 CHECKS = (
     "aspect_ratio",
@@ -1100,10 +1100,10 @@ class _Review:
                 position = self._in_span(via, row["layer"])
                 if position is None:
                     continue
-                reach = via.pad_radius(row["layer"]) + row["width"] / 2.0
-                if point_seg_distance(
-                    x, y, row["x1"], row["y1"], row["x2"], row["y2"]
-                ) <= reach + EPS_MIL:
+                # Edge distance: an arc is measured to the arc, not its chord.
+                if self.index._point_primitive_distance(
+                    x, y, row
+                ) <= via.pad_radius(row["layer"]) + EPS_MIL:
                     connected.add(position)
             elif kind == "pad":
                 if row["layer"] == 74:

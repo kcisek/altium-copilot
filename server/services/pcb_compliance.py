@@ -22,7 +22,6 @@ from collections import defaultdict
 from dataclasses import replace
 
 try:
-    from parsers.pcb_doc import ARC_MAX_SAGITTA_MIL
     from services.pcb_rules import (
         ObjectResolver,
         RuleTarget,
@@ -30,7 +29,6 @@ try:
         rule_values,
     )
 except ImportError:
-    from server.parsers.pcb_doc import ARC_MAX_SAGITTA_MIL
     from server.services.pcb_rules import (
         ObjectResolver,
         RuleTarget,
@@ -1074,15 +1072,6 @@ class _Checker:
             )
             if required is None or distance >= required - CLEARANCE_TOLERANCE_MIL:
                 continue
-            # Arc chords lie up to their sagitta inside the arc: a pour's arc
-            # wrapping a via at the limit measures that much short of it.
-            # Chords cannot tell such a gap from a violation.
-            arcs = (row["kind"] == "arc") + (candidate["kind"] == "arc")
-            if arcs and distance >= (
-                required - CLEARANCE_TOLERANCE_MIL - arcs * ARC_MAX_SAGITTA_MIL
-            ):
-                report.extra_count("arc_chord_marginal_pairs")
-                continue
             layer_name = (
                 self.layer_label(next(iter(shared)))
                 if len(shared) == 1
@@ -1495,10 +1484,7 @@ def _approximations(
             "regions, text, holes, keepouts and no-net copper are "
             "not modelled; octagonal pads are rectangles and through-hole pads "
             "have each layer's size and shape (top-middle-bottom and full "
-            "stacks); arcs are chords "
-            f"(<= {ARC_MAX_SAGITTA_MIL} mil sagitta), so a gap involving an arc "
-            "that falls short of the limit by no more than that per arc is "
-            "counted under arc_chord_marginal_pairs, not reported; gaps within "
+            "stacks); gaps within "
             f"{CLEARANCE_TOLERANCE_MIL} mil of the limit are not reported. The "
             "object matrix (Track/Arc/Via/SMDPad/THPad/Poly) is applied per object "
             "pair; counts are object pairs."

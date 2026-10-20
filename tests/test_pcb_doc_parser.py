@@ -235,6 +235,16 @@ def test_decode_arcs_explodes_to_segments():
     )
 
 
+def test_decode_arcs_keeps_the_arc_on_every_chord():
+    primitives, _ = decode_arcs(_bin_record(1, _arc_payload(radius=25_0000)))
+    assert {(chord.arc_x, chord.arc_y, chord.arc_radius) for chord in primitives} == {
+        (100.0, 100.0, 25.0)
+    }
+    for chord in primitives:
+        for x, y in ((chord.x1, chord.y1), (chord.x2, chord.y2)):
+            assert math.hypot(x - 100.0, y - 100.0) == pytest.approx(25.0)
+
+
 def test_decode_arcs_out_of_range_layer_skipped():
     primitives, skipped = decode_arcs(_bin_record(1, _arc_payload(layer=200)))
     assert primitives == []

@@ -29,6 +29,7 @@ from server.services.via_checks import (
     DEFAULT_MIN_RING_MIL,
     run_via_check,
 )
+from tests.test_pcb_index import decoded_arc
 
 NETS = ["SIG", "SIG2", "GND", "DP_P", "DP_N", "OTHER"]
 N = {name: number for number, name in enumerate(NETS)}
@@ -634,6 +635,16 @@ def test_pour_counts_as_a_connection():
     assert all(
         stub.get("connected_layer") != "L4" for stub in _findings(result, "back_drill")
     )
+
+
+def test_arc_touching_the_via_pad_connects():
+    # The arc's crown touches the 16 mil pad on L4; its chords stop ~0.2 mil short.
+    arc = decoded_arc(N["SIG"], 0.0, -40.0, 30.0, 0.0, 180.0, 4.0, layer=4)
+    primitives = [_via("SIG", 0, 0), _track("SIG", 1, -100, 0, 0, 0), *arc]
+    index = _index(primitives, rules=[_back_drill_rule(MAXSTUBLENGTH="10mil")],
+                   drill_pairs=[THROUGH, BACK_DRILL])
+    (stub,) = _findings(run_via_check(index, checks=["back_drill"]), "back_drill")
+    assert stub["connected_layer"] == "L4"
 
 
 def test_full_stack_inner_pad_wider_than_the_record_diameter_connects():

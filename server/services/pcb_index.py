@@ -14,12 +14,17 @@ try:
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
     )
     from services.pcb_geometry import (
+        arc_arc_distance,
+        arc_bounds,
         parallel_overlap,
+        point_arc_distance,
         point_in_polygon,
         point_polygon_distance,
         point_seg_distance,
+        polygon_arc_distance,
         polygon_polygon_distance,
         oriented_rect_vertices,
+        seg_arc_distance,
         seg_polygon_distance,
         seg_seg_distance,
     )
@@ -31,12 +36,17 @@ except ImportError:
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
     )
     from server.services.pcb_geometry import (
+        arc_arc_distance,
+        arc_bounds,
         parallel_overlap,
+        point_arc_distance,
         point_in_polygon,
         point_polygon_distance,
         point_seg_distance,
+        polygon_arc_distance,
         polygon_polygon_distance,
         oriented_rect_vertices,
+        seg_arc_distance,
         seg_polygon_distance,
         seg_seg_distance,
     )
@@ -93,6 +103,9 @@ CREATE TABLE prims (
     hole REAL,
     pad_name TEXT,
     length REAL,
+    arc_x REAL,
+    arc_y REAL,
+    arc_radius REAL,
     pin_package REAL,
     minx REAL,
     miny REAL,
@@ -160,15 +173,18 @@ class PcbIndex:
             return getattr(primitive, name)
 
     def _primitive_geometry(self, primitive, layer: int | None = None):
-        """Return (segment, radius, polygon) for exact copper distance.
+        """Return (segment, radius, polygon, arc) for exact copper distance.
 
-        The copper is the segment or the polygon grown by radius: a track or
-        arc chord is its centreline grown by half its width, a round or
+        The copper is the arc, else the polygon, else the segment, grown by
+        radius: a track is its centreline grown by half its width, an arc
+        chord row the arc piece between its ends (arc: centre, radius and
+        those ends, see pcb_geometry) grown by half its width, a round or
         oblong pad a capsule, a rectangle its polygon (radius 0), and a
         rounded rectangle its core rectangle (each side shorter by twice the
-        corner radius) grown by the corner radius. layer picks a multi-layer
-        pad's copper on that layer; without it a pad has its main (top-layer)
-        copper.
+        corner radius) grown by the corner radius. segment is still the
+        chord on an arc row; arc is None on rows without the arc columns.
+        layer picks a multi-layer pad's copper on that layer; without it a
+        pad has its main (top-layer) copper.
         """
         copper = None
         if layer is not None and self._field(primitive, "kind") == "pad":
@@ -184,7 +200,10 @@ class PcbIndex:
         y2 = self._field(primitive, "y2")
         width = self._field(primitive, "width")
         if kind != "pad":
-            return (x1, y1, x2, y2), width / 2.0, None
+            arc = None
+            if kind == "arc":
+                arc = self._arc_piece(primitive, x1, y1, x2, y2)
+            return (x1, y1, x2, y2), width / 2.0, None, arc
 
         rotation = self._field(primitive, "rotation") or 0.0
         corner = 0.0
@@ -220,7 +239,7 @@ class PcbIndex:
                 y1 - dy,
                 x1 + dx,
                 y1 + dy,
-            ), minor / 2.0, None
+            ), minor / 2.0, None, None
         polygon = oriented_rect_vertices(
             x1,
             y1,
@@ -228,7 +247,20 @@ class PcbIndex:
             height - 2.0 * corner,
             rotation,
         )
-        return None, corner, polygon
+        return None, corner, polygon, None
+
+    def _arc_piece(self, primitive, x1, y1, x2, y2) -> tuple | None:
+        """The arc piece of an arc chord row; None for a row without its
+        arc's centre and radius (a hand-built one), measured as the chord."""
+        try:
+            center_x = self._field(primitive, "arc_x")
+            center_y = self._field(primitive, "arc_y")
+            radius = self._field(primitive, "arc_radius")
+        except AttributeError:
+            return None
+        if center_x is None or center_y is None or not radius:
+            return None
+        return (center_x, center_y, radius, x1, y1, x2, y2)
 
     def _primitive_bounds(self, primitive):
         """Bounding box of the copper on every layer (a multi-layer pad's
@@ -246,7 +278,10 @@ class PcbIndex:
 
     @staticmethod
     def _geometry_bounds(geometry):
-        segment, radius, polygon = geometry
+        segment, radius, polygon, arc = geometry
+        if arc is not None:
+            min_x, min_y, max_x, max_y = arc_bounds(arc)
+            return min_x - radius, min_y - radius, max_x + radius, max_y + radius
         if polygon is not None:
             x_values = [point[0] for point in polygon]
             y_values = [point[1] for point in polygon]
@@ -304,20 +339,25 @@ class PcbIndex:
 
     @staticmethod
     def _geometry_distance(first, second) -> float:
-        first_segment, first_radius, first_polygon = first
-        second_segment, second_radius, second_polygon = second
-        if first_polygon is not None and second_polygon is not None:
-            distance = polygon_polygon_distance(first_polygon, second_polygon)
-        elif first_polygon is not None:
-            distance = seg_polygon_distance(
-                *second_segment,
-                first_polygon,
-            )
-        elif second_polygon is not None:
-            distance = seg_polygon_distance(
-                *first_segment,
-                second_polygon,
-            )
+        # Order the pair polygon, arc, segment so each combination has one case.
+        if first[2] is None and (
+            second[2] is not None or (first[3] is None and second[3] is not None)
+        ):
+            first, second = second, first
+        first_segment, first_radius, first_polygon, first_arc = first
+        second_segment, second_radius, second_polygon, second_arc = second
+        if first_polygon is not None:
+            if second_polygon is not None:
+                distance = polygon_polygon_distance(first_polygon, second_polygon)
+            elif second_arc is not None:
+                distance = polygon_arc_distance(first_polygon, second_arc)
+            else:
+                distance = seg_polygon_distance(*second_segment, first_polygon)
+        elif first_arc is not None:
+            if second_arc is not None:
+                distance = arc_arc_distance(first_arc, second_arc)
+            else:
+                distance = seg_arc_distance(*second_segment, first_arc)
         else:
             distance = seg_seg_distance(*first_segment, *second_segment)
         return max(0.0, distance - first_radius - second_radius)
@@ -343,8 +383,10 @@ class PcbIndex:
         Without layers a pad has its main (top-layer) copper."""
         result = []
         for layer, group in self._layer_groups(layers, primitive):
-            segment, radius, polygon = self._primitive_geometry(primitive, layer)
-            if polygon is not None:
+            segment, radius, polygon, arc = self._primitive_geometry(primitive, layer)
+            if arc is not None:
+                distance = point_arc_distance(x, y, arc)
+            elif polygon is not None:
                 distance = point_polygon_distance(x, y, polygon)
             else:
                 distance = point_seg_distance(x, y, *segment)
@@ -398,9 +440,9 @@ class PcbIndex:
                 "kind, net_id, layer, layer_to, component, pour_id, poured_by, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
                 "corner_radius, layer_copper, source_id, "
-                "hole, pad_name, length, pin_package, "
+                "hole, pad_name, length, arc_x, arc_y, arc_radius, pin_package, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -423,6 +465,9 @@ class PcbIndex:
                     primitive.hole,
                     primitive.pad_name,
                     primitive.length,
+                    primitive.arc_x,
+                    primitive.arc_y,
+                    primitive.arc_radius,
                     primitive.pin_package,
                     min_x,
                     min_y,

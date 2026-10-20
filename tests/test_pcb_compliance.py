@@ -26,7 +26,7 @@ from server.services.pcb_compliance import (
 from server.services.pcb_index import PcbIndex
 from server.services.pcb_rules import MULTI_LAYER, ObjectFacts
 from server.services.via_checks import run_via_check
-from tests.test_pcb_index import NETLIST, pcb_data  # noqa: F401
+from tests.test_pcb_index import NETLIST, decoded_arc, pcb_data  # noqa: F401
 
 
 def _rule(kind, priority, scope1="All", scope2="All", name=None, enabled=True,
@@ -740,24 +740,21 @@ def test_clearance_counts_an_arc_once(pcb_data):
     assert (violation["count"], violation["required_mil"]) == (1, 8.0)
 
 
-def test_clearance_leaves_arc_chord_sagitta_to_the_chords(pcb_data):
-    # Chords lie up to 0.25 mil inside their arc: a gap short of the limit by
-    # no more than that (per arc) cannot be told from a violation. Tracks get
-    # no such margin.
-    rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE="10mil")]
-    for other, expected in (
-        (_track(2, 1, 0, 15.8, 80, 15.8, 6.0), (0, 1)),  # 9.8 mil from the arc
-        (_track(2, 1, 0, 15.7, 80, 15.7, 6.0), (1, None)),  # 9.7 mil
-    ):
-        index = _index(pcb_data, rules, primitives=_arc(1, 8) + [other])
-        clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
-                          "Clearance")
-        assert (clearance["violation_count"],
-                clearance.get("arc_chord_marginal_pairs")) == expected
-    tracks = [_track(1, 1, 0, 0, 80, 0, 6.0), _track(2, 1, 0, 15.8, 80, 15.8, 6.0)]
-    clearance = _kind(check_compliance(_index(pcb_data, rules, primitives=tracks),
-                                       nets=["CLK_A"], kinds=["Clearance"]), "Clearance")
-    assert clearance["violation_count"] == 1
+def test_clearance_measures_arcs_exactly(pcb_data):
+    # A GND bend wrapping a CLK_A via 16 mil from its copper (radius 30, 8 mil
+    # wide; via 20 mil). Its chords lie up to ~0.2 mil inside the arc, so they
+    # read the gap short of a 16 mil rule; the arc meets it.
+    primitives = decoded_arc(0, 0.0, 0.0, 30.0, 0.0, 180.0, 8.0) + [_via(1, 0.0, 0.0)]
+    for limit, expected in (("16mil", 0), ("16.2mil", 1)):
+        rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE=limit)]
+        clearance = _kind(
+            check_compliance(_index(pcb_data, rules, primitives=primitives),
+                             nets=["CLK_A"], kinds=["Clearance"]),
+            "Clearance",
+        )
+        assert clearance["violation_count"] == expected
+    (violation,) = clearance["violations"]
+    assert (violation["objects"], violation["actual_mil"]) == ("Via-Arc", 16.0)
 
 
 def test_violation_groups_are_paged_with_offset(pcb_data):
