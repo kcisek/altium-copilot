@@ -1239,8 +1239,10 @@ class _Review:
         stop = best["stop"]
         label = self._pair_label(best)
         via.drilled.append(label)
+        # The oversize is added once, as in the drill table and Board6 hole list
+        # Altium wrote for the Mini PC example, though its help calls it radial.
         oversize = rule_values.get("oversize_mil") or 0.0
-        via.drill_holes[label] = (via.prim.hole or 0.0) + 2 * oversize
+        via.drill_holes[label] = (via.prim.hole or 0.0) + oversize
         # The tip stops in the dielectric between the stop layer and the first
         # drilled layer.
         first_drilled = stop + 1 if side == "bottom" else stop - 1
