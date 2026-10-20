@@ -579,7 +579,8 @@ def test_back_drill_applied():
     assert pair["drilled_layers"] == 3
     assert pair["first_and_last_drilled"] == ["L4", "Bottom Layer"]
     assert pair["depth_to_stop_layer_mil"] == pytest.approx(THICKNESS - 17.8)
-    assert pair["vias"] == 1 and pair["drill_diameters_mil"] == [16.0]
+    # Hole 8 mil plus the 4 mil oversize, added once as Altium does.
+    assert pair["vias"] == 1 and pair["drill_diameters_mil"] == [12.0]
     (rule,) = result["back_drill"]["rules"]
     assert rule["candidate_vias"] == 1 and rule["back_drilled_vias"] == 1
     assert rule["max_stub_length_mil"] == 35.0 and rule["oversize_mil"] == 4.0
@@ -814,7 +815,7 @@ def test_check_vias_tool_units_and_limits(board):
     assert result["pcb_doc"] == "Board.PcbDoc" and result["units"] == "mm"
     assert result["board"]["stack_thickness_mm"] == pytest.approx(THICKNESS * 0.0254, abs=1e-4)
     pair = result["back_drill"]["pairs"][0]
-    assert pair["drill_diameters_mm"] == [pytest.approx(16.0 * 0.0254, abs=1e-4)]
+    assert pair["drill_diameters_mm"] == [pytest.approx(12.0 * 0.0254, abs=1e-4)]
     assert result["summary"]["back_drilled"] == 1
     ring = _findings(result, "annular_ring")[0]
     assert ring["annular_ring_mm"] == pytest.approx(3.0 * 0.0254, abs=1e-4)
@@ -885,3 +886,20 @@ def test_minipc_back_drill_matches_the_removed_pads():
     assert {layer for via in removed for layer in via.via.removed_pads} == below_stop
     assert not _findings(result, "back_drill", "warning")
     assert len(order) == 16 and all(1 <= layer <= 32 for layer in order)
+
+
+def test_minipc_back_drill_size_matches_altiums_drill_table():
+    """Altium's drill table (cached in MiniPC_Drill.PCBDwf) and the board's own hole
+    list size the 16 back drills at 0.5 mm: the 0.2 mm hole plus the 0.3 mm oversize
+    once, not twice as the radial wording in Altium's help suggests."""
+    drawing = MINIPC.with_name("MiniPC_Drill.PCBDwf")
+    if not (MINIPC.is_file() and drawing.is_file()):
+        pytest.skip("Altium example boards not installed")
+    from server.parsers.pcb_doc import parse_pcb_doc
+    from server.parsers.pcb_dwf import parse_pcb_dwf
+
+    index = PcbIndex(parse_pcb_doc(str(MINIPC)), None)
+    (pair,) = run_via_check(index, checks=["back_drill"])["back_drill"]["pairs"]
+    (row,) = [row for row in parse_pcb_dwf(str(drawing)).drill_table if row.get("backdrill")]
+    assert row["count"] == pair["vias"] == 16
+    assert pair["drill_diameters_mil"] == [pytest.approx(row["size_mm"] / 0.0254, abs=0.01)]

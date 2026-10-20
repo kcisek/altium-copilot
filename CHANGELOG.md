@@ -161,7 +161,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   outer layer, stopping before the other one) apply to vias in a Max Via Stub Length
   (Back Drilling) rule's scope that have no connection on the layers they remove; each
   back drill lists its drilled layers, depth to the stop layer and drill sizes (hole
-  plus twice the oversize). Findings: aspect ratio above 10:1 (info above 8:1, and for a
+  plus the oversize). Findings: aspect ratio above 10:1 (info above 8:1, and for a
   mechanically drilled blind via above 1:1; microvias above 1:1, info above 0.8:1),
   annular ring below the Minimum Annular Ring rule or the requested minimum (info below
   0.1 mm, 0.05 mm on microvias), sizes outside the Routing Via Style rule (info for
@@ -363,6 +363,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
+- `check_vias` sizes a back drill as the via hole plus the Max Via Stub Length (Back
+  Drilling) rule's oversize, as Altium does. It added the oversize twice, following
+  Altium's help, which calls the oversize radial and gives hole + 2 x oversize. Altium
+  itself adds it once: on the Mini PC example (0.2 mm holes, 0.3 mm oversize) the
+  drill table in MiniPC_Drill.PCBDwf and the board's own hole list (Board6
+  `HASHKEY` entries marked `[Backdrill]`) both give 0.5 mm for the 16 back drills,
+  where `check_vias` gave 0.8 mm. `drill_diameters_mil` now matches them
 - Pour outlines follow their arc edges (Polygons6 `KINDn=1` with `CXn`, `CYn`, `Rn`,
   `SAn`, `EAn`). They were read as straight lines between the vertices, so a point
   near a rounded pour edge was outside the pour. Each arc now becomes chords at most

@@ -883,8 +883,9 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
         "GAP": ("clearance_mil", "mil"),
         "ALLOWSTACKEDMICROVIAS": ("allow_stacked_microvias", "bool"),
     },
-    # Max Via Stub Length (Back Drilling): oversize is radial (drill = hole +
-    # 2 x oversize); the max stub length is a DRC limit, not the drill depth.
+    # Max Via Stub Length (Back Drilling): Altium drills hole + oversize (the help
+    # says radial, hole + 2 x oversize, but its drill tables add it once); the max
+    # stub length is a DRC limit, not the drill depth.
     "BackDrilling": {
         "MAXSTUBLENGTH": ("max_stub_length_mil", "mil"),
         "HOLEOVERSIZE": ("oversize_mil", "mil"),
