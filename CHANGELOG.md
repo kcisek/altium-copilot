@@ -299,6 +299,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   stays by name, and the response says so when it was renamed or deleted
 - Stale-designator DNP UniqueIds that could not be resolved at load are kept and
   resolved by the next `refresh_netlist`
+- `get_net_neighbors` and `query_pcb_region` no longer measure polygon-pour outlines as
+  copper. A pour's outline (the boundary drawn in `Polygons6`, kept as zero-width edges)
+  was matched like a track: on Altium's PC4-SODIMM example DQ09 read GND at 1.13 mil
+  with an 81.6 mil parallel run, where the nearest GND copper is 4.92 mil away, and 22 of
+  the 25 neighbours listed for GND were at 0.0 mil (now 3.94 mil at the closest, against
+  a 3.937 mil clearance rule). Copper distances come from tracks, arcs, vias and pads
+  only; a hatched pour's tracks are real copper and still count. `get_net_neighbors`
+  adds `pours`: other nets' pours on the net's layers, by outline, with `inside_pour`
+  when the net's copper lies within the outline and `min_outline_distance_mil` when the
+  outline comes within the search distance. The net's own outlines are not measured.
+  `query_pcb_region` lists outlines only under `pours`. Solid pour copper is still not
+  parsed. The clearance spot-check, DRC violation nets and `check_decoupling` already
+  left outlines out
 - PCB tools name components by the designator printed on the board (decoded from
   `Texts6`), not the PcbDoc's `SOURCEDESIGNATOR`, which is the schematic sheet's logical
   name and differs on multi-channel and board-annotated designs (57 of 73 parts on

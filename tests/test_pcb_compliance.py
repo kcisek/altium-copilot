@@ -367,6 +367,17 @@ def test_clearance_needs_a_small_net_set(pcb_data):
     assert any(entry["kind"] == "Clearance" for entry in default["not_checked"])
 
 
+def test_clearance_ignores_pour_outlines(pcb_data):
+    # A GND pour's zero-width outline edge crosses the CLK_A track: the outline
+    # is not copper, so neither net's check reports it.
+    rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE="10mil")]
+    outline = replace(_track(0, 1, 50, -50, 50, 50, 0.0), pour_id=0)
+    index = _index(pcb_data, rules, primitives=[_track(1, 1, 0, 0, 100, 0, 6.0), outline])
+    for net in ("CLK_A", "GND"):
+        result = check_compliance(index, nets=[net], kinds=["Clearance"])
+        assert _kind(result, "Clearance")["violations"] == []
+
+
 def test_selection_errors_and_pair_expansion(pcb_data):
     index = _index(pcb_data, [WIDTH_ALL], pairs=[CLK_PAIR])
     assert check_compliance(index, kinds=["Bogus"])["error"] == "invalid_kind"
