@@ -289,6 +289,34 @@ def test_failed_full_load_keeps_the_partial_load(env):
     assert json.loads(main.list_variants())["active_variant"] == "Lite"
 
 
+def test_unregistered_netlist_in_the_output_folder_wins(env):
+    # An archived copy of the project carries its own, newer Board.NET.
+    root, _, _ = env
+    old = root / "Archive" / "Project Outputs for Board" / "Board.NET"
+    net = root / "Project Outputs for Board" / "Board.NET"
+    for path, text in ((old, "(\nVCC\nR2-1\n)\n"), (net, "(\nGND\nR1-1\n)\n")):
+        path.parent.mkdir(parents=True)
+        path.write_text(text, encoding="utf-8")
+    newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file() and f.suffix != ".NET")
+    os.utime(net, (newest + 100, newest + 100))
+    os.utime(old, (newest + 200, newest + 200))
+    result = _load(root)
+    assert "partial" not in result
+    assert json.loads(main.query_net("GND"))["pin_count"] == 1
+    assert json.loads(main.query_net("VCC"))["error"] == "net_not_found"
+
+
+def test_ambiguous_unregistered_netlists_load_partially(env):
+    root, _, _ = env
+    for folder in ("CopyA", "CopyB"):
+        path = root / folder / "Board.NET"
+        path.parent.mkdir()
+        path.write_text("(\nGND\nR1-1\n)\n", encoding="utf-8")
+        newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file())
+        os.utime(path, (newest + 100, newest + 100))
+    assert _load(root)["partial"] is True
+
+
 def test_up_to_date_netlist_missing_from_the_registry_loads_fully(env):
     # E.g. Altium regenerated the netlist itself, or the folder moved: the registry
     # has no matching netlist_mtime, but the .NET is newer than every source.

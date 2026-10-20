@@ -104,14 +104,20 @@ def _origin_url_from_files(path: Path) -> str | None:
 
 
 def _git(git: str, cwd: Path, *args: str, check: bool = True,
-         config: tuple[str, ...] = ()) -> str | None:
-    """stdout of a local git command; None (check False) or GitError when it fails."""
+         config: list[tuple[str, str]] | None = None) -> str | None:
+    """stdout of a local git command; None (check False) or GitError when it fails.
+    config entries go through GIT_CONFIG_KEY_n, which takes a key verbatim (a -c
+    argument is split at its first '=', which a filter driver's name may contain)."""
+    env = {**os.environ, **_GIT_ENV}
+    if config:
+        env["GIT_CONFIG_COUNT"] = str(len(config))
+        for n, (key, value) in enumerate(config):
+            env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"] = key, value
     try:
         proc = subprocess.Popen(  # noqa: S603 - fixed git subcommands, no shell
-            [git, "--no-pager", "--no-optional-locks", *_GIT_CONFIG, *config, "-C", str(cwd),
-             *args],
+            [git, "--no-pager", "--no-optional-locks", *_GIT_CONFIG, "-C", str(cwd), *args],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", env={**os.environ, **_GIT_ENV},
+            text=True, encoding="utf-8", errors="replace", env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             start_new_session=_POSIX,
         )
@@ -209,18 +215,22 @@ def _last_fetch(git: str, cwd: Path, fetch_head: Path,
     return None, None
 
 
-def _uncommitted(git: str, cwd: Path, filters: set[str]) -> dict:
+def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
     """Uncommitted changes: counts per kind, how many are design files the tools read,
     and a sample of paths, design files first. Files in new folders are listed one by
-    one, so a new folder of sheets counts as design files."""
-    blank = tuple(arg for name in sorted(filters) for arg in (
-        "-c", f"filter.{name}.clean=", "-c", f"filter.{name}.smudge=",
-        "-c", f"filter.{name}.process=", "-c", f"filter.{name}.required=false"))
-    out = _git(git, cwd, "status", "--porcelain", "-z", "--untracked-files=all",
+    one, so a new folder of sheets counts as design files.
+
+    Filter drivers are blanked, so a filtered file (git-lfs and the like) whose stat data
+    changed is compared raw with its stored, cleaned content and would look modified:
+    such unstaged changes are counted as unverified, not as changes."""
+    blank = [(f"filter.{name}.{key}", value) for name in sorted(filters)
+             for key, value in (("clean", ""), ("smudge", ""), ("process", ""),
+                                ("required", "false"))]
+    out = _git(git, top, "status", "--porcelain", "-z", "--untracked-files=all",
                "--ignore-submodules=all", config=blank)
     entries = out.split("\0")
-    counts: dict[str, int] = {}
-    paths: list[str] = []
+    changes: list[tuple[str, str]] = []
+    worktree_only: list[str] = []
     i = 0
     while i < len(entries):
         entry = entries[i]
@@ -237,12 +247,33 @@ def _uncommitted(git: str, cwd: Path, filters: set[str]) -> dict:
                          if code[0] in letters or code[1] in letters), "modified")
         if "R" in code or "C" in code:
             i += 1  # the rename's source path follows
+        if code[0] == " " and code[1] in "MT":
+            worktree_only.append(path)
+        changes.append((kind, path))
+    filtered = _filtered(git, top, worktree_only, filters) if filters else set()
+    counts: dict[str, int] = {}
+    for kind, path in changes:
+        kind = "unverified" if path in filtered else kind
         counts[kind] = counts.get(kind, 0) + 1
-        paths.append(path)
-    design = [path for path in paths if Path(path).suffix.lower() in DESIGN_EXTENSIONS]
-    others = [path for path in paths if Path(path).suffix.lower() not in DESIGN_EXTENSIONS]
+    paths = [path for _, path in changes]
+    design = [path for path in paths
+              if path not in filtered and Path(path).suffix.lower() in DESIGN_EXTENSIONS]
+    others = [path for path in paths if path not in design]
     return {"count": len(paths), "by_kind": counts, "design_files": len(design),
-            "sample": (design + others)[:UNCOMMITTED_SAMPLE]}
+            "unverified": len(filtered), "sample": (design + others)[:UNCOMMITTED_SAMPLE]}
+
+
+def _filtered(git: str, top: Path, paths: list[str], filters: set[str]) -> set[str]:
+    """The paths whose filter attribute names a configured (here blanked) driver."""
+    found: set[str] = set()
+    for start in range(0, len(paths), 100):
+        out = _git(git, top, "check-attr", "-z", "filter", "--", *paths[start:start + 100],
+                   check=False) or ""
+        fields = out.split("\0")
+        for path, _, value in zip(fields[0::3], fields[1::3], fields[2::3]):
+            if value in filters:
+                found.add(path)
+    return found
 
 
 def _commit(git: str, cwd: Path, rev: str) -> dict | None:
@@ -311,7 +342,7 @@ def _a365_status(git: str, cwd: Path, top: Path, fetch_head: Path, filters: set[
     branch, upstream, default, existing = _refs(git, cwd)
     remote_ref = _remote_ref(branch, upstream, default, existing)
     fetched, fetch_source = _last_fetch(git, cwd, fetch_head, remote_ref)
-    changes = _uncommitted(git, cwd, filters)
+    changes = _uncommitted(git, top, filters)
     status: dict = {
         "altium365": True,
         "workspace": workspace,
@@ -331,6 +362,11 @@ def _a365_status(git: str, cwd: Path, top: Path, fetch_head: Path, filters: set[
     if changes["count"]:
         status["uncommitted"] = changes["by_kind"]
         status["uncommitted_design_files"] = changes["design_files"]
+        if changes["unverified"]:
+            status["uncommitted_unverified_note"] = (
+                f"{changes['unverified']} file(s) stored through a filter (e.g. git-lfs) "
+                "look changed, but filters are not run here, so they are not verified."
+            )
         status["uncommitted_sample"] = changes["sample"]
     try:
         subfolder = cwd.resolve().relative_to(top.resolve())

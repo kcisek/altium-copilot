@@ -322,20 +322,22 @@ def test_only_local_read_only_git_commands(clone):
         assert "protocol.allow=never" in args and "core.fsmonitor=false" in args
         subcommand = args[args.index("-C") + 2]
         assert subcommand in {"rev-parse", "config", "for-each-ref", "status", "log",
-                              "rev-list"}
+                              "rev-list", "check-attr"}
         if subcommand == "log":
             assert "--no-show-signature" in args
         if subcommand == "status":
             assert "--ignore-submodules=all" in args
 
 
-def test_repository_filters_do_not_run(clone, tmp_path):
+@pytest.mark.parametrize("driver", ["probe", "a=b"])
+def test_repository_filters_do_not_run(clone, tmp_path, driver):
     # A clean filter (git-lfs is one) runs on git status for a file whose stat data
     # changed; it could write to .git. Required drivers must not make status fail either.
+    # A driver name may contain '=', which a -c argument would split.
     marker = tmp_path / "filter-ran"
-    (clone / ".gitattributes").write_text("*.txt filter=probe\n", encoding="utf-8")
-    git(clone, "config", "filter.probe.clean", f"touch '{marker.as_posix()}'; cat")
-    git(clone, "config", "filter.probe.required", "true")
+    (clone / ".gitattributes").write_text(f"*.txt filter={driver}\n", encoding="utf-8")
+    git(clone, "config", f"filter.{driver}.clean", f"touch '{marker.as_posix()}'; cat")
+    git(clone, "config", f"filter.{driver}.required", "true")
     commit(clone, "Notes.txt", "abc\n", "Add notes")
     git(clone, "add", ".gitattributes")
     git(clone, "commit", "-q", "-m", "Attributes")
@@ -346,17 +348,39 @@ def test_repository_filters_do_not_run(clone, tmp_path):
     assert "error" not in status
     assert status["uncommitted_count"] == 0
     assert not marker.exists()
+    assert not (clone / ".git" / "lfs").exists()
     git(clone, "--no-optional-locks", "status", "--porcelain")  # control: the filter runs
     assert marker.exists()
 
 
-def test_a_hanging_git_is_stopped(clone, monkeypatch):
-    git(clone, "config", "alias.hang", "!sleep 30")
+def test_a_hanging_git_is_stopped_with_its_children(clone, monkeypatch, tmp_path):
+    marker = tmp_path / "child-survived"
+    git(clone, "config", "alias.hang", f"!sleep 3; touch '{marker.as_posix()}'")
     monkeypatch.setattr(clone_module, "GIT_TIMEOUT_S", 1)
     start = time.monotonic()
     with pytest.raises(clone_module.GitError, match="did not answer within 1 s"):
         clone_module._git(shutil.which("git"), clone, "hang")
-    assert time.monotonic() - start < 8
+    assert time.monotonic() - start < 3
+    time.sleep(max(0.0, start + 5 - time.monotonic()))  # the child would be done by now
+    assert not marker.exists()
+
+
+def test_filtered_files_that_only_look_changed_are_unverified(clone):
+    # git-lfs stores a pointer: with its clean filter blanked, a file whose stat data
+    # changed is compared raw with the pointer and looks modified.
+    (clone / ".gitattributes").write_text("*.PcbDoc filter=ptr\n", encoding="utf-8")
+    git(clone, "config", "filter.ptr.clean", "cat >/dev/null; echo pointer")
+    git(clone, "config", "filter.ptr.smudge", "cat")
+    commit(clone, "Board.PcbDoc", "real board data", "Add board")
+    git(clone, "add", ".gitattributes")
+    git(clone, "commit", "-q", "-m", "Attributes")
+    git(clone, "update-ref", "refs/remotes/origin/master", "HEAD")
+    os.utime(clone / "Board.PcbDoc", (NOW.timestamp(), NOW.timestamp()))
+    status = clone_status(clone, now=NOW)
+    assert status["uncommitted"] == {"unverified": 1}
+    assert status["uncommitted_design_files"] == 0
+    assert "not verified" in status["uncommitted_unverified_note"]
+    assert warnings_of(status) == []
 
 
 def test_git_calls_cannot_reach_a_remote(clone, tmp_path):

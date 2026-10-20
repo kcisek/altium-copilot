@@ -760,15 +760,6 @@ def _project_context(project_dir: str) -> str | None:
     return claude_md[0].read_text(encoding="utf-8") if claude_md else None
 
 
-def _find_net_file(project_dir: str, project_name: str) -> Path | None:
-    """The project's Protel netlist anywhere under its folder, as Altium writes it."""
-    matches = (
-        list(Path(project_dir).rglob(f"{project_name}.NET")) or
-        list(Path(project_dir).rglob(f"{project_name}.net"))
-    )
-    return matches[0] if matches else None
-
-
 def _load_cached_netlist(project_dir: str, prj_pcb_path: str, prj_data, net_path: Path,
                          netlist_mtime: float | None = None) -> str:
     """Full load from an up-to-date .NET on disk, without Altium."""
@@ -815,12 +806,24 @@ def _load_cached_netlist(project_dir: str, prj_pcb_path: str, prj_data, net_path
 
 def _load_unregistered_netlist(project_dir: str, prj_pcb_path: str) -> str | None:
     """Full load from a .NET that is up to date but not the one the registry recorded
-    (Altium regenerated it on its own, the folder moved, a new registry), or None."""
-    net_path = _find_net_file(project_dir, Path(prj_pcb_path).stem)
-    if net_path is None:
+    (Altium regenerated it on its own, the folder moved, a new registry), or None.
+    With several candidates (e.g. an archived copy of the project in a subfolder) only
+    the one in the project's output folder is trusted."""
+    name = Path(prj_pcb_path).stem
+    matches = list(Path(project_dir).rglob(f"{name}.NET")) or list(Path(project_dir).rglob(f"{name}.net"))
+    if not matches:
         return None
     try:
         prj_data = parse_prj_pcb(prj_pcb_path)
+        if len(matches) == 1:
+            net_path = matches[0]
+        else:
+            output = PureWindowsPath(prj_data.output_path or f"Project Outputs for {name}")
+            output_dir = (Path(*output.parts) if output.is_absolute()
+                          else Path(prj_pcb_path).parent / Path(*output.parts)).resolve()
+            net_path = next((m for m in matches if m.parent.resolve() == output_dir), None)
+            if net_path is None:
+                return None
         sources = netlist_sources(prj_pcb_path, prj_data.sheet_paths, prj_data.annotation_paths)
         if not prj_data.sheet_paths or not is_netlist_fresh(net_path, sources):
             return None

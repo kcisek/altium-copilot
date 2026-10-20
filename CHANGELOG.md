@@ -241,7 +241,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   stored in the variants. A cached netlist older than the sheets is not used
   (`netlist_stale`). With Altium closed, a `.NET` that is newer than every source but
   not the one the registry recorded (Altium regenerated it on its own, the folder moved,
-  a new registry) now loads fully instead of partially, and is recorded. After a partial
+  a new registry) now loads fully instead of partially, and is recorded; with several
+  `.NET` files under the folder only the one in the project's output folder is trusted.
+  After a partial
   load, `refresh_netlist` loads the project again, fully once Altium has it open; it
   keeps the active variant (or says it is gone in `variant_note`), and when the full
   load fails (e.g. Altium is busy) the partial load is restored (`partial_load_kept`)
@@ -261,7 +263,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   `protocol.allow=never` (no transport, so no lazy fetch either) and no prompts, and
   starts nothing the configuration names: `core.fsmonitor` off, filter drivers blanked
   for `git status` (a clean filter such as git-lfs could otherwise run and write to
-  `.git`), submodules ignored, no signature checks in `git log`. A git that hangs past
+  `.git`; passed as `GIT_CONFIG_KEY_n`, so a driver name with `=` is blanked too),
+  submodules ignored, no signature checks in `git log`. A filtered file that only looks
+  changed (its stat data moved, so its raw content is compared with the stored pointer)
+  is counted as `unverified`, not as a change. A git that hangs past
   10 s is stopped with everything it started. A missing `git` or a git error is
   reported, never fails a load; whether the folder is an Altium 365 clone then comes
   from `.git/config`, so other repositories get no `altium365` block. Credentials in the
