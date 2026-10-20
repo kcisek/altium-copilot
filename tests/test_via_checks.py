@@ -20,6 +20,7 @@ from server.parsers.pcb_doc import (
     Primitive,
     ViaStack,
     decode_board,
+    decode_polygons,
     decode_vias,
 )
 from server.parsers.prj_pcb import VariantDefinition, VariantState
@@ -635,6 +636,23 @@ def test_pour_counts_as_a_connection():
     assert all(
         stub.get("connected_layer") != "L4" for stub in _findings(result, "back_drill")
     )
+
+
+def test_pour_arc_edge_counts_for_a_connection():
+    # The pour's right edge is a Polygons6 arc bulging out to x = 100, round the
+    # via at x = 80 (outside the straight edge at x = 50).
+    record = {
+        "LAYER": "MID3", "NET": str(N["SIG"]), "HATCHSTYLE": "Solid",
+        "VX0": "-50mil", "VY0": "-50mil", "VX1": "50mil", "VY1": "-50mil", "KIND1": "1",
+        "CX1": "50mil", "CY1": "0mil", "R1": "50mil", "SA1": "270", "EA1": "90",
+        "VX2": "50mil", "VY2": "50mil", "VX3": "-50mil", "VY3": "50mil",
+    }
+    (pour,), _ = decode_polygons([record], dict(LAYERS))
+    primitives = [_via("SIG", 80, 0), _track("SIG", 1, -100, 0, 80, 0)]
+    index = _index(primitives, rules=[_back_drill_rule(MAXSTUBLENGTH="10mil")],
+                   drill_pairs=[THROUGH, BACK_DRILL], pours=[pour])
+    (stub,) = _findings(run_via_check(index, checks=["back_drill"]), "back_drill")
+    assert stub["connected_layer"] == "L4"
 
 
 def test_arc_touching_the_via_pad_connects():

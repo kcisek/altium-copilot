@@ -13,7 +13,7 @@ from server.parsers.drc_report import (
     read_text,
 )
 from server.parsers.pcb_doc import (
-    DiffPair, DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour,
+    DiffPair, DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour, decode_polygons,
 )
 from server.parsers.prj_pcb import VariantState
 from server.services.drc_results import (
@@ -553,6 +553,23 @@ def test_shorts_ignore_the_board_sized_box():
     pour.shelved = False
     pour.vertices = [(2400, 2400), (2600, 2400), (2600, 2600), (2400, 2600)]
     assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK"]
+
+
+def test_short_to_a_polygon_finds_the_pour_by_its_arcs():
+    index = _index()
+    index.pcb.layer_name_to_v6["bottom layer"] = 32
+    index.pcb.board.outline_vertices = [(1000, 1000), (3000, 1000), (3000, 3000), (1000, 3000)]
+    # A GND pour whose right edge is a Polygons6 arc bulging out to x = 1550,
+    # round U1-5 at (1500, 1500); its straight edge is at x = 1450.
+    (pour,), _ = decode_polygons([{
+        "LAYER": "BOTTOM", "NET": "0", "HATCHSTYLE": "Solid",
+        "VX0": "1300mil", "VY0": "1400mil", "VX1": "1450mil", "VY1": "1400mil", "KIND1": "1",
+        "CX1": "1450mil", "CY1": "1500mil", "R1": "100mil", "SA1": "270", "EA1": "90",
+        "VX2": "1450mil", "VY2": "1600mil", "VX3": "1300mil", "VY3": "1600mil",
+    }], index.pcb.layer_name_to_v6)
+    index.pcb.pours = [pour]
+    box = (-125000.0, -125000.0, 125000.0, 125000.0)
+    assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK", "GND"]
 
 
 def test_clearance_to_a_polygon_takes_the_pours_net():
