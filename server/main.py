@@ -55,7 +55,10 @@ try:
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
     from services.pcb_health import run_health_check
-    from services.dfm import DRILL_ROWS_LISTED, SHRINK_STEPS, page_dfm, review_dfm
+    from services.dfm import (
+        DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
+    )
+    from services.manufacturing_review import build_manufacturing_review
     from services.fab_profiles import load_profile
     from services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
@@ -105,7 +108,10 @@ except ImportError:
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.pcb_health import run_health_check
-    from server.services.dfm import DRILL_ROWS_LISTED, SHRINK_STEPS, page_dfm, review_dfm
+    from server.services.dfm import (
+        DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
+    )
+    from server.services.manufacturing_review import build_manufacturing_review
     from server.services.fab_profiles import load_profile
     from server.services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
@@ -365,7 +371,15 @@ component locations, distances):
     and severity together (status advisory: its only misses are info, such as
     Altimade's ordering limits while it is only the default; that is not a fabrication
     miss, so report it as a note), quote not_checked, and say "meets <profile>'s limits
-    on the checks run", never just "manufacturable".
+    on the checks run", never just "manufacturable". Assembly (DFA: "can it be
+    assembled?", fiducials, tombstoning, part spacing, too many unique parts) is the
+    same tool for the active variant: part_counts, assembly_sides, part_spacing,
+    part_to_edge, fiducials, tombstoning, fine_pitch. A limit the profile does not set
+    (part spacing, part to edge, pitch) is measured, not judged: ask the assembler.
+20. pcb_manufacturing_review — "is this board ready to order?", "review it for
+    manufacturing", "go/no-go before fab": a guided fabrication then assembly review
+    ending in a go / no-go that lists what was not checked; it asks which fabricator
+    first. One check against a fab profile is check_dfm.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3596,16 +3610,19 @@ def check_dfm(
     units: PcbUnits | None = None,
     offset: int = 0,
 ) -> str:
-    """Design-for-manufacture (DFM) check of the saved PcbDoc against a fabricator's
-    capability limits: "is this board manufacturable?", "DFM check", "can my fab /
-    Altimade / JLCPCB / PCBWay make this?", "check against my fab's capabilities",
-    before ordering boards. The answer is "meets <profile>'s limits on the checks run",
-    never "manufacturable" in general: name the profile (scope says which), and never
-    present Altimade's result as another fabricator's. When the user names another fab,
-    ask for its numbers (or a fab_profile.json) and pass profile="none" with limits.
-    Not: the board's own rules against its copper (check_rule_compliance); Altium's DRC
-    result (get_drc_report); via inventory, back drills and stubs (check_vias); Altium's
-    health check (check_pcb_health).
+    """Design-for-manufacture (DFM) and assembly (DFA) check of the saved PcbDoc against
+    a fabricator's or assembler's capability limits: "is this board manufacturable?",
+    "DFM check", "can my fab / Altimade / JLCPCB / PCBWay make this?", "check against my
+    fab's capabilities", before ordering boards; "can it be assembled?", "DFA check",
+    fiducials, tombstoning, part spacing, parts near the edge, "too many unique parts
+    for Altimade?". The answer is "meets <profile>'s limits on the checks run", never
+    "manufacturable" in general: name the profile (scope says which), and never present
+    Altimade's result as another fabricator's. When the user names another fab or
+    assembler, ask for its numbers (or a fab_profile.json) and pass profile="none" with
+    limits. Not: the board's own rules against its copper (check_rule_compliance);
+    Altium's DRC result (get_drc_report); via inventory, back drills and stubs
+    (check_vias); Altium's health check (check_pcb_health); the parts list (get_bom,
+    check_bom); a full manufacturing review (pcb_manufacturing_review).
 
     profile: "altimade" (built in: Altium's Altimade ordering service, its published
     limits), "none" (only limits apply) or a .json file in the project folder ("acme"
@@ -3623,18 +3640,27 @@ def check_dfm(
     aspect_ratio (copper-to-copper depth over the hole as drawn), hole_to_hole
     (overlapping holes whatever the profile), copper_to_edge (holes to the edge too),
     layer_count, copper_weight, board_size, drill_count, rules_vs_profile (a board rule
-    looser than the profile, so Altium's DRC would let it through). results gives each
-    check's status with its severity, limit and worst value: answer from status and
-    severity together. Status is fail (a miss of severity error or warning), marginal
-    (every such miss within tolerance_percent of its limit, default 2% and at most 1
-    mil, e.g. 0.1 mm against 4 mil: a warning), advisory (only info misses, such as
-    Altimade's ordering limits while Altimade is only the default: not a fabrication
-    miss, report it as a note), pass, or not_checked with a reason. board_minimums is
-    what the board needs from any fab, whatever the profile; drills is the drill table.
-    Findings are classes (a width, a family of gaps, a drill row or via type) with
-    counts (spacing counts places: spots where two nets' copper comes too close) and the
-    worst examples, errors first. Quote not_checked (solder mask, silkscreen, plane
-    pullback, panels, assembly).
+    looser than the profile, so Altium's DRC would let it through). Assembly, for the
+    active variant (its Not Fitted parts left out): part_counts (placements and unique
+    parts against max_placements / max_unique_parts, Altimade's ordering limits; unique
+    parts are the BOM's lines with a netlist, else approximate), assembly_sides (SMD on
+    both sides, THT on the bottom: extra steps, info), part_spacing (same-side parts by
+    3D body outline and pad copper; overlapping parts), part_to_edge, fiducials
+    (global per assembled side, local near fine-pitch parts), tombstoning (small
+    passives whose pads meet their copper unequally) and fine_pitch. An assembly limit
+    the profile does not set (min_part_spacing, min_part_to_edge, min_global_fiducials,
+    local_fiducial_pitch, min_pitch) is measured, not judged: ask the assembler.
+    results gives each check's status with its severity, limit and worst value: answer
+    from status and severity together. Status is fail (a miss of severity error or
+    warning), marginal (every such miss within tolerance_percent of its limit, default
+    2% and at most 1 mil, e.g. 0.1 mm against 4 mil: a warning), advisory (only info
+    misses, such as Altimade's ordering limits while Altimade is only the default: not a
+    fabrication miss, report it as a note), pass, or not_checked with a reason.
+    board_minimums is what the board needs from any fab or assembler, whatever the
+    profile; drills is the drill table. Findings are classes (a width, a family of
+    gaps, a drill row or via type) with counts (spacing counts places: spots where two
+    nets' copper comes too close) and the worst examples, errors first. Quote
+    not_checked (solder mask, silkscreen, plane pullback, panels, courtyards, paste).
 
     checks narrows to some of these; findings are paginated (offset from next_offset).
     Example locations (at_mil) are relative to the board origin: add origin_mil for
@@ -3646,12 +3672,14 @@ def check_dfm(
     to_mm, resolved, units_error = _pcb_units_or_error(index, units)
     if units_error:
         return json.dumps(units_error)
-    project, _, _ = _require_project(netlist=False)
+    project, netlist, variant_state = _require_project(netlist=False)
     fab_profile, error = load_profile(profile, project.get("root_dir"), limits)
     if error:
         return json.dumps(error)
-    # Cached on the index per (checks, units, profile): paging and repeat calls reuse it.
-    full = review_dfm(index, fab_profile, checks, to_mm)
+    # Cached on the index per (checks, units, profile, variant): paging and repeat calls
+    # reuse it.
+    full = review_dfm(index, fab_profile, checks, to_mm,
+                      _dfm_variant(project, netlist, variant_state))
     if "error" in full:
         return json.dumps(full)
     paths = project.get("pcb_doc_paths") or []
@@ -3666,6 +3694,23 @@ def check_dfm(
     context["origin_mil"] = full["origin_mil"]
     context["scope"] = full["scope"]
     return _dfm_page(context, full, offset, to_mm)
+
+
+def _dfm_variant(project: dict, netlist: dict | None,
+                 variant_state: VariantState) -> AssemblyContext:
+    """check_dfm's assembly context: the active variant's Not Fitted parts and, with a
+    netlist, the BOM line count of its fitted parts (grouped as get_bom groups them)."""
+    active = variant_state.active
+    unique = None
+    if netlist is not None and netlist.get("components"):
+        plan, _, _ = _bom_plan(netlist, variant_state, None)
+        parts, _ = build_bom_parts(netlist, plan, project.get("parameters") or {})
+        unique = len(group_bom_lines([part for part in parts if part.fitted]))
+    return AssemblyContext(
+        variant=active.name, is_dnp=variant_state.is_dnp,
+        dnp_key=tuple(sorted(set(active.dnp_refdes))), unique_parts=unique,
+        netlist_free=netlist is None,
+    )
 
 
 DFM_FINDINGS_OMITTED = (
@@ -4130,6 +4175,34 @@ def constraints_review() -> str:
     if netlist is None:
         review += CONSTRAINTS_REVIEW_NETLIST_FREE_NOTE
     return review
+
+
+@mcp.tool(title="PCB Manufacturing Review", annotations=ToolAnnotations(readOnlyHint=True))
+def pcb_manufacturing_review() -> str:
+    """Start a structured manufacturing-readiness review of the saved PCB before ordering:
+    fabrication against the user's fabricator (check_dfm with its profile, check_vias,
+    check_pcb_health, check_connectivity, get_drc_report), then assembly (check_dfm's
+    assembly checks, get_bom and check_bom), ending in a go / no-go that lists what was
+    not checked. It asks which fabricator first and never presents Altimade's limits as
+    another fab's. Call when the user asks for a manufacturing, DFM/DFA or production
+    readiness review ('is this board ready to order?', 'review it for manufacturing',
+    'go/no-go before fab', 'can it be built and assembled?'). Not for one check against a
+    fab profile (check_dfm), the high-speed constraints (constraints_review) or the
+    circuit (schematic_review)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady:
+        return json.dumps(REVIEW_NO_PROJECT_ERROR)
+    index, error = _pcb_index_or_error()
+    if error:
+        error["hint"] = (
+            "pcb_manufacturing_review needs the project's PcbDoc; for the parts list alone "
+            "use get_bom and check_bom."
+        )
+        return json.dumps(error)
+    return build_manufacturing_review(
+        project, variant_state.active.name, index, netlist_free=netlist is None,
+    )
 
 
 REVIEW_NO_PROJECT_ERROR = {

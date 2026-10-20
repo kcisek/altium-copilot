@@ -48,14 +48,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   1 mil for a length) is a warning, and mm/mil rounding is named only where it explains
   the miss. `board_minimums` says what the board needs from any fabricator, whatever the
   profile, and `drills` is the drill table. Solder mask, silkscreen, acute angles, copper
-  text, plane pullback, panels and assembly are listed as not checked. The review is
+  text, plane pullback and panels are listed as not checked. The review is
   computed once per board, profile and units, then paged to fit the result size.
   On Altium's examples MiniPC's drill table matches its Draftsman drill table (back
   drills aside, all 16 bare holes included), and the review takes about 2.2 s after the
-  2.5 s index (a repeat call or another page 1 ms); its result is 18 findings (6 of them
-  spacing) in 32,000 characters. On a private set of 55 real boards it ran without an
+  2.5 s index (a repeat call or another page 1 ms); its fabrication checks give 18
+  findings (6 of them spacing). On a private set of 55 real boards it ran without an
   exception, at most 0.22 s per board after the index (median 0.05 s), with every page
   under the 60,000-character limit
+- `check_dfm` checks assembly (DFA) too, for the active variant (its Not Fitted parts
+  are left out): `part_counts` (placements and unique parts against `max_placements`
+  and `max_unique_parts`, Altimade's published 600 and 200, which are advice while
+  Altimade is only the default; unique parts are the BOM's lines with a netlist, else
+  distinct footprint and Comment, said to be approximate), `assembly_sides` (SMD parts
+  on both sides and through-hole parts on the bottom: extra process steps, info),
+  `part_spacing` (same-side neighbours by the nearest of their 3D body outlines and pad
+  copper, the pads' extent for a part without a body, each part's nearest fitted
+  neighbour, against `min_part_spacing`; overlapping parts are a warning, or advice
+  without the limit; a part the assembler does not place, such as a fan model or a
+  mounting hole, over others is its own info class), `part_to_edge` (pad copper or body
+  to the outline and cutouts against `min_part_to_edge`; pads crossing the edge, bodies
+  past it and card-edge connectors are their own info classes, parts off the board a
+  note), `fiducials` (global fiducials per assembled side and two near each fine-pitch
+  part, against `min_global_fiducials` and `local_fiducial_pitch`, else the typical 3
+  and 0.5 mm as info), `tombstoning` (small passives with one pad connected directly to
+  a pour, region or fill and the other not are a warning; with no area copper at either
+  pad, one pad on a much wider track is an imbalance to review) and `fine_pitch`
+  (against `min_pitch`, the pitch measured between pins: a pin drawn as several pads is
+  one; Altimade publishes no number, so parts at 0.5 mm or finer are advice). The new
+  profile keys are in the template; an assembly limit that is not set is measured, not
+  judged. `board_minimums` adds placements per side, unique parts, fiducials per side,
+  the finest pitch and the smallest part gap and part-to-edge distance; courtyards,
+  component heights, pick-and-place, paste and through-hole pins against the other
+  side's parts are listed as not checked. On MiniPC the whole review takes
+  about 2.5 s after the index. On a private set of 55 real boards it ran without an
+  exception, at most 0.3 s per board after the index, every page under the limit; 7
+  boards have a small passive with one pad directly connected, 16 have overlapping
+  bodies and 3 have fiducials
+- `pcb_manufacturing_review`: a guided manufacturing-readiness review of the saved PCB.
+  Claude asks which fabricator and assembler (their numbers or a `fab_profile.json`),
+  confirms the profile, checks fabrication (`check_dfm`, vias, health, connectivity,
+  Altium's DRC report with its assessment) then assembly (`check_dfm`'s DFA checks, the
+  BOM), and ends in a go/no-go that lists what was not checked; it never presents
+  Altimade's limits as another fab's
+- The PcbDoc parser reads the parts' 3D bodies (outline, overall and standoff height,
+  side and model type; never the model's name)
 - The PcbDoc parser reads whether a pad's hole is plated, a square or slot hole's
   angle, whether the hole is offset from the pad, pads that are bare holes (no copper,
   such as mounting holes; MiniPC has 16 that Altium's drill table lists) and the number

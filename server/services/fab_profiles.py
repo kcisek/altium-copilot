@@ -5,7 +5,10 @@ Pure logic, no MCP. The keys are the same in a profile file, in the limits argum
 in the echoed profile: a length ends in _mm or _mil (min_trace_mm, min_spacing_mil), and
 so does a board size (a number, or [a, b] either way round); ratios, percentages and
 counts take no suffix (max_aspect_ratio, tolerance_percent, max_drill_sizes, layer_counts,
-copper_oz). Inside, every length is in mil under its bare name (min_trace).
+copper_oz, max_placements). Inside, every length is in mil under its bare name (min_trace).
+The assembly limits (max_unique_parts, max_placements, min_part_spacing, min_part_to_edge,
+min_global_fiducials, local_fiducial_pitch, min_pitch) are an assembler's: only the two
+part counts are published by Altimade, the others stay unset until someone gives them.
 
 A specific limit falls back to its generic one unless it is set or removed: the via, PTH
 and NPTH drills to min_drill, the via and PTH rings to min_annular_ring, the via and pad
@@ -24,9 +27,11 @@ Altimade is Altium's single-click ordering service; its page lists the limits a 
 must meet before it can be ordered. Values come from the page's mm figures, the smaller
 ones where its mil and mm disagree (0.075 mm against 2.955 mil, 0.101 mm against
 3.995 mil), and each keeps its text as published so that a client can quote it. The
-service-only limits (layer counts, board size, copper weight) say what Altimade will
-order, not what a fabricator can build: info when Altimade is only the default, error
-(copper weight: warning) when someone chose it.
+service-only limits (layer counts, board size, copper weight, unique parts and
+placements) say what Altimade will order, not what a fabricator or assembler can build:
+info when Altimade is only the default, error (copper weight: warning) when someone
+chose it. Altimade also checks a minimum component pitch but publishes no number, so
+min_pitch is not set by it.
 """
 
 import json
@@ -73,6 +78,14 @@ LIMIT_KEYS: dict[str, str] = {
     "max_board_size": "size",
     "max_drill_sizes": "count",
     "copper_oz": "weight",
+    # Assembly (DFA). Counts of fitted parts: distinct parts (BOM lines) and placements.
+    "max_unique_parts": "count",
+    "max_placements": "count",
+    "min_part_spacing": "length",  # same-side neighbours, body or pad copper edge to edge
+    "min_part_to_edge": "length",  # a part's pad copper or body to the board edge
+    "min_global_fiducials": "count",  # per assembled side
+    "local_fiducial_pitch": "length",  # parts at or below this pad pitch want local ones
+    "min_pitch": "length",  # the finest pad pitch the assembler places
 }
 FALLBACKS = {
     "min_via_annular_ring": "min_annular_ring",
@@ -92,6 +105,8 @@ SERVICE_LIMITS = {
     "min_board_size": "error",
     "max_board_size": "error",
     "copper_oz": "warning",
+    "max_unique_parts": "error",
+    "max_placements": "error",
 }
 _SUFFIXED = frozenset({"length", "size"})
 VALID_KEYS: tuple[str, ...] = tuple(
@@ -123,6 +138,12 @@ _MAX_MM = {
     "drill_allowance": 1.0,
     "min_board_size": 2000.0,
     "max_board_size": 2000.0,
+    # Assembly: 5 mm between parts covers rework room around a BGA, 10 mm to the edge a
+    # conveyor rail; the pitches cover 0.1 inch headers.
+    "min_part_spacing": 5.0,
+    "min_part_to_edge": 10.0,
+    "local_fiducial_pitch": 2.54,
+    "min_pitch": 2.54,
 }
 # Smaller values (other than 0, which a minimum may be) are below any fab's capability,
 # mostly mm typed as mil: such a limit would pass nearly any board. 0.0127 mm is 0.5 mil.
@@ -147,7 +168,16 @@ _MIN_MM = {
     "drill_allowance": 0.0127,
     "min_board_size": 0.2,
     "max_board_size": 25.0,
+    # Assembly: no assembler asks for parts closer than 0.05 mm or a part edge clearance
+    # below 0.1 mm (copper to edge already needs more), and no pad pitch is under 0.1 mm.
+    "min_part_spacing": 0.05,
+    "min_part_to_edge": 0.1,
+    "local_fiducial_pitch": 0.1,
+    "min_pitch": 0.1,
 }
+# Counts with a plausible ceiling: an assembler asks for a few global fiducials per side
+# (three is usual); more is a typo that would fail every board.
+_MAX_COUNT = {"min_global_fiducials": 10}
 # The other unit is suggested only when the value read in it is in range and at least
 # this many mil, so that following the suggestion never gives a near-zero limit.
 HINT_FLOOR_MIL = 1.0
@@ -186,6 +216,11 @@ _ALTIMADE_LIMITS = {
         "Board width, Board height"),
     "layer_counts": ((2, 4, 6, 8), "2, 4, 6, 8", "Layer count"),
     "copper_oz": (1.0, "1 oz", "Inner copper weight, Outer copper weight"),
+    # Assembly rows (violations "Max Unique Component Count Exceeded", "Max Total
+    # Component Placement Count Exceeded"). Its pitch check ("Min Detected Component
+    # Pitch Is Too Low") has no published number: min_pitch stays unset.
+    "max_unique_parts": (200, "200", "Max number of unique components"),
+    "max_placements": (600, "600", "Max total placements"),
 }
 ALTIMADE = {
     "name": "Altimade",
@@ -543,6 +578,9 @@ def _value(name: str, key: str, unit: str | None, raw):
         return tuple(sorted(set(counts))), None
     if kind == "count":
         count = _whole(raw)
+        cap = _MAX_COUNT.get(name)
+        if cap is not None and (count is None or not 1 <= count <= cap):
+            return None, f"{key} must be a whole number from 1 to {cap}."
         if count is None or count < 1:
             return None, f"{key} must be a whole number of at least 1."
         return count, None
@@ -605,9 +643,10 @@ def _reserved(file_name: str) -> bool:
     return file_name.split(".")[0].rstrip(" ").upper() in _RESERVED
 
 
-def _profile_files(root_dir) -> tuple[list[str], int]:
+def profile_files(root_dir) -> tuple[list[str], int]:
     """The .json files in the project folder a profile argument can name: at most
-    FILES_LISTED of them, names with "fab" or "profile" first, and how many there are."""
+    FILES_LISTED of them, names with "fab" or "profile" first, and how many there are
+    (fab_profile.json included when present)."""
     if root_dir is None:
         return [], 0
     try:
@@ -623,7 +662,7 @@ def _profile_files(root_dir) -> tuple[list[str], int]:
 
 
 def _not_found(name: str, root_dir, reason: str) -> ProfileError:
-    files, total = _profile_files(root_dir)
+    files, total = profile_files(root_dir)
     return ProfileError({
         "error": "profile_not_found",
         "message": reason,

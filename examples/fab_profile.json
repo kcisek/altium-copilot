@@ -29,6 +29,13 @@
     "max_board_size_mm": null,
     "max_drill_sizes": null,
     "copper_oz": null,
+    "max_unique_parts": null,
+    "max_placements": null,
+    "min_part_spacing_mm": null,
+    "min_part_to_edge_mm": null,
+    "min_global_fiducials": null,
+    "local_fiducial_pitch_mm": null,
+    "min_pitch_mm": null,
     "_specific_limits": {
       "min_via_annular_ring_mm": "falls back to min_annular_ring_mm",
       "min_pth_annular_ring_mm": "falls back to min_annular_ring_mm",
@@ -44,7 +51,12 @@
       "min_route_size_mm": "the narrowest routed slot; a narrower slot is info",
       "drill_allowance_mm": "drilled = finished hole + allowance, for a second aspect ratio",
       "tolerance_percent": "a miss within this percentage of a limit is marginal (default 2)",
-      "copper_oz": "the heaviest copper weight the fab offers, in oz"
+      "copper_oz": "the heaviest copper weight the fab offers, in oz",
+      "max_unique_parts": "the most distinct parts (BOM lines) the assembler takes per board",
+      "max_placements": "the most placed parts the assembler takes per board",
+      "min_global_fiducials": "global fiducials the assembler asks for on each assembled side",
+      "local_fiducial_pitch_mm": "parts at or below this pad pitch want two local fiducials",
+      "min_pitch_mm": "the finest pad pitch the assembler places"
     }
   }
 }

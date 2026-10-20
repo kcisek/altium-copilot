@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from server.services.fab_profiles import (
-    _MAX_MM, _MIN_MM, ALTIMADE, ALTIMADE_URL, DEFAULTS, FALLBACKS, FILES_LISTED,
+    _MAX_COUNT, _MAX_MM, _MIN_MM, ALTIMADE, ALTIMADE_URL, DEFAULTS, FALLBACKS, FILES_LISTED,
     HINT_FLOOR_MIL, LIMIT_KEYS, MAX_FILE_BYTES, MM, SERVICE_LIMITS, VALID_KEYS,
-    builtin_profile, external_key, load_profile, parse_limits,
+    builtin_profile, external_key, load_profile, parse_limits, profile_files,
 )
+
+ASSEMBLY_LENGTHS = ("min_part_spacing", "min_part_to_edge", "local_fiducial_pitch", "min_pitch")
+ASSEMBLY_COUNTS = ("max_unique_parts", "max_placements", "min_global_fiducials")
 
 TEMPLATE = Path(__file__).parent.parent / "examples" / "fab_profile.json"
 
@@ -57,6 +60,23 @@ def test_vocabulary_suffixes_lengths_only():
     assert set(_MAX_MM) == set(_MIN_MM) == suffixed
     assert all(0 < _MIN_MM[name] < _MAX_MM[name] for name in suffixed)
     assert len(VALID_KEYS) == len(LIMIT_KEYS) + len(suffixed)  # _mm and _mil each
+    assert all(LIMIT_KEYS[name] == "count" for name in _MAX_COUNT)
+
+
+def test_assembly_keys():
+    for name in ASSEMBLY_LENGTHS:
+        assert LIMIT_KEYS[name] == "length" and name not in FALLBACKS
+        assert f"{name}_mm" in VALID_KEYS and f"{name}_mil" in VALID_KEYS
+    for name in ASSEMBLY_COUNTS:
+        assert LIMIT_KEYS[name] == "count" and name in VALID_KEYS
+        assert f"{name}_mm" not in VALID_KEYS
+    # The part counts are Altimade's ordering limits; the others are no service's.
+    assert SERVICE_LIMITS["max_unique_parts"] == SERVICE_LIMITS["max_placements"] == "error"
+    assert not set(ASSEMBLY_LENGTHS) & set(SERVICE_LIMITS)
+    assert "min_global_fiducials" not in SERVICE_LIMITS
+    # No assembly limit falls back to a fabrication one, nor the other way round.
+    assembly = set(ASSEMBLY_LENGTHS) | set(ASSEMBLY_COUNTS)
+    assert not assembly & (set(FALLBACKS) | set(FALLBACKS.values()))
 
 
 def test_hole_to_copper_and_hole_to_edge_keys():
@@ -111,6 +131,67 @@ def test_altimade_values_published_and_sources():
         assert profile.origin(name) is None and profile.published(name) is None
     assert "board_thickness" in profile.not_checked
     assert set(ALTIMADE["limits"]) <= set(LIMIT_KEYS)
+
+
+def test_altimade_assembly_limits():
+    # The page's rows "Max number of unique components" 200 and "Max total placements"
+    # 600 (updated 2026-10-13); its pitch check publishes no number.
+    profile = builtin_profile("altimade")
+    for name, value, row in (("max_unique_parts", 200, "Max number of unique components"),
+                             ("max_placements", 600, "Max total placements")):
+        assert profile.get(name) == value and isinstance(profile.get(name), int)
+        assert profile.published(name) == str(value)
+        assert profile.origin(name) == "builtin" and profile.source_of(name) == ALTIMADE_URL
+        assert ALTIMADE["limits"][name]["row"] == row
+    for name in ("min_part_spacing", "min_part_to_edge", "min_global_fiducials",
+                 "local_fiducial_pitch", "min_pitch"):
+        assert profile.get(name) is None and not profile.is_set(name)
+        assert profile.origin(name) is None and profile.published(name) is None
+    rows = {row["limit"]: row for row in profile.echo(True)["limits"]}
+    assert rows["max_unique_parts"] == {"limit": "max_unique_parts", "value": 200,
+                                        "published": "200", "origin": "builtin"}
+    assert rows["max_placements"] == {"limit": "max_placements", "value": 600,
+                                      "published": "600", "origin": "builtin"}
+    assert not {"min_part_spacing_mm", "min_pitch_mm", "min_global_fiducials"} & set(rows)
+    # Order: the assembly rows come after the fabrication ones.
+    limits = [row["limit"] for row in profile.echo(True)["limits"]]
+    assert limits.index("copper_oz") < limits.index("max_unique_parts")
+
+
+def test_assembly_limits_from_arguments_and_files(tmp_path):
+    limits = {"min_part_spacing_mm": 0.25, "min_part_to_edge_mil": 125,
+              "local_fiducial_pitch_mm": 0.5, "min_pitch_mm": 0.4,
+              "min_global_fiducials": 3.0, "max_unique_parts": 150, "max_placements": None}
+    profile = _ok("altimade", None, limits)
+    assert profile.get("min_part_spacing") == pytest.approx(0.25 * MM)
+    assert profile.get("min_part_to_edge") == 125.0
+    assert profile.get("local_fiducial_pitch") == pytest.approx(0.5 * MM)
+    assert profile.get("min_pitch") == pytest.approx(0.4 * MM)
+    assert profile.get("min_global_fiducials") == 3
+    assert isinstance(profile.get("min_global_fiducials"), int)
+    assert profile.get("max_unique_parts") == 150 and profile.published("max_unique_parts") is None
+    assert profile.get("max_placements") is None  # null removes Altimade's 600
+    assert profile.severity("max_unique_parts") == "error"
+    rows = {row["limit"]: row for row in profile.echo(True)["limits"]}
+    assert rows["min_part_spacing_mm"] == {"limit": "min_part_spacing_mm", "value_mm": 0.25,
+                                           "origin": "argument"}
+    assert rows["min_part_to_edge_mm"]["value_mm"] == 3.175
+    assert rows["min_global_fiducials"] == {"limit": "min_global_fiducials", "value": 3,
+                                            "origin": "argument"}
+    assert rows["max_placements"] == {"limit": "max_placements", "value": None,
+                                      "origin": "argument"}
+    mil = {row["limit"]: row for row in profile.echo(False)["limits"]}
+    assert mil["min_pitch_mil"]["value_mil"] == pytest.approx(15.748)
+    _write(tmp_path, "assembler.json", {"limits": {"max_placements": 1000,
+                                                    "min_part_spacing_mm": 0.3}})
+    profile = _ok("assembler", tmp_path)
+    assert profile.get("max_placements") == 1000 and profile.origin("max_placements") == "file"
+    assert profile.severity("max_placements") == "error"
+    assert profile.get("max_unique_parts") is None  # nothing inherited without based_on
+    _write(tmp_path, "based.json", {"based_on": "altimade", "limits": {"min_pitch_mm": 0.5}})
+    profile = _ok("based", tmp_path)
+    assert profile.get("max_placements") == 600 and profile.origin("max_placements") == "builtin"
+    assert profile.severity("max_placements") == "error"  # chosen, not the default
 
 
 def test_specific_limits_fall_back_to_the_generic_one():
@@ -197,6 +278,14 @@ def test_profile_not_found_says_when_the_file_list_is_cut(tmp_path):
     assert len(error["files"]) == FILES_LISTED and error["files_total"] == 27
     # Names that look like fab profiles come first, so the cut keeps them.
     assert error["files"][:3] == ["Acme Profile.json", "zz_fab.json", "f00.json"]
+
+
+def test_profile_files(tmp_path):
+    assert profile_files(None) == ([], 0) and profile_files(tmp_path) == ([], 0)
+    for name in ("b.json", "fab_profile.json", "Acme.json", "notes.txt", "_x.json"):
+        _write(tmp_path, name, {})
+    (tmp_path / "folder.json").mkdir()
+    assert profile_files(tmp_path) == (["fab_profile.json", "Acme.json", "b.json"], 3)
 
 
 @pytest.mark.parametrize("name", [
@@ -455,6 +544,17 @@ def test_limit_values_convert_to_mil():
     ({"max_drill_sizes": 2.5}, "whole number"),
     ({"tolerance_percent": 25}, "between 0 and 20"),
     ({"copper_oz": 0}, "oz weight"),
+    ({"min_part_spacing": 0.2}, "use min_part_spacing_mm or min_part_spacing_mil"),
+    ({"max_placements_mm": 600}, "takes no unit suffix: use max_placements"),
+    ({"max_placements": 0}, "whole number of at least 1"),
+    ({"max_unique_parts": 199.5}, "whole number of at least 1"),
+    ({"max_unique_parts": "200"}, "whole number of at least 1"),
+    ({"min_global_fiducials": 0}, "whole number from 1 to 10"),
+    ({"min_global_fiducials": 11}, "whole number from 1 to 10"),
+    ({"min_global_fiducials": 2.5}, "whole number from 1 to 10"),
+    ({"min_global_fiducials": True}, "whole number from 1 to 10"),
+    ({"min_part_to_edge_mm": -1}, "zero or more"),
+    ({"min_pitch_mm": "0.4"}, "must be a number"),
 ])
 def test_invalid_limits(limits, text):
     error = _error(None, None, limits)
@@ -487,6 +587,10 @@ def test_wrong_types_say_what_they_are(value, text):
     ("min_trace", 1.0, 1.2),
     ("min_drill", 10.0, 10.5),
     ("max_drill", 10.0, 12.0),
+    ("min_part_spacing", 5.0, 6.0),
+    ("min_part_to_edge", 10.0, 12.0),
+    ("local_fiducial_pitch", 2.54, 5.0),
+    ("min_pitch", 2.54, 5.0),
 ])
 def test_upper_bounds_ask_about_mil(key, ok, bad):
     assert _ok("none", None, {f"{key}_mm": ok}).get(key) == pytest.approx(ok * MM)
@@ -513,6 +617,10 @@ def test_heavy_copper_spacing_is_accepted_in_mm():
     ("max_drill_mil", 3, "max_drill_mm"),
     ("min_board_size_mil", [2.54, 2.54], "min_board_size_mm"),
     ("max_board_size_mil", [500, 400], "max_board_size_mm"),
+    ("min_part_spacing_mil", 0.3, "min_part_spacing_mm"),
+    ("min_part_to_edge_mil", 3, "min_part_to_edge_mm"),
+    ("local_fiducial_pitch_mil", 0.5, "local_fiducial_pitch_mm"),
+    ("min_pitch_mil", 0.4, "min_pitch_mm"),
 ])
 def test_lower_bounds_catch_mm_typed_as_mil(key, value, other):
     # Such a limit would pass nearly any board; the mm reading is the likely one.
@@ -557,11 +665,17 @@ def test_service_limit_severity(tmp_path):
     assert chosen.severity("layer_counts") == "error"
     assert chosen.severity("max_board_size") == "error"
     assert chosen.severity("copper_oz") == "warning"
+    assert chosen.severity("max_unique_parts") == chosen.severity("max_placements") == "error"
     assert _ok(None, None, {"layer_counts": [2, 4]}).severity("layer_counts") == "error"
+    # A count given on top of the default is someone's choice: error.
+    assert _ok(None, None, {"max_placements": 600}).severity("max_placements") == "error"
+    assert _ok(None, None, {"max_placements": 600}).severity("max_unique_parts") == "info"
     _write(tmp_path, "fab_profile.json", {"based_on": "altimade"})
     assert _ok(None, tmp_path).severity("layer_counts") == "error"
     with pytest.raises(KeyError):
         default.severity("min_trace")
+    with pytest.raises(KeyError):
+        default.severity("min_global_fiducials")
 
 
 def test_echo_rows_in_mm_and_mil():
