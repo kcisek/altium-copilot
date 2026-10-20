@@ -12,8 +12,8 @@ import pytest
 import server.main as main_mod
 from server.parsers.pcb_doc import (
     DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour, Primitive, ShapeVertex, XSignal,
-    _health_check_storage, _hole_slot, decode_components, decode_fills, decode_polygons,
-    decode_regions, parse_pcb_doc, shape_from_properties,
+    _health_check_storage, _hole_slot, decode_components, decode_fill_records, decode_polygons,
+    decode_region_records, parse_pcb_doc, shape_from_properties,
 )
 from server.parsers.prj_pcb import VariantDefinition, VariantState
 from server.services.pcb_health import (
@@ -96,15 +96,15 @@ def test_shapes_with_arcs_and_settings():
 def test_regions_fills_and_slots_decode():
     data = (_region(1, [(0, 0), (10, 0), (10, 10, (5, 10, 5, 0, 180))], net=2, component=3)
             + _region(33, _square(0, 0, 5), polygon=7, keepout=True, kind=3))
-    regions, skipped = decode_regions(data, True)
+    regions, skipped = decode_region_records(data, True)
     assert skipped == 0 and len(regions) == 2
     first, second = regions
     assert (first.layer, first.net, first.component, first.polygon) == (1, 2, 3, None)
     assert len(first.vertices) == 3 and first.vertices[2].arc == (5.0, 10.0, 5.0, 0.0, 180.0)
     assert (second.polygon, second.keepout, second.board_cutout) == (7, True, True)
-    flat, _ = decode_regions(_region(57, _square(0, 0, 5), shape_based=False), False)
+    flat, _ = decode_region_records(_region(57, _square(0, 0, 5), shape_based=False), False)
     assert [(v.x, v.y) for v in flat[0].vertices] == _square(0, 0, 5)
-    fills, _ = decode_fills(_fill(1, 0, 0, 20, 10, component=4, rotation=45.0))
+    fills, _ = decode_fill_records(_fill(1, 0, 0, 20, 10, component=4, rotation=45.0))
     assert (fills[0].component, fills[0].x2, fills[0].rotation) == (4, 20.0, 45.0)
     size_shape = bytearray(300)
     size_shape[262] = 2
@@ -339,7 +339,7 @@ def test_arc_first_vertex_and_rounded_corners_are_clean():
     # The first vertex is an arc (Altium closes with a straight copy), its angles a hair
     # off and its centre one internal unit away: a pie slice, not a crossing shape.
     pie = _region(1, [(10, 0, (0.0001, 0.0001, 10, 0.0003, 89.9997)), (0, 10), (0, 0)])
-    regions, _ = decode_regions(pie, True)
+    regions, _ = decode_region_records(pie, True)
     assert len(regions[0].vertices) == 3
     corner = _region(1, [(0, 2, (2.0001, 2.0001, 2, 179.9998, 270.0002)), (2, 0), (100, 0),
                          (100, 50), (0, 50)])
@@ -484,7 +484,7 @@ def test_cut_short_streams_and_flattened_micro_segments():
     assert result["summary"] == {}
     assert any("Could not read 1 region records" in note for note in result["notes"])
     fill = _fill(1, 0, 0, 20, 10)
-    assert decode_fills(fill + fill[:10])[1] == 1
+    assert decode_fill_records(fill + fill[:10])[1] == 1
     tiny = _region(1, [(0, 0), (0.01, 0), (40, 0), (40, 40)], shape_based=False)
     result = run_health_check(_regions(tiny, shape_based=False), checks=REGION_CHECKS)
     assert result["summary"] == {}

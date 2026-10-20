@@ -174,6 +174,55 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   quarter-wave resonance on differential pairs no back-drill rule covers. On Altium's
   MiniPC example the recomputed back drill selects the same 16 vias whose pads Altium
   removed on the drilled layers
+- `check_connectivity`: copper connectivity of the saved board, like Altium's Un-Routed
+  Net and Net Antennae rules, offline. Per net, whether its copper joins all its pads:
+  tracks, true arcs, vias, pads and any same-net copper that touches, a hatched pour's
+  tracks and arcs, the regions a solid pour was last poured into (thermal spokes
+  included), copper regions, fills, and internal planes assigned to the net (split
+  planes by their outline, Power Plane Connect No Connect honoured; plane connections
+  are labelled assumed). A Jumper component's pads on one net count as joined, as in
+  Altium. The summary counts nets routed, partly routed and unrouted with percentages
+  and connections complete (Altium's routing completion formula, N pads needing N - 1);
+  single-pad nets and nets without pads are counted apart. Findings:
+  - `unrouted`: each missing connection between the nearest pads of two copper
+    islands with its distance, the islands' closest copper approach when within
+    25 mil (`copper_gap_mil`, also listed as `near_misses` beyond the spanning tree),
+    `same_component` for two pads of one part, and the net's shelved pours and pours
+    with no saved copper
+  - `isolated_copper`: copper of a net that reaches none of its pads; dead pour islands
+    as info
+  - `antenna`: an open-ended track or arc (once per primitive, also in isolated
+    copper), or one ending on a via that connects nothing else, with the stub length
+    back to the first branch and the open track's own length against the Net Antennae
+    rule that applies, when one is enabled
+  - `weak_connection`: copper that only touches where a net needs it, which Altium's
+    'Check for incomplete connections' rejects (centrelines that do not meet, a track
+    centreline off the pad, via or pour copper, a via centre off the pad), listed when
+    `checks` names `weak` (the summary always counts them);
+    `nets_joined_only_by_weak_connections` would read un-routed with that option on
+  Nets connected only through assumed copper are listed in `assumed_copper_nets`.
+  Filters by net or pair, net class, layer and check; paginated, with long connection
+  lists shortened to fit. `altium_drc` sets Altium's last Batch DRC report beside it:
+  its Un-Routed Net rows (missing connections apart from dead copper and plane rows)
+  and Net Antennae counts, the nets each side lists as not routed, the board's Net
+  Antennae rules, and the issues that limit trust in the report. On Altium's 6 examples
+  every net is routed (without regions and fills 2,572 connections would read
+  missing). On the 18 of 83 real boards whose own DRC report sits beside them, none
+  reports an un-routed net and neither does this check (so un-routed violations
+  themselves are not yet compared on real data); the 2 Net Antennae violations on one
+  board are the 2 antennae found here, inside the report's violation boxes, and vias
+  that connect on one layer only are not reported, as those reports do not
+- The PcbDoc parser reads `Regions6` (copper regions on signal layers: a solid pour's
+  poured copper, free and footprint regions, with holes; keepouts, polygon cutouts and
+  board cutouts left out) and `Fills6` (copper fills on signal layers) into
+  `PcbData.areas`; regions and fills on internal plane layers are voids in the plane and
+  are not read as copper. A stream with records that cannot be read (a record past the
+  end, vertices that are not board coordinates) warns and does not count as read. Also
+  read: the internal plane net assignments (Board6 `PLANEnNETNAME`) and each pour's
+  `POLYGONTYPE` (split planes). A shelved pour's regions are dropped like its tracks.
+  A pour's layer is now resolved from Altium's own tokens (`TOP`, `MIDn`, `BOTTOM`,
+  `PLANEn`, so split planes land on their plane layer) before the board's layer names,
+  which can no longer shadow them. Other tools do not use the regions yet
 - The PcbDoc parser reads each via's tenting (with a manual solder mask expansion that
   covers the ring counted as tented), test-point flags, pad stack mode, per-layer pad
   diameters and removed pads, and the stack's drill pairs and back drills (Board6
@@ -317,6 +366,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 - `get_drc_report`: a report where several tables list a different number of rows
   than their counts ("3 tables list ...") was called incomplete instead of having counts
   that differ
+- The length engine (`get_signal_length`, `check_lengths`, `list_diff_pairs`) grew a
+  rectangular pad by a track's half width or a via's radius with square corners, so
+  copper just off a pad's corner (up to 0.41 times that reach) counted as touching it.
+  The corners are now round. On Altium's examples 2 of 1,276 net lengths change and on
+  83 real boards 1 of 5,729, each by under 1 mil
 - `requirements.txt` pins `mcp<2`: mcp 2.x removed `mcp.server.fastmcp`, so a fresh
   install failed to start the server. `httpx`, which the update check imports, is now a
   declared dependency instead of arriving through mcp

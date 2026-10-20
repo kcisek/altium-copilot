@@ -16,10 +16,10 @@ import re
 from collections import defaultdict
 
 try:
-    from parsers.pcb_doc import decode_fills, decode_regions
+    from parsers.pcb_doc import decode_fill_records, decode_region_records
     from services.pcb_geometry import point_in_polygon, point_seg_distance
 except ImportError:
-    from server.parsers.pcb_doc import decode_fills, decode_regions
+    from server.parsers.pcb_doc import decode_fill_records, decode_region_records
     from server.services.pcb_geometry import point_in_polygon, point_seg_distance
 
 MICRO_SEGMENT_MIL = 0.03  # 300 internal units, Altium's GetSmallSegments(300)
@@ -280,9 +280,9 @@ class _Board:
         self.region_stream = self.shape_based or "Regions6/Data" in raw
         data = raw.get("ShapeBasedRegions6/Data") or raw.get("Regions6/Data") or b""
         self.region_bytes = len(data)
-        self.regions, bad_regions = decode_regions(data, self.shape_based)
-        self.board_regions, bad_board = decode_regions(raw.get("BoardRegions/Data", b""), False)
-        self.fills, bad_fills = decode_fills(raw.get("Fills6/Data", b""))
+        self.regions, bad_regions = decode_region_records(data, self.shape_based)
+        self.board_regions, bad_board = decode_region_records(raw.get("BoardRegions/Data", b""), False)
+        self.fills, bad_fills = decode_fill_records(raw.get("Fills6/Data", b""))
         self.unread = {"region": bad_regions, "board region": bad_board, "fill": bad_fills}
         self.designators = {
             component.index: component.designator or component.refdes or f"#{component.index}"

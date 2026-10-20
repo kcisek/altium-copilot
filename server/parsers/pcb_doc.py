@@ -862,6 +862,9 @@ class BoardInfo:
     # Health Check Monitor settings saved with the board (HEALTHCHECKSTORAGE):
     # check id -> enabled; None when the board stores none (all on but id 20).
     health_checks: dict[int, bool] | None = None
+    # Internal plane net assignments (PLANEnNETNAME): v6 layer (38 + n) ->
+    # net name; planes without a net ('(No Net)') are left out.
+    plane_nets: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -957,9 +960,32 @@ class PolygonPour:
     # Modified since its copper was poured (COPPERINVALIDATE): the saved copper
     # does not follow the outline until it is repoured.
     copper_invalid: bool = False
-    polygon_type: str = ""  # POLYGONTYPE: Polygon, Split Plane, ...
+    # POLYGONTYPE: 'Polygon' for a pour, 'Split Plane' for a split plane on
+    # an internal plane layer; None when the record does not say.
+    polygon_type: str | None = None
     # The outline with its arcs (vertices keeps only the vertices).
     shape: list[ShapeVertex] = field(default_factory=list)
+
+
+@dataclass
+class CopperArea:
+    """Copper drawn as an area: a Regions6 region (a solid pour's poured
+    copper, a free copper region, a footprint's region) or a Fills6 fill.
+
+    outline and each hole are vertex lists in mil, in the absolute frame of
+    the other primitives. A solid pour's copper is one region per poured
+    island, saved without a net (pour_id names the pour, which holds it).
+    """
+
+    kind: str  # "region" | "fill"
+    layer: int
+    net: int | None
+    component: int | None
+    outline: list[tuple[float, float]]
+    holes: list[list[tuple[float, float]]] = field(default_factory=list)
+    # Polygons6 index of the pour this is the poured copper of; None for
+    # free regions and fills.
+    pour_id: int | None = None
 
 
 # Altium writes int32 max (214748.3647 mil) for an unbounded max width/gap.
@@ -1168,6 +1194,13 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         )
         substack_index += 1
 
+    plane_nets: dict[int, str] = {}
+    for key, value in properties.items():
+        match = re.fullmatch(r"PLANE(\d+)NETNAME", key)
+        net_name = (value or "").strip()
+        if match and 1 <= int(match.group(1)) <= 16 and net_name and net_name != "(No Net)":
+            plane_nets[38 + int(match.group(1))] = net_name
+
     return BoardInfo(
         origin_x=parse_dim_mil(properties.get("ORIGINX")),
         origin_y=parse_dim_mil(properties.get("ORIGINY")),
@@ -1186,6 +1219,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         drill_pairs=decode_drill_pairs(properties),
         outline_shape=shape_from_properties(properties),
         health_checks=_health_check_storage(properties.get("HEALTHCHECKSTORAGE")),
+        plane_nets=plane_nets,
     )
 
 
@@ -1262,6 +1296,23 @@ def component_kind(kind: str, version2: str, version3: str) -> int:
     return number(kind)
 
 
+def _positional_layer(token: str) -> int | None:
+    """v6 id of Altium's positional layer tokens (TOP, MIDn, BOTTOM, PLANEn),
+    which a user's layer names must not shadow; None for other names."""
+    match = re.fullmatch(r"(top|bottom|mid(\d+)|plane(\d+))", token)
+    if not match:
+        return None
+    if match[1] == "top":
+        return 1
+    if match[1] == "bottom":
+        return 32
+    if match[2] is not None:
+        number = int(match[2])
+        return number + 1 if 1 <= number <= 30 else None
+    number = int(match[3])
+    return 38 + number if 1 <= number <= 16 else None
+
+
 def decode_polygons(
     records: list[dict[str, str]],
     layer_name_to_v6: dict[str, int],
@@ -1286,7 +1337,10 @@ def decode_polygons(
                 vertices.append((x, y))
             vertex_index += 1
         net_raw = record.get("NET")
-        layer = layer_name_to_v6.get(record.get("LAYER", "").lower())
+        token = record.get("LAYER", "").strip().lower()
+        layer = _positional_layer(token)
+        if layer is None:
+            layer = layer_name_to_v6.get(token)
         pour = PolygonPour(
             pour_id=pour_id,
             net=int(net_raw) if net_raw and net_raw.isdigit() else None,
@@ -1295,7 +1349,7 @@ def decode_polygons(
             vertices=vertices,
             shelved=record.get("SHELVED", "").strip().upper() == "TRUE",
             copper_invalid=record.get("COPPERINVALIDATE", "").strip().upper() == "TRUE",
-            polygon_type=record.get("POLYGONTYPE", "").strip(),
+            polygon_type=(record.get("POLYGONTYPE") or "").strip() or None,
             shape=shape_from_properties(record),
         )
         pours.append(pour)
@@ -1318,6 +1372,152 @@ def decode_polygons(
                 )
             )
     return pours, edges
+
+
+def _signal_layer(layer: int) -> bool:
+    """A signal layer (1-32). Internal planes (39-54) are drawn in negative:
+    a region or fill there is a void in the plane, not copper."""
+    return 1 <= layer <= 32
+
+
+# Regions6 / Fills6 keepouts: flags2 (payload byte 2) is 2, as in KiCad's
+# AREGION6 / AFILL6 (byte 1 holds the lock bits).
+_KEEPOUT = 2
+# A vertex beyond the int32 range of Altium's coordinates is corrupt.
+_MAX_COORDINATE_MIL = 2**31 / ALTIUM_UNITS_PER_MIL
+
+
+def _records_with_rest(data: bytes):
+    """iter_binary_records, then (None, unread bytes) when a record's length
+    runs past the stream (iter_binary_records stops there silently)."""
+    used = 0
+    for record_type, payload in iter_binary_records(data):
+        used += 5 + len(payload)
+        yield record_type, payload
+    if used < len(data):
+        yield None, data[used:]
+
+
+def _read_vertices(payload: bytes, at: int) -> tuple[list[tuple[float, float]], int]:
+    """(vertices in mil, offset after them) of a u32 count + count x (double x,
+    double y) list in Altium units; ValueError when the payload is short."""
+    if at + 4 > len(payload):
+        raise ValueError("vertex count past the record")
+    (count,) = struct.unpack_from("<I", payload, at)
+    at += 4
+    if at + 16 * count > len(payload):
+        raise ValueError("vertices past the record")
+    values = struct.unpack_from(f"<{2 * count}d", payload, at)
+    if not all(
+        math.isfinite(value) and abs(value) < _MAX_COORDINATE_MIL * ALTIUM_UNITS_PER_MIL
+        for value in values
+    ):
+        raise ValueError("vertex outside the board coordinate range")
+    vertices = [
+        (values[i] / ALTIUM_UNITS_PER_MIL, values[i + 1] / ALTIUM_UNITS_PER_MIL)
+        for i in range(0, 2 * count, 2)
+    ]
+    return vertices, at + 16 * count
+
+
+def decode_regions(data: bytes) -> tuple[list[CopperArea], int]:
+    """Decode the copper of Regions6 records: kind 0 regions on signal layers
+    that are not keepouts or board cutouts.
+
+    Payload (KiCad's AREGION6): layer u8, flags1 (lock bits), flags2 (2 =
+    keepout), net u16 at 3, pour index u16 at 5, component u16 at 7, hole
+    count u16 at 14,
+    u32 text length at 18 and |KEY=VALUE text (KIND, ISBOARDCUTOUT), then the
+    outline and each hole as u32 count + (double x, double y) vertices.
+    Polygon cutouts (KIND 1) and other kinds are not copper. A region of
+    fewer than 3 vertices has no area and is left out; unreadable records
+    (a vertex not finite or past the coordinate range, a record running past
+    the stream) are counted as skipped.
+    """
+    areas: list[CopperArea] = []
+    skipped = 0
+    for record_type, payload in _records_with_rest(data):
+        if record_type != 11 or len(payload) < 22:
+            skipped += 1
+            continue
+        layer = payload[0]
+        if not _signal_layer(layer) or payload[2] == _KEEPOUT:
+            continue
+        net, pour, component = struct.unpack_from("<HHH", payload, 3)
+        (hole_count,) = struct.unpack_from("<H", payload, 14)
+        (text_length,) = struct.unpack_from("<I", payload, 18)
+        properties = _parse_text_properties(payload[22 : 22 + text_length])
+        if (
+            properties.get("KIND", "0").strip() != "0"
+            or properties.get("ISBOARDCUTOUT", "").strip().upper() == "TRUE"
+        ):
+            continue
+        try:
+            outline, at = _read_vertices(payload, 22 + text_length)
+            holes = []
+            for _ in range(hole_count):
+                hole, at = _read_vertices(payload, at)
+                if len(hole) >= 3:
+                    holes.append(hole)
+        except (ValueError, struct.error):
+            skipped += 1
+            continue
+        if len(outline) < 3:
+            continue
+        areas.append(
+            CopperArea(
+                kind="region",
+                layer=layer,
+                net=_optional_index(net, NO_NET),
+                component=_optional_index(component, NO_COMPONENT),
+                outline=outline,
+                holes=holes,
+                pour_id=None if pour in _NO_POLYGON else pour,
+            )
+        )
+    return areas, skipped
+
+
+def decode_fills(data: bytes) -> tuple[list[CopperArea], int]:
+    """Decode copper Fills6 records (KiCad's AFILL6): layer u8, flags2 at 2
+    (2 = keepout), net u16 at 3, component u16 at 7, two corners (int32 x, y)
+    at 13 and a rotation (double, degrees, about the centre) at 29."""
+    areas: list[CopperArea] = []
+    skipped = 0
+    for record_type, payload in _records_with_rest(data):
+        if record_type != 6 or len(payload) < 37:
+            skipped += 1
+            continue
+        layer = payload[0]
+        if not _signal_layer(layer) or payload[2] == _KEEPOUT:
+            continue
+        net, _, component = struct.unpack_from("<HHH", payload, 3)
+        x1, y1, x2, y2 = (
+            _units_to_mil(value) for value in struct.unpack_from("<iiii", payload, 13)
+        )
+        (rotation,) = struct.unpack_from("<d", payload, 29)
+        if x1 == x2 or y1 == y2 or not math.isfinite(rotation):
+            continue
+        center_x, center_y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        cosine = math.cos(math.radians(rotation))
+        sine = math.sin(math.radians(rotation))
+        outline = []
+        for x, y in ((x1, y1), (x2, y1), (x2, y2), (x1, y2)):
+            dx, dy = x - center_x, y - center_y
+            outline.append((
+                center_x + dx * cosine - dy * sine,
+                center_y + dx * sine + dy * cosine,
+            ))
+        areas.append(
+            CopperArea(
+                kind="fill",
+                layer=layer,
+                net=_optional_index(net, NO_NET),
+                component=_optional_index(component, NO_COMPONENT),
+                outline=outline,
+            )
+        )
+    return areas, skipped
 
 
 def _component_texts(data: bytes):
@@ -1706,7 +1906,7 @@ class PcbFill:
     rotation: float
 
 
-def decode_regions(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int]:
+def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int]:
     """Region records: u8 layer, u8 flags, u8 flags2 (2 = keepout), u16 net, u16
     polygon, u16 component, hole count u16 at 14, properties (u32 length) at 18, u32
     vertex count, then vertices (Regions6 and BoardRegions: double x, y; shape-based:
@@ -1786,7 +1986,7 @@ def decode_regions(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int
     return regions, skipped
 
 
-def decode_fills(data: bytes) -> tuple[list[PcbFill], int]:
+def decode_fill_records(data: bytes) -> tuple[list[PcbFill], int]:
     """Fills6 records: layer at 0, flags2 at 2 (2 = keepout), net 3, component 7,
     corners int32 at 13 and 21, rotation double at 29."""
     fills: list[PcbFill] = []
@@ -1839,8 +2039,13 @@ class PcbData:
     # Rules6 kind ids checked by the board's batch DRC; None when unknown.
     drc_rule_kinds: set[int] | None = None
     drc_options: DrcOptions | None = None
-    # LAZY_STREAMS as read, for decode_regions and decode_fills.
+    # LAZY_STREAMS as read, for decode_region_records and decode_fill_records.
     raw: dict[str, bytes] = field(default_factory=dict)
+    # Copper regions and fills (a shelved pour's dropped, a pour's copper
+    # given its net); area_streams names the streams read ('Regions6',
+    # 'Fills6'), so a missing stream is not mistaken for no area copper.
+    areas: list[CopperArea] = field(default_factory=list)
+    area_streams: tuple[str, ...] = ()
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -1858,6 +2063,10 @@ def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
     # seen actually populates all 30 mid slots.
     for mid_index in range(1, 31):
         aliases.setdefault(f"mid{mid_index}", mid_index + 1)
+    # Internal planes likewise: Polygons6 names a split plane's layer PLANEn
+    # (v6 38 + n).
+    for plane_index in range(1, 17):
+        aliases.setdefault(f"plane{plane_index}", 38 + plane_index)
     return aliases
 
 
@@ -1888,6 +2097,25 @@ def _resolve_pour_copper(
                 primitive.net = pour.net
         kept.append(primitive)
     return kept, len(dropped)
+
+
+def _resolve_pour_areas(
+    areas: list[CopperArea], pours: list[PolygonPour]
+) -> tuple[list[CopperArea], int]:
+    """(areas, dropped): a solid pour's regions get its net, and a shelved
+    pour's are dropped, as _resolve_pour_copper does for hatched copper."""
+    kept: list[CopperArea] = []
+    dropped = 0
+    for area in areas:
+        if area.pour_id is not None and area.pour_id < len(pours):
+            pour = pours[area.pour_id]
+            if pour.shelved:
+                dropped += 1
+                continue
+            if area.net is None:
+                area.net = pour.net
+        kept.append(area)
+    return kept, dropped
 
 
 def parse_streams(streams: dict[str, bytes]) -> PcbData:
@@ -1964,11 +2192,38 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
     else:
         warnings.append("Polygons6 stream missing")
     primitives, shelved_copper = _resolve_pour_copper(primitives, pours)
+
+    areas: list[CopperArea] = []
+    area_streams: list[str] = []
+    for stream, decoder in (
+        ("Regions6/Data", decode_regions),
+        ("Fills6/Data", decode_fills),
+    ):
+        # Optional: boards without regions or fills may lack the stream.
+        if stream not in streams:
+            continue
+        stream_name = stream.split("/")[0]
+        try:
+            decoded, skipped = decoder(streams[stream])
+        except Exception as error:
+            warnings.append(f"{stream_name} parse failed: {error}")
+            continue
+        areas.extend(decoded)
+        if skipped:
+            # Some copper could not be read: the stream does not count as read,
+            # so a pour without readable copper is not taken for an unpoured one.
+            skipped_records[stream_name] = skipped
+            warnings.append(f"{stream_name}: {skipped} records could not be read")
+        else:
+            area_streams.append(stream_name)
+    areas, shelved_areas = _resolve_pour_areas(areas, pours)
+    shelved_copper += shelved_areas
     if shelved_copper:
         skipped_records["shelved_pour_copper"] = shelved_copper
 
+    valid_areas = [area for area in areas if area.net is None or area.net < len(nets)]
+    invalid_net_count = len(areas) - len(valid_areas)
     valid_primitives = []
-    invalid_net_count = 0
     for primitive in primitives:
         if primitive.net is not None and primitive.net >= len(nets):
             invalid_net_count += 1
@@ -2054,6 +2309,8 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         drc_rule_kinds=drc_rule_kinds,
         drc_options=drc_options,
         raw={stream: streams[stream] for stream in LAZY_STREAMS if stream in streams},
+        areas=valid_areas,
+        area_streams=tuple(area_streams),
     )
 
 
@@ -2066,6 +2323,8 @@ _WANTED_STREAMS = (
     "Arcs6/Data",
     "Pads6/Data",
     "Polygons6/Data",
+    "Regions6/Data",
+    "Fills6/Data",
     "Texts6/Data",
     "WideStrings6/Data",
     "Rules6/Data",
@@ -2083,9 +2342,8 @@ def parse_pcb_doc(path: str) -> PcbData:
     read_warnings: list[str] = []
     with olefile.OleFileIO(path) as ole:
         available = {"/".join(stream) for stream in ole.listdir()}
-        wanted = [*_WANTED_STREAMS, *LAZY_STREAMS]
-        if "ShapeBasedRegions6/Data" in available:
-            wanted.remove("Regions6/Data")  # the same records, arcs flattened
+        wanted = [*_WANTED_STREAMS,
+                  *(stream for stream in LAZY_STREAMS if stream not in _WANTED_STREAMS)]
         for stream in wanted:
             if stream in available:
                 try:
