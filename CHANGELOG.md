@@ -324,6 +324,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   top-middle-bottom or full stack on the bottom or an inner layer take that layer's
   size and shape, and an empty slot falls back to a filled one: three bottom-layer
   pads with an empty top slot on the Bluetooth Sentinel example were dropped
+- Through-hole pads with a top-middle-bottom or full pad stack keep their size and
+  shape per layer in every PCB distance (clearance spot-check, `query_pcb_region`,
+  `get_net_neighbors`, DRC violation nets, pad-to-pad length): two objects are measured
+  on the layers they share, each pad with its copper there. They had the top-layer size
+  on every layer. On 83 real boards (aggregate) 3,255 through-hole pads have other
+  copper on the inner layers: 21 gaps to inner-layer tracks grew (by up to 12.4 mil),
+  450 pad pairs with larger inner copper came within 20 mil (the closest 9.8 mil), and
+  spot checks of 395 nets lost 6 THPad-Track clearance violations that only the
+  top-layer size caused, with none new; the length of the 1,447 nets with such pads is
+  unchanged. `query_pcb_region` lists only the layers a pad's copper reaches, and a
+  clearance violation names the layer its gap is on. Altium's examples have no such
+  pads and measure the same
 
 ## [0.3.0] - 2026-07-19
 

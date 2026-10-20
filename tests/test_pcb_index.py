@@ -4,10 +4,12 @@ from copy import deepcopy
 import pytest
 
 from server.parsers.pcb_doc import (
+    PAD_INNER_LAYERS,
     PAD_SHAPE_RECT,
     PAD_SHAPE_ROUND,
     PAD_SHAPE_ROUNDRECT,
     BoardInfo,
+    PadCopper,
     PcbComponent,
     PcbData,
     PcbLayer,
@@ -750,6 +752,91 @@ def test_rounded_rectangle_pad_in_index_queries(pcb_data):
     ]
     assert "ROUNDED_PAD" in [
         net["net"] for net in index.region_query(19.5, 25.0, radius=1.0)["nets"]
+    ]
+
+
+def _stack_pad(net, x=0.0, y=0.0, component=None):
+    """A Multi-Layer pad: 60 mil round on top and bottom, 40 mil round on
+    the inner layers but L3-SIG, where it is an 80 x 20 mil rectangle."""
+    pad = _pad(net=net, component=component, x=x, y=y, layer=74, width=60.0)
+    pad.layer_copper = {
+        PAD_INNER_LAYERS: PadCopper(40.0, 40.0, PAD_SHAPE_ROUND),
+        3: PadCopper(80.0, 20.0, PAD_SHAPE_RECT),
+    }
+    return pad
+
+
+def test_multi_layer_pad_geometry_per_layer(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _stack_pad(net=0)
+    # Bounds cover every layer: the L3-SIG rectangle is the wider.
+    assert index._primitive_bounds(pad) == pytest.approx((-40.0, -30.0, 40.0, 30.0))
+    # Without layers a pad has its main (top-layer) copper.
+    assert index._point_primitive_distance(35.0, 0.0, pad) == pytest.approx(5.0)
+    assert index._point_primitive_distance(35.0, 0.0, pad, [2]) == pytest.approx(15.0)
+    assert index._point_primitive_distance(35.0, 0.0, pad, [3]) == 0.0
+    assert index._point_primitive_distance(35.0, 0.0, pad, [1, 2]) == pytest.approx(5.0)
+    assert sorted(
+        (distance, tuple(group))
+        for distance, group in index._point_layer_distances(
+            35.0, 0.0, pad, [1, 2, 3, 32]
+        )
+    ) == [(0.0, (3,)), (pytest.approx(5.0), (1, 32)), (pytest.approx(15.0), (2,))]
+    # A track on L2-GND 35 mil off the centre (2 mil wide).
+    track = _track(net=1, layer=2, x1=35.0, y1=-50.0, x2=35.0, y2=50.0, width=2.0)
+    assert index._primitive_distance(pad, track, [2]) == pytest.approx(14.0)
+    assert index._primitive_distance(track, pad, [2]) == pytest.approx(14.0)
+    assert index._primitive_distance(pad, track) == pytest.approx(4.0)
+    # Pad to pad, 100 mil apart: closest on top and bottom, unless only
+    # inner layers are shared.
+    other = _stack_pad(net=1, x=100.0)
+    assert index._closest_layers(pad, other, [1, 2, 32]) == (
+        pytest.approx(40.0), [1, 32]
+    )
+    assert index._closest_layers(pad, other, [2, 3]) == (pytest.approx(20.0), [3])
+    # A pad without per-layer copper measures once for every layer given.
+    simple = _pad(net=1, component=None, x=100.0, y=0.0, layer=74, width=60.0)
+    distance, layers = index._closest_layers(simple, track, {1, 2})
+    assert (distance, sorted(layers)) == (pytest.approx(34.0), [1, 2])
+    assert index._closest_layers(simple, track) == (pytest.approx(34.0), None)
+
+
+def test_multi_layer_pad_in_index_queries(pcb_data):
+    data = deepcopy(pcb_data)
+    data.nets.extend(["PTH", "L2_NET", "L3_NET"])
+    data.board.layers.append(_layer(74, "Multi-Layer", None, kind="non-stack"))
+    data.primitives.extend([
+        _stack_pad(net=3, x=700.0, y=700.0),
+        # 14 mil from the L2-GND copper (4 mil from the top-layer size).
+        _track(net=4, layer=2, x1=735.0, y1=650.0, x2=735.0, y2=750.0, width=2.0),
+        # 4 mil from the L3-SIG rectangle, beyond the top-layer size's reach.
+        _track(net=5, layer=3, x1=745.0, y1=650.0, x2=745.0, y2=750.0, width=2.0),
+    ])
+    index = PcbIndex(data, NETLIST)
+    row = index.db.execute("SELECT * FROM prims WHERE net_id = 3").fetchone()
+    assert (row["minx"], row["maxx"]) == pytest.approx((660.0, 740.0))
+    assert index._primitive_distance(
+        row, index.db.execute("SELECT * FROM prims WHERE net_id = 4").fetchone(), [2]
+    ) == pytest.approx(14.0)
+
+    def neighbors(distance):
+        return {
+            (neighbor["net"], neighbor["layer"]): neighbor["min_edge_distance_mil"]
+            for neighbor in index.net_neighbors("PTH", distance=distance)["neighbors"]
+        }
+
+    assert neighbors(10.0) == {("L3_NET", "L3-SIG"): 4.0}
+    assert neighbors(15.0) == {
+        ("L2_NET", "L2-GND"): 14.0, ("L3_NET", "L3-SIG"): 4.0,
+    }
+    # 4 mil above the top and bottom copper, 14 / 24 mil from the inner one.
+    (net,) = index.region_query(700.0, 734.0, radius=5.0)["nets"]
+    assert (net["net"], net["min_distance_mil"]) == ("PTH", 4.0)
+    assert net["layers"] == ["Bottom Layer", "Top Layer"]
+    assert index.region_query(700.0, 734.0, radius=5.0, layer=2)["nets"] == []
+    inner = index.region_query(700.0, 734.0, radius=15.0, layer=2)["nets"]
+    assert [(net["net"], net["min_distance_mil"], net["layers"]) for net in inner] == [
+        ("PTH", 14.0, ["L2-GND"])
     ]
 
 
