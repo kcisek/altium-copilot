@@ -581,6 +581,32 @@ def test_pour_outline_reports_inside_and_distance_separately(outline_data):
     ]
 
 
+def test_pour_outline_follows_its_arcs(pcb_data):
+    # PLANE's right edge is a Polygons6 arc bulging out to x = 1100: SIG's track
+    # starts in the bulge and crosses the arc there.
+    data = deepcopy(pcb_data)
+    data.nets.extend(["SIG", "PLANE"])
+    data.primitives.append(_track(net=3, layer=1, x1=1050, y1=700, x2=1200, y2=700))
+    _add_pour(
+        data, 4, "TOP", [(650, 500), (900, 500), (900, 900), (650, 900)],
+        KIND1="1", CX1="900mil", CY1="700mil", R1="200mil", SA1="270", EA1="90",
+    )
+    index = PcbIndex(data, NETLIST)
+    assert index.net_neighbors("SIG", distance=10.0)["pours"] == [
+        {
+            "net": "PLANE",
+            "layer": "Top Layer",
+            "inside_pour": True,
+            "min_outline_distance_mil": 0.0,
+        }
+    ]
+    inside = index.region_query(1050.0, 700.0, radius=0.0, layer=1)
+    assert [(p["net"], p["inside_pour"]) for p in inside["pours"]] == [("PLANE", True)]
+    (beyond,) = index.region_query(1105.0, 700.0, radius=10.0, layer=1)["pours"]
+    assert beyond["inside_pour"] is False
+    assert beyond["min_distance_mil"] == pytest.approx(5.0, abs=0.25)
+
+
 def test_pour_outline_respects_the_layer_filter(outline_data):
     index = PcbIndex(outline_data, NETLIST)
     assert index.net_neighbors("SIG", distance=10.0, layer=3)["pours"] == []

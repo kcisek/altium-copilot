@@ -391,6 +391,39 @@ ARC_CHORD_STEP_DEG = 30.0
 ARC_MAX_SAGITTA_MIL = 0.25
 
 
+def _arc_chord_points(
+    center_x: float, center_y: float, radius: float, start: float, end: float
+) -> list[tuple[float, float]]:
+    """Chord points (mil) of an arc running counter-clockwise from the start
+    angle to the end angle (degrees; a whole circle when they are equal): at
+    least two chords, each of at most ARC_CHORD_STEP_DEG and lying at most
+    ARC_MAX_SAGITTA_MIL inside the arc."""
+    sweep = (end - start) % 360.0 or 360.0
+    adaptive_step = math.degrees(
+        2.0
+        * math.acos(
+            max(
+                -1.0,
+                1.0 - min(ARC_MAX_SAGITTA_MIL / radius, 2.0),
+            )
+        )
+    )
+    chord_step = min(
+        ARC_CHORD_STEP_DEG,
+        max(adaptive_step, 0.5),
+    )
+    steps = max(2, math.ceil(sweep / chord_step))
+    return [
+        (
+            center_x
+            + radius * math.cos(math.radians(start + sweep * index / steps)),
+            center_y
+            + radius * math.sin(math.radians(start + sweep * index / steps)),
+        )
+        for index in range(steps + 1)
+    ]
+
+
 def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
     """Decode Arcs6 records into chord rows (indexing and length), each
     carrying its arc's centre and radius so distances use the arc itself."""
@@ -435,32 +468,10 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
         center_y_mil = _units_to_mil(center_y)
         radius_mil = _units_to_mil(radius)
         sweep = (end_angle - start_angle) % 360.0 or 360.0
-        adaptive_step = math.degrees(
-            2.0
-            * math.acos(
-                max(
-                    -1.0,
-                    1.0 - min(ARC_MAX_SAGITTA_MIL / radius_mil, 2.0),
-                )
-            )
+        points = _arc_chord_points(
+            center_x_mil, center_y_mil, radius_mil, start_angle, end_angle
         )
-        chord_step = min(
-            ARC_CHORD_STEP_DEG,
-            max(adaptive_step, 0.5),
-        )
-        steps = max(2, math.ceil(sweep / chord_step))
-        points = [
-            (
-                center_x_mil
-                + radius_mil
-                * math.cos(math.radians(start_angle + sweep * index / steps)),
-                center_y_mil
-                + radius_mil
-                * math.sin(math.radians(start_angle + sweep * index / steps)),
-            )
-            for index in range(steps + 1)
-        ]
-        chord_length = radius_mil * math.radians(sweep) / steps
+        chord_length = radius_mil * math.radians(sweep) / (len(points) - 1)
         poured_by = _poured_by(payload)
         for (x1, y1), (x2, y2) in zip(points, points[1:]):
             primitives.append(
@@ -893,14 +904,51 @@ def shape_from_properties(properties: dict[str, str]) -> list[ShapeVertex]:
             radius = parse_dim_mil(properties.get(f"R{index}"))
             start = _optional_float(properties.get(f"SA{index}"))
             end = _optional_float(properties.get(f"EA{index}"))
-            if None not in (cx, cy, radius, start, end) and radius > 0:
-                arc = (cx, cy, radius, start, end)
+            values = (cx, cy, radius, start, end)
+            if None not in values and all(map(math.isfinite, values)) and radius > 0:
+                arc = values
         if x is not None and y is not None:
             vertices.append(ShapeVertex(x, y, arc))
         index += 1
     if len(vertices) > 1 and vertices[-1] == ShapeVertex(vertices[0].x, vertices[0].y):
         vertices.pop()  # the closing copy of the first vertex
     return vertices
+
+
+# Altium rounds an arc's end points and the vertices they join each on its
+# own: up to 0.0033 mil apart over the Polygons6 arcs of 95 boards.
+_SHAPE_SNAP_MIL = 0.01
+# KiCad's importer draws an arc edge of a smaller sweep (start = end
+# included) as a straight one.
+_SHAPE_MIN_SWEEP_DEG = 0.2
+
+
+def shape_points(shape: list[ShapeVertex]) -> list[tuple[float, float]]:
+    """The shape as points (mil), each arc edge approximated by chords that lie
+    at most ARC_MAX_SAGITTA_MIL inside it. As in KiCad's Altium importer, the
+    arc runs counter-clockwise from its start to its end angle and is drawn
+    from the end nearer its vertex, the far end meeting the next vertex; an
+    end within _SHAPE_SNAP_MIL of a vertex is that vertex, and an arc of
+    under _SHAPE_MIN_SWEEP_DEG is a straight edge."""
+    points: list[tuple[float, float]] = []
+    for index, vertex in enumerate(shape):
+        here = (vertex.x, vertex.y)
+        if (
+            vertex.arc is None
+            or (vertex.arc[4] - vertex.arc[3]) % 360.0 < _SHAPE_MIN_SWEEP_DEG
+        ):
+            points.append(here)
+            continue
+        arc = _arc_chord_points(*vertex.arc)
+        if math.dist(arc[-1], here) < math.dist(arc[0], here):
+            arc.reverse()
+        if math.dist(arc[0], here) <= _SHAPE_SNAP_MIL:
+            arc[0] = here
+        following = shape[(index + 1) % len(shape)]
+        if math.dist(arc[-1], (following.x, following.y)) <= _SHAPE_SNAP_MIL:
+            arc.pop()  # the next vertex is the arc's far end
+        points.extend(arc)
+    return points
 
 
 def _health_check_storage(raw: str | None) -> dict[int, bool] | None:
@@ -953,6 +1001,7 @@ class PolygonPour:
     net: int | None
     layer: int | None
     hatch_style: str | None
+    # The outline as points, arc edges approximated by chords (shape_points).
     vertices: list[tuple[float, float]]
     # Shelved (Polygon Manager): kept in the file, with any copper, but hidden
     # from DRC and connectivity until restored. No copper for these tools.
@@ -963,7 +1012,7 @@ class PolygonPour:
     # POLYGONTYPE: 'Polygon' for a pour, 'Split Plane' for a split plane on
     # an internal plane layer; None when the record does not say.
     polygon_type: str | None = None
-    # The outline with its arcs (vertices keeps only the vertices).
+    # The outline as stored: its vertices with their arcs.
     shape: list[ShapeVertex] = field(default_factory=list)
 
 
@@ -1319,23 +1368,15 @@ def decode_polygons(
 ) -> tuple[list[PolygonPour], list[Primitive]]:
     """Decode pour outlines for containment and proximity queries.
 
-    A shelved pour gets no outline rows: it has no copper for the proximity
-    queries those rows serve.
+    The outline (vertices, and its zero-width rows) follows arc edges by
+    chords (shape_points). A shelved pour gets no outline rows: it has no
+    copper for the proximity queries those rows serve.
     """
     pours: list[PolygonPour] = []
     edges: list[Primitive] = []
     for pour_id, record in enumerate(records):
-        vertices: list[tuple[float, float]] = []
-        vertex_index = 0
-        while (
-            f"VX{vertex_index}" in record
-            and f"VY{vertex_index}" in record
-        ):
-            x = parse_dim_mil(record[f"VX{vertex_index}"])
-            y = parse_dim_mil(record[f"VY{vertex_index}"])
-            if x is not None and y is not None:
-                vertices.append((x, y))
-            vertex_index += 1
+        shape = shape_from_properties(record)
+        vertices = shape_points(shape)
         net_raw = record.get("NET")
         token = record.get("LAYER", "").strip().lower()
         layer = _positional_layer(token)
@@ -1350,7 +1391,7 @@ def decode_polygons(
             shelved=record.get("SHELVED", "").strip().upper() == "TRUE",
             copper_invalid=record.get("COPPERINVALIDATE", "").strip().upper() == "TRUE",
             polygon_type=(record.get("POLYGONTYPE") or "").strip() or None,
-            shape=shape_from_properties(record),
+            shape=shape,
         )
         pours.append(pour)
         if layer is None or len(vertices) < 3 or pour.shelved:

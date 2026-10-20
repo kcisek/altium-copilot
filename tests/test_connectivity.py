@@ -26,6 +26,7 @@ from server.parsers.pcb_doc import (
     decode_board,
     decode_fill_records,
     decode_fills,
+    decode_polygons,
     decode_region_records,
     decode_regions,
     parse_streams,
@@ -577,6 +578,25 @@ def test_pour_outline_stands_in_when_regions_were_not_read():
     assert result["copper_model"]["pour_outlines_assumed"] == 1
     assert result["summary"]["nets_connected_through_assumed_copper"] == 1
     assert "Regions6 stream" in result["approximations"][0]
+
+
+def test_pour_outline_follows_its_arcs():
+    # The outline stands in for the copper (Regions6 not read); its right edge is
+    # a Polygons6 arc bulging out to x = 500, round U2-1, 30 mil past the chord.
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    board.pad("GND", "U2", "1", 485, 0)
+    record = {
+        "LAYER": "TOP", "NET": str(board.net("GND")), "HATCHSTYLE": "Solid",
+        "VX0": "-50mil", "VY0": "-50mil", "VX1": "450mil", "VY1": "-50mil", "KIND1": "1",
+        "CX1": "450mil", "CY1": "0mil", "R1": "50mil", "SA1": "270", "EA1": "90",
+        "VX2": "450mil", "VY2": "50mil", "VX3": "-50mil", "VY3": "50mil",
+    }
+    (pour,), _ = decode_polygons([record], {"top": 1})
+    board.pours.append(pour)
+    index = board.index(area_streams=())
+    assert _status(index, "GND") == "routed"
+    assert check_connectivity(index)["copper_model"]["pour_outlines_assumed"] == 1
 
 
 def test_shelved_pour_is_named_with_the_unrouted_net():

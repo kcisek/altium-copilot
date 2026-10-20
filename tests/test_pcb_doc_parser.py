@@ -4,6 +4,7 @@ import struct
 import pytest
 
 from server.parsers.pcb_doc import (
+    ARC_MAX_SAGITTA_MIL,
     NO_NET,
     PAD_INNER_LAYERS,
     PAD_SHAPE_RECT,
@@ -37,6 +38,7 @@ from server.parsers.pcb_doc import (
     decode_wide_strings,
 )
 from server.parsers.pcb_doc import _build_layer_aliases
+from server.services.pcb_geometry import point_in_polygon
 
 
 def _text_record(props: dict[str, str]) -> bytes:
@@ -891,6 +893,162 @@ def test_decode_polygons_resolves_inner_layer_via_mid_alias():
     )
     assert pours[0].layer == 2
     assert len(edges) == 3  # proximity edges must be built, not silently dropped
+
+
+def _polygon(*vertices, **props) -> dict[str, str]:
+    """A Polygons6 record: (x, y) vertices, or (x, y, (cx, cy, r, sa, ea)) for a
+    KINDn=1 arc edge from that vertex (mil and degrees, as Altium writes them)."""
+    record = {"LAYER": "TOP", "NET": "5", "HATCHSTYLE": "Solid", **props}
+    for index, (x, y, *arc) in enumerate(vertices):
+        record[f"VX{index}"] = f"{x}mil"
+        record[f"VY{index}"] = f"{y}mil"
+        if arc:
+            cx, cy, radius, start, end = arc[0]
+            record.update({
+                f"KIND{index}": "1", f"CX{index}": f"{cx}mil", f"CY{index}": f"{cy}mil",
+                f"R{index}": f"{radius}mil", f"SA{index}": f"{start}", f"EA{index}": f"{end}",
+            })
+        else:
+            record[f"KIND{index}"] = "0"
+    return record
+
+
+def _assert_follows_arc(points, cx, cy, radius):
+    """Each point is on the arc, each chord at most ARC_MAX_SAGITTA_MIL inside it."""
+    for x, y in points:
+        assert math.dist((x, y), (cx, cy)) == pytest.approx(radius, abs=1e-6)
+    for first, second in zip(points, points[1:]):
+        middle = ((first[0] + second[0]) / 2, (first[1] + second[1]) / 2)
+        assert radius - math.dist(middle, (cx, cy)) <= ARC_MAX_SAGITTA_MIL + 1e-9
+
+
+# The right edge of a 100 mil square bulges out to x = 150: an arc counter-
+# clockwise from 270 to 90 degrees around (100, 50), drawn from vertex 1.
+D_SHAPE = (
+    (0, 0), (100, 0, (100, 50, 50, 270, 90)), (100, 100), (0, 100), (0, 0),
+)
+
+
+def test_decode_polygons_follows_arc_edges():
+    pours, edges = decode_polygons([_polygon(*D_SHAPE)], {"top": 1})
+    (pour,) = pours
+    vertices = pour.vertices
+    assert vertices[:2] == [(0.0, 0.0), (100.0, 0.0)]
+    assert vertices[-2:] == [(100.0, 100.0), (0.0, 100.0)]  # no closing copy
+    arc = vertices[1:-1]
+    assert len(arc) > 3
+    _assert_follows_arc(arc, 100.0, 50.0, 50.0)
+    assert max(x for x, _ in arc) == pytest.approx(150.0, abs=ARC_MAX_SAGITTA_MIL)
+    assert [y for _, y in arc] == sorted(y for _, y in arc)  # bottom to top
+    assert point_in_polygon(140.0, 50.0, vertices)  # in the bulge
+    assert not point_in_polygon(151.0, 50.0, vertices)
+    assert pour.shape[1].arc == (100.0, 50.0, 50.0, 270.0, 90.0)
+    # The outline rows follow the same points, closed.
+    assert len(edges) == len(vertices)
+    closed = vertices + vertices[:1]
+    assert [((e.x1, e.y1), (e.x2, e.y2)) for e in edges] == list(zip(closed, closed[1:]))
+    assert all(
+        e.kind == "track" and e.width == 0.0 and e.pour_id == 0 and e.layer == 1
+        for e in edges
+    )
+
+
+def test_decode_polygons_draws_an_arc_from_the_end_at_its_vertex():
+    # The same outline clockwise: the arc's end (90 degrees) is at its vertex,
+    # so it runs top to bottom, out to x = 150, back to vertex 3.
+    record = _polygon(
+        (0, 0), (0, 100), (100, 100, (100, 50, 50, 270, 90)), (100, 0),
+    )
+    ((pour,), _) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    assert vertices[:3] == [(0.0, 0.0), (0.0, 100.0), (100.0, 100.0)]
+    assert vertices[-1] == (100.0, 0.0)
+    arc = vertices[2:]
+    _assert_follows_arc(arc, 100.0, 50.0, 50.0)
+    assert [y for _, y in arc] == sorted((y for _, y in arc), reverse=True)
+    assert point_in_polygon(140.0, 50.0, vertices)
+
+
+def test_decode_polygons_round_pour_mostly_arc():
+    # Three quarters of a disc, as Bluetooth Sentinel's round pours are drawn:
+    # one 270 degree arc and two straight edges through the centre. Its three
+    # vertices alone enclose the missing quarter instead.
+    record = _polygon((100, 0, (0, 0, 100, 0, 270)), (0, -100), (0, 0))
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    assert vertices[0] == (100.0, 0.0)
+    assert vertices[-2:] == [(0.0, -100.0), (0.0, 0.0)]
+    _assert_follows_arc(vertices[:-1], 0.0, 0.0, 100.0)
+    assert point_in_polygon(-50.0, 50.0, vertices)
+    assert point_in_polygon(50.0, 50.0, vertices)
+    assert not point_in_polygon(30.0, -30.0, vertices)
+    area = 0.5 * abs(sum(
+        x1 * y2 - x2 * y1
+        for (x1, y1), (x2, y2) in zip(vertices, vertices[1:] + vertices[:1])
+    ))
+    disc = 0.75 * math.pi * 100.0**2
+    assert 0.995 * disc < area < disc  # chords cut a little inside the arc
+    assert len(edges) == len(vertices)
+
+
+def test_decode_polygons_snaps_arc_ends_to_their_vertices():
+    # Altium rounds the arc and the vertices on their own: an end a few
+    # thousandths of a mil off its vertex is that vertex, not a second point.
+    record = _polygon(
+        (0, 0), (100.003, 0, (100, 50, 50, 270, 90)), (99.998, 100), (0, 100),
+    )
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    assert vertices[1] == (100.003, 0.0)
+    assert (99.998, 100.0) in vertices
+    assert min(
+        math.dist(first, second) for first, second in zip(vertices, vertices[1:])
+    ) > 1.0
+    assert all(math.hypot(e.x2 - e.x1, e.y2 - e.y1) > 1.0 for e in edges)
+
+
+def test_decode_polygons_arc_on_the_last_vertex_closes_on_the_first():
+    record = _polygon((100, 100), (0, 100), (0, 0), (100, 0, (100, 50, 50, 270, 90)))
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    assert vertices[:4] == [(100.0, 100.0), (0.0, 100.0), (0.0, 0.0), (100.0, 0.0)]
+    _assert_follows_arc(vertices[3:] + vertices[:1], 100.0, 50.0, 50.0)
+    assert vertices.count((100.0, 100.0)) == 1
+    assert all(math.hypot(e.x2 - e.x1, e.y2 - e.y1) > 1.0 for e in edges)
+    assert point_in_polygon(140.0, 50.0, vertices)
+
+
+def test_decode_polygons_consecutive_arcs():
+    # A round pour of two half circles, each drawn from its own vertex.
+    record = _polygon((50, 0, (50, 50, 50, 270, 90)), (50, 100, (50, 50, 50, 90, 270)))
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    _assert_follows_arc(vertices + vertices[:1], 50.0, 50.0, 50.0)
+    assert len(set(vertices)) == len(vertices) == len(edges)
+    assert point_in_polygon(50.0, 50.0, vertices)
+    assert point_in_polygon(5.0, 50.0, vertices) and point_in_polygon(95.0, 50.0, vertices)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("R1", None),  # KIND1=1 without its radius
+        ("EA1", "270"),  # no sweep: KiCad draws it straight too
+        ("EA1", "270.1"),
+        ("SA1", "nan"),
+        ("EA1", "inf"),
+        ("CX1", "1e999mil"),
+    ],
+)
+def test_decode_polygons_draws_a_degenerate_arc_straight(key, value):
+    record = _polygon(*D_SHAPE)
+    if value is None:
+        del record[key]
+    else:
+        record[key] = value
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    assert pour.vertices == [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    assert len(edges) == 4
 
 
 def _stream_text(records: list[dict[str, str]]) -> bytes:

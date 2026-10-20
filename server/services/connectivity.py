@@ -76,8 +76,7 @@ APPROXIMATIONS = [
     f"{CENTRE_MIL:g} mil count as meeting) where a net needs them: with that option on, "
     "its nets_joined_only_by_weak_connections would read un-routed. Altium also wants "
     "a directly connected pad or via's centre inside the pour outline; that is not "
-    "tested (pour outline arcs are not read), nor whether the board's rule has the "
-    "option on.",
+    "tested, nor whether the board's rule has the option on.",
     "Pour copper is the copper saved in the file (a solid pour's regions, a hatched "
     "pour's tracks and arcs): a pour changed since its last repour is checked as "
     "saved; a shelved pour, and one with no saved copper (never poured, or poured to "
@@ -642,9 +641,8 @@ class Connectivity:
     def _pour_contact_strong(self, row, layer: int, area) -> bool:
         """Does an object touching a solid pour's copper meet it as 'Check for
         incomplete connections' wants? A routing track must reach it with its
-        centreline. Pads and vias are not tested: Altium wants a directly
-        connected one's centre inside the pour outline, whose arcs are not
-        read."""
+        centreline. Pads and vias are not tested (Altium wants a directly
+        connected one's centre inside the pour outline)."""
         if row["kind"] not in ("track", "arc") or row["poured_by"] is not None:
             return True
         segment, _, _, arc = self.index._primitive_geometry(row, layer)
