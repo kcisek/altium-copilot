@@ -53,6 +53,10 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
+    from services.connectivity import (
+        check_connectivity as review_connectivity, drc_comparison,
+        page_result as page_connectivity_result,
+    )
     from services.clone_status import clone_status
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
@@ -96,6 +100,10 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
+    from server.services.connectivity import (
+        check_connectivity as review_connectivity, drc_comparison,
+        page_result as page_connectivity_result,
+    )
     from server.services.clone_status import clone_status
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
@@ -326,6 +334,15 @@ component locations, distances):
     the drill table (component holes and slots are not in it); holes are as drawn
     (finished), which fabricators drill larger. Back drilling is recomputed the way
     Altium writes the drill files; stubs of nets with no back-drill rule are advice.
+17. check_connectivity — "is the board fully routed?", "what is left to route?", "why
+    does DRC say un-routed?", floating copper, net antennae, routing progress: per net,
+    whether its saved copper (tracks, vias, pads, the pour copper as last poured,
+    regions, fills, assigned internal planes) joins all its pads, with each missing
+    connection's nearest pads and distance, a near-miss copper gap, isolated copper and
+    antennae; weak (edge-only) joins when checks names weak. It reads the copper saved
+    now; quote altium_drc's report issues before comparing with Altium's last DRC run. Nets
+    connected through assumed copper (planes, split-plane or pour outlines) are in
+    assumed_copper_nets; say those connections are assumed.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -368,7 +385,9 @@ the user the schematic and layout may be out of sync.
 
 Before relying on polygon results, ask the user to repour polygons and save the PcbDoc.
 The tools model saved nominal polygon outlines, not final region/fill copper; voids,
-cutouts, removed islands, and clearances must be verified in Altium.
+cutouts, removed islands, and clearances must be verified in Altium. check_connectivity
+is the exception: it reads the poured copper as saved (a pour changed since its last
+repour is checked as it was poured, and an unpoured one connects nothing).
 
 If the user wants to know where something is visually, give coordinates relative to the
 origin and offer to interpret a screenshot or photo they paste for orientation — the
@@ -3310,6 +3329,116 @@ def check_vias(
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
+
+
+@mcp.tool(
+    title="Check Connectivity",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_connectivity(
+    net: str | None = None,
+    net_class: str | None = None,
+    layer: str | None = None,
+    checks: list[str] | None = None,
+    compare_drc: bool = True,
+    offset: int = 0,
+    units: PcbUnits | None = None,
+) -> str:
+    """Copper connectivity of the saved PcbDoc, like Altium's Un-Routed Net and Net
+    Antennae rules: "is the board fully routed?", "what is left to route?", "why does
+    DRC say un-routed?", dead copper, antennae, routing progress.
+
+    Per net, whether its copper joins all its pads: tracks, arcs, vias, pads and touching
+    copper, the pour copper saved in the file (solid pours' regions, hatched pours'
+    tracks), copper regions, fills, and internal planes assigned to the net. summary
+    counts nets routed / partly routed / unrouted with percentages and connections
+    complete (Altium's routing completion). Findings, warnings first: unrouted (each
+    missing connection between the nearest pads of two copper islands, distance_mil,
+    and copper_gap_mil when the islands' copper comes within 25 mil: a near miss; the
+    closest near misses in near_misses), isolated_copper (copper of a net reaching none of its
+    pads: floating tracks and vias, dead pour islands as info), antenna (open-ended
+    tracks and tracks ending on a via that connects nothing else, with stub_mil and
+    open_track_mil; over_tolerance against an enabled Net Antennae rule, null without
+    one), weak_connection (copper that only touches where a net needs it, which Altium's
+    'Check for incomplete connections' rejects). With compare_drc, altium_drc puts
+    Altium's last Batch DRC report beside it (get_drc_report reads that report).
+
+    net (nets or differential pairs) and net_class take comma-separated names; layer
+    narrows the findings (not the summary) to one copper layer; checks narrows to
+    unrouted, isolated, antennae, weak (weak is listed only when named; the summary
+    always counts it). Findings are paginated (offset from next_offset). Lengths use
+    units (default: board display unit)."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    nets = _split_names(net)
+    classes = _split_names(net_class)
+    full = review_connectivity(index, nets=nets, net_classes=classes, layer=layer, checks=checks)
+    if "error" in full:
+        return json.dumps(full)
+    project, _, _ = _require_project(netlist=False)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    if paths:
+        pcb_path = Path(paths[0])
+        context["pcb_doc"] = pcb_path.name
+        context["pcb_saved_utc"] = _utc(pcb_path.stat().st_mtime) if pcb_path.is_file() else None
+        if len(paths) > 1:
+            context["note"] = f"Project lists {len(paths)} PcbDocs; checked '{pcb_path.name}'."
+        if compare_drc:
+            context["altium_drc"] = _connectivity_drc(
+                project, pcb_path, index, full, bool(nets or classes)
+            )
+    for limit, net_limit, connection_limit in (
+        (100, 200, 20), (40, 100, 10), (15, 50, 5), (5, 20, 3), (2, 10, 1),
+    ):
+        result = _convert_units(
+            {**context, **page_connectivity_result(
+                full, offset, limit, net_limit, connection_limit
+            )},
+            to_mm,
+        )
+        if limit < 100:
+            result["findings_limited_to"] = limit
+            result["connections_per_finding_limited_to"] = connection_limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+def _connectivity_drc(project: dict, pcb_path: Path, index, full: dict, filtered: bool) -> dict:
+    """Altium's last Batch DRC report beside check_connectivity: its Un-Routed Net and
+    Net Antennae counts and the issues that limit trust in it."""
+    report, report_path, _, _, notes = load_report(project, pcb_path)
+    if report is None:
+        return {
+            "report": None,
+            "note": "No Batch DRC report was found for this board (get_drc_report says "
+            "where it looks).",
+        }
+    issues = notes + assess(report, report_path, pcb_path, project, index.pcb)
+    block: dict = {
+        "report": report_path.name,
+        "report_saved_utc": _utc(report_path.stat().st_mtime),
+        **drc_comparison(report, full),
+    }
+    relevant = [
+        {"issue": issue["issue"], "severity": issue["severity"], "detail": issue["detail"]}
+        for issue in issues if issue["severity"] in ("error", "warning")
+    ]
+    if relevant:
+        block["report_issues"] = relevant
+    if filtered:
+        block["note"] = (
+            "The report's counts are the whole board's; the net lists cover the nets "
+            "checked."
+        )
+    return block
 
 
 BOM_LINE_LIMIT = 100

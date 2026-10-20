@@ -215,10 +215,11 @@ def _pad_contains(
         out_x = max(0.0, abs(local_x) - (width / 2.0 - corner))
         out_y = max(0.0, abs(local_y) - (height / 2.0 - corner))
         return out_x * out_x + out_y * out_y <= (corner + tolerance) ** 2
-    return (
-        abs(local_x) <= width / 2.0 + tolerance
-        and abs(local_y) <= height / 2.0 + tolerance
-    )
+    # Grown by the tolerance, the rectangle keeps round corners: copper off a
+    # corner diagonally is as far as its distance to that corner.
+    out_x = max(0.0, abs(local_x) - width / 2.0)
+    out_y = max(0.0, abs(local_y) - height / 2.0)
+    return out_x * out_x + out_y * out_y <= tolerance * tolerance
 
 
 def _project(segment: tuple, x: float, y: float):
@@ -301,6 +302,10 @@ class NetGraph:
         self.routed_mil = 0.0
         self.routed_by_layer: dict[int, float] = defaultdict(float)
         self.segment_count = 0
+        # Track and arc-chord rows: (x1, y1, x2, y2, layer, half width,
+        # planar length, true length, prim id), and each row's end nodes.
+        self.segments: list[tuple] = []
+        self.track_ends: dict[int, tuple[int, int]] = {}
         self._attached: dict[tuple[int, int], float] = {}
         # Track ends lying inside another track's round end cap (overlapping
         # copper that the endpoint merge leaves apart): node pair -> distance.
@@ -351,7 +356,8 @@ class NetGraph:
         return list(dict.fromkeys(item for item in (layer, layer_to) if item is not None))
 
     def _build(self, rows) -> None:
-        segments: list[tuple] = []  # x1, y1, x2, y2, layer, half width, planar, true
+        # x1, y1, x2, y2, layer, half width, planar, true, prim id
+        segments: list[tuple] = self.segments
         vias: list[dict] = []
         pads: list[dict] = []
         # Signal layers carrying tracks but absent from the stack table: through
@@ -370,7 +376,7 @@ class NetGraph:
                 true = row["length"] if row["length"] is not None else planar
                 segments.append((
                     row["x1"], row["y1"], row["x2"], row["y2"], row["layer"],
-                    (row["width"] or 0.0) / 2.0, planar, true,
+                    (row["width"] or 0.0) / 2.0, planar, true, row["id"],
                 ))
                 self.routed_mil += true
                 self.routed_by_layer[row["layer"]] += true
@@ -466,6 +472,10 @@ class NetGraph:
                 node = self._node(end_x[root], end_y[root], end_layer[root])
                 root_nodes[root] = node
             node_of_end[end] = node
+        for number, segment in enumerate(segments):
+            self.track_ends[segment[8]] = (
+                node_of_end[2 * number], node_of_end[2 * number + 1],
+            )
 
         # An endpoint inside another track's round end cap (a neck-down that
         # does not snap) overlaps it without merging, since the merge keeps to
@@ -642,7 +652,7 @@ class NetGraph:
                 if node0 != node1:
                     self._edge(
                         node0, node1, (t1 - t0) * segment[7],
-                        ("seg", segment[4], None, None, True),
+                        ("seg", segment[4], None, ("seg", segment[8]), True),
                     )
 
         for (end_node, owner_node), distance in self._attached.items():
