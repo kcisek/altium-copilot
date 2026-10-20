@@ -434,10 +434,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   pour's copper is InPolygon, but IsPolygon, IsNamedPolygon and InPolygonClass match only
   the polygon object, as in Altium. On Altium's Bluetooth Sentinel example (ten
   Horizontal GND pours: 6,473 tracks, 675 arcs) GND copper is within 10 mil of all 40 of
-  the 40 longest signal nets (was 30), 3.69 mil at the closest. The pour's arcs around
-  vias are chords that lie up to 0.25 mil inside the arc, so the clearance spot-check
-  counts gaps within the chords' sagitta of the limit as `arc_chord_marginal_pairs` (364
-  on that board) instead of reporting them. The 83 real boards have no hatched pours
+  the 40 longest signal nets (was 30), 3.94 mil at the closest: the pour's arcs around
+  vias, at the board's 3.937 mil clearance. The 83 real boards have no hatched pours
+- Copper distances to arcs are exact. Arcs are still split into chords (at most 0.25 mil
+  sagitta) for the spatial index and for length, but each chord row now carries its
+  arc's centre and radius (`Primitive.arc_x` / `arc_y` / `arc_radius`, same `prims`
+  columns), and distances measure the arc between the chord's ends, grown by half the
+  width, to points, tracks, pads, vias and other arcs, with bounding boxes that include
+  the arc's bulge. Chords lie inside their arc, so copper on an arc's inner side read up
+  to 0.25 mil too close and on its outer side up to 0.25 mil too far. This applies to
+  `get_net_neighbors`, `query_pcb_region`, the clearance spot-check, DRC violation nets
+  and `check_vias` connections. The clearance spot-check drops its
+  `arc_chord_marginal_pairs` allowance: on Altium's Bluetooth Sentinel example the GND
+  pour's arcs around vias read 3.937 mil, exactly the clearance (were 3.69), and the 10
+  longest signal nets report no violations. On the MiniPC example the bends of the SFP
+  differential pairs read 5.91 mil between legs on all four pairs (were 5.72 to 5.89);
+  the other public examples are unchanged. On the 83 real boards no gap within 10 mil
+  of a net's arc changes, and neither does the clearance spot-check of their arc nets
 
 ## [0.3.0] - 2026-07-19
 

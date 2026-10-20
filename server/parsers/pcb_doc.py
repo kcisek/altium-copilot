@@ -182,6 +182,13 @@ class Primitive:
     # True copper length of an arc chord (r * sweep / steps); the chord itself
     # is shorter. None for other primitives: their length is the segment's.
     length: float | None = None
+    # Arc chords: centre and radius (mil) of their arc. The copper of a chord
+    # row is the arc between its end points grown by half the width; the
+    # chord itself lies up to ARC_MAX_SAGITTA_MIL inside it. None for other
+    # primitives.
+    arc_x: float | None = None
+    arc_y: float | None = None
+    arc_radius: float | None = None
     # Pad Pin/Package Length (pad to die, mil): 0.0 when unset, None when the
     # pad record is too short to carry it (and for non-pad primitives).
     pin_package: float | None = None
@@ -380,7 +387,8 @@ ARC_MAX_SAGITTA_MIL = 0.25
 
 
 def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
-    """Decode Arcs6 records into chord segments for proximity math."""
+    """Decode Arcs6 records into chord rows (indexing and length), each
+    carrying its arc's centre and radius so distances use the arc itself."""
     primitives: list[Primitive] = []
     skipped = 0
     for arc_id, (record_type, payload) in enumerate(
@@ -464,6 +472,9 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
                     source_id=arc_id,
                     length=chord_length,
                     poured_by=poured_by,
+                    arc_x=center_x_mil,
+                    arc_y=center_y_mil,
+                    arc_radius=radius_mil,
                 )
             )
     return primitives, skipped
