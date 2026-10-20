@@ -1638,3 +1638,113 @@ def test_examples_bare_holes_and_panels():
                     (False, 2.35): 2}
     assert pcb.embedded_boards == 0
     assert parse_pcb_doc(str(panel)).embedded_boards == 1
+
+
+# ---------- ComponentBodies6 ----------
+
+
+def _body_record(vertices, *, component=0, layer=69, record_type=12, holes=(), close=False,
+                 **props) -> bytes:
+    """A ComponentBodies6 record: the Regions6 head (layer u8 at 0, net u16 at 3, polygon
+    u16 at 5, component u16 at 7, hole count u16 at 14, text length u32 at 18), the text,
+    then u32 count + (double x, double y) per vertex in 1e-4 mil, and each hole likewise."""
+    text = ("|" + "|".join(f"{key}={value}" for key, value in props.items())).encode() + b"\x00"
+    head = bytearray(22)
+    head[0] = layer
+    struct.pack_into("<HHH", head, 3, NO_NET, 0xFFFF, component)
+    struct.pack_into("<H", head, 14, len(holes))
+    struct.pack_into("<I", head, 18, len(text))
+
+    def ring(points):
+        points = [*points, points[0]] if close else list(points)
+        return struct.pack("<I", len(points)) + b"".join(
+            struct.pack("<dd", x * 10_000, y * 10_000) for x, y in points)
+
+    payload = bytes(head) + text + ring(vertices) + b"".join(ring(hole) for hole in holes)
+    return _bin_record(record_type, payload)
+
+
+BODY_SQUARE = [(100.0, 200.0), (140.0, 200.0), (140.0, 220.0), (100.0, 220.0)]
+
+
+def test_decode_component_bodies():
+    from server.parsers.pcb_doc import decode_component_bodies
+
+    data = (
+        _body_record(BODY_SQUARE, component=3, OVERALLHEIGHT="31.4961mil",
+                     STANDOFFHEIGHT="0mil", BODYPROJECTION="1", **{"MODEL.MODELTYPE": "1",
+                     "MODEL.NAME": "secret.step", "V7_LAYER": "MECHANICAL13"})
+        + _body_record(BODY_SQUARE, component=0xFFFF, layer=57, close=True,
+                       holes=[[(110.0, 205.0), (120.0, 205.0), (120.0, 210.0)]],
+                       OVERALLHEIGHT="0.5mm")
+        + _body_record([(0.0, 0.0), (1.0, 0.0)], BODYPROJECTION="0")  # no area: kept
+    )
+    bodies, skipped = decode_component_bodies(data)
+    assert skipped == 0
+    first, free, line = bodies
+    assert (first.component, first.layer, first.projection, first.model_type) == (
+        3, 69, "bottom", 1)
+    assert first.outline == BODY_SQUARE
+    assert first.overall_height_mil == pytest.approx(31.4961)
+    assert first.standoff_height_mil == 0.0
+    assert "secret" not in repr(first)  # the model's name is not kept
+    # A free body; the closing copy of the first vertex is dropped, holes are read past.
+    assert (free.component, free.layer, free.projection, free.model_type) == (
+        None, 57, None, None)
+    assert free.outline == BODY_SQUARE
+    assert free.overall_height_mil == pytest.approx(0.5 / 0.0254)
+    assert free.standoff_height_mil is None
+    assert (line.outline, line.projection) == ([(0.0, 0.0), (1.0, 0.0)], "top")
+
+
+def test_decode_component_bodies_skips_unreadable_records():
+    from server.parsers.pcb_doc import decode_component_bodies
+
+    good = _body_record(BODY_SQUARE, OVERALLHEIGHT="10mil")
+    region = _body_record(BODY_SQUARE, record_type=11)  # a region, not a body
+    short = _bin_record(12, b"\x00" * 10)  # shorter than the head
+    cut = bytearray(_body_record(BODY_SQUARE))
+    struct.pack_into("<I", cut, 5 + 22 + len(b"|\x00"), 99)  # 99 vertices: past the record
+    nan = bytearray(_body_record(BODY_SQUARE))
+    struct.pack_into("<d", nan, 5 + 22 + len(b"|\x00") + 4, math.nan)
+    holes = bytearray(_body_record(BODY_SQUARE, holes=[[(110.0, 205.0), (120.0, 205.0),
+                                                        (120.0, 210.0)]]))
+    struct.pack_into("<H", holes, 5 + 14, 2)  # two holes, one in the record
+    bodies, skipped = decode_component_bodies(
+        region + good + short + bytes(cut) + bytes(nan) + bytes(holes) + good + good[:-7])
+    assert [body.overall_height_mil for body in bodies] == [10.0, 10.0]
+    # region, short, cut, nan, the hole list past the record and the one past the stream
+    assert skipped == 6
+
+
+def test_parse_streams_reads_component_bodies():
+    streams = {**_minimal_streams(),
+               "ComponentBodies6/Data": _body_record(BODY_SQUARE, OVERALLHEIGHT="10mil")
+               + _bin_record(12, b"\x00" * 10)}
+    pcb = parse_streams(streams)
+    assert [body.outline for body in pcb.bodies] == [BODY_SQUARE]
+    assert pcb.skipped_records["ComponentBodies6"] == 1
+    # The stream is optional: no warning when it is missing.
+    bare = parse_streams(_minimal_streams())
+    assert bare.bodies == [] and "ComponentBodies6" not in bare.skipped_records
+    assert not any("ComponentBodies6" in warning for warning in bare.warnings)
+
+
+def test_examples_component_bodies():
+    """Every ComponentBodies6 record of the examples decodes (1897 records, 0 skipped);
+    each body's projection is its part's side."""
+    if not EXAMPLES.is_dir():
+        pytest.skip("Altium example boards not installed")
+    from server.parsers.pcb_doc import parse_pcb_doc
+
+    counts = {}
+    for path in sorted(EXAMPLES.rglob("*.PcbDoc")):
+        pcb = parse_pcb_doc(str(path))
+        assert "ComponentBodies6" not in pcb.skipped_records
+        assert all(body.projection == pcb.components[body.component].side
+                   for body in pcb.bodies if body.component is not None)
+        counts[path.name] = len(pcb.bodies)
+    if "MiniPC.PcbDoc" not in counts:
+        pytest.skip("MiniPC example not installed")
+    assert counts["MiniPC.PcbDoc"] == 1055
+    assert counts["PC4-SODIMM_V200_RC_A1_20141015.PcbDoc"] == 198

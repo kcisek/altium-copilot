@@ -1749,6 +1749,62 @@ def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegio
 
 
 @dataclass
+class ComponentBody:
+    """A ComponentBodies6 record: a 3D body's 2D outline (mil, absolute) and heights.
+    The model's name and other free text are not kept."""
+
+    component: int | None  # Components6 index; None for a free body
+    layer: int  # v6 layer (a mechanical layer)
+    outline: list[tuple[float, float]]
+    overall_height_mil: float | None  # OVERALLHEIGHT
+    standoff_height_mil: float | None  # STANDOFFHEIGHT
+    projection: str | None  # BODYPROJECTION 0 "top", 1 "bottom"; None when unset
+    model_type: int | None  # MODEL.MODELTYPE: 0 extruded, 1 STEP, 2 cylinder, 3 sphere
+
+
+# ComponentBodies6 records are type 12 with the region layout (_RegionHead): layer u8
+# at 0, component u16 at 7, hole count u16 at 14, u32 text length at 18 and the text,
+# then the outline as u32 count + (double x, double y) and each hole likewise.
+_BODY_RECORD = 12
+_BODY_PROJECTIONS = {"0": "top", "1": "bottom"}
+
+
+def decode_component_bodies(data: bytes) -> tuple[list[ComponentBody], int]:
+    """(bodies, skipped) of a ComponentBodies6 stream. Records of another type, shorter
+    than the head, running past the stream or with unreadable vertices are skipped. An
+    outline of fewer than 3 vertices is kept as read (it has no area)."""
+    bodies: list[ComponentBody] = []
+    skipped = 0
+    for record_type, payload in _records_with_rest(data):
+        if record_type != _BODY_RECORD or len(payload) < _REGION_HEAD:
+            skipped += 1
+            continue
+        (component,) = struct.unpack_from("<H", payload, 7)
+        (hole_count,) = struct.unpack_from("<H", payload, 14)
+        (text_length,) = struct.unpack_from("<I", payload, 18)
+        properties = _parse_text_properties(payload[_REGION_HEAD : _REGION_HEAD + text_length])
+        try:
+            outline, at = _read_vertices(payload, _REGION_HEAD + text_length)
+            for _ in range(hole_count):
+                _, at = _read_vertices(payload, at)
+        except (ValueError, struct.error):
+            skipped += 1
+            continue
+        if len(outline) > 1 and outline[-1] == outline[0]:
+            outline.pop()  # a closing copy of the first vertex
+        bodies.append(ComponentBody(
+            component=_optional_index(component, NO_COMPONENT),
+            layer=payload[0],
+            outline=outline,
+            overall_height_mil=parse_dim_mil(properties.get("OVERALLHEIGHT")),
+            standoff_height_mil=parse_dim_mil(properties.get("STANDOFFHEIGHT")),
+            projection=_BODY_PROJECTIONS.get(properties.get("BODYPROJECTION", "").strip()),
+            model_type=_optional_int(properties.get("MODEL.MODELTYPE")),
+        ))
+    return bodies, skipped
+
+
+@dataclass
 class PcbFill:
     """A Fills6 rectangle (mil): corners before rotation about their centre."""
 
@@ -2230,6 +2286,8 @@ class PcbData:
     bare_holes: list[BareHole] = field(default_factory=list)
     # EmbeddedBoards6 records: a panel's board arrays, whose boards are not read.
     embedded_boards: int = 0
+    # ComponentBodies6: the parts' 3D bodies (outlines and heights).
+    bodies: list[ComponentBody] = field(default_factory=list)
 
 
 def _build_layer_aliases(board: BoardInfo) -> dict[str, int]:
@@ -2374,6 +2432,14 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
             embedded_boards = len(read_text_records(streams["EmbeddedBoards6/Data"]))
         except Exception as error:
             warnings.append(f"EmbeddedBoards6 parse failed: {error}")
+    bodies: list[ComponentBody] = []
+    if "ComponentBodies6/Data" in streams:  # optional: a board may have no bodies
+        try:
+            bodies, skipped = decode_component_bodies(streams["ComponentBodies6/Data"])
+            if skipped:
+                skipped_records["ComponentBodies6"] = skipped
+        except Exception as error:
+            warnings.append(f"ComponentBodies6 parse failed: {error}")
 
     pours: list[PolygonPour] = []
     if "Polygons6/Data" in streams:
@@ -2509,6 +2575,7 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         area_streams=tuple(area_streams),
         bare_holes=bare_holes,
         embedded_boards=embedded_boards,
+        bodies=bodies,
     )
 
 
@@ -2532,6 +2599,7 @@ _WANTED_STREAMS = (
     "DifferentialPairs6/Data",
     "Design Rule Checker Options6/Data",
     "EmbeddedBoards6/Data",
+    "ComponentBodies6/Data",
 )
 
 

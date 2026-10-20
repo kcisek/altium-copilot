@@ -14,7 +14,14 @@ import server.main as main_mod
 from server.parsers.pcb_doc import PcbData, Primitive, parse_pcb_doc
 from server.parsers.prj_pcb import VariantDefinition, VariantState
 from server.services.pcb_index import PcbIndex
-from tests.test_dfm import EXAMPLES, LAYERS, _board, _hole_board, _spacing_board
+from tests.test_dfm import (
+    EXAMPLES,
+    LAYERS,
+    _board,
+    _hole_board,
+    _parts_board,
+    _spacing_board,
+)
 from tests.test_netlist_free_load import _load, env  # noqa: F401
 from tests.test_pcb_index import pcb_data  # noqa: F401
 
@@ -29,6 +36,16 @@ UNITLESS = {
     "microvia_worst", "next_offset", "object_pairs", "objects", "offset",
     "overlapping_pairs", "plated_holes_without_ring", "total", "touching_pairs", "value",
     "warning", "worst", "worst_aspect_ratio", "worst_microvia_aspect_ratio",
+    # assembly: part counts per side, fiducial counts
+    "bottom", "bottom_smd", "bottom_tht", "fiducials", "fiducials_nearby", "local_parts",
+    "max_placements", "max_unique_parts", "min_global_fiducials", "placements",
+    "small_passives", "top", "top_smd", "top_tht", "typical_global_fiducials", "unique_parts",
+}
+# Assembly limits every assembly check of MiniPC misses (part spacing at its bound).
+ASSEMBLY_STRICT = {
+    "max_placements": 1, "max_unique_parts": 1, "min_part_spacing_mm": 5.0,
+    "min_part_to_edge_mm": 10.0, "min_global_fiducials": 10, "local_fiducial_pitch_mm": 2.54,
+    "min_pitch_mm": 2.54,
 }
 STRICT = {
     "min_trace_mm": 1.0, "min_spacing_mm": 0.3, "min_drill_mm": 5.0, "max_drill_mm": 0.15,
@@ -519,11 +536,126 @@ def _heavy_copper_index() -> PcbIndex:
     return PcbIndex(pcb, None)
 
 
-def test_items_16_and_19_are_wrapped():
-    for number in (16, 19):
+def test_items_16_19_and_20_are_wrapped():
+    for number in (16, 19, 20):
         lines = _item(main_mod.SERVER_INSTRUCTIONS, number)
         assert len(lines) > 2
         assert max(len(line) for line in lines) <= 90, number
+
+
+# ---------- assembly and the manufacturing review ----------
+
+BOM_NETLIST = {
+    "nets": {}, "pin_to_net": {},
+    "components": {
+        "R1": {"kind": 0, "params": {"comment": "10k"}, "footprint": "R0402"},
+        "R2": {"kind": 0, "params": {"comment": "10k"}, "footprint": "R0402"},
+        "R3": {"kind": 0, "params": {"comment": "22k"}, "footprint": "R0402"},
+        "J1": {"kind": 0, "params": {"comment": "hdr"}, "footprint": "HDR"},
+    },
+}
+
+
+def test_assembly_follows_the_active_variant_and_the_bom(board, monkeypatch):
+    """Not Fitted parts of the active variant are not placed; with a netlist the unique
+    parts are the BOM's lines (R3 is 22k: 3 lines, where footprint and the PCB's Comment
+    give 2), without one they are approximate."""
+    _, holder = board
+    _swap(holder, _parts_board())  # R1-R3 (Comment 10k) and J1
+    state = VariantState([VariantDefinition(name="Lite", dnp_refdes=["R1"]),
+                          VariantDefinition(name="Full")])
+    monkeypatch.setattr(main_mod, "_variant_state", state)
+    monkeypatch.setattr(main_mod._altium, "_netlist", BOM_NETLIST)
+    arguments = {"checks": ["part_counts"], "profile": "none",
+                 "limits": {"max_placements": 2, "max_unique_parts": 2}}
+    lite = _call(**arguments)
+    entry = lite["results"]["part_counts"]
+    assert entry["value"] == {"placements": 3, "unique_parts": 3}
+    assert "unique_parts_approximate" not in entry and entry["status"] == "fail"
+    assert lite["board_minimums"]["unique_parts"] == {"value": 3, "approximate": False}
+    note = next(note for note in lite["notes"] if "Assembly checks" in note)
+    assert "active variant 'Lite'" in note and "No netlist" not in note
+    state.set_variant("Full")  # the cached review is per variant
+    full = _call(**arguments)
+    assert full["results"]["part_counts"]["value"] == {"placements": 4, "unique_parts": 3}
+    monkeypatch.setattr(main_mod._altium, "_netlist", None)  # netlist-free
+    free = _call(**arguments)
+    assert free["results"]["part_counts"]["value"] == {"placements": 4, "unique_parts": 2}
+    assert free["results"]["part_counts"]["unique_parts_approximate"] is True
+    assert any("No netlist is loaded" in note for note in free["notes"])
+
+
+def test_unique_parts_count_only_the_fitted_lines(board, monkeypatch):
+    """R3 (22k) has a BOM line of its own: Not Fitted, the line goes (3 lines to 2)."""
+    _, holder = board
+    _swap(holder, _parts_board())
+    monkeypatch.setattr(main_mod, "_variant_state", VariantState(
+        [VariantDefinition(name="NoR3", dnp_refdes=["R3"])]))
+    monkeypatch.setattr(main_mod._altium, "_netlist", BOM_NETLIST)
+    result = _call(checks=["part_counts"], profile="none", limits={"max_unique_parts": 1})
+    assert result["results"]["part_counts"]["value"] == {"placements": 3, "unique_parts": 2}
+    assert result["board_minimums"]["unique_parts"] == {"value": 2, "approximate": False}
+
+
+def test_the_cached_review_follows_a_variants_not_fitted_list(board, monkeypatch):
+    """The same variant name with another Not Fitted list (the project edited and
+    reloaded, the index kept) is another review."""
+    _, holder = board
+    _swap(holder, _parts_board())
+    monkeypatch.setattr(main_mod._altium, "_netlist", None)  # the index is kept
+    monkeypatch.setattr(main_mod, "_variant_state", VariantState(
+        [VariantDefinition(name="Lite", dnp_refdes=[])]))
+    arguments = {"checks": ["part_counts"], "profile": "none", "limits": {"max_placements": 9}}
+    assert _call(**arguments)["results"]["part_counts"]["value"]["placements"] == 4
+    monkeypatch.setattr(main_mod, "_variant_state", VariantState(
+        [VariantDefinition(name="Lite", dnp_refdes=["R1", "R2"])]))
+    assert _call(**arguments)["results"]["part_counts"]["value"]["placements"] == 2
+
+
+def test_manufacturing_review_tool(board, monkeypatch):
+    root, _ = board
+    review = main_mod.pcb_manufacturing_review()
+    with pytest.raises(ValueError):
+        json.loads(review)  # a prompt, not JSON
+    assert "Demo" in review and "Phase 3" in review and "check_dfm(" in review
+    for check in ("part_counts", "tombstoning", "rules_vs_profile"):
+        assert check in review
+    monkeypatch.setattr(main_mod._altium, "_netlist", None)
+    assert "Netlist-free load" in main_mod.pcb_manufacturing_review()
+    project = dict(main_mod._project, pcb_doc_paths=[])
+    monkeypatch.setattr(main_mod, "_project", project)
+    missing = json.loads(main_mod.pcb_manufacturing_review())
+    assert missing["error"] and "get_bom and check_bom" in missing["hint"]
+    monkeypatch.setattr(main_mod, "_project", None)
+    assert json.loads(main_mod.pcb_manufacturing_review())["error"] == "no_project"
+    tools = {tool.name: tool for tool in asyncio.run(main_mod.mcp.list_tools())}
+    tool = tools["pcb_manufacturing_review"]
+    assert tool.annotations.readOnlyHint is True and tool.title == "PCB Manufacturing Review"
+
+
+def test_assembly_wording_manifest_and_readme():
+    tools = {tool.name: tool for tool in asyncio.run(main_mod.mcp.list_tools())}
+    description = " ".join(tools["check_dfm"].description.split())
+    for phrase in ('"can it be assembled?"', '"DFA check"', "fiducials", "tombstoning",
+                   "part spacing", '"too many unique parts for Altimade?"',
+                   "its Not Fitted parts left out", "is measured, not judged: ask the assembler",
+                   "a full manufacturing review (pcb_manufacturing_review)"):
+        assert phrase in description, phrase
+    review = " ".join(tools["pcb_manufacturing_review"].description.split())
+    assert "'is this board ready to order?'" in review and "check_dfm" in review
+    item = " ".join(" ".join(_item(main_mod.SERVER_INSTRUCTIONS, 19)).split())
+    assert '"can it be assembled?"' in item and "tombstoning" in item
+    twenty = " ".join(" ".join(_item(main_mod.SERVER_INSTRUCTIONS, 20)).split())
+    assert twenty.startswith('20. pcb_manufacturing_review — "is this board ready to order?"')
+    assert main_mod.SERVER_INSTRUCTIONS.index("20. pcb_manufacturing_review") > 4096
+    manifest = json.loads((Path(__file__).parents[1] / "manifest.json").read_text("utf-8"))
+    entries = {entry["name"]: entry["description"] for entry in manifest["tools"]}
+    assert "go/no-go" in entries["pcb_manufacturing_review"]
+    assert "fiducials" in entries["check_dfm"] and "tombstoning" in entries["check_dfm"]
+    readme = (Path(__file__).parents[1] / "README.md").read_text("utf-8")
+    modes = readme[readme.index("## Specialist modes"):]
+    assert "| `pcb_manufacturing_review` |" in modes.split("\n\n## ")[0]
+    assert '*"Can it be assembled? Any tombstoning risk? Enough fiducials?"*' in readme
 
 
 def test_every_check_and_limit_rule_is_in_the_docstring():
@@ -552,12 +684,14 @@ def test_minipc_worst_case_fits_through_the_tool(board, minipc_index):
     _, holder = board
     _swap(holder, minipc_index)
     for units in ("mm", "mil"):
-        text = main_mod.check_dfm(profile="none", limits=STRICT, units=units)
+        text = main_mod.check_dfm(profile="none", limits={**STRICT, **ASSEMBLY_STRICT},
+                                  units=units)
         assert len(text) <= LIMIT
         result = json.loads(text)
         assert result["has_more"] and result["findings_limited_to"] in (40, 15, 5)
         assert {check: entry["status"] for check, entry in result["results"].items()
-                if entry["status"] != "fail"} == {"drill_count": "advisory"}
+                if entry["status"] != "fail"} == {"drill_count": "advisory",
+                                                  "assembly_sides": "advisory"}
     default = json.loads(main_mod.check_dfm())
     assert len(json.dumps(default, indent=2)) <= LIMIT
     assert default["results"]["spacing"]["objects"] == 14001  # places, not object pairs

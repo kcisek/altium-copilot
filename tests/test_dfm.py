@@ -37,6 +37,7 @@ from server.services.dfm import (
 )
 from server.services.fab_profiles import MM, load_profile
 from server.services.pcb_index import PcbIndex
+from tests import test_dfm_assembly as facts
 from tests.test_dfm_geometry import OUTLINE, _area, _th_pad, _via
 from tests.test_pcb_health import _region, _square
 from tests.test_pcb_index import _pad, _track
@@ -126,7 +127,10 @@ def test_invalid_checks():
     result = review_dfm(_index(), _default(), ["spacing", "Bogus"])
     assert result["error"] == "invalid_checks" and "bogus" in result["message"]
     assert result["valid_checks"] == list(VALID_CHECKS)
-    assert len(VALID_CHECKS) == 12 and "copper_weight" in VALID_CHECKS
+    assert len(VALID_CHECKS) == 19 and "copper_weight" in VALID_CHECKS
+    assert VALID_CHECKS[12:] == dfm._ASSEMBLY == (
+        "part_counts", "assembly_sides", "part_spacing", "part_to_edge", "fiducials",
+        "tombstoning", "fine_pitch")
     # Names are case- and space-insensitive and keep the checks' own order.
     full = review_dfm(_index(), _default(), [" Board_Size ", "trace_width"])
     assert full["checks_run"] == ["trace_width", "board_size"]
@@ -1060,9 +1064,11 @@ def test_result_shape_board_facts_and_units():
     ranks = [("error", "warning", "info").index(f["severity"]) for f in result["findings"]]
     assert ranks == sorted(ranks)
     for key in ("solder_mask", "silkscreen", "acute_angles", "copper_text", "plane_pullback",
-                "same_net_gaps", "panels", "assembly", "board_thickness", "no_net_gaps",
-                "inside_valid_pours"):
+                "same_net_gaps", "panels", "courtyards", "component_heights",
+                "pick_and_place", "paste_stencil", "board_thickness", "no_net_gaps",
+                "inside_valid_pours", "other_side_pins"):
         assert key in result["not_checked"]
+    assert "assembly" not in result["not_checked"]
     assert any("Altimade's published limits were used" in note for note in result["notes"])
     # Issue texts follow the units: mm with enough decimals to tell value from limit.
     mm = review_dfm(index, _default(), ["spacing"], to_mm=True)
@@ -1095,7 +1101,7 @@ def test_narrowed_checks_measure_no_more_than_asked():
     assert list(result["results"]) == ["layer_count"]
     assert result["board_minimums"]["not_measured"] == [
         "min_gap", "min_hole_to_copper", "min_hole_to_hole", "min_copper_to_edge",
-        "min_hole_to_edge"]
+        "min_hole_to_edge", "min_part_gap", "min_part_to_edge"]
     assert not any(index._dfm_geometry.results[name] for name in (
         "spacing", "hole_to_copper", "copper_to_edge", "hole_to_edge", "hole_to_hole"))
     # Hole, ring and trace minimums are cheap: always there.
@@ -1200,6 +1206,433 @@ def test_worst_page_fits_on_a_synthetic_board():
     assert len(_rendered(page, True)) < 60000 and len(_rendered(page)) < 60000
 
 
+# ---------- assembly (DFA) ----------
+
+ASSEMBLY = list(dfm._ASSEMBLY)
+# Assembly limits every check misses on MiniPC (part spacing at its 5 mm bound).
+ASSEMBLY_STRICT = {
+    "max_placements": 1, "max_unique_parts": 1, "min_part_spacing_mm": 5.0,
+    "min_part_to_edge_mm": 10.0, "min_global_fiducials": 10, "local_fiducial_pitch_mm": 2.54,
+    "min_pitch_mm": 2.54,
+}
+
+
+def _variant(*dnp, unique=None, netlist_free=False, name="Lite"):
+    return dfm.AssemblyContext(variant=name, is_dnp=lambda refdes: refdes in dnp,
+                               dnp_key=tuple(sorted(dnp)), unique_parts=unique,
+                               netlist_free=netlist_free)
+
+
+def _parts_board(resistors=3, bottom_smd=False):
+    """resistors 0402 resistors on top (netted pads), J1 a through-hole header on the
+    bottom, MH1 a no-BOM mounting hole and LOGO1 a graphical part; bottom_smd adds C1, an
+    SMD capacitor on the bottom."""
+    components, primitives = [], []
+    for number in range(resistors):
+        x = 100.0 + 60.0 * (number % 12)
+        y = 100.0 + 60.0 * (number // 12)
+        components.append(facts._part(number, f"R{number + 1}", x, y, footprint="R0402",
+                                      comment="10k"))
+        primitives += [facts._smd(number, x - 10, y, 10.0, net=A),
+                       facts._smd(number, x + 10, y, 10.0, net=B)]
+    header = len(components)
+    components += [facts._part(header, "J1", 500, 800, side="bottom", footprint="HDR",
+                               comment="hdr"),
+                   facts._part(header + 1, "MH1", 800, 800, kind=5),
+                   facts._part(header + 2, "LOGO1", 900, 900, kind=2)]
+    primitives += [facts._tht(header, 500, 800, net=A), facts._tht(header, 600, 800, net=B),
+                   facts._tht(header + 1, 800, 800, plated=False),
+                   facts._smd(header + 2, 900, 900, net=A)]
+    if bottom_smd:
+        components.append(facts._part(header + 3, "C1", 300, 600, side="bottom",
+                                      footprint="C0402", comment="1u"))
+        primitives += [facts._smd(header + 3, 290, 600, 10.0, net=A, layer=32),
+                       facts._smd(header + 3, 310, 600, 10.0, net=B, layer=32)]
+    return facts._index(components, primitives, outline=facts.OUTLINE)
+
+
+def test_part_counts_against_the_profile_and_the_variant():
+    index = _parts_board()
+    limits = {"max_placements": 3, "max_unique_parts": 1}
+    full = review_dfm(index, _profile(limits), ["part_counts"])
+    entry = full["results"]["part_counts"]
+    # Placements: R1-R3 and J1; the no-BOM mounting hole and the logo are not placed.
+    assert entry == {"status": "fail", "limit": {"placements": 3, "unique_parts": 1},
+                     "value": {"placements": 4, "unique_parts": 2},
+                     "unique_parts_approximate": True, "objects": 2, "groups": 2,
+                     "severity": "error"}
+    unique, placements = _found(full, "part_counts")  # the larger miss first
+    assert (placements["placements"], placements["max_placements"]) == (4, 3)
+    assert placements["issue"].startswith("4 placements (3 top, 1 bottom), above the "
+                                          "profile's maximum of 3.")
+    assert unique["issue"].startswith("About 2 unique parts (distinct footprint and Comment")
+    # The active variant: R1 Not Fitted; with a netlist the BOM's line count is exact.
+    lite = review_dfm(index, _profile(limits), ["part_counts"], variant=_variant("R1", unique=1))
+    assert lite["results"]["part_counts"]["value"] == {"placements": 3, "unique_parts": 1}
+    assert lite["results"]["part_counts"]["status"] == "pass"
+    assert "unique_parts_approximate" not in lite["results"]["part_counts"]
+    assert lite["board_minimums"]["placements"] == {"top_smd": 2, "top_tht": 0,
+                                                    "bottom_smd": 0, "bottom_tht": 1}
+    assert lite["board_minimums"]["unique_parts"] == {"value": 1, "approximate": False}
+    assert any("active variant 'Lite'" in note for note in lite["notes"])
+    # No limit: not checked, the counts still in board_minimums.
+    none = review_dfm(index, _profile(), ["part_counts"])
+    assert none["results"]["part_counts"] == {
+        "status": "not_checked",
+        "reason": "the profile sets no max_placements or max_unique_parts."}
+    assert none["board_minimums"]["placements"]["top_smd"] == 3
+
+
+def test_altimade_part_counts_are_advice_while_it_is_only_the_default():
+    index = _parts_board(resistors=600)  # 601 placements
+    default = review_dfm(index, _default(), ["part_counts"])
+    entry = default["results"]["part_counts"]
+    assert (entry["status"], entry["severity"], entry["limit"]) == (
+        "advisory", "info", {"placements": 600, "unique_parts": 200})
+    (finding,) = _found(default, "part_counts")
+    assert finding["issue"].endswith("not what an assembler can place (advisory).")
+    assert any("placements and unique parts) are info" in note for note in default["notes"])
+    chosen = review_dfm(index, _profile(name="altimade"), ["part_counts"])
+    assert chosen["results"]["part_counts"]["status"] == "fail"
+    assert _found(chosen, "part_counts")[0]["severity"] == "error"
+
+
+def test_assembly_sides_are_advice():
+    single = review_dfm(_parts_board(), _default(), ["assembly_sides"])
+    entry = single["results"]["assembly_sides"]
+    assert (entry["status"], entry["sides"]) == ("advisory", ["top", "bottom"])
+    (tht,) = _found(single, "assembly_sides")
+    assert (tht["severity"], tht["count"], tht["side"]) == ("info", 1, "bottom")
+    assert tht["issue"].startswith("1 through-hole part on the bottom side")
+    assert tht["examples"] == [{"at_mil": [550.0, 800.0], "object": "J1", "side": "bottom"}]
+    both = review_dfm(_parts_board(bottom_smd=True), _default(), ["assembly_sides"])
+    smd = next(f for f in _found(both, "assembly_sides") if "smd_parts" in f)
+    assert smd["smd_parts"] == {"top": 3, "bottom": 1} and smd["count"] == 1
+    assert smd["issue"].startswith("1 SMD part on the bottom side and 3 on the top: two "
+                                   "reflow passes")
+    # The count is the bottom side's SMD parts (a unit of parts, as the THT class), and a
+    # mixed part on the bottom is a through-hole part there too.
+    components = [facts._part(0, "R1"), facts._part(1, "Q1", side="bottom"),
+                  facts._part(2, "C1", side="bottom"), facts._part(3, "C2", side="bottom")]
+    primitives = [facts._smd(0, 0, 0, net=A), facts._smd(0, 40, 0, net=B),
+                  facts._smd(1, 200, 0, layer=32, net=A), facts._tht(1, 300, 0, net=B)]
+    primitives += [facts._smd(part, x, 200, layer=32, net=net) for part, x, net in (
+        (2, 0, A), (2, 40, B), (3, 200, A), (3, 240, B))]
+    bottom = review_dfm(facts._index(components, primitives), _default(), ["assembly_sides"])
+    smd, tht = sorted(_found(bottom, "assembly_sides"), key=lambda f: "smd_parts" not in f)
+    assert (smd["count"], smd["smd_parts"]) == (3, {"top": 1, "bottom": 3})
+    assert (tht["count"], [e["object"] for e in tht["examples"]]) == (1, ["Q1"])
+    assert bottom["results"]["assembly_sides"]["objects"] == 4
+    top = facts._index([facts._part(0, "R1")], [facts._smd(0, 0, 0, net=A),
+                                                 facts._smd(0, 40, 0, net=B)])
+    alone = review_dfm(top, _default(), ["assembly_sides"])
+    assert alone["results"]["assembly_sides"]["status"] == "pass"
+    assert not alone["findings"]
+
+
+def test_part_spacing_classes_overlaps_and_the_variant():
+    index = facts._spacing_board()
+    full = review_dfm(index, _profile({"min_part_spacing_mil": 21.5}), ["part_spacing"])
+    entry = full["results"]["part_spacing"]
+    assert (entry["status"], entry["limit_mil"], entry["worst_mil"]) == ("fail", 21.5, 0.0)
+    assert entry["overlapping_pairs"] == 1 and entry["severity"] == "warning"
+    found = {(f["basis"], bool(f.get("marginal")), f["count"], f["gap_mil"])
+             for f in _found(full, "part_spacing")}
+    # E's body reaches past its pads towards F: 10 mil body to pads (mixed), as G to H.
+    assert found == {("body", False, 1, 0.0), ("body", False, 1, 0.0), ("pads", False, 1, 20.0),
+                     ("mixed", False, 2, 10.0), ("body", True, 1, 21.2132)}
+    overlap = next(f for f in _found(full, "part_spacing") if "overlap" in f["issue"])
+    assert overlap["examples"] == [{"at_mil": [4100.0, 0.0], "objects": "I / J",
+                                    "side": "top", "gap_mil": 0.0}]
+    assert overlap["issue"].startswith("1 pair of placed parts whose 3D bodies overlap")
+    marginal = next(f for f in _found(full, "part_spacing") if f.get("marginal"))
+    assert "confirm with the assembler" in marginal["issue"]
+    pads = next(f for f in _found(full, "part_spacing") if f["basis"] == "pads")
+    assert "20 mil between their pads (pad copper, or a rectangle around the pads of a part " \
+        "without a 3D body)" in pads["issue"]
+    mixed = next(f for f in _found(full, "part_spacing") if f["basis"] == "mixed")
+    assert mixed["gap_range_mil"] == [10.0, 20.0]
+    assert "10 mil to 20 mil from one part's 3D body to the other's pads" in mixed["issue"]
+    assert full["board_minimums"]["min_part_gap"] == {
+        "value_mil": 0.0, "basis": "body", "reach_mil": pytest.approx(196.8504, abs=1e-4),
+        "overlapping_pairs": 1}
+    # No limit: overlapping bodies alone are advice.
+    bare = review_dfm(index, _profile(), ["part_spacing"])
+    (finding,) = _found(bare, "part_spacing")
+    assert bare["results"]["part_spacing"]["status"] == "advisory"
+    assert finding["severity"] == "info" and finding["issue"].endswith("so this is advisory.")
+    # J Not Fitted: no overlap left, so nothing to report without a limit.
+    lite = review_dfm(index, _profile(), ["part_spacing"], variant=_variant("J"))
+    assert lite["results"]["part_spacing"] == {
+        "status": "not_checked",
+        "reason": "the profile sets no min_part_spacing, and no fitted parts' outlines "
+                  "overlap."}
+    assert lite["board_minimums"]["min_part_gap"]["value_mil"] == 0.0
+    assert "overlapping_pairs" not in lite["board_minimums"]["min_part_gap"]
+    # With the limit, a pair with a Not Fitted part is no miss: C out, C / D goes.
+    narrow = review_dfm(index, _profile({"min_part_spacing_mil": 21.5}), ["part_spacing"],
+                        variant=_variant("C"))
+    assert not [f for f in _found(narrow, "part_spacing") if f["basis"] == "pads"]
+    assert narrow["results"]["part_spacing"]["objects"] == 5
+
+
+def test_part_spacing_searches_on_past_not_fitted_neighbours():
+    """R2 and R4 Not Fitted sit 2 mil from R1 and R3, which are 10 mil apart: the fitted
+    pair sets the gap with or without the limit."""
+    index = facts._dnp_board()
+    lite = review_dfm(index, _profile(), ["part_spacing"], variant=_variant("R2", "R4"))
+    assert lite["results"]["part_spacing"]["status"] == "not_checked"
+    assert lite["board_minimums"]["min_part_gap"] == {
+        "value_mil": 10.0, "basis": "pads", "reach_mil": pytest.approx(196.8504, abs=1e-4)}
+    limited = review_dfm(index, _profile({"min_part_spacing_mil": 5}), ["part_spacing"],
+                         variant=_variant("R2", "R4"))
+    entry = limited["results"]["part_spacing"]
+    assert (entry["status"], entry["worst_mil"]) == ("pass", 10.0)
+    every = review_dfm(index, _profile(), ["part_spacing"])
+    assert every["board_minimums"]["min_part_gap"]["value_mil"] == 2.0
+
+
+def _unplaced_board():
+    """M1, a Mechanical 3D model without pads (a fan), over R1 and R2; U1's body over
+    C3's pads (C3 has no body)."""
+    components = [facts._part(0, "R1"), facts._part(1, "R2"),
+                  facts._part(2, "M1", kind=1), facts._part(3, "U1"), facts._part(4, "C3")]
+    primitives = [facts._smd(0, 100, 100, net=A), facts._smd(0, 140, 100, net=B),
+                  facts._smd(1, 300, 100, net=A), facts._smd(1, 340, 100, net=B)]
+    primitives += [facts._smd(3, 960 + 20 * n, 500, 10.0, net=A) for n in range(5)]
+    primitives += [facts._smd(4, 1020, 525, 10.0, net=A), facts._smd(4, 1040, 525, 10.0, net=B)]
+    bodies = [facts._body(0, facts._rect(110, 90, 130, 110)),
+              facts._body(1, facts._rect(310, 90, 330, 110)),
+              facts._body(2, facts._rect(0, 0, 500, 200)),
+              facts._body(3, facts._rect(930, 470, 1070, 540))]
+    return facts._index(components, primitives, bodies)
+
+
+def test_overlaps_with_parts_the_assembler_does_not_place_are_their_own_class():
+    index = _unplaced_board()
+    full = review_dfm(index, _profile({"min_part_spacing_mil": 4}), ["part_spacing"])
+    entry = full["results"]["part_spacing"]
+    # The fan model over R1 and R2 is info, not a miss: only U1 over C3's pads fails.
+    assert (entry["status"], entry["overlapping_pairs"], entry["objects"]) == ("fail", 1, 1)
+    model, covered = sorted(_found(full, "part_spacing"), key=lambda f: f["severity"])
+    assert (model["severity"], model["count"], model["object"], model["not_placed"]) == (
+        "info", 2, "M1", "a 3D model without pads")
+    assert model["issue"].startswith("M1, which the assembler does not place (a 3D model "
+                                     "without pads), overlaps the outlines of 2 other parts")
+    assert [e["objects"] for e in model["examples"]] == ["M1 / R1", "M1 / R2"]
+    assert (covered["severity"], covered["basis"], covered["count"]) == ("warning", "mixed", 1)
+    assert covered["issue"].startswith("1 pair of placed parts where one part's 3D body lies "
+                                       "over the other's pads")
+    assert full["board_minimums"]["min_part_gap"]["overlapping_pairs"] == 1
+    # Without the pads overlap and without a limit: the model alone is a run entry (pass).
+    alone = review_dfm(index, _profile(), ["part_spacing"], variant=_variant("C3"))
+    assert alone["results"]["part_spacing"] == {
+        "status": "pass", "limit_mil": None, "worst_mil": 140.0, "objects": 0, "groups": 1,
+        "severity": "info"}
+
+
+def test_part_to_edge_classes_and_their_own_classes():
+    index = facts._edge_board()
+    full = review_dfm(index, _profile({"min_part_to_edge_mil": 50}), ["part_to_edge"])
+    entry = full["results"]["part_to_edge"]
+    assert (entry["status"], entry["limit_mil"], entry["worst_mil"]) == ("fail", 50.0, 2.0)
+    found = {(f["severity"], f.get("basis") or f["kind"], f["count"], f.get("distance_mil"),
+              f["examples"][0]["object"]) for f in _found(full, "part_to_edge")}
+    assert found == {
+        ("warning", "body", 1, 2.0, "P0"),  # its body nearer than its pads (7 mil)
+        ("warning", "pads", 1, 5.0, "P6"),  # a cutout; P5's own cutout is no edge
+        ("warning", "pads", 1, 15.0, "P1"),  # its body overhangs: the pads are measured
+        ("info", "crossing", 1, None, "P2"),
+        ("info", "overhang", 1, None, "P1"),
+    }
+    cutout = next(f for f in _found(full, "part_to_edge") if f.get("distance_mil") == 5.0)
+    assert cutout["issue"].startswith("1 placed part whose pad copper is closer to a board "
+                                      "cutout than the profile's minimum part to edge 50 mil")
+    assert any("1 part(s) lie outside the board outline" in note for note in full["notes"])
+    assert full["board_minimums"]["min_part_to_edge"]["value_mil"] == 2.0
+    # No limit: its own classes ran, so a run entry (info) that judges no distance, with
+    # the guidance and the nearest part.
+    bare = review_dfm(index, _profile(), ["part_to_edge"])
+    entry = bare["results"]["part_to_edge"]
+    assert (entry["status"], entry["severity"], entry["limit_mil"], entry["worst_mil"],
+            entry["objects"]) == ("pass", "info", None, 2.0, 0)
+    assert entry["note"].startswith("Not judged: the profile sets no min_part_to_edge")
+    assert "125 mil for top-side SMD" in entry["note"] and "body 2 mil from it" in entry["note"]
+    assert {f["kind"] for f in _found(bare, "part_to_edge")} == {"crossing", "overhang"}
+    # Nothing of its own (P1 and P2 Not Fitted): not checked, with the reason.
+    quiet = review_dfm(index, _profile(), ["part_to_edge"], variant=_variant("P1", "P2"))
+    assert quiet["results"]["part_to_edge"]["status"] == "not_checked"
+    assert "body 2 mil from it" in quiet["results"]["part_to_edge"]["reason"]
+    assert not _found(quiet, "part_to_edge")
+    # Not Fitted parts are not placed.
+    lite = review_dfm(index, _profile({"min_part_to_edge_mil": 50}), ["part_to_edge"],
+                      variant=_variant("P0", "P6"))
+    assert lite["results"]["part_to_edge"]["worst_mil"] == 15.0
+    flat = review_dfm(facts._index([facts._part(0, "R1")], [facts._smd(0, 0, 0, net=A)]),
+                      _profile({"min_part_to_edge_mil": 50}), ["part_to_edge"])
+    assert flat["results"]["part_to_edge"] == {"status": "not_checked",
+                                               "reason": "the board has no outline."}
+    assert "min_part_to_edge" in flat["board_minimums"]["not_measured"]
+
+
+def test_edge_connectors_are_their_own_class():
+    finger = dict(width=20.0, height=60.0)
+    primitives = [facts._smd(0, x, 35, net=A, **finger) for x in range(100, 400, 50)]
+    index = facts._index([facts._part(0, "X1")], primitives, outline=facts.OUTLINE)
+    full = review_dfm(index, _profile({"min_part_to_edge_mil": 50}), ["part_to_edge"])
+    (finding,) = _found(full, "part_to_edge")
+    assert (finding["kind"], finding["severity"], finding["count"]) == ("fingers", "info", 1)
+    assert full["results"]["part_to_edge"]["status"] == "pass"
+
+
+def _fiducial_board():
+    """Three free-pad fiducials on top, U1 (0.4 mm pitch) 3000 mil from them, U2 (0.65 mm)
+    near them and an SMD capacitor on the bottom."""
+    one = 1.0 * MM
+    components = [facts._part(0, "U1"), facts._part(1, "U2"),
+                  facts._part(2, "C1", side="bottom")]
+    primitives = [facts._smd(None, x, y, one, shape=facts.PAD_SHAPE_ROUND)
+                  for x, y in ((100, 100), (900, 100), (100, 900))]
+    primitives += [facts._smd(0, 3500 + 0.4 * MM * n, 500, 8.0, net=A) for n in range(4)]
+    primitives += [facts._smd(1, 400 + 0.65 * MM * n, 500, 8.0, net=A) for n in range(4)]
+    primitives += [facts._smd(2, 600, 600, 10.0, net=A, layer=32),
+                   facts._smd(2, 640, 600, 10.0, net=B, layer=32)]
+    return facts._index(components, primitives)
+
+
+def test_fiducials_global_and_local():
+    index = _fiducial_board()
+    default = review_dfm(index, _default(), ["fiducials"])
+    entry = default["results"]["fiducials"]
+    assert (entry["status"], entry["value"], entry["limit"]) == (
+        "advisory", {"top": 3, "bottom": 0}, None)
+    bottom, local = _found(default, "fiducials")
+    assert (bottom["side"], bottom["count"], bottom["typical_global_fiducials"]) == (
+        "bottom", 3, 3)
+    assert bottom["issue"].startswith("No global fiducials on the bottom side, which has 1 "
+                                      "SMD placement; assemblers typically want 3")
+    # Two counts, not one objects: missing global fiducials and parts short of local ones.
+    assert (entry["missing_global"], entry["local_parts"]) == ({"top": 0, "bottom": 3}, 1)
+    assert "objects" not in entry
+    assert (local["severity"], local["count"], local["pitch_mil"]) == (
+        "info", 1, pytest.approx(0.4 * MM, abs=1e-3))
+    assert local["examples"][0]["object"] == "U1" and local["examples"][0][
+        "fiducials_nearby"] == 0
+    assert "within 1969 mil" in local["issue"] and "rule of thumb" in local["issue"]
+    assert "(finest 15.748 mil) has fewer than 2 fiducials within 1969 mil on its side" in \
+        local["issue"]
+    mm = review_dfm(index, _default(), ["fiducials"], to_mm=True)
+    assert "within 50 mm" in _found(mm, "fiducials")[1]["issue"]
+    # With the assembler's limits: warnings; 0.4 mm is not at or below 0.3 mm.
+    limits = {"min_global_fiducials": 2, "local_fiducial_pitch_mm": 0.3}
+    strict = review_dfm(index, _profile(limits), ["fiducials"])
+    (finding,) = _found(strict, "fiducials")
+    assert (finding["severity"], finding["count"], finding["min_global_fiducials"]) == (
+        "warning", 2, 2)
+    assert strict["results"]["fiducials"]["status"] == "fail"
+    assert strict["results"]["fiducials"]["local_fiducial_pitch_mil"] == pytest.approx(
+        0.3 * MM, abs=1e-3)
+    local = review_dfm(index, _profile({"local_fiducial_pitch_mm": 0.65}), ["fiducials"])
+    local_finding = next(f for f in _found(local, "fiducials") if "pitch_mil" in f)
+    assert local_finding["severity"] == "warning" and local_finding["count"] == 1  # U2 has 3
+
+
+def test_two_local_fiducials_are_enough():
+    """U1 (0.4 mm pitch) with exactly LOCAL_FIDUCIALS free-pad fiducials near it is not
+    listed; with one it is."""
+    one = 1.0 * MM
+
+    def board(fiducials):
+        primitives = [facts._smd(None, 100 + 200 * n, 100, one, shape=facts.PAD_SHAPE_ROUND)
+                      for n in range(fiducials)]
+        primitives += [facts._smd(0, 500 + 0.4 * MM * n, 500, 8.0, net=A) for n in range(4)]
+        return facts._index([facts._part(0, "U1")], primitives)
+
+    assert dfm.LOCAL_FIDUCIALS == 2
+    two = review_dfm(board(2), _default(), ["fiducials"])
+    assert two["results"]["fiducials"]["local_parts"] == 0
+    assert not [f for f in _found(two, "fiducials") if "pitch_mil" in f]
+    one_only = review_dfm(board(1), _default(), ["fiducials"])
+    assert one_only["results"]["fiducials"]["local_parts"] == 1
+
+
+def test_tombstoning_classes_and_the_variant():
+    index = facts._tomb_board()
+    full = review_dfm(index, _profile(), ["tombstoning"])
+    entry = full["results"]["tombstoning"]
+    assert (entry["status"], entry["small_passives"], entry["severity"]) == (
+        "fail", 6, "warning")  # R8 (0805) is not small
+    direct, track = _found(full, "tombstoning")
+    assert (direct["size_code"], direct["cause"], direct["severity"]) == (
+        "0402", "direct", "warning")
+    assert direct["examples"][0] == {"at_mil": [130.0, 100.0], "object": "R1", "side": "top",
+                                     "connections": ["direct", "relief"]}
+    assert "thermal reliefs" in direct["issue"]
+    assert (track["size_code"], track["cause"], track["severity"]) == ("0603", "track", "info")
+    assert track["examples"][0]["tracks_mil"] == [20.0, 8.0]
+    assert "not a certainty" in track["issue"]
+    # R1 Not Fitted: only the track imbalance is left, which is advice.
+    lite = review_dfm(index, _profile(), ["tombstoning"], variant=_variant("R1"))
+    assert lite["results"]["tombstoning"]["status"] == "advisory"
+    assert lite["results"]["tombstoning"]["small_passives"] == 5
+
+
+def _pitch_board():
+    """U1 0.4 mm, U2 0.495 mm (within 2% of 0.5 mm), U3 0.65 mm pitch."""
+    components = [facts._part(n, f"U{n + 1}") for n in range(3)]
+    primitives = [facts._smd(part, 500 * part + pitch * MM * n, 0, 8.0, net=A)
+                  for part, pitch in enumerate((0.4, 0.495, 0.65)) for n in range(4)]
+    return facts._index(components, primitives)
+
+
+def test_fine_pitch():
+    index = _pitch_board()
+    full = review_dfm(index, _profile({"min_pitch_mm": 0.5}), ["fine_pitch"])
+    entry = full["results"]["fine_pitch"]
+    assert (entry["status"], entry["severity"]) == ("fail", "error")
+    assert entry["worst_mil"] == pytest.approx(0.4 * MM, abs=1e-3)
+    miss, marginal = _found(full, "fine_pitch")
+    assert (miss["count"], miss["examples"][0]["object"], miss.get("marginal")) == (1, "U1", None)
+    assert marginal["marginal"] and marginal["severity"] == "warning"
+    assert miss["issue"].startswith("1 fitted part with a pad pitch of 15.748 mil, below "
+                                    "the profile's minimum pitch 19.685 mil.")
+    # Altimade publishes no pitch: parts at 0.5 mm or finer are advice.
+    default = review_dfm(index, _default(), ["fine_pitch"])
+    (advice,) = _found(default, "fine_pitch")
+    assert default["results"]["fine_pitch"]["status"] == "advisory"
+    assert advice["count"] == 2 and "Altimade checks component pitch" in advice["issue"]
+    coarse = review_dfm(index, _profile(), ["fine_pitch"], variant=_variant("U1", "U2"))
+    assert coarse["results"]["fine_pitch"] == {
+        "status": "not_checked",
+        "reason": "the profile sets no min_pitch; the finest pitch is 25.591 mil."}
+    assert coarse["board_minimums"]["min_pitch_mil"] == pytest.approx(0.65 * MM, abs=1e-3)
+
+
+def test_assembly_minimums_notes_and_the_cache_follow_the_variant():
+    index = _parts_board(bottom_smd=True)
+    profile = _default()
+    narrowed = review_dfm(index, profile, ["layer_count"])
+    minimums = narrowed["board_minimums"]
+    assert minimums["placements"] == {"top_smd": 3, "top_tht": 0, "bottom_smd": 1,
+                                      "bottom_tht": 1}
+    assert minimums["fiducials"] == {"top": 0, "bottom": 0}
+    assert minimums["min_pitch_mil"] is None
+    assert minimums["not_measured"][-2:] == ["min_part_gap", "min_part_to_edge"]
+    assert not any("Assembly checks" in note for note in narrowed["notes"])
+    lite = review_dfm(index, profile, ASSEMBLY, variant=_variant("R1"))
+    note = next(note for note in lite["notes"] if "Assembly checks" in note)
+    assert "Fiducials are counted whatever the variant: their copper is on the bare board." \
+        in note
+    assert lite is review_dfm(index, profile, ASSEMBLY, variant=_variant("R1"))
+    assert lite is not review_dfm(index, profile, ASSEMBLY, variant=_variant("R2"))
+    assert lite is not review_dfm(index, profile, ASSEMBLY, variant=_variant("R1", unique=2))
+    free = review_dfm(index, profile, ["part_counts"], variant=_variant(netlist_free=True))
+    note = next(note for note in free["notes"] if "Assembly checks" in note)
+    assert "No netlist is loaded" in note
+    whole = review_dfm(index, profile)
+    assert list(whole["results"]) == list(VALID_CHECKS)
+
+
 # ---------- Altium's examples ----------
 
 
@@ -1210,43 +1643,62 @@ def _example(name):
     return PcbIndex(parse_pcb_doc(str(path)), None), path
 
 
-# Default profile (Altimade, chosen_by default): every check's status per board.
+# Default profile (Altimade, chosen_by default), every part fitted: every check's status
+# per board.
 SNAPSHOT = {
     "Bluetooth_Sentinel.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass",
         "annular_ring": "marginal", "aspect_ratio": "pass", "hole_to_hole": "not_checked",
         "copper_to_edge": "fail", "layer_count": "pass", "copper_weight": "pass",
         "board_size": "pass", "drill_count": "not_checked", "rules_vs_profile": "fail",
+        "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
+        "part_to_edge": "pass", "fiducials": "advisory",
+        "tombstoning": "advisory", "fine_pitch": "advisory",
     },
     "MiniPC.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass", "annular_ring": "fail",
         "aspect_ratio": "pass", "hole_to_hole": "not_checked", "copper_to_edge": "pass",
         "layer_count": "advisory", "copper_weight": "advisory", "board_size": "pass",
         "drill_count": "not_checked", "rules_vs_profile": "fail",
+        "part_counts": "advisory", "assembly_sides": "advisory", "part_spacing": "advisory",
+        "part_to_edge": "pass", "fiducials": "advisory",
+        "tombstoning": "fail", "fine_pitch": "advisory",
     },
     "PC4-SODIMM_V200_RC_A1_20141015.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass",
         "annular_ring": "marginal", "aspect_ratio": "pass", "hole_to_hole": "not_checked",
         "copper_to_edge": "fail", "layer_count": "pass", "copper_weight": "advisory",
         "board_size": "pass", "drill_count": "not_checked", "rules_vs_profile": "fail",
+        "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
+        "part_to_edge": "not_checked", "fiducials": "advisory",
+        "tombstoning": "pass", "fine_pitch": "advisory",
     },
     "WiFi.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass", "annular_ring": "pass",
         "aspect_ratio": "pass", "hole_to_hole": "not_checked", "copper_to_edge": "fail",
         "layer_count": "pass", "copper_weight": "advisory", "board_size": "pass",
         "drill_count": "not_checked", "rules_vs_profile": "fail",
+        "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
+        "part_to_edge": "not_checked", "fiducials": "advisory",
+        "tombstoning": "pass", "fine_pitch": "advisory",
     },
     "WiFi_panel.PcbDoc": {
         "trace_width": "pass", "spacing": "pass", "hole_size": "pass", "annular_ring": "fail",
         "aspect_ratio": "pass", "hole_to_hole": "not_checked", "copper_to_edge": "pass",
         "layer_count": "pass", "copper_weight": "advisory", "board_size": "pass",
         "drill_count": "not_checked", "rules_vs_profile": "pass",
+        "part_counts": "pass", "assembly_sides": "pass", "part_spacing": "not_checked",
+        "part_to_edge": "not_checked", "fiducials": "pass",
+        "tombstoning": "pass", "fine_pitch": "not_checked",
     },
     "SL1 Xilinx Spartan-IIE PQ208 Rev1.02.PcbDoc": {
         "trace_width": "pass", "spacing": "pass", "hole_size": "pass",
         "annular_ring": "marginal", "aspect_ratio": "pass", "hole_to_hole": "not_checked",
         "copper_to_edge": "pass", "layer_count": "pass", "copper_weight": "pass",
         "board_size": "pass", "drill_count": "not_checked", "rules_vs_profile": "pass",
+        "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "advisory",
+        "part_to_edge": "not_checked", "fiducials": "advisory",
+        "tombstoning": "pass", "fine_pitch": "advisory",
     },
 }
 
@@ -1270,6 +1722,21 @@ def test_examples_status_snapshot(name):
         sizes = [len(_rendered(page_dfm(mm, 0, limit, examples), to_mm))
                  for limit, examples in SHRINK_STEPS]
         assert sizes[1] < 60000
+
+
+def test_sodimm_assembly():
+    """Free-pad fiducials (3 per side), its card edge (a no-BOM part: not placed) and
+    pads relief-connected only: no tombstoning."""
+    index, _ = _example("PC4-SODIMM_V200_RC_A1_20141015.PcbDoc")
+    full = review_dfm(index, _profile(ASSEMBLY_STRICT), ASSEMBLY)
+    assert full["results"]["fiducials"]["value"] == {"top": 3, "bottom": 3}
+    assert full["results"]["tombstoning"] == {"status": "pass", "small_passives": 182,
+                                              "objects": 0, "groups": 0}
+    assert full["board_minimums"]["placements"] == {"top_smd": 98, "top_tht": 0,
+                                                    "bottom_smd": 100, "bottom_tht": 0}
+    assert not [f for f in _found(full, "part_to_edge") if f.get("kind") == "fingers"]
+    examples = [e["object"] for f in _found(full, "part_to_edge") for e in f["examples"]]
+    assert "X1" not in examples
 
 
 @pytest.fixture(scope="module")
@@ -1307,6 +1774,44 @@ def test_minipc_review_runtime_and_numbers(minipc):
     assert pad_gaps["count"] == 226
     # Nothing within Altimade's 10 mil of the edge: the nearest copper of the 1 mm search.
     assert full["results"]["copper_to_edge"]["worst_mil"] == pytest.approx(11.811, abs=1e-3)
+    # Assembly, every part fitted: Altimade's 600 placements is advice while it is only
+    # the default; the power passives' direct pads (the map's validation) are a warning.
+    minimums = full["board_minimums"]
+    # MH1-MH4 (Mechanical parts, a plated hole each) are mounting holes, not placements.
+    assert minimums["placements"] == {"top_smd": 346, "top_tht": 17, "bottom_smd": 677,
+                                      "bottom_tht": 1}
+    assert minimums["unique_parts"] == {"value": 130, "approximate": True}
+    assert minimums["fiducials"] == {"top": 0, "bottom": 0}
+    assert minimums["min_pitch_mil"] == pytest.approx(0.4 * MM, abs=1e-3)
+    # Pad copper reaches past the bodies: two capacitors' pads 0.08 mm apart.
+    assert minimums["min_part_gap"]["value_mil"] == pytest.approx(3.15, abs=1e-3)
+    assert minimums["min_part_gap"]["basis"] == "pads"
+    assert minimums["min_part_gap"]["overlapping_pairs"] == 13
+    assert minimums["min_part_to_edge"] == {"value_mil": pytest.approx(29.134, abs=1e-3),
+                                            "basis": "pads", "reach_mil": pytest.approx(
+                                                393.7008, abs=1e-3)}
+    counts = full["results"]["part_counts"]
+    assert counts["value"] == {"placements": 1041, "unique_parts": 130}
+    assert counts["severity"] == "info"
+    tombs = _found(full, "tombstoning")
+    # Track imbalance only where neither pad touches area copper.
+    assert sorted((f["size_code"], f["cause"], f["count"], f["severity"]) for f in tombs) == [
+        ("0402", "direct", 1, "warning"), ("0402", "track", 3, "info"),
+        ("0603", "direct", 6, "warning")]
+    assert full["results"]["tombstoning"]["small_passives"] == 825
+    # 13 pairs of placed parts' bodies overlap (advisory); M1, a fan model without pads,
+    # lies over 12 more parts: its own class, not a miss.
+    overlap, model = _found(full, "part_spacing")
+    assert (overlap["count"], overlap["basis"], model["count"], model["object"]) == (
+        13, "body", 12, "M1")
+    assert full["results"]["part_spacing"]["objects"] == 13
+    sides = next(f for f in _found(full, "assembly_sides") if "smd_parts" in f)
+    assert sides["count"] == 677 and sides["smd_parts"] == {"top": 347, "bottom": 677}
+    assert full["results"]["fiducials"]["missing_global"] == {"top": 3, "bottom": 3}
+    assert full["results"]["fiducials"]["local_parts"] == 20
+    (fine,) = _found(full, "fine_pitch")
+    assert fine["count"] == 20 and fine["severity"] == "info"
+    assert "publishes no number" in fine["issue"]
 
 
 def test_minipc_drill_table_matches_draftsman(minipc):
@@ -1339,11 +1844,15 @@ def test_minipc_worst_case_page_fits(minipc):
         "min_annular_ring_mm": 0.5, "min_copper_to_edge_mm": 5.0, "max_aspect_ratio": 1,
         "min_hole_to_hole_mm": 0.5, "min_pad_hole_to_hole_mm": 1.0, "layer_counts": [2],
         "min_board_size_mm": [500, 500], "max_drill_sizes": 1, "copper_oz": 0.5,
-        "min_route_size_mm": 5.0,
+        "min_route_size_mm": 5.0, **ASSEMBLY_STRICT,
     }
+    start = time.perf_counter()
     full = review_dfm(index, _profile(strict), to_mm=True)
+    assert time.perf_counter() - start < 9.0  # about 3.5 s, part spacing at its 5 mm bound
+    # Every check fails but the two that are advice whatever the limits.
     assert {check: entry["status"] for check, entry in full["results"].items()
-            if entry["status"] != "fail"} == {"drill_count": "advisory"}
+            if entry["status"] != "fail"} == {"drill_count": "advisory",
+                                              "assembly_sides": "advisory"}
     assert len(_rendered(page_dfm(full, 0, *SHRINK_STEPS[1]), True)) < 60000
 
 

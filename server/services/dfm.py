@@ -2,7 +2,9 @@
 profile (fab_profiles.Profile): trace width, copper spacing (hole walls to copper
 included), hole sizes, annular rings, aspect ratios, hole to hole, copper and holes to
 the board edge, layer count, copper weight, board size, drill sizes, and the board's own
-rules against the profile.
+rules against the profile; and assembly (DFA) for the active variant over
+dfm_assembly's facts: placements and unique parts, the sides assembled, part spacing,
+parts near the edge, fiducials, tombstoning of small passives and fine pitch.
 
 Pure logic, no MCP. Lengths are mils under *_mil keys, so callers can convert units;
 ratios and counts carry no unit. Issue texts are written in the units asked for, with
@@ -43,6 +45,22 @@ class: only the land pattern fixes them. Overlapping and coincident holes are re
 whatever the profile (they need no limit). Annular rings skip pads whose hole is offset
 (the offset is not decoded) and inner layers where the copper is no larger than the hole
 (a removed, non-functional pad). Back drills are not in the drill table.
+
+Assembly: the parts the assembler places are the fitted parts (AssemblyContext.is_dnp)
+of a BOM kind with soldered pads, fiducials and mounting holes left out. Not Fitted parts
+are left out of every assembly check (a DNP alternate footprint may overlap the fitted
+one on purpose), and part spacing searches each part's nearest neighbour among the
+fitted ones: it measures every fitted part on the board with pads or a body (a mounting
+hole's screw head needs room too); a part the assembler does not place overlapping
+others is its own info class. Part to edge, tombstoning and pitch take the placed parts.
+A limit the profile does not set is measured, not judged: part spacing and part to edge
+are then not_checked, unless their own classes found something (overlapping parts are
+advisory; pads crossing the edge, bodies past it and edge connectors are info), fine
+pitch is advisory for parts at FINE_PITCH_MIL or finer, and fiducials are compared with
+typical counts (GLOBAL_FIDUCIALS per assembled side, LOCAL_FIDUCIALS near parts at
+LOCAL_FIDUCIAL_PITCH_MIL or finer) as info. Max placements and unique parts are
+Altimade's ordering limits: info while Altimade is only the default. Fiducials report
+their misses as missing_global and local_parts, not one objects count.
 """
 
 import heapq
@@ -50,10 +68,14 @@ import itertools
 import json
 import math
 from collections import Counter
+from dataclasses import dataclass, field
+from typing import Callable
 
 try:
     from parsers.pcb_doc import MULTI_LAYER, pad_copper_on
+    from services import dfm_assembly as assembly
     from services import dfm_geometry as geometry
+    from services.bom import natural_key
     from services.fab_profiles import MM
     from services.pcb_compliance import (
         CLEARANCE_TOLERANCE_MIL,
@@ -65,7 +87,9 @@ try:
     from services.via_checks import _Stack, is_microvia, via_depth, via_span
 except ImportError:
     from server.parsers.pcb_doc import MULTI_LAYER, pad_copper_on
+    from server.services import dfm_assembly as assembly
     from server.services import dfm_geometry as geometry
+    from server.services.bom import natural_key
     from server.services.fab_profiles import MM
     from server.services.pcb_compliance import (
         CLEARANCE_TOLERANCE_MIL,
@@ -89,8 +113,17 @@ CHECKS = (
     "board_size",
     "drill_count",
     "rules_vs_profile",
+    # assembly (DFA)
+    "part_counts",
+    "assembly_sides",
+    "part_spacing",
+    "part_to_edge",
+    "fiducials",
+    "tombstoning",
+    "fine_pitch",
 )
 VALID_CHECKS = CHECKS
+_ASSEMBLY = CHECKS[CHECKS.index("part_counts"):]
 EXAMPLES = 5  # worst examples kept per finding (page_dfm lists fewer)
 NETS_LISTED = 5
 PAGE_NETS = 3  # page_dfm keeps this many sample nets, or as many as examples
@@ -111,6 +144,17 @@ HOLE_SIZE_DEFAULT_MIL = 1.0
 MARGINAL_CAP_MIL = 1.0
 # Places: a spot is the meeting point rounded to this (mil), per layer and object pair.
 PLACE_MIL = 0.1
+# Typical DFA values used when the profile sets no limit (texts and info findings only,
+# never a fail; map_limits: Altium's fiducial article and the common rule of thumb):
+# global fiducials per assembled side, local fiducials near a fine-pitch part and the
+# pitch at or below which a part wants them, and the pitch fine_pitch lists as info.
+GLOBAL_FIDUCIALS = 3
+LOCAL_FIDUCIALS = 2
+LOCAL_FIDUCIAL_PITCH_MIL = 0.5 * MM
+FINE_PITCH_MIL = 0.5 * MM
+# Altium's DFA article: top-side SMD parts 125 mil from the edge without breakaway rails
+# (guidance in a reason text, not a default).
+PART_EDGE_GUIDANCE_MIL = 125.0
 
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 _SEQUENCE = itertools.count()
@@ -136,9 +180,38 @@ NOT_CHECKED = {
     "same_net_gaps": "Gaps between copper of one net (thermal relief air gaps, slivers) "
                      "are not checked.",
     "panels": "Embedded board arrays (panels) are not read.",
-    "assembly": "Assembly (DFA): part spacing, part to edge, fiducials and tombstoning are "
-                "not checked by this tool.",
+    "courtyards": "Courtyard outlines are not read: part spacing uses the 3D bodies' "
+                  "outlines and the pads' copper (a part without a body: a rectangle around "
+                  "its pads).",
+    "other_side_pins": "Part spacing compares parts on one side: through-hole pins and "
+                       "bodies reaching through to the other side are not checked against "
+                       "that side's parts (a bottom SMD part on a top connector's pins).",
+    "component_heights": "Component heights against an enclosure or a height limit are "
+                         "not checked.",
+    "pick_and_place": "Pick-and-place centroids and rotations are not checked.",
+    "paste_stencil": "Paste mask and stencil apertures (paste reduction, step stencils) "
+                     "are not checked.",
 }
+_SIDES = ("top", "bottom")
+
+
+@dataclass(frozen=True)
+class AssemblyContext:
+    """The active variant for the assembly checks. is_dnp: VariantState.is_dnp, applied
+    to a part's netlist name, else its PCB designator (None: every part fitted);
+    variant: its name; dnp_key: a hashable copy of its Not Fitted list (the cache key);
+    unique_parts: the BOM line count of the fitted parts when a netlist is loaded (as
+    get_bom groups them), None without one (then distinct footprint and Comment,
+    approximate); netlist_free: no netlist is loaded."""
+
+    variant: str | None = None
+    is_dnp: Callable[[str], bool] | None = field(default=None, compare=False)
+    dnp_key: tuple = ()
+    unique_parts: int | None = None
+    netlist_free: bool = False
+
+    def key(self) -> tuple:
+        return (self.variant, self.dnp_key, self.unique_parts, self.netlist_free)
 
 
 def _round(value, digits: int = 4):
@@ -259,8 +332,10 @@ def _place(layer, at, *keys) -> tuple:
 
 
 class _Review:
-    def __init__(self, index, profile, checks: tuple[str, ...], to_mm: bool):
+    def __init__(self, index, profile, checks: tuple[str, ...], to_mm: bool,
+                 variant: AssemblyContext | None = None):
         self.index = index
+        self.variant = variant or AssemblyContext()
         self.pcb = pcb = index.pcb
         self.profile = profile
         self.checks = checks
@@ -287,6 +362,13 @@ class _Review:
         self.hole_result = None
         self.wall_result = None  # hole walls to copper (spacing)
         self.hole_edge_result = None  # hole walls to the edge (copper_to_edge)
+        # Assembly: the active variant's placements and Not Fitted parts (built on first
+        # use), and the measured part gap and part edge of the checks run.
+        self._placements = None
+        self._placed: list | None = None
+        self._not_fitted: set[int] | None = None
+        self.part_gap = None  # (nearest PartGap | None, overlapping pairs, reach)
+        self.part_edge = None  # (distance, basis, reach) | (None, None, reach)
         self._position_names: dict[int, str] = {}
         self._short_rules: dict[tuple, bool] = {}
 
@@ -402,7 +484,7 @@ class _Review:
         return None
 
     def marginal_text(self, key: str, limit: float, side: str = "min",
-                      length: bool = True) -> str:
+                      length: bool = True, maker: str = "fabricator") -> str:
         """The marginal sentence: within tolerance_percent of the limit (or within
         MARGINAL_CAP_MIL, when that is the smaller), the published text when the profile
         has one, and mm/mil rounding only when it explains a miss (rounding)."""
@@ -419,7 +501,7 @@ class _Review:
                 text += (f"; rounded to {rounded} the limit is missed, so mm/mil rounding may "
                          "explain it")
             text += ")"
-        return text + "; confirm with the fabricator."
+        return text + f"; confirm with the {maker}."
 
     def group(self, check: str, severity: str, verdict: str = "miss", **fields) -> _Group:
         marginal = verdict == "marginal"
@@ -1749,11 +1831,11 @@ class _Review:
             group.count = len(over)
             group.describe = self._describe_copper(heaviest, name, ounces, len(over), severity)
 
-    def default_service(self, severity: str) -> str:
+    def default_service(self, severity: str, maker: str = "a fabricator can build") -> str:
         if severity != "info":
             return ""
         return (" Altimade is only the default profile here: this is what Altimade orders, "
-                "not what a fabricator can build (advisory).")
+                f"not what {maker} (advisory).")
 
     def _describe_layers(self, copper, counts, severity):
         def describe(group: _Group) -> str:
@@ -2039,6 +2121,646 @@ class _Review:
             return text
         return describe
 
+    # --- assembly (DFA) ---
+
+    def placements(self):
+        """dfm_assembly's placements for the active variant (computed once)."""
+        if self._placements is None:
+            self._placements = assembly.placements(self.index, self.variant.is_dnp)
+        return self._placements
+
+    def not_fitted(self) -> set[int]:
+        """Components Not Fitted in the active variant (any kind)."""
+        if self._not_fitted is None:
+            is_dnp = self.variant.is_dnp
+            self._not_fitted = {part.component for part in assembly.parts(self.index)
+                                if not part.fitted(is_dnp)}
+        return self._not_fitted
+
+    def placed_parts(self) -> list:
+        """The parts the assembler places, in designator order (computed once)."""
+        if self._placed is None:
+            parts = assembly.parts(self.index)
+            placed = [parts[component] for component in self.placements().components]
+            self._placed = sorted(placed, key=lambda part: natural_key(part.designator or ""))
+        return self._placed
+
+    def unique_parts(self) -> tuple[int, bool]:
+        """(unique parts, approximate): the BOM's line count with a netlist, else
+        distinct footprint and Comment of the placements."""
+        if self.variant.unique_parts is not None:
+            return self.variant.unique_parts, False
+        return self.placements().unique, True
+
+    def side_counts(self) -> dict[str, dict[str, int]]:
+        """Placements per side: SMD (mixed parts included) and THT (mixed included)."""
+        counts = self.placements().counts
+        return {side: {"smd": counts[side]["smd"] + counts[side]["mixed"],
+                       "tht": counts[side]["tht"] + counts[side]["mixed"],
+                       "all": sum(counts[side].values())} for side in _SIDES}
+
+    def part_example(self, part, at=None, **fields):
+        """An example naming a part: its designator, side and a point (its centre)."""
+        x, y = at if at is not None else part.centre
+        return self._example(x, y, object=self.designator(part.component), side=part.side,
+                             **fields)
+
+    def finest_pitch(self) -> float | None:
+        pitches = [part.pitch_mil for part in self.placed_parts() if part.pitch_mil is not None]
+        return min(pitches) if pitches else None
+
+    def check_part_counts(self) -> None:
+        """Placements (fitted parts of a BOM kind with soldered pads, fiducials left out)
+        and unique parts (the BOM's lines with a netlist, else distinct footprint and
+        Comment) against max_placements and max_unique_parts: Altimade's ordering
+        limits, info while Altimade is only the default."""
+        if self.no_limit("part_counts", "max_placements", "max_unique_parts"):
+            return
+        total = len(self.placements().components)
+        unique, approximate = self.unique_parts()
+        limits = {"placements": self.profile.get("max_placements"),
+                  "unique_parts": self.profile.get("max_unique_parts")}
+        entry = {"status": "pass", "limit": limits,
+                 "value": {"placements": total, "unique_parts": unique}}
+        if approximate:
+            entry["unique_parts_approximate"] = True
+        self.results["part_counts"] = entry
+        for key, name, value in (("max_placements", "placements", total),
+                                 ("max_unique_parts", "unique_parts", unique)):
+            limit = limits[name]
+            if limit is None or value <= limit:
+                continue
+            severity = self.profile.severity(key)
+            group = self.group("part_counts", severity, margin=(value - limit) / limit,
+                               **{name: value, key: limit})
+            group.count = 1
+            group.describe = self._describe_counts(name, value, limit, severity, approximate)
+
+    def _describe_counts(self, name, value, limit, severity, approximate):
+        def describe(group: _Group) -> str:
+            if name == "placements":
+                sides = self.side_counts()
+                text = (f"{value} placements ({sides['top']['all']} top, "
+                        f"{sides['bottom']['all']} bottom), above the profile's maximum of "
+                        f"{limit}. Counted: fitted parts of the active variant in the BOM "
+                        "with soldered pads, fiducials left out; ask the assembler how it "
+                        "counts.")
+            elif approximate:
+                text = (f"About {value} unique parts (distinct footprint and Comment: no "
+                        "netlist is loaded, so the BOM's lines cannot be counted), above the "
+                        f"profile's maximum of {limit}.")
+            else:
+                text = (f"{value} unique parts (the BOM lines of the active variant's fitted "
+                        "parts, grouped as get_bom groups them), above the profile's maximum "
+                        f"of {limit}.")
+            return text + self.default_service(severity, "an assembler can place")
+        return describe
+
+    def check_assembly_sides(self) -> None:
+        """Info whatever the profile: SMD parts on both sides (a second reflow; the count
+        is the bottom side's SMD parts) and through-hole parts on the bottom (selective,
+        wave or hand soldering). Counts are parts (a mixed part on the bottom is in
+        both)."""
+        sides = self.side_counts()
+        self.results["assembly_sides"] = {
+            "status": "pass", "sides": [side for side in _SIDES if sides[side]["all"]],
+        }
+        if sides["top"]["smd"] and sides["bottom"]["smd"]:
+            smd = {side: sides[side]["smd"] for side in _SIDES}
+            group = self.group("assembly_sides", "info", smd_parts=smd)
+            group.count = smd["bottom"]
+
+            def describe(group: _Group) -> str:
+                parts = "part" if smd["bottom"] == 1 else "parts"
+                return (f"{smd['bottom']} SMD {parts} on the bottom side and {smd['top']} on "
+                        "the top: two reflow passes, and the side reflowed first goes through "
+                        "the oven twice (heavy parts there may need glue). Confirm the "
+                        "assembler quotes double-sided assembly.")
+            group.describe = describe
+        bottom = [part for part in self.placed_parts()
+                  if part.side == "bottom" and part.mount in ("tht", "mixed")]
+        if bottom:
+            group = self.group("assembly_sides", "info", side="bottom", mount="tht")
+            for part in bottom:
+                group.add(0.0, self.part_example(part))
+
+            def describe_tht(group: _Group) -> str:
+                what, them = ("part", "it") if group.count == 1 else ("parts", "them")
+                return (f"{group.count} through-hole {what} on the bottom side: selective "
+                        "soldering, a wave pallet or hand soldering after reflow (an extra "
+                        f"step). Move {them} to the top if the design allows.")
+            group.describe = describe_tht
+
+    def check_part_spacing(self) -> None:
+        """Fitted parts closer than min_part_spacing to a same-side neighbour (the
+        smallest of body, body-to-pad and pad gaps) and placed parts whose outlines
+        overlap: a warning with the limit, advisory (info) without one. A part the
+        assembler does not place (a mechanical model, a mounting hole, a fiducial) over
+        fitted parts is its own info class, whatever the limit."""
+        out = self.not_fitted()
+        facts = assembly.part_spacing(self.index, out)  # each part's nearest fitted one
+        limit = self.profile.get("min_part_spacing")
+        placed = set(self.placements().components)
+        overlaps = [gap for gap in facts.overlaps
+                    if gap.first in placed and gap.second in placed]
+        unplaced = [gap for gap in facts.overlaps
+                    if gap.first not in placed or gap.second not in placed]
+        close = []
+        if limit is not None and limit > 0:
+            close = [gap for gap in assembly.close_pairs(self.index, limit)
+                     if gap.first not in out and gap.second not in out and not gap.overlap]
+        nearest = min([gap for gap in (facts.minimum(),) if gap] + close,
+                      key=lambda gap: (gap.gap_mil, gap.first, gap.second), default=None)
+        self.part_gap = (nearest, len(overlaps), facts.reach_mil)
+        if limit is None and not overlaps and not unplaced:
+            self.not_run("part_spacing", "the profile sets no min_part_spacing, and no "
+                                         "fitted parts' outlines overlap.")
+            return
+        entry = {"status": "pass", "limit_mil": _round(limit),
+                 "worst_mil": _round(nearest.gap_mil) if nearest else None}
+        if overlaps:
+            entry["overlapping_pairs"] = len(overlaps)
+        self.results["part_spacing"] = entry
+        classes: dict[tuple, _Group] = {}
+        severity = "info" if limit is None else "warning"
+        for gap in overlaps:
+            key = ("overlap", gap.basis)
+            if key not in classes:
+                group = classes[key] = self.group("part_spacing", severity, margin=1.0,
+                                                  basis=gap.basis, gap_mil=0.0)
+                group.describe = self._describe_overlap(gap.basis, limit)
+            classes[key].add(0.0, self._gap_example(gap))
+        self._unplaced_overlaps(unplaced, placed)
+        for gap in close:
+            verdict = self.below(gap.gap_mil, limit, CLEARANCE_TOLERANCE_MIL) or "marginal"
+            key = ("gap", gap.basis, verdict)
+            if key not in classes:
+                group = classes[key] = self.group(
+                    "part_spacing", "warning", verdict, margin=(limit - gap.gap_mil) / limit,
+                    basis=gap.basis, gap_mil=_round(gap.gap_mil),
+                )
+                group.range_keys = ("gap_mil", "gap_range_mil")
+                group.describe = self._describe_part_gap(gap.basis, limit)
+            classes[key].add(gap.gap_mil, self._gap_example(gap))
+
+    def _unplaced_overlaps(self, gaps, placed: set) -> None:
+        """One info class (not a miss) per part the assembler does not place whose
+        outline overlaps fitted parts: a 3D model without pads, a mounting hole, a
+        fiducial or a part not in the BOM."""
+        parts = assembly.parts(self.index)
+        classes: dict[int, _Group] = {}
+
+        def order(component: int) -> tuple:  # the unplaced part, else the first by name
+            return component in placed, natural_key(self.designator(component) or "")
+
+        owned = sorted(((min(gap.first, gap.second, key=order), gap) for gap in gaps),
+                       key=lambda item: (order(item[0]), item[1].first, item[1].second))
+        for owner, gap in owned:
+            if owner not in classes:
+                name, reason = self.designator(owner), self._unplaced_reason(parts[owner])
+                group = classes[owner] = self.group("part_spacing", "info", miss=False,
+                                                    object=name, not_placed=reason)
+                group.describe = self._describe_unplaced(name or "A part without a designator",
+                                                         reason)
+            classes[owner].add(0.0, self._gap_example(gap))
+
+    @staticmethod
+    def _unplaced_reason(part) -> str:
+        if part.fiducial:
+            return "a fiducial"
+        if part.mount == "no_pads":
+            return "a 3D model without pads"
+        if part.mount == "mechanical":
+            return "a mounting hole"
+        if part.kind not in assembly.BOM_KINDS:
+            return "not in the BOM"
+        return "not placed"
+
+    def _describe_unplaced(self, name, reason):
+        def describe(group: _Group) -> str:
+            parts = "part" if group.count == 1 else "parts"
+            return (f"{name}, which the assembler does not place ({reason}), overlaps the "
+                    f"outlines of {group.count} other {parts}: confirm it is meant to (a fan, "
+                    "heatsink or shield above them, a screw head's room) or fix its 3D body.")
+        return describe
+
+    def _gap_example(self, gap):
+        def make() -> dict:
+            first, second = sorted((self.designator(gap.first) or "", self.designator(
+                gap.second) or ""), key=natural_key)
+            return {"at_mil": self.at(*gap.at), "objects": f"{first} / {second}",
+                    "side": gap.side, "gap_mil": _round(gap.gap_mil)}
+        return make
+
+    def _describe_overlap(self, basis, limit):
+        def describe(group: _Group) -> str:
+            pairs = "pair" if group.count == 1 else "pairs"
+            if basis == "body":
+                text = (f"{group.count} {pairs} of placed parts whose 3D bodies overlap: they "
+                        "collide unless one sits over the other on purpose (a shield can, a "
+                        "part under a connector) or a body outline is wrong.")
+            elif basis == "mixed":
+                text = (f"{group.count} {pairs} of placed parts where one part's 3D body lies "
+                        "over the other's pads: the pads cannot be soldered under it unless it "
+                        "stands off on purpose; check the placement and the body.")
+            else:
+                text = (f"{group.count} {pairs} of placed parts whose pads overlap (pad copper, "
+                        "or a rectangle around the pads of a part without a 3D body): check "
+                        "the placement.")
+            if limit is None:
+                text += " The profile sets no min_part_spacing, so this is advisory."
+            return text
+        return describe
+
+    def _describe_part_gap(self, basis, limit):
+        what = {"body": "between their 3D body outlines",
+                "pads": "between their pads (pad copper, or a rectangle around the pads of a "
+                        "part without a 3D body)",
+                "mixed": "from one part's 3D body to the other's pads"}[basis]
+
+        def describe(group: _Group) -> str:
+            pairs = "pair" if group.count == 1 else "pairs"
+            span, minimum = self.gap_range(group, limit)
+            text = (f"{group.count} {pairs} of same-side parts closer than the "
+                    f"profile's minimum part spacing {minimum}: {span} {what}.")
+            if group.marginal:
+                text += self.marginal_text("min_part_spacing", limit, maker="assembler")
+            return text
+        return describe
+
+    def check_part_to_edge(self) -> None:
+        """Placed parts whose pad copper or 3D body is closer than min_part_to_edge to the
+        board outline or a cutout (a warning). Their own info classes, whatever the
+        limit: pads reaching or crossing the edge, bodies past it, edge connectors."""
+        facts = assembly.part_to_edge(self.index)
+        if not facts.has_outline:
+            self.not_run("part_to_edge", "the board has no outline.")
+            return
+        limit = self.profile.get("min_part_to_edge")
+        placed = set(self.placements().components)
+        parts = assembly.parts(self.index)
+        edges = sorted((edge for component, edge in facts.parts.items() if component in placed),
+                       key=lambda edge: natural_key(self.designator(edge.component) or ""))
+        measured = []  # (distance, basis, edge kind, point, part)
+        crossing, overhang, fingers = [], [], []
+        for edge in edges:
+            part = parts[edge.component]
+            if edge.fingers:
+                fingers.append(edge)
+                continue
+            if edge.crosses:
+                crossing.append(edge)
+                continue
+            if edge.overhang:
+                overhang.append(edge)
+            options = []
+            if edge.pad_distance_mil is not None:
+                options.append((edge.pad_distance_mil, "pads", edge.pad_edge, edge.pad_at))
+            if edge.body_distance_mil is not None and not edge.overhang:
+                options.append((edge.body_distance_mil, "body", edge.body_edge, edge.body_at))
+            if options:
+                measured.append((*min(options, key=lambda option: option[0]), part))
+        measured.sort(key=lambda item: (item[0], item[4].component))
+        nearest = measured[0] if measured else None
+        self.part_edge = ((nearest[0], nearest[1]) if nearest else (None, None),
+                          facts.reach_mil)
+        off = [component for component in facts.off_board if component in placed]
+        if off:
+            self.notes.append(
+                f"{len(off)} part(s) lie outside the board outline (parked?): part to edge "
+                "skips them; check_pcb_health's components_outside_board lists them."
+            )
+        self._edge_info(crossing, "crossing", lambda edge: edge.pad_at)
+        self._edge_info(overhang, "overhang", lambda edge: edge.body_at)
+        self._edge_info(fingers, "fingers", lambda edge: edge.pad_at)
+        if limit is None:
+            where = (f" the nearest placed part's {nearest[1]} {self.len(nearest[0])} from "
+                     "it (board_minimums)" if nearest else " no placed part within "
+                     f"{self.len(facts.reach_mil)} of it")
+            reason = ("the profile sets no min_part_to_edge (Altium's DFA guidance: "
+                      f"{self.len(PART_EDGE_GUIDANCE_MIL)} for top-side SMD without breakaway "
+                      f"rails; ask the assembler);{where}.")
+            if not (crossing or overhang or fingers):
+                self.not_run("part_to_edge", reason)
+                return
+            # Its own classes ran whatever the limit: a run entry, the distance unjudged.
+            self.results["part_to_edge"] = {
+                "status": "pass", "limit_mil": None,
+                "worst_mil": _round(nearest[0]) if nearest else None,
+                "note": "Not judged: " + reason,
+            }
+            return
+        self.results["part_to_edge"] = {
+            "status": "pass", "limit_mil": _round(limit),
+            "worst_mil": _round(nearest[0]) if nearest else None,
+        }
+        cutoff = limit - CLEARANCE_TOLERANCE_MIL
+        classes: dict[tuple, _Group] = {}
+        for distance, basis, kind, point, part in measured:
+            if distance >= cutoff:
+                break
+            verdict = self.below(distance, limit, CLEARANCE_TOLERANCE_MIL) or "marginal"
+            key = (basis, kind, verdict)
+            if key not in classes:
+                group = classes[key] = self.group(
+                    "part_to_edge", "warning", verdict, margin=(limit - distance) / limit,
+                    basis=basis, distance_mil=_round(distance),
+                )
+                group.range_keys = ("distance_mil", "distance_range_mil")
+                group.describe = self._describe_part_edge(basis, kind, limit)
+            classes[key].add(distance, self.part_example(part, point,
+                                                         distance_mil=_round(distance)))
+
+    def _edge_info(self, edges, kind, point) -> None:
+        """An info class of parts (not a miss): pads crossing the edge, bodies past it or
+        edge connectors."""
+        if not edges:
+            return
+        parts = assembly.parts(self.index)
+        group = self.group("part_to_edge", "info", miss=False, kind=kind)
+        for edge in edges:
+            part = parts[edge.component]
+            group.add(0.0, self.part_example(part, point(edge) or part.centre))
+        texts = {
+            "crossing": "whose pad copper reaches or crosses the board edge (or a pad lies "
+                        "off it): castellated or edge-mounted on purpose? Otherwise move "
+                        "{them} onto the board.",
+            "overhang": "whose 3D body reaches past the board edge (connectors usually do on "
+                        "purpose): confirm the assembler's rails and the panel allow it.",
+            "fingers": "with card-edge fingers (an edge connector): left out of part to edge; "
+                       "copper_to_edge reports the fingers' clearance.",
+        }
+
+        def describe(group: _Group) -> str:
+            what, them = ("placed part", "it") if group.count == 1 else ("placed parts", "them")
+            return f"{group.count} {what} {texts[kind].replace('{them}', them)}"
+        group.describe = describe
+
+    def _describe_part_edge(self, basis, kind, limit):
+        edge = "a board cutout" if kind == "cutout" else "the board outline"
+        what = "pad copper" if basis == "pads" else "3D body"
+
+        def describe(group: _Group) -> str:
+            parts, them = ("part", "it") if group.count == 1 else ("parts", "them")
+            span, minimum = self.gap_range(group, limit)
+            text = (f"{group.count} placed {parts} whose {what} is closer to {edge} than the "
+                    f"profile's minimum part to edge {minimum}: {span} from it. Move {them} "
+                    "in, or ask the assembler about breakaway rails.")
+            if group.marginal:
+                text += self.marginal_text("min_part_to_edge", limit, maker="assembler")
+            return text
+        return describe
+
+    def check_fiducials(self) -> None:
+        """Global fiducials per side with SMD placements against min_global_fiducials
+        (typical GLOBAL_FIDUCIALS as info when unset), and fine-pitch parts (pitch at or
+        below local_fiducial_pitch, typical LOCAL_FIDUCIAL_PITCH_MIL as info) with fewer
+        than LOCAL_FIDUCIALS fiducials within dfm_assembly.LOCAL_FIDUCIAL_MIL."""
+        counts = assembly.fiducial_counts(self.index)
+        minimum = self.profile.get("min_global_fiducials")
+        wanted = GLOBAL_FIDUCIALS if minimum is None else minimum
+        pitch_limit = self.profile.get("local_fiducial_pitch")
+        pitch = LOCAL_FIDUCIAL_PITCH_MIL if pitch_limit is None else pitch_limit
+        sides = self.side_counts()
+        # Two counts, not one objects: global fiducials missing per side, and fine-pitch
+        # parts short of local ones.
+        missing = {side: 0 for side in _SIDES}
+        entry = self.results["fiducials"] = {
+            "status": "pass", "limit": minimum,
+            "value": {side: counts.get(side, 0) for side in _SIDES},
+            "local_fiducial_pitch_mil": _round(pitch_limit),
+            "missing_global": missing, "local_parts": 0,
+        }
+        wanted_key = "typical_global_fiducials" if minimum is None else "min_global_fiducials"
+        for side in _SIDES:
+            have = counts.get(side, 0)
+            if not sides[side]["smd"] or have >= wanted:
+                continue
+            severity = "info" if minimum is None else "warning"
+            group = self.group("fiducials", severity, margin=(wanted - have) / wanted,
+                               side=side, fiducials=have, **{wanted_key: wanted})
+            group.count = missing[side] = wanted - have
+            group.describe = self._describe_global(side, have, wanted, sides[side]["smd"],
+                                                   minimum is None)
+        if pitch <= 0:
+            return
+        fine = [part for part in self.placed_parts()
+                if part.pitch_mil is not None and part.pitch_mil <= pitch + EPS_MIL
+                and (part.near_fiducials or 0) < LOCAL_FIDUCIALS]
+        entry["local_parts"] = len(fine)
+        if not fine:
+            return
+        pitch_key = ("typical_local_fiducial_pitch_mil" if pitch_limit is None
+                     else "local_fiducial_pitch_mil")
+        group = self.group("fiducials", "info" if pitch_limit is None else "warning",
+                           **{pitch_key: _round(pitch)})
+        group.range_keys = ("pitch_mil", "pitch_range_mil")
+        for part in sorted(fine, key=lambda part: part.pitch_mil):
+            group.add(part.pitch_mil, self.part_example(
+                part, pitch_mil=_round(part.pitch_mil), fiducials_nearby=part.near_fiducials))
+        group.describe = self._describe_local(pitch, pitch_limit is None)
+
+    def _describe_global(self, side, have, wanted, smd, typical):
+        def describe(group: _Group) -> str:
+            found = ("No global fiducials" if not have else "1 global fiducial" if have == 1
+                     else f"{have} global fiducials")
+            placements = "placement" if smd == 1 else "placements"
+            text = f"{found} on the {side} side, which has {smd} SMD {placements}; "
+            if typical:
+                return text + (f"assemblers typically want {wanted}, far apart near the "
+                               "board corners (the profile sets no min_global_fiducials). "
+                               "Fiducials on the panel's rails may cover it: confirm with "
+                               "the assembler.")
+            return text + f"the profile asks for {wanted} per assembled side."
+        return describe
+
+    def _describe_local(self, pitch, typical):
+        reach = _text(assembly.LOCAL_FIDUCIAL_MIL, self.to_mm, 0)
+
+        def describe(group: _Group) -> str:
+            parts, have, its = (("part", "has", "its") if group.count == 1
+                                else ("parts", "have", "their"))
+            text = (f"{group.count} fitted {parts} with a pad pitch of {self.len(pitch)} or "
+                    f"finer (finest {self.len(group.low)}) {have} fewer than "
+                    f"{LOCAL_FIDUCIALS} fiducials within {reach} on {its} side: add two local "
+                    "fiducials diagonally outside each part, or confirm with the assembler "
+                    "that the global ones suffice.")
+            if typical:
+                text += (f" {self.len(pitch)} is a common rule of thumb, not the profile's "
+                         "(it sets no local_fiducial_pitch).")
+            return text
+        return describe
+
+    def check_tombstoning(self) -> None:
+        """Fitted small two-terminal passives (0603 or smaller, or a pad span within
+        0603's) whose terminals meet their copper unequally: one direct-connected to area
+        copper and the other not (a warning), or, neither touching area copper, one on a
+        much wider track (info: an imbalance to review)."""
+        placed = set(self.placements().components)
+        parts = assembly.parts(self.index)
+        found = [tomb for tomb in assembly.tombstoning(self.index)
+                 if tomb.small and tomb.component in placed]
+        self.results["tombstoning"] = {"status": "pass", "small_passives": len(found)}
+        classes: dict[tuple, _Group] = {}
+        found.sort(key=lambda tomb: natural_key(self.designator(tomb.component) or ""))
+        for tomb in found:
+            if not tomb.causes:
+                continue
+            key = (tomb.size_code, tomb.causes)
+            if key not in classes:
+                severity = "warning" if "direct" in tomb.causes else "info"
+                group = classes[key] = self.group(
+                    "tombstoning", severity, size_code=tomb.size_code,
+                    cause=" and ".join(tomb.causes),
+                )
+                group.describe = self._describe_tombstone(tomb.size_code, tomb.causes)
+            fields = {"connections": [pad.style for pad in tomb.pads]}
+            if "track" in tomb.causes:
+                fields["tracks_mil"] = [_round(pad.widest_track_mil) for pad in tomb.pads]
+            classes[key].add(0.0, self.part_example(parts[tomb.component], **fields),
+                             nets=[self.net(pad.net) for pad in tomb.pads])
+
+    def _describe_tombstone(self, size, causes):
+        def describe(group: _Group) -> str:
+            noun = "two-terminal passive" if group.count == 1 else "two-terminal passives"
+            what = (f"{group.count} fitted {size} {noun}" if size else
+                    f"{group.count} fitted small {noun} (size unknown, pad span within "
+                    "0603's)")
+            texts = []
+            if "direct" in causes:
+                texts.append(
+                    "one pad connected directly to a pour, region or fill of its net and the "
+                    "other not: the direct pad heats more slowly in reflow, so the part can "
+                    "tombstone. Give the pour thermal reliefs (PolygonConnect rule) or "
+                    "connect both pads alike."
+                )
+            if "track" in causes:
+                texts.append(
+                    "no area copper at either pad, and one pad on a track at least "
+                    f"{self.len(assembly.TRACK_IMBALANCE_MIL)} wide and "
+                    f"{assembly.TRACK_IMBALANCE_RATIO:g} times the other pad's widest track: "
+                    "a thermal imbalance to review (a tombstoning risk, not a certainty); "
+                    "neck the track down at the pad."
+                )
+            return f"{what} with " + " Also ".join(texts)
+        return describe
+
+    def check_fine_pitch(self) -> None:
+        """Fitted parts whose pad pitch (the nearest pad centres of two terminals, for 4
+        or more SMD terminals) is below min_pitch (an error); without the limit, parts at
+        FINE_PITCH_MIL or finer as info."""
+        limit = self.profile.get("min_pitch")
+        pitched = sorted((part for part in self.placed_parts() if part.pitch_mil is not None),
+                         key=lambda part: part.pitch_mil)
+        finest = pitched[0].pitch_mil if pitched else None
+        altimade = "altimade" in (self.profile.key, self.profile.based_on)
+        unpublished = (" (Altimade checks component pitch but publishes no number)"
+                       if altimade else "")
+        if limit is None:
+            fine = [part for part in pitched if part.pitch_mil <= FINE_PITCH_MIL + EPS_MIL]
+            if not fine:
+                where = (f"the finest pitch is {self.len(finest)}" if finest is not None
+                         else "no fitted part has 4 or more SMD terminals")
+                self.not_run("fine_pitch", f"the profile sets no min_pitch{unpublished}; "
+                                           f"{where}.")
+                return
+            self.results["fine_pitch"] = {"status": "pass", "limit_mil": None,
+                                          "worst_mil": _round(finest)}
+            group = self.group("fine_pitch", "info",
+                               typical_fine_pitch_mil=_round(FINE_PITCH_MIL))
+            group.range_keys = ("pitch_mil", "pitch_range_mil")
+            for part in fine:
+                group.add(part.pitch_mil, self.part_example(part,
+                                                            pitch_mil=_round(part.pitch_mil)))
+
+            def describe(group: _Group) -> str:
+                parts = "part" if group.count == 1 else "parts"
+                return (f"{group.count} fitted {parts} with a pad pitch of "
+                        f"{self.len(FINE_PITCH_MIL)} or finer (finest {self.len(group.low)}): "
+                        f"the profile sets no min_pitch{unpublished}, so confirm the "
+                        "assembler places this pitch (stencil and paste too).")
+            group.describe = describe
+            return
+        self.results["fine_pitch"] = {"status": "pass", "limit_mil": _round(limit),
+                                      "worst_mil": _round(finest)}
+        classes: dict[tuple, _Group] = {}
+        for part in pitched:
+            verdict = self.below(part.pitch_mil, limit, EPS_MIL)
+            if verdict is None:
+                break
+            key = (round(part.pitch_mil, 1), verdict)
+            if key not in classes:
+                group = classes[key] = self.group(
+                    "fine_pitch", "error", verdict, margin=(limit - part.pitch_mil) / limit,
+                    pitch_mil=_round(part.pitch_mil), min_pitch_mil=_round(limit),
+                )
+                group.describe = self._describe_pitch(part.pitch_mil, limit)
+            classes[key].add(part.pitch_mil, self.part_example(
+                part, pitch_mil=_round(part.pitch_mil)))
+
+    def _describe_pitch(self, pitch, limit):
+        def describe(group: _Group) -> str:
+            value, minimum = self.pair(pitch, limit)
+            parts = "part" if group.count == 1 else "parts"
+            text = (f"{group.count} fitted {parts} with a pad pitch of {value}, below the "
+                    f"profile's minimum pitch {minimum}.")
+            if group.marginal:
+                text += self.marginal_text("min_pitch", limit, maker="assembler")
+            return text
+        return describe
+
+    def assembly_minimums(self, out: dict, not_measured: list) -> None:
+        """What the board asks of any assembler for the active variant: placements per
+        side (mixed parts counted as THT), unique parts, fiducials per side, the finest
+        pitch of the fitted parts, and the part gap and part to edge when their check
+        ran."""
+        counts = self.placements().counts
+        out["placements"] = {}
+        for side in _SIDES:
+            out["placements"][f"{side}_smd"] = counts[side]["smd"]
+            out["placements"][f"{side}_tht"] = counts[side]["tht"] + counts[side]["mixed"]
+        unique, approximate = self.unique_parts()
+        out["unique_parts"] = {"value": unique, "approximate": approximate}
+        fiducials = assembly.fiducial_counts(self.index)
+        out["fiducials"] = {side: fiducials.get(side, 0) for side in _SIDES}
+        out["min_pitch_mil"] = _round(self.finest_pitch())
+        if self.part_gap is not None:
+            gap, overlapping, reach = self.part_gap
+            out["min_part_gap"] = {
+                "value_mil": _round(gap.gap_mil) if gap else None,
+                "basis": gap.basis if gap else None, "reach_mil": _round(reach),
+            }
+            if overlapping:
+                out["min_part_gap"]["overlapping_pairs"] = overlapping
+        else:
+            not_measured.append("min_part_gap")
+        if self.part_edge is not None:
+            (distance, basis), reach = self.part_edge
+            out["min_part_to_edge"] = {"value_mil": _round(distance), "basis": basis,
+                                       "reach_mil": _round(reach)}
+        else:
+            not_measured.append("min_part_to_edge")
+
+    def assembly_notes(self) -> list[str]:
+        if not any(check in self.checks for check in _ASSEMBLY):
+            return []
+        name = self.variant.variant
+        text = (f"Assembly checks are for the active variant '{name}': its Not Fitted parts "
+                "are left out (placements, unique parts, spacing, part to edge, the parts "
+                "wanting local fiducials, tombstoning, pitch and their board minimums). "
+                "Fiducials are counted whatever the variant: their copper is on the bare "
+                "board." if name else
+                "Assembly checks count every part as fitted (no variant given).")
+        if self.variant.netlist_free:
+            text += (" No netlist is loaded: Not Fitted parts come from the designators "
+                     "stored in the project's variants, and unique parts are approximate.")
+        notes = [text]
+        if "part_spacing" in self.checks or "part_to_edge" in self.checks:
+            notes.append("Part outlines are the 3D bodies on the part's side and its pads' "
+                         "copper (a part without a body: a rectangle around its pads): a "
+                         "missing or oversized body changes part spacing and part to edge.")
+        return notes
+
     # --- board facts ---
 
     def board(self) -> dict:
@@ -2140,6 +2862,7 @@ class _Review:
         for name in ("worst_aspect_ratio", "worst_microvia_aspect_ratio"):
             if name in minimums:
                 out[name] = minimums[name]
+        self.assembly_minimums(out, not_measured)
         if not_measured:
             out["not_measured"] = not_measured
         return out
@@ -2205,7 +2928,7 @@ class _Review:
                 entry["objects"] = len(entry.get("rules", ()))
                 if entry["objects"]:
                     severities.append("warning")
-            else:
+            elif check != "fiducials":  # fiducials: missing_global and local_parts
                 entry["objects"] = sum(group.count for group in mine if group.miss)
             entry["groups"] = len(mine)
             if severities:
@@ -2263,11 +2986,13 @@ class _Review:
                 parts.append(f"{shelved} shelved pour(s) have no copper here")
             notes.append("; ".join(parts) + ": repour and save (check_pcb_health "
                          "shelved_modified_polygons).")
+        notes += self.assembly_notes()
         if self.profile.chosen_by == "default":
             notes.append("No fabricator was chosen, so Altimade's published limits were "
                          "used; its service-only limits (layer counts, board size, copper "
-                         "weight) are info, and a check missing only those is advisory. "
-                         "Other fabricators differ: pass profile or limits.")
+                         "weight, placements and unique parts) are info, and a check "
+                         "missing only those is advisory. Other fabricators differ: pass "
+                         "profile or limits.")
         notes.append(
             "Holes are as drawn (Altium's finished hole); fabricators drill larger for "
             "plating. Example locations are relative to the board origin (origin_mil, or "
@@ -2293,22 +3018,25 @@ def _selected(checks) -> tuple[tuple[str, ...] | None, dict | None]:
     return tuple(check for check in CHECKS if check in requested), None
 
 
-def review_dfm(index, profile, checks: list[str] | None = None, to_mm: bool = False) -> dict:
+def review_dfm(index, profile, checks: list[str] | None = None, to_mm: bool = False,
+               variant: AssemblyContext | None = None) -> dict:
     """The whole DFM review of the board against profile, unpaged (page_dfm pages it), or
-    {"error": "invalid_checks", ...}. Cached on the index per (checks, profile, units):
-    treat the result as read-only."""
+    {"error": "invalid_checks", ...}. variant: the active variant for the assembly checks
+    and board minimums (None: every part fitted, unique parts approximate). Cached on the
+    index per (checks, profile, units, variant): treat the result as read-only."""
     selected, error = _selected(checks)
     if error:
         return error
+    variant = variant or AssemblyContext()
     key = (selected, to_mm, profile.cache_key(),
-           json.dumps(profile.echo(to_mm), sort_keys=True, default=str))
+           json.dumps(profile.echo(to_mm), sort_keys=True, default=str), variant.key())
     cache = getattr(index, "_dfm_cache", None)
     if cache is None:
         cache = index._dfm_cache = {}
     if key not in cache:
         if len(cache) >= CACHE_SIZE:
             cache.pop(next(iter(cache)))
-        review = _Review(index, profile, selected, to_mm)
+        review = _Review(index, profile, selected, to_mm, variant)
         try:
             cache[key] = review.run()
         finally:

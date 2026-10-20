@@ -67,6 +67,7 @@ WORKING_TOOL_CALLS = {
     "check_dfm": lambda: main.check_dfm(),
     "get_drc_report": lambda: main.get_drc_report(),
     "constraints_review": lambda: main.constraints_review(),
+    "pcb_manufacturing_review": lambda: main.pcb_manufacturing_review(),
     "get_design_notes": lambda: main.get_design_notes(),
     "get_design_image": lambda: main.get_design_image("Fab.PCBDwf"),
     "list_variants": lambda: main.list_variants(),
@@ -170,7 +171,7 @@ def test_other_tools_work_without_netlist(env, tool):
         return
     try:
         error = json.loads(result).get("error")
-    except ValueError:  # constraints_review returns a prompt, not JSON
+    except ValueError:  # the review tools return a prompt, not JSON
         error = None
     # There is no DRC report in the project folder, and it is no Altium 365 clone;
     # everything else answers.
@@ -212,6 +213,8 @@ def test_constraints_review_explains_the_missing_netlist(env):
     review = main.constraints_review()
     assert "Netlist-free load" in review
     assert "get_component_placement" in review
+    manufacturing = main.pcb_manufacturing_review()
+    assert "Netlist-free load" in manufacturing and "approximate" in manufacturing
 
 
 def test_stale_cached_netlist_is_not_used(env):
@@ -248,6 +251,7 @@ def test_without_a_project_tools_still_say_no_project(env):
         assert json.loads(call(*args))["error"] == "no_project"
     assert json.loads(main.schematic_review())["error"] == "no_project"
     assert json.loads(main.constraints_review())["error"] == "no_project"
+    assert json.loads(main.pcb_manufacturing_review())["error"] == "no_project"
 
 
 LITE_VARIANT = "[ProjectVariant2]\nDescription=Lite\nVariationCount=0\n"
