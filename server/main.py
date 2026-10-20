@@ -752,7 +752,12 @@ def get_clone_status(project_dir: str | None = None) -> str:
     if not Path(project_dir).is_dir():
         return json.dumps({"error": "folder_not_found",
                            "message": f"Folder not found: {project_dir}"})
-    status = clone_status(project_dir)
+    try:
+        status = clone_status(project_dir)
+    except Exception as error:
+        logging.warning("Altium 365 clone status failed: %s", error)
+        return json.dumps({"error": "clone_status_failed",
+                           "message": f"{type(error).__name__}: {error}"})
     if status.get("altium365") is False:
         return json.dumps({
             "error": "not_an_altium365_clone",
@@ -772,6 +777,80 @@ def _project_context(project_dir: str) -> str | None:
     """The project folder's CLAUDE.md, if any."""
     claude_md = list(Path(project_dir).glob("CLAUDE.md")) + list(Path(project_dir).glob("claude.md"))
     return claude_md[0].read_text(encoding="utf-8") if claude_md else None
+
+
+def _load_cached_netlist(project_dir: str, prj_pcb_path: str, prj_data, net_path: Path,
+                         netlist_mtime: float | None = None) -> str:
+    """Full load from an up-to-date .NET on disk, without Altium."""
+    global _project, _variant_state, _netlist_last_updated
+    project_name = Path(prj_pcb_path).stem
+    sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
+    _project = None
+    _variant_state = None
+    _altium._netlist = None
+    _netlist_last_updated = None
+    _pcb_session.__init__()
+    _altium.load_netlist_from_file(str(net_path), prj_data.sheet_paths, prj_data.annotation_paths)
+    _project = {
+        "name": project_name,
+        "root_dir": project_dir,
+        "prj_pcb_path": prj_pcb_path,
+        "sheets": sheets,
+        **_project_documents(prj_data),
+    }
+    _variant_state = VariantState(prj_data.variants)
+    _resolve_dnp_uids(_variant_state, _altium._netlist)
+    _netlist_last_updated = datetime.now(timezone.utc).isoformat()
+    if netlist_mtime is None:
+        upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
+    else:
+        upsert_registry_entry(Path(prj_pcb_path).name, project_dir, netlist_mtime=netlist_mtime)
+    response = {
+        "loaded": True,
+        "project": project_name,
+        "sheets": [s["name"] for s in sheets],
+        "sheet_count": len(sheets),
+        "variants": [v.name for v in prj_data.variants],
+        "variant_count": len(prj_data.variants),
+        "netlist_updated_utc": _netlist_last_updated,
+        **_load_diagnostics(_altium._netlist or {}),
+        **_design_info(prj_data),
+        **_altium365_info(project_dir),
+    }
+    context = _project_context(project_dir)
+    if context is not None:
+        response["project_context"] = context
+    return json.dumps(response, indent=2)
+
+
+def _load_unregistered_netlist(project_dir: str, prj_pcb_path: str) -> str | None:
+    """Full load from a .NET that is up to date but not the one the registry recorded
+    (Altium regenerated it on its own, the folder moved, a new registry), or None.
+    With several candidates (e.g. an archived copy of the project in a subfolder) only
+    the one in the project's output folder is trusted."""
+    name = Path(prj_pcb_path).stem
+    matches = list(Path(project_dir).rglob(f"{name}.NET")) or list(Path(project_dir).rglob(f"{name}.net"))
+    if not matches:
+        return None
+    try:
+        prj_data = parse_prj_pcb(prj_pcb_path)
+        if len(matches) == 1:
+            net_path = matches[0]
+        else:
+            output = PureWindowsPath(prj_data.output_path or f"Project Outputs for {name}")
+            output_dir = (Path(*output.parts) if output.is_absolute()
+                          else Path(prj_pcb_path).parent / Path(*output.parts)).resolve()
+            net_path = next((m for m in matches if m.parent.resolve() == output_dir), None)
+            if net_path is None:
+                return None
+        sources = netlist_sources(prj_pcb_path, prj_data.sheet_paths, prj_data.annotation_paths)
+        if not prj_data.sheet_paths or not is_netlist_fresh(net_path, sources):
+            return None
+        return _load_cached_netlist(project_dir, prj_pcb_path, prj_data, net_path,
+                                    netlist_mtime=net_path.stat().st_mtime)
+    except Exception as e:
+        logging.warning("Unregistered netlist not loaded: %s", e)
+        return None
 
 
 def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool) -> dict:
@@ -897,43 +976,9 @@ def set_project_dir(project_dir: str) -> str:
                             )
                             _stale_cache = bool(prj_data.sheet_paths) and not _fresh
                             if _fresh:
-                                sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
-                                _project = None
-                                _variant_state = None
-                                _altium._netlist = None
-                                _netlist_last_updated = None
-                                _pcb_session.__init__()
-                                _altium.load_netlist_from_file(
-                                    str(_net_matches[0]), prj_data.sheet_paths,
-                                    prj_data.annotation_paths,
+                                return _load_cached_netlist(
+                                    project_dir, prj_pcb_path, prj_data, _net_matches[0]
                                 )
-                                _project = {
-                                    "name": project_name,
-                                    "root_dir": project_dir,
-                                    "prj_pcb_path": prj_pcb_path,
-                                    "sheets": sheets,
-                                    **_project_documents(prj_data),
-                                }
-                                _variant_state = VariantState(prj_data.variants)
-                                _resolve_dnp_uids(_variant_state, _altium._netlist)
-                                _netlist_last_updated = datetime.now(timezone.utc).isoformat()
-                                upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
-                                response = {
-                                    "loaded": True,
-                                    "project": project_name,
-                                    "sheets": [s["name"] for s in sheets],
-                                    "sheet_count": len(sheets),
-                                    "variants": [v.name for v in prj_data.variants],
-                                    "variant_count": len(prj_data.variants),
-                                    "netlist_updated_utc": _netlist_last_updated,
-                                    **_load_diagnostics(_altium._netlist or {}),
-                                    **_design_info(prj_data),
-                                    **_altium365_info(project_dir),
-                                }
-                                _context = _project_context(project_dir)
-                                if _context is not None:
-                                    response["project_context"] = _context
-                                return json.dumps(response, indent=2)
                     except Exception as e:
                         logging.warning("Registry cache shortcut failed: %s", e)
             break
@@ -942,6 +987,9 @@ def set_project_dir(project_dir: str) -> str:
     # project still loads from its files, without a netlist.
     status = _altium.get_status()
     if not status.get("running"):
+        loaded = None if _stale_cache else _load_unregistered_netlist(project_dir, prj_pcb_path)
+        if loaded is not None:
+            return loaded
         return json.dumps(_load_netlist_free(project_dir, prj_pcb_path, _stale_cache), indent=2)
     if status.get("warning") == "no_sheet_open":
         return json.dumps({
@@ -1055,7 +1103,7 @@ def refresh_netlist() -> str:
     except ProjectNotReady as e:
         return json.dumps(e.payload)
     if netlist is None:
-        return set_project_dir(project["root_dir"])
+        return _reload_partial(project, variant_state)
     # Re-read the sheet list so sheets added, moved or removed since load are picked up
     # and the sheet names stay in step with the components' sheet attribution.
     prj_data = None
@@ -1134,6 +1182,33 @@ def refresh_netlist() -> str:
     if variant_note:
         result["variant_note"] = variant_note
     return json.dumps(result)
+
+
+def _reload_partial(project: dict, variant_state: VariantState) -> str:
+    """refresh_netlist after a netlist-free load: load the project again, fully once
+    Altium has it open. The active variant stays; if the full load fails after it
+    cleared the state, the partial load is restored."""
+    active = variant_state.active.name
+    result = json.loads(set_project_dir(project["root_dir"]))
+    if "error" in result and _project is None:
+        if _load_netlist_free(project["root_dir"], project["prj_pcb_path"], False).get("loaded"):
+            result["partial_load_kept"] = True
+            result["message"] = (
+                result.get("message", "") + " The partial load is kept: board, rule, notes "
+                "and variant tools still work."
+            ).strip()
+    if _variant_state is not None:
+        if _variant_state.get(active):
+            _variant_state.set_variant(active)
+        else:
+            result["variant_note"] = (
+                f"The active variant '{active}' is no longer in the project (renamed or "
+                f"deleted); '{_variant_state.active.name}' is active now. Ask the user which "
+                "variant to work in, then call set_active_variant."
+            )
+        if "error" not in result:
+            result["active_variant"] = _variant_state.active.name
+    return json.dumps(result, indent=2)
 
 
 # ---------- query_net ----------
