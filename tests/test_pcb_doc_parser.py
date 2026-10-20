@@ -5,6 +5,7 @@ import pytest
 
 from server.parsers.pcb_doc import (
     NO_NET,
+    PAD_SHAPE_ROUNDRECT,
     PcbData,
     decode_arcs,
     decode_board,
@@ -249,6 +250,9 @@ def _pad_record(
     rotation=90.0,
     shape=2,
     extra_sub=b"",
+    mode=0,
+    bottom_size=None,
+    bottom_shape=None,
 ) -> bytes:
     name_bytes = name.encode("latin-1")
     name_blob = bytes([len(name_bytes)]) + name_bytes
@@ -257,9 +261,14 @@ def _pad_record(
     struct.pack_into("<H", main, 3, net)
     struct.pack_into("<H", main, 7, component)
     struct.pack_into("<ii", main, 13, x, y)
-    struct.pack_into("<iiiiiii", main, 21, sx, sy, sx, sy, sx, sy, hole)
-    main[49] = shape
+    bottom_x, bottom_y = bottom_size or (sx, sy)
+    struct.pack_into(
+        "<iiiiiii", main, 21, sx, sy, sx, sy, bottom_x, bottom_y, hole
+    )
+    main[49] = main[50] = shape
+    main[51] = shape if bottom_shape is None else bottom_shape
     struct.pack_into("<d", main, 52, rotation)
+    main[62] = mode
     subrecords = [b"\x00", b"\x00" * 5, b"\x00", bytes(main), extra_sub]
     body = struct.pack("<I", len(name_blob)) + name_blob
     for subrecord in subrecords:
@@ -306,6 +315,106 @@ def test_decode_pads_out_of_range_layer_skipped():
     primitives, skipped = decode_pads(_pad_record(layer=200))
     assert primitives == []
     assert skipped == 1
+
+
+def _size_and_shape(alt=None, radius=None, length=651) -> bytes:
+    """A size-and-shape subrecord: {slot: alt shape} at 532 and {slot:
+    corner radius percent} at 564 (slot 0 top, 31 bottom)."""
+    record = bytearray(length)
+    for slot, value in (alt or {}).items():
+        record[532 + slot] = value
+    for slot, value in (radius or {}).items():
+        record[564 + slot] = value
+    return bytes(record)
+
+
+def test_decode_pads_rounded_rectangle():
+    data = _pad_record(
+        sx=40_0000,
+        sy=60_0000,
+        shape=1,
+        extra_sub=_size_and_shape(alt={0: 9}, radius={0: 25}),
+    )
+    (pad,), skipped = decode_pads(data)
+    assert skipped == 0
+    assert (pad.shape, pad.width, pad.height) == (
+        PAD_SHAPE_ROUNDRECT,
+        40.0,
+        60.0,
+    )
+    # 25 % of half the shorter side.
+    assert pad.corner_radius == pytest.approx(5.0)
+
+
+@pytest.mark.parametrize(
+    "shape, size_and_shape",
+    [
+        (1, _size_and_shape(alt={0: 1})),
+        # Only a round main shape becomes a rounded rectangle (as in KiCad).
+        (2, _size_and_shape(alt={0: 9}, radius={0: 25})),
+        # Too short to hold the alt shapes.
+        (1, _size_and_shape(alt={0: 9}, radius={0: 25}, length=595)),
+        (1, b""),
+    ],
+)
+def test_decode_pads_without_rounded_corners(shape, size_and_shape):
+    (pad,), _ = decode_pads(
+        _pad_record(shape=shape, extra_sub=size_and_shape)
+    )
+    assert (pad.shape, pad.corner_radius) == (shape, None)
+
+
+def test_decode_pads_corner_radius_capped_at_oblong():
+    data = _pad_record(
+        sx=40_0000,
+        sy=60_0000,
+        shape=1,
+        extra_sub=_size_and_shape(alt={0: 9}, radius={0: 150}),
+    )
+    (pad,), _ = decode_pads(data)
+    assert pad.corner_radius == pytest.approx(20.0)
+
+
+def test_decode_pads_bottom_pad_of_full_stack_uses_bottom_slot():
+    # Altium leaves the top slot of such a pad empty: it was dropped before.
+    data = _pad_record(
+        layer=32,
+        sx=0,
+        sy=0,
+        shape=1,
+        mode=2,
+        bottom_size=(40_0000, 60_0000),
+        bottom_shape=1,
+        extra_sub=_size_and_shape(alt={0: 1, 31: 9}, radius={31: 50}),
+    )
+    (pad,), skipped = decode_pads(data)
+    assert skipped == 0
+    assert (pad.layer, pad.width, pad.height, pad.shape) == (
+        32,
+        40.0,
+        60.0,
+        PAD_SHAPE_ROUNDRECT,
+    )
+    assert pad.corner_radius == pytest.approx(10.0)
+
+
+def test_decode_pads_bottom_pad_of_simple_stack_uses_top_slot():
+    data = _pad_record(
+        layer=32,
+        sx=40_0000,
+        sy=60_0000,
+        shape=1,
+        bottom_size=(1, 1),
+        bottom_shape=2,
+        extra_sub=_size_and_shape(alt={0: 9, 31: 1}, radius={0: 50}),
+    )
+    (pad,), _ = decode_pads(data)
+    assert (pad.width, pad.height, pad.shape) == (
+        40.0,
+        60.0,
+        PAD_SHAPE_ROUNDRECT,
+    )
+    assert pad.corner_radius == pytest.approx(10.0)
 
 
 def _pad_record_with_main(main_length: int, pin_package: int | None) -> bytes:

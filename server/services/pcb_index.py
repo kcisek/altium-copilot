@@ -6,7 +6,7 @@ import sqlite3
 from collections import defaultdict
 
 try:
-    from parsers.pcb_doc import PcbData
+    from parsers.pcb_doc import PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PcbData
     from services.pcb_rules import (
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
     )
@@ -21,7 +21,9 @@ try:
         seg_seg_distance,
     )
 except ImportError:
-    from server.parsers.pcb_doc import PcbData
+    from server.parsers.pcb_doc import (
+        PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PcbData,
+    )
     from server.services.pcb_rules import (
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
     )
@@ -81,6 +83,7 @@ CREATE TABLE prims (
     height REAL,
     rotation REAL,
     shape INTEGER,
+    corner_radius REAL,
     source_id INTEGER,
     hole REAL,
     pad_name TEXT,
@@ -121,7 +124,14 @@ class PcbIndex:
             return getattr(primitive, name)
 
     def _primitive_geometry(self, primitive):
-        """Return (segment, radius, polygon) for exact copper distance."""
+        """Return (segment, radius, polygon) for exact copper distance.
+
+        The copper is the segment or the polygon grown by radius: a track or
+        arc chord is its centreline grown by half its width, a round or
+        oblong pad a capsule, a rectangle its polygon (radius 0), and a
+        rounded rectangle its core rectangle (each side shorter by twice the
+        corner radius) grown by the corner radius.
+        """
         kind = self._field(primitive, "kind")
         x1 = self._field(primitive, "x1")
         y1 = self._field(primitive, "y1")
@@ -134,8 +144,15 @@ class PcbIndex:
         height = self._field(primitive, "height") or width
         rotation = self._field(primitive, "rotation") or 0.0
         shape = self._field(primitive, "shape")
-        if shape == 1:
-            minor = min(width, height)
+        minor = min(width, height)
+        corner = 0.0
+        if shape == PAD_SHAPE_ROUNDRECT:
+            try:
+                corner = self._field(primitive, "corner_radius") or 0.0
+            except AttributeError:
+                corner = 0.0
+            corner = max(0.0, min(corner, minor / 2.0))
+        if shape == PAD_SHAPE_ROUND or (corner > 0 and corner >= minor / 2.0):
             major = max(width, height)
             angle = rotation + (90.0 if height > width else 0.0)
             half_centerline = max(0.0, (major - minor) / 2.0)
@@ -150,11 +167,11 @@ class PcbIndex:
         polygon = oriented_rect_vertices(
             x1,
             y1,
-            width,
-            height,
+            width - 2.0 * corner,
+            height - 2.0 * corner,
             rotation,
         )
-        return None, 0.0, polygon
+        return None, corner, polygon
 
     def _primitive_bounds(self, primitive):
         segment, radius, polygon = self._primitive_geometry(primitive)
@@ -162,10 +179,10 @@ class PcbIndex:
             x_values = [point[0] for point in polygon]
             y_values = [point[1] for point in polygon]
             return (
-                min(x_values),
-                min(y_values),
-                max(x_values),
-                max(y_values),
+                min(x_values) - radius,
+                min(y_values) - radius,
+                max(x_values) + radius,
+                max(y_values) + radius,
             )
         x1, y1, x2, y2 = segment
         return (
@@ -183,20 +200,19 @@ class PcbIndex:
             self._primitive_geometry(second)
         )
         if first_polygon is not None and second_polygon is not None:
-            return polygon_polygon_distance(first_polygon, second_polygon)
-        if first_polygon is not None:
+            distance = polygon_polygon_distance(first_polygon, second_polygon)
+        elif first_polygon is not None:
             distance = seg_polygon_distance(
                 *second_segment,
                 first_polygon,
             )
-            return max(0.0, distance - second_radius)
-        if second_polygon is not None:
+        elif second_polygon is not None:
             distance = seg_polygon_distance(
                 *first_segment,
                 second_polygon,
             )
-            return max(0.0, distance - first_radius)
-        distance = seg_seg_distance(*first_segment, *second_segment)
+        else:
+            distance = seg_seg_distance(*first_segment, *second_segment)
         return max(0.0, distance - first_radius - second_radius)
 
     def _point_primitive_distance(
@@ -207,11 +223,10 @@ class PcbIndex:
     ) -> float:
         segment, radius, polygon = self._primitive_geometry(primitive)
         if polygon is not None:
-            return point_polygon_distance(x, y, polygon)
-        return max(
-            0.0,
-            point_seg_distance(x, y, *segment) - radius,
-        )
+            distance = point_polygon_distance(x, y, polygon)
+        else:
+            distance = point_seg_distance(x, y, *segment)
+        return max(0.0, distance - radius)
 
     def __init__(self, pcb: PcbData, netlist: dict | None):
         self.pcb = pcb
@@ -259,10 +274,10 @@ class PcbIndex:
                 "INSERT INTO prims ("
                 "kind, net_id, layer, layer_to, component, pour_id, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
-                "source_id, "
+                "corner_radius, source_id, "
                 "hole, pad_name, length, pin_package, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -278,6 +293,7 @@ class PcbIndex:
                     primitive.height,
                     primitive.rotation,
                     primitive.shape,
+                    primitive.corner_radius,
                     primitive.source_id,
                     primitive.hole,
                     primitive.pad_name,

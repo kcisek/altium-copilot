@@ -115,6 +115,9 @@ class Primitive:
     # Pad Pin/Package Length (pad to die, mil): 0.0 when unset, None when the
     # pad record is too short to carry it (and for non-pad primitives).
     pin_package: float | None = None
+    # Corner radius (mil) of a rounded-rectangle pad (shape PAD_SHAPE_ROUNDRECT);
+    # None for every other shape and primitive.
+    corner_radius: float | None = None
 
 
 def iter_binary_records(data: bytes):
@@ -321,6 +324,29 @@ _PAD_MAIN_MIN_LENGTH = 60
 # groups at the FPGA); 171-, 185- and 186-byte records hold 0 there throughout
 # the corpus.
 _PAD_PIN_PACKAGE_OFFSET = 158
+# Pad stack mode (main subrecord byte 62): simple pads use the top size and
+# shape on every layer; top-middle-bottom and full-stack pads keep one per
+# layer, and a bottom-layer pad then has its copper in the bottom slot (its
+# top slot can be empty).
+_PAD_MODE_OFFSET = 62
+_PAD_MODE_SIMPLE = 0
+_BOTTOM_LAYER = 32
+# Size-and-shape subrecord (the one after the main subrecord; KiCad's
+# importer reads the same layout): 32 per-layer slots (0 top, 1-30 mid,
+# 31 bottom) of alt shape at 532 and corner radius percent at 564.
+_PAD_SIZE_SHAPE_INDEX = 4
+_PAD_SIZE_SHAPE_MIN_LENGTH = 596
+_PAD_ALT_SHAPE_OFFSET = 532
+_PAD_CORNER_RADIUS_OFFSET = 564
+_PAD_BOTTOM_SLOT = 31
+
+PAD_SHAPE_ROUND = 1  # round, or oblong when not square
+PAD_SHAPE_RECT = 2
+PAD_SHAPE_OCTAGONAL = 3
+# Altium writes a rounded rectangle as round in the main subrecord; the
+# size-and-shape subrecord's alt shape 9 and corner radius (percent of half
+# the shorter side, 100 = oblong) make it one.
+PAD_SHAPE_ROUNDRECT = 9
 
 
 def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
@@ -373,15 +399,34 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
             size_y,
             _mid_size_x,
             _mid_size_y,
-            _bottom_size_x,
-            _bottom_size_y,
+            bottom_size_x,
+            bottom_size_y,
             hole,
         ) = struct.unpack_from("<iiiiiii", main, 21)
         shape = main[49]
+        slot = 0
+        if (
+            main[0] == _BOTTOM_LAYER
+            and len(main) > _PAD_MODE_OFFSET
+            and main[_PAD_MODE_OFFSET] != _PAD_MODE_SIMPLE
+        ):
+            size_x, size_y = bottom_size_x, bottom_size_y
+            shape = main[51]
+            slot = _PAD_BOTTOM_SLOT
         (rotation,) = struct.unpack_from("<d", main, 52)
         if size_x <= 0 or size_y <= 0 or hole < 0:
             skipped += 1
             continue
+        corner_radius = None
+        size_shape = subrecords[_PAD_SIZE_SHAPE_INDEX]
+        if (
+            shape == PAD_SHAPE_ROUND
+            and len(size_shape) >= _PAD_SIZE_SHAPE_MIN_LENGTH
+            and size_shape[_PAD_ALT_SHAPE_OFFSET + slot] == PAD_SHAPE_ROUNDRECT
+        ):
+            shape = PAD_SHAPE_ROUNDRECT
+            percent = min(size_shape[_PAD_CORNER_RADIUS_OFFSET + slot], 100)
+            corner_radius = _units_to_mil(min(size_x, size_y)) * percent / 200.0
         pin_package = None
         if len(main) >= _PAD_PIN_PACKAGE_OFFSET + 4:
             (raw_pin_package,) = struct.unpack_from(
@@ -408,6 +453,7 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                 hole=_units_to_mil(hole),
                 pad_name=pad_name,
                 pin_package=pin_package,
+                corner_radius=corner_radius,
             )
         )
     return primitives, skipped

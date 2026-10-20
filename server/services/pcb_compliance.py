@@ -1377,7 +1377,8 @@ def _approximations(
         notes.append(
             "Clearance spot-check: tracks, arcs, vias and pads of nets only; "
             "pours, fills, regions, text, holes, keepouts and no-net copper are "
-            "not modelled; non-round pads are sharp rectangles; arcs are chords "
+            "not modelled; octagonal pads are rectangles and through-hole pads "
+            "use their top-layer size on every layer; arcs are chords "
             "(<= 0.25 mil sagitta); gaps within "
             f"{CLEARANCE_TOLERANCE_MIL} mil of the limit are not reported. The "
             "object matrix (Track/Arc/Via/SMDPad/THPad) is applied per object "

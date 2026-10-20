@@ -401,6 +401,22 @@ def test_track_running_over_a_pad_connects_it(index):
     assert pad_to_pad(index, "FLY", "U3-14", "U2-14")["length_mil"] == pytest.approx(500.0)
 
 
+def test_rounded_rectangle_pad_contains_keeps_its_corners():
+    pad = {"x": 0.0, "y": 0.0, "w": 40.0, "h": 60.0, "rot": 0.0, "shape": 9,
+           "corner": 10.0}
+    # Inside the sharp corner, 3.4 mil outside the rounded one.
+    assert not pcb_length._pad_contains(pad, 19.5, 29.5, 0.0)
+    assert pcb_length._pad_contains(pad, 19.5, 29.5, 3.5)
+    assert pcb_length._pad_contains(pad, 19.5, 0.0, 0.0)
+    assert pcb_length._pad_contains(pad, 21.0, 0.0, 1.0)
+    assert not pcb_length._pad_contains(pad, 21.0, 0.0, 0.5)
+    turned = {**pad, "rot": 90.0}
+    assert pcb_length._pad_contains(turned, 29.5, 0.0, 0.0)
+    assert not pcb_length._pad_contains(turned, 29.5, 19.5, 0.0)
+    # Without a corner radius it is the rectangle.
+    assert pcb_length._pad_contains({**pad, "corner": None}, 19.5, 29.5, 0.0)
+
+
 def test_via_in_pad_connects_without_a_track(index):
     result = pad_to_pad(index, "VIP", "U1-15", "U2-15")
     assert result["status"] == "ok"
