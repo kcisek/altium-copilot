@@ -389,9 +389,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   stack for lengths, barrels and rule scopes
 - Shelved polygon pours are read (`SHELVED` in `Polygons6`). Altium hides a shelved pour
   from DRC and connectivity, so it is no longer treated as copper: `get_net_neighbors`,
-  `query_pcb_region`, `check_decoupling` ("a pour around it"), DRC violation nets, rule
-  scopes on a net's pour copper and the length tools' "pours may complete the
-  connection" note leave it out, and its outline gets no proximity rows. Copper that
+  `query_pcb_region`, `check_decoupling` ("a pour around it"), `check_vias` (a same-net
+  pour around a via connects it on that layer), DRC violation nets, rule scopes on a
+  net's pour copper and the length tools' "pours may complete the connection" note leave
+  it out, and its outline gets no proximity rows. Copper that
   Altium keeps in the file for a shelved pour is dropped
   (`skipped_records.shelved_pour_copper`). `get_net_pcb` still lists the pour with
   `shelved: true`, and `get_board_info` counts `shelved_pours`. On 2 of 83 real boards

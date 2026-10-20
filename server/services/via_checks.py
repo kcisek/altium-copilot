@@ -1154,7 +1154,13 @@ class _Review:
         if not hasattr(self, "_pours"):
             self._pours = defaultdict(list)
             for pour in self.index.pcb.pours:
-                if pour.net is not None and pour.layer is not None and len(pour.vertices) >= 3:
+                # A shelved pour has no copper: it connects nothing.
+                if (
+                    pour.net is not None
+                    and pour.layer is not None
+                    and len(pour.vertices) >= 3
+                    and not pour.shelved
+                ):
                     self._pours[pour.net].append(pour)
         return self._pours
 
