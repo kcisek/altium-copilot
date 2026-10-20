@@ -7,8 +7,12 @@ from pathlib import Path
 import pytest
 
 from server.parsers.pcb_doc import (
+    PAD_INNER_LAYERS,
+    PAD_SHAPE_RECT,
+    PAD_SHAPE_ROUND,
     BoardInfo,
     DiffPair,
+    PadCopper,
     PcbClass,
     PcbComponent,
     PcbData,
@@ -399,6 +403,77 @@ def test_arc_uses_true_length_not_chords(index):
 def test_track_running_over_a_pad_connects_it(index):
     assert pad_to_pad(index, "FLY", "U1-14", "U3-14")["length_mil"] == pytest.approx(500.0)
     assert pad_to_pad(index, "FLY", "U3-14", "U2-14")["length_mil"] == pytest.approx(500.0)
+
+
+def test_rounded_rectangle_pad_contains_keeps_its_corners():
+    pad = {"x": 0.0, "y": 0.0, "w": 40.0, "h": 60.0, "rot": 0.0, "shape": 9,
+           "corner": 10.0}
+    # Inside the sharp corner, 3.4 mil outside the rounded one.
+    assert not pcb_length._pad_contains(pad, 19.5, 29.5, 0.0)
+    assert pcb_length._pad_contains(pad, 19.5, 29.5, 3.5)
+    assert pcb_length._pad_contains(pad, 19.5, 0.0, 0.0)
+    assert pcb_length._pad_contains(pad, 21.0, 0.0, 1.0)
+    assert not pcb_length._pad_contains(pad, 21.0, 0.0, 0.5)
+    turned = {**pad, "rot": 90.0}
+    assert pcb_length._pad_contains(turned, 29.5, 0.0, 0.0)
+    assert not pcb_length._pad_contains(turned, 29.5, 19.5, 0.0)
+    # Without a corner radius it is the rectangle; past half the short side,
+    # the oblong.
+    assert pcb_length._pad_contains({**pad, "corner": None}, 19.5, 29.5, 0.0)
+    oblong = {**pad, "shape": 1}
+    for x, y in [(19.0, 15.0), (19.0, 21.0), (5.0, 29.0), (0.0, 30.5)]:
+        assert pcb_length._pad_contains(
+            {**pad, "corner": 35.0}, x, y, 0.5
+        ) == pcb_length._pad_contains(oblong, x, y, 0.5)
+
+
+def test_track_end_in_a_rounded_pad_corner_does_not_connect(length_data):
+    data = deepcopy(length_data)
+    data.nets.append("CORNER")
+    net = len(data.nets) - 1
+    pad = _pad("STRAIGHT", "U1", "20", 0.0, 2000.0, size=40.0, shape=9)
+    pad.net, pad.height, pad.corner_radius = net, 60.0, 10.0
+    far = _pad("STRAIGHT", "U2", "20", 1000.0, 2000.0)
+    far.net = net
+    # Ends 3.4 mil outside the rounded corner (inside the sharp one).
+    track = _track("STRAIGHT", 19.5, 2029.5, 1000.0, 2000.0, width=0.5)
+    track.net = net
+    data.primitives += [pad, far, track]
+    assert pad_to_pad(_index(data), "CORNER", "U1-20", "U2-20")["status"] != "ok"
+    track.x1, track.y1 = 15.0, 2025.0
+    assert pad_to_pad(_index(data), "CORNER", "U1-20", "U2-20")["status"] == "ok"
+
+
+def test_pad_contains_uses_the_copper_on_the_layer():
+    pad = {"x": 0.0, "y": 0.0, "w": 20.0, "h": 20.0, "rot": 0.0, "shape": 1,
+           "copper": {PAD_INNER_LAYERS: PadCopper(60.0, 60.0, PAD_SHAPE_ROUND),
+                      32: PadCopper(30.0, 80.0, PAD_SHAPE_RECT)}}
+    assert not pcb_length._pad_contains(pad, 25.0, 0.0, 0.0)
+    assert not pcb_length._pad_contains(pad, 25.0, 0.0, 0.0, 1)
+    assert pcb_length._pad_contains(pad, 25.0, 0.0, 0.0, 2)
+    assert not pcb_length._pad_contains(pad, 25.0, 0.0, 0.0, 32)
+    assert pcb_length._pad_contains(pad, 0.0, 35.0, 0.0, 32)
+
+
+def test_through_hole_pad_connects_with_its_copper_on_the_track_layer(length_data):
+    data = deepcopy(length_data)
+    data.nets.append("STACK")
+    net = len(data.nets) - 1
+    near = _pad("STRAIGHT", "U1", "30", 0.0, 3000.0, layer=MULTI, size=20.0,
+                shape=1, hole=10.0)
+    near.layer_copper = {PAD_INNER_LAYERS: PadCopper(60.0, 60.0, PAD_SHAPE_ROUND)}
+    far = _pad("STRAIGHT", "U2", "30", 1000.0, 3000.0, layer=MULTI, hole=5.0)
+    # On L2 the track ends 25 mil from the centre: inside the 60 mil inner
+    # copper, outside the 20 mil top-layer size.
+    track = _track("STRAIGHT", 25.0, 3000.0, 1000.0, 3000.0, layer=2)
+    for primitive in (near, far, track):
+        primitive.net = net
+    data.primitives += [near, far, track]
+    assert pad_to_pad(_index(data), "STACK", "U1-30", "U2-30")["status"] == "ok"
+    # The other way round (60 mil on top, 20 mil inside) it misses.
+    near.width = near.height = 60.0
+    near.layer_copper = {PAD_INNER_LAYERS: PadCopper(20.0, 20.0, PAD_SHAPE_ROUND)}
+    assert pad_to_pad(_index(data), "STACK", "U1-30", "U2-30")["status"] != "ok"
 
 
 def test_via_in_pad_connects_without_a_track(index):

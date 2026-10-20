@@ -25,6 +25,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 try:
+    from parsers.pcb_doc import PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, pad_copper_on
+    from services.pcb_index import layer_copper
     from services.pcb_rules import (
         MULTI_LAYER,
         ScopeSyntaxError,
@@ -35,6 +37,10 @@ try:
         stale_references,
     )
 except ImportError:
+    from server.parsers.pcb_doc import (
+        PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, pad_copper_on,
+    )
+    from server.services.pcb_index import layer_copper
     from server.services.pcb_rules import (
         MULTI_LAYER,
         ScopeSyntaxError,
@@ -79,10 +85,11 @@ APPROXIMATIONS = [
     "A series part between xSignal legs counts 0 length.",
     "Polygon pours, fills and regions are not part of the copper graph; a "
     "connection made only through them is reported incomplete.",
-    "Pad shapes are approximated: round/oblong as capsules, every other shape "
-    "as its rotated rectangle; paths run to the pad or via centre, so copper "
-    "wandering inside a pad and stubs off the path are not counted (Altium's "
-    "track total may be longer).",
+    "Pad shapes: round/oblong pads are capsules, rounded rectangles keep their "
+    "corners, octagonal pads are rectangles, and through-hole pads have each "
+    "layer's size and shape; paths run to the pad or via centre, so "
+    "copper wandering inside a pad and stubs off the path are not counted "
+    "(Altium's track total may be longer).",
     "Nets without exactly 2 pads use routed copper plus via barrels; Altium "
     "shows no Signal Length for them (use xSignals).",
     f"Violations within {MARGINAL_MIL:g} mil of the band are marked marginal: "
@@ -91,7 +98,8 @@ APPROXIMATIONS = [
 
 _GRAPH_SQL = (
     "SELECT id, kind, layer, layer_to, component, x1, y1, x2, y2, width, "
-    "height, rotation, shape, hole, pad_name, length, pin_package FROM prims "
+    "height, rotation, shape, corner_radius, layer_copper, hole, pad_name, "
+    "length, pin_package FROM prims "
     "WHERE net_id = ? AND kind IN ('track', 'arc', 'via', 'pad') "
     "AND pour_id IS NULL ORDER BY id"
 )
@@ -171,12 +179,23 @@ def stack_z(index) -> dict[int, float] | None:
 # ---------- geometry helpers ----------
 
 
-def _pad_contains(pad: dict, x: float, y: float, tolerance: float) -> bool:
-    """Is (x, y) inside the pad grown by tolerance? Round/oblong pads
-    (shape 1) are capsules; every other shape is its rotated rectangle."""
+def _pad_contains(
+    pad: dict, x: float, y: float, tolerance: float, layer: int | None = None
+) -> bool:
+    """Is (x, y) inside the pad's copper on layer grown by tolerance? Round/
+    oblong pads are capsules, rounded rectangles keep their corners, every
+    other shape is its rotated rectangle. A multi-layer pad's copper can
+    differ per layer; without a layer it has its main (top-layer) copper."""
     dx, dy = x - pad["x"], y - pad["y"]
     width, height = pad["w"], pad["h"]
-    if pad["shape"] == 1:
+    shape, corner = pad["shape"], pad.get("corner") or 0.0
+    copper = (
+        pad_copper_on(pad.get("copper"), layer) if layer is not None else None
+    )
+    if copper is not None:
+        width, height, shape = copper.width, copper.height, copper.shape
+        corner = copper.corner_radius or 0.0
+    if shape == PAD_SHAPE_ROUND:
         minor, major = min(width, height), max(width, height)
         if major - minor < 1e-9:
             return dx * dx + dy * dy <= (width / 2.0 + tolerance) ** 2
@@ -190,6 +209,11 @@ def _pad_contains(pad: dict, x: float, y: float, tolerance: float) -> bool:
     cosine, sine = math.cos(angle), math.sin(angle)
     local_x = dx * cosine + dy * sine
     local_y = -dx * sine + dy * cosine
+    if shape == PAD_SHAPE_ROUNDRECT and corner > 0.0:
+        corner = min(corner, width / 2.0, height / 2.0)
+        out_x = max(0.0, abs(local_x) - (width / 2.0 - corner))
+        out_y = max(0.0, abs(local_y) - (height / 2.0 - corner))
+        return out_x * out_x + out_y * out_y <= (corner + tolerance) ** 2
     return (
         abs(local_x) <= width / 2.0 + tolerance
         and abs(local_y) <= height / 2.0 + tolerance
@@ -363,7 +387,9 @@ class NetGraph:
                 pad = {
                     "pid": row["id"], "x": row["x1"], "y": row["y1"], "w": width,
                     "h": row["height"] or width, "rot": row["rotation"] or 0.0,
-                    "shape": row["shape"], "component": row["component"],
+                    "shape": row["shape"], "corner": _column(row, "corner_radius"),
+                    "copper": layer_copper(row),
+                    "component": row["component"],
                     "name": row["pad_name"],
                     "ppl": _column(row, "pin_package") or 0.0,
                     "layers": (
@@ -373,7 +399,14 @@ class NetGraph:
                     ),
                 }
                 pad["layer_set"] = set(pad["layers"])
-                pad["reach"] = math.hypot(pad["w"], pad["h"]) / 2.0
+                # A multi-layer pad's inner copper can be the larger.
+                pad["reach"] = max(
+                    [math.hypot(pad["w"], pad["h"])]
+                    + [
+                        math.hypot(copper.width, copper.height)
+                        for copper in (pad["copper"] or {}).values()
+                    ]
+                ) / 2.0
                 pads.append(pad)
                 self.pads[row["id"]] = pad
                 nodes: dict[int, int] = {}
@@ -513,7 +546,7 @@ class NetGraph:
                         continue
                     segment = segments[host]
                     hit = _project(segment, x, y)
-                    if hit is None or not fits(hit[1], hit[2], hit[3], segment[5]):
+                    if hit is None or not fits(hit[1], hit[2], hit[3], segment[5], layer):
                         continue
                     owner_node = self._owner_node(owner_nodes, x, y, layer)
                     split_node = self._node(hit[1], hit[2], layer)
@@ -532,7 +565,7 @@ class NetGraph:
                     self._attach(node_of_end[end], owner, distance)
             body_attach(
                 nodes, x, y, via["layers"],
-                lambda px, py, distance, half, radius=radius: distance <= radius + half,
+                lambda px, py, distance, half, layer, radius=radius: distance <= radius + half,
             )
         for pad in pads:
             nodes = self.pad_nodes[pad["pid"]]
@@ -540,7 +573,7 @@ class NetGraph:
             for end in ends_near(x, y, pad["reach"] + max_half):
                 if end_layer[end] not in pad["layer_set"]:
                     continue
-                if _pad_contains(pad, end_x[end], end_y[end], end_half[end]):
+                if _pad_contains(pad, end_x[end], end_y[end], end_half[end], end_layer[end]):
                     owner = self._owner_node(nodes, x, y, end_layer[end])
                     self._attach(
                         node_of_end[end], owner,
@@ -548,7 +581,9 @@ class NetGraph:
                     )
             body_attach(
                 nodes, x, y, pad["layers"],
-                lambda px, py, distance, half, pad=pad: _pad_contains(pad, px, py, half),
+                lambda px, py, distance, half, layer, pad=pad: _pad_contains(
+                    pad, px, py, half, layer
+                ),
             )
 
         # Vias touching pads (via-in-pad) or other vias (stacked microvias).
@@ -562,8 +597,12 @@ class NetGraph:
                 for cell in _cells(pad["x"], pad["y"], pad["reach"] + max_radius, via_cell):
                     for number in via_grid.get(cell, ()):
                         via = vias[number]
-                        common = [layer for layer in via["layers"] if layer in pad["layer_set"]]
-                        if not common or not _pad_contains(pad, via["x"], via["y"], via["r"]):
+                        common = [
+                            layer for layer in via["layers"]
+                            if layer in pad["layer_set"]
+                            and _pad_contains(pad, via["x"], via["y"], via["r"], layer)
+                        ]
+                        if not common:
                             continue
                         distance = math.hypot(via["x"] - pad["x"], via["y"] - pad["y"])
                         for layer in common:
