@@ -1,8 +1,12 @@
+import math
 from copy import deepcopy
 
 import pytest
 
 from server.parsers.pcb_doc import (
+    PAD_SHAPE_RECT,
+    PAD_SHAPE_ROUND,
+    PAD_SHAPE_ROUNDRECT,
     BoardInfo,
     PcbComponent,
     PcbData,
@@ -558,6 +562,195 @@ def test_rectangular_pad_uses_rotated_shape_not_max_diameter(pcb_data):
     ]
     region = index.region_query(0.0, 40.0, radius=10.0)
     assert "RECT_PAD" not in [net["net"] for net in region["nets"]]
+
+
+def _rounded_pad(corner, net=0, component=None, rotation=0.0):
+    """A 40 x 60 mil rounded-rectangle pad at the origin."""
+    pad = _pad(
+        net=net,
+        component=component,
+        x=0.0,
+        y=0.0,
+        width=40.0,
+        height=60.0,
+        shape=PAD_SHAPE_ROUNDRECT,
+        rotation=rotation,
+    )
+    pad.corner_radius = corner
+    return pad
+
+
+def test_rounded_rectangle_pad_distances(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=10.0)
+    sharp = deepcopy(pad)
+    sharp.shape = PAD_SHAPE_RECT
+    oblong = deepcopy(pad)
+    oblong.shape = PAD_SHAPE_ROUND
+    # Off the corner: the corner arc is centred at (10, 20), radius 10.
+    assert index._point_primitive_distance(30.0, 40.0, pad) == pytest.approx(
+        math.hypot(20.0, 20.0) - 10.0
+    )
+    assert index._point_primitive_distance(30.0, 40.0, sharp) == pytest.approx(
+        math.hypot(10.0, 10.0)
+    )
+    assert index._point_primitive_distance(
+        30.0, 40.0, oblong
+    ) == pytest.approx(math.hypot(30.0, 30.0) - 20.0)
+    # Inside the sharp corner, outside the rounded one.
+    assert index._point_primitive_distance(19.5, 29.5, pad) == pytest.approx(
+        math.hypot(9.5, 9.5) - 10.0
+    )
+    # Straight edges and the inside are the rectangle's.
+    assert index._point_primitive_distance(25.0, 0.0, pad) == pytest.approx(5.0)
+    assert index._point_primitive_distance(0.0, -35.0, pad) == pytest.approx(
+        5.0
+    )
+    assert index._point_primitive_distance(15.0, 25.0, pad) == 0.0
+    # Bounds are the full pad.
+    assert index._primitive_bounds(pad) == pytest.approx(
+        (-20.0, -30.0, 20.0, 30.0)
+    )
+    # A track across the corner diagonal (x + y = 60, 2 mil wide).
+    track = _track(net=1, layer=1, x1=15.0, y1=45.0, x2=35.0, y2=25.0, width=2.0)
+    assert index._primitive_distance(pad, track) == pytest.approx(
+        30.0 / math.sqrt(2.0) - 10.0 - 1.0
+    )
+    assert index._primitive_distance(track, pad) == pytest.approx(
+        30.0 / math.sqrt(2.0) - 10.0 - 1.0
+    )
+    # Corner to corner with another rounded pad and with a via.
+    other = deepcopy(pad)
+    other.x1 = other.x2 = 60.0
+    other.y1 = other.y2 = 90.0
+    assert index._primitive_distance(pad, other) == pytest.approx(
+        math.hypot(40.0, 50.0) - 20.0
+    )
+    via = Primitive(
+        kind="via", layer=1, layer_to=32, net=2, component=None,
+        x1=30.0, y1=40.0, x2=30.0, y2=40.0, width=4.0, hole=2.0,
+    )
+    assert index._primitive_distance(via, pad) == pytest.approx(
+        math.hypot(20.0, 20.0) - 10.0 - 2.0
+    )
+
+
+def test_rounded_rectangle_pad_rotated(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    # Turned 90 degrees the pad spans x +-30, y +-20; corner arc at (20, 10).
+    pad = _rounded_pad(corner=10.0, rotation=90.0)
+    assert index._point_primitive_distance(40.0, 30.0, pad) == pytest.approx(
+        math.hypot(20.0, 20.0) - 10.0
+    )
+    assert index._primitive_bounds(pad) == pytest.approx(
+        (-30.0, -20.0, 30.0, 20.0)
+    )
+
+
+@pytest.mark.parametrize(
+    "corner, same_as",
+    [(0.0, PAD_SHAPE_RECT), (None, PAD_SHAPE_RECT), (20.0, PAD_SHAPE_ROUND),
+     (35.0, PAD_SHAPE_ROUND)],
+)
+def test_rounded_rectangle_pad_limits(pcb_data, corner, same_as):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=corner)
+    reference = deepcopy(pad)
+    reference.shape = same_as
+    for point in [(30.0, 40.0), (19.5, 29.5), (25.0, 3.0), (5.0, 45.0)]:
+        assert index._point_primitive_distance(
+            *point, pad
+        ) == pytest.approx(index._point_primitive_distance(*point, reference))
+
+
+def test_rounded_rectangle_pad_at_an_angle_and_overlapping(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=10.0, rotation=30.0)
+    cosine, sine = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    # (30, 40) in the pad's own frame, turned with it.
+    x, y = 30.0 * cosine - 40.0 * sine, 30.0 * sine + 40.0 * cosine
+    assert index._point_primitive_distance(x, y, pad) == pytest.approx(
+        math.hypot(20.0, 20.0) - 10.0
+    )
+    # Core 20 x 40 turned 30 degrees, grown by 10.
+    half_x = 10.0 * cosine + 20.0 * sine + 10.0
+    half_y = 10.0 * sine + 20.0 * cosine + 10.0
+    assert index._primitive_bounds(pad) == pytest.approx(
+        (-half_x, -half_y, half_x, half_y)
+    )
+    inside = _rounded_pad(corner=1.0)
+    inside.width = inside.height = 4.0
+    assert index._primitive_distance(pad, inside) == 0.0
+    assert index._primitive_distance(inside, pad) == 0.0
+    overlapping = _rounded_pad(corner=10.0, rotation=30.0)
+    overlapping.x1 = overlapping.x2 = 30.0 * cosine
+    overlapping.y1 = overlapping.y2 = 30.0 * sine
+    assert index._primitive_distance(pad, overlapping) == 0.0
+
+
+def test_full_corner_radius_is_an_oblong(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    pad = _rounded_pad(corner=20.0 - 1e-12)
+    segment, radius, polygon = index._primitive_geometry(pad)
+    assert polygon is None
+    assert radius == pytest.approx(20.0)
+    assert segment == pytest.approx((0.0, -10.0, 0.0, 10.0))
+
+
+def test_rounded_rectangle_row_without_corner_column(pcb_data):
+    index = PcbIndex(pcb_data, NETLIST)
+    row = {
+        "kind": "pad", "x1": 0.0, "y1": 0.0, "x2": 0.0, "y2": 0.0,
+        "width": 40.0, "height": 60.0, "rotation": 0.0,
+        "shape": PAD_SHAPE_ROUNDRECT,
+    }
+    assert index._point_primitive_distance(19.5, 29.5, row) == 0.0
+
+
+def test_rounded_rectangle_pad_in_index_queries(pcb_data):
+    data = deepcopy(pcb_data)
+    data.nets.extend(["ROUNDED_PAD", "CORNER_TRACK"])
+    data.components.append(
+        PcbComponent(
+            index=3,
+            refdes="J1",
+            source_uid_tail=None,
+            channel_path=None,
+            x=0.0,
+            y=0.0,
+            rotation=0.0,
+            side="top",
+        )
+    )
+    data.primitives.extend([
+        _rounded_pad(corner=10.0, net=3, component=3),
+        # 10.2 mil from the rounded corner, 6.1 mil from a sharp one.
+        _track(net=4, layer=1, x1=15.0, y1=45.0, x2=35.0, y2=25.0, width=2.0),
+    ])
+    index = PcbIndex(data, NETLIST)
+    rows = index.db.execute(
+        "SELECT shape, corner_radius FROM prims WHERE kind = 'pad' "
+        "AND net_id = 3"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(PAD_SHAPE_ROUNDRECT, 10.0)]
+    component = index.find_components("J1")[0]
+    assert (component["minx"], component["maxy"]) == pytest.approx(
+        (-20.0, 30.0)
+    )
+    neighbors = index.net_neighbors("ROUNDED_PAD", distance=8.0)
+    assert "CORNER_TRACK" not in [
+        neighbor["net"] for neighbor in neighbors["neighbors"]
+    ]
+    neighbors = index.net_neighbors("ROUNDED_PAD", distance=11.0)
+    assert "CORNER_TRACK" in [
+        neighbor["net"] for neighbor in neighbors["neighbors"]
+    ]
+    assert "ROUNDED_PAD" not in [
+        net["net"] for net in index.region_query(19.5, 29.5, radius=1.0)["nets"]
+    ]
+    assert "ROUNDED_PAD" in [
+        net["net"] for net in index.region_query(19.5, 25.0, radius=1.0)["nets"]
+    ]
 
 
 def test_region_query_caps_pours(pcb_data):

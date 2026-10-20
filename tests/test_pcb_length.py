@@ -401,6 +401,45 @@ def test_track_running_over_a_pad_connects_it(index):
     assert pad_to_pad(index, "FLY", "U3-14", "U2-14")["length_mil"] == pytest.approx(500.0)
 
 
+def test_rounded_rectangle_pad_contains_keeps_its_corners():
+    pad = {"x": 0.0, "y": 0.0, "w": 40.0, "h": 60.0, "rot": 0.0, "shape": 9,
+           "corner": 10.0}
+    # Inside the sharp corner, 3.4 mil outside the rounded one.
+    assert not pcb_length._pad_contains(pad, 19.5, 29.5, 0.0)
+    assert pcb_length._pad_contains(pad, 19.5, 29.5, 3.5)
+    assert pcb_length._pad_contains(pad, 19.5, 0.0, 0.0)
+    assert pcb_length._pad_contains(pad, 21.0, 0.0, 1.0)
+    assert not pcb_length._pad_contains(pad, 21.0, 0.0, 0.5)
+    turned = {**pad, "rot": 90.0}
+    assert pcb_length._pad_contains(turned, 29.5, 0.0, 0.0)
+    assert not pcb_length._pad_contains(turned, 29.5, 19.5, 0.0)
+    # Without a corner radius it is the rectangle; past half the short side,
+    # the oblong.
+    assert pcb_length._pad_contains({**pad, "corner": None}, 19.5, 29.5, 0.0)
+    oblong = {**pad, "shape": 1}
+    for x, y in [(19.0, 15.0), (19.0, 21.0), (5.0, 29.0), (0.0, 30.5)]:
+        assert pcb_length._pad_contains(
+            {**pad, "corner": 35.0}, x, y, 0.5
+        ) == pcb_length._pad_contains(oblong, x, y, 0.5)
+
+
+def test_track_end_in_a_rounded_pad_corner_does_not_connect(length_data):
+    data = deepcopy(length_data)
+    data.nets.append("CORNER")
+    net = len(data.nets) - 1
+    pad = _pad("STRAIGHT", "U1", "20", 0.0, 2000.0, size=40.0, shape=9)
+    pad.net, pad.height, pad.corner_radius = net, 60.0, 10.0
+    far = _pad("STRAIGHT", "U2", "20", 1000.0, 2000.0)
+    far.net = net
+    # Ends 3.4 mil outside the rounded corner (inside the sharp one).
+    track = _track("STRAIGHT", 19.5, 2029.5, 1000.0, 2000.0, width=0.5)
+    track.net = net
+    data.primitives += [pad, far, track]
+    assert pad_to_pad(_index(data), "CORNER", "U1-20", "U2-20")["status"] != "ok"
+    track.x1, track.y1 = 15.0, 2025.0
+    assert pad_to_pad(_index(data), "CORNER", "U1-20", "U2-20")["status"] == "ok"
+
+
 def test_via_in_pad_connects_without_a_track(index):
     result = pad_to_pad(index, "VIP", "U1-15", "U2-15")
     assert result["status"] == "ok"

@@ -25,6 +25,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 try:
+    from parsers.pcb_doc import PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT
     from services.pcb_rules import (
         MULTI_LAYER,
         ScopeSyntaxError,
@@ -35,6 +36,7 @@ try:
         stale_references,
     )
 except ImportError:
+    from server.parsers.pcb_doc import PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT
     from server.services.pcb_rules import (
         MULTI_LAYER,
         ScopeSyntaxError,
@@ -79,10 +81,11 @@ APPROXIMATIONS = [
     "A series part between xSignal legs counts 0 length.",
     "Polygon pours, fills and regions are not part of the copper graph; a "
     "connection made only through them is reported incomplete.",
-    "Pad shapes are approximated: round/oblong as capsules, every other shape "
-    "as its rotated rectangle; paths run to the pad or via centre, so copper "
-    "wandering inside a pad and stubs off the path are not counted (Altium's "
-    "track total may be longer).",
+    "Pad shapes: round/oblong pads are capsules, rounded rectangles keep their "
+    "corners, octagonal pads are rectangles, and through-hole pads use their "
+    "top-layer size on every layer; paths run to the pad or via centre, so "
+    "copper wandering inside a pad and stubs off the path are not counted "
+    "(Altium's track total may be longer).",
     "Nets without exactly 2 pads use routed copper plus via barrels; Altium "
     "shows no Signal Length for them (use xSignals).",
     f"Violations within {MARGINAL_MIL:g} mil of the band are marked marginal: "
@@ -91,7 +94,8 @@ APPROXIMATIONS = [
 
 _GRAPH_SQL = (
     "SELECT id, kind, layer, layer_to, component, x1, y1, x2, y2, width, "
-    "height, rotation, shape, hole, pad_name, length, pin_package FROM prims "
+    "height, rotation, shape, corner_radius, hole, pad_name, length, "
+    "pin_package FROM prims "
     "WHERE net_id = ? AND kind IN ('track', 'arc', 'via', 'pad') "
     "AND pour_id IS NULL ORDER BY id"
 )
@@ -173,10 +177,11 @@ def stack_z(index) -> dict[int, float] | None:
 
 def _pad_contains(pad: dict, x: float, y: float, tolerance: float) -> bool:
     """Is (x, y) inside the pad grown by tolerance? Round/oblong pads
-    (shape 1) are capsules; every other shape is its rotated rectangle."""
+    are capsules, rounded rectangles keep their corners, every other shape is
+    its rotated rectangle."""
     dx, dy = x - pad["x"], y - pad["y"]
     width, height = pad["w"], pad["h"]
-    if pad["shape"] == 1:
+    if pad["shape"] == PAD_SHAPE_ROUND:
         minor, major = min(width, height), max(width, height)
         if major - minor < 1e-9:
             return dx * dx + dy * dy <= (width / 2.0 + tolerance) ** 2
@@ -190,6 +195,12 @@ def _pad_contains(pad: dict, x: float, y: float, tolerance: float) -> bool:
     cosine, sine = math.cos(angle), math.sin(angle)
     local_x = dx * cosine + dy * sine
     local_y = -dx * sine + dy * cosine
+    corner = pad.get("corner") or 0.0
+    if pad["shape"] == PAD_SHAPE_ROUNDRECT and corner > 0.0:
+        corner = min(corner, width / 2.0, height / 2.0)
+        out_x = max(0.0, abs(local_x) - (width / 2.0 - corner))
+        out_y = max(0.0, abs(local_y) - (height / 2.0 - corner))
+        return out_x * out_x + out_y * out_y <= (corner + tolerance) ** 2
     return (
         abs(local_x) <= width / 2.0 + tolerance
         and abs(local_y) <= height / 2.0 + tolerance
@@ -363,7 +374,8 @@ class NetGraph:
                 pad = {
                     "pid": row["id"], "x": row["x1"], "y": row["y1"], "w": width,
                     "h": row["height"] or width, "rot": row["rotation"] or 0.0,
-                    "shape": row["shape"], "component": row["component"],
+                    "shape": row["shape"], "corner": _column(row, "corner_radius"),
+                    "component": row["component"],
                     "name": row["pad_name"],
                     "ppl": _column(row, "pin_package") or 0.0,
                     "layers": (
