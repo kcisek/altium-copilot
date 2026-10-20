@@ -131,6 +131,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   5 nearest capacitors. Rules and thresholds were calibrated on real boards (85% of the
   IC rails measured have a capacitor within 5 mm); regions and planes are not read, so
   it is advice, not DRC. Filters by IC and rail; any part can be checked as an IC
+- `check_vias`: via inventory and fabrication review. Via types by span (first and last
+  layer in stack order: through, blind, buried, microvia per IPC-2226A: one dielectric,
+  at most 0.25 mm deep, and 1:1 or a hole up to 0.15 mm), hole as drawn and pad
+  diameter, with counts per type and per net class, copper-to-copper depth and aspect
+  ratio from the stack heights, the smallest annular ring over the layers that keep a
+  pad, tenting, vias in SMD pads,
+  stacked microvias and the stack's drill pairs. Back drilling is recomputed the way
+  Altium writes the drill files: the Layer Stack Manager's back drills (drilled from the
+  outer layer, stopping before the other one) apply to vias in a Max Via Stub Length
+  (Back Drilling) rule's scope that have no connection on the layers they remove; each
+  back drill lists its drilled layers, depth to the stop layer and drill sizes (hole
+  plus twice the oversize). Findings: aspect ratio above 10:1 (info above 8:1, and for a
+  mechanically drilled blind via above 1:1; microvias above 1:1, info above 0.8:1),
+  annular ring below the Minimum Annular Ring rule or the requested minimum (info below
+  0.1 mm, 0.05 mm on microvias), sizes outside the Routing Via Style rule (info for
+  holes of 1 mm and up drawn as vias), blind or buried spans without a drill pair, vias
+  in SMD pads (fill and cap advice, one note per thermal via array; warning for another
+  net's pad or a ViasUnderSMD rule forbidding it), untented or one-side tented vias and
+  tented holes above 0.5 mm, stubs above a back-drill rule's maximum (the residual after
+  back drilling is taken as the worst case, the drill tip stopping just past the first
+  drilled layer), back-drill rules without back drills, and stubs over 40 mil with their
+  quarter-wave resonance on differential pairs no back-drill rule covers. On Altium's
+  MiniPC example the recomputed back drill selects the same 16 vias whose pads Altium
+  removed on the drilled layers
+- The PcbDoc parser reads each via's tenting (with a manual solder mask expansion that
+  covers the ring counted as tented), test-point flags, pad stack mode, per-layer pad
+  diameters and removed pads, and the stack's drill pairs and back drills (Board6
+  LAYERPAIRn)
 - Design notes: Claude now reads what designers wrote into the project besides the
   circuit. New tool `get_design_notes` (paginated, or one document by name) returns:
   - project parameters from the `.PrjPcb`
@@ -206,6 +234,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   design-notes caveats live in the tool descriptions
 - CONTRIBUTING asks for a `SCHEMA_VERSION` bump only when an existing snapshot table or
   column changes or changes meaning; a new table needs none
+- `get_design_rules` and `get_rules_for_net` name the values of Back Drilling rules
+  (max_stub_length_mil, oversize_mil, tolerances, use_top_back_drill,
+  use_bottom_back_drill), ViasUnderSMD (allowed), LayerPairs (enforce) and the stacked
+  microvia flag of Hole To Hole Clearance (allow_stacked_microvias); they were under
+  other / other_mil. Only Back Drilling is among get_rules_for_net's default kinds
 
 ### Fixed
 - `requirements.txt` pins `mcp<2`: mcp 2.x removed `mcp.server.fastmcp`, so a fresh
@@ -349,6 +382,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   unchanged. `query_pcb_region` lists only the layers a pad's copper reaches, and a
   clearance violation names the layer its gap is on. Altium's examples have no such
   pads and measure the same
+- Stack layers get their layer ids from the stack's LAYERID, not from the layer name.
+  Boards keep stale names in old layer slots (e.g. internal planes once named like a
+  signal layer), and the name lookup put those signal layers on the plane ids: on
+  Altium's MiniPC example 8 of the 16 copper layers, so their tracks fell outside the
+  stack for lengths, barrels and rule scopes
 
 ## [0.3.0] - 2026-07-19
 
