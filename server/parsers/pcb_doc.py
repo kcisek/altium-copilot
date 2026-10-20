@@ -904,8 +904,9 @@ def shape_from_properties(properties: dict[str, str]) -> list[ShapeVertex]:
             radius = parse_dim_mil(properties.get(f"R{index}"))
             start = _optional_float(properties.get(f"SA{index}"))
             end = _optional_float(properties.get(f"EA{index}"))
-            if None not in (cx, cy, radius, start, end) and radius > 0:
-                arc = (cx, cy, radius, start, end)
+            values = (cx, cy, radius, start, end)
+            if None not in values and all(map(math.isfinite, values)) and radius > 0:
+                arc = values
         if x is not None and y is not None:
             vertices.append(ShapeVertex(x, y, arc))
         index += 1
@@ -917,6 +918,9 @@ def shape_from_properties(properties: dict[str, str]) -> list[ShapeVertex]:
 # Altium rounds an arc's end points and the vertices they join each on its
 # own: up to 0.0033 mil apart over the Polygons6 arcs of 95 boards.
 _SHAPE_SNAP_MIL = 0.01
+# KiCad's importer draws an arc edge of a smaller sweep (start = end
+# included) as a straight one.
+_SHAPE_MIN_SWEEP_DEG = 0.2
 
 
 def shape_points(shape: list[ShapeVertex]) -> list[tuple[float, float]]:
@@ -924,11 +928,15 @@ def shape_points(shape: list[ShapeVertex]) -> list[tuple[float, float]]:
     at most ARC_MAX_SAGITTA_MIL inside it. As in KiCad's Altium importer, the
     arc runs counter-clockwise from its start to its end angle and is drawn
     from the end nearer its vertex, the far end meeting the next vertex; an
-    end within _SHAPE_SNAP_MIL of a vertex is that vertex."""
+    end within _SHAPE_SNAP_MIL of a vertex is that vertex, and an arc of
+    under _SHAPE_MIN_SWEEP_DEG is a straight edge."""
     points: list[tuple[float, float]] = []
     for index, vertex in enumerate(shape):
         here = (vertex.x, vertex.y)
-        if vertex.arc is None:
+        if (
+            vertex.arc is None
+            or (vertex.arc[4] - vertex.arc[3]) % 360.0 < _SHAPE_MIN_SWEEP_DEG
+        ):
             points.append(here)
             continue
         arc = _arc_chord_points(*vertex.arc)

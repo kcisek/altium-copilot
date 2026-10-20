@@ -1007,12 +1007,48 @@ def test_decode_polygons_snaps_arc_ends_to_their_vertices():
     assert all(math.hypot(e.x2 - e.x1, e.y2 - e.y1) > 1.0 for e in edges)
 
 
-def test_decode_polygons_ignores_an_incomplete_arc():
-    # KIND1=1 without its radius: a straight edge, as before arcs were read.
+def test_decode_polygons_arc_on_the_last_vertex_closes_on_the_first():
+    record = _polygon((100, 100), (0, 100), (0, 0), (100, 0, (100, 50, 50, 270, 90)))
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    assert vertices[:4] == [(100.0, 100.0), (0.0, 100.0), (0.0, 0.0), (100.0, 0.0)]
+    _assert_follows_arc(vertices[3:] + vertices[:1], 100.0, 50.0, 50.0)
+    assert vertices.count((100.0, 100.0)) == 1
+    assert all(math.hypot(e.x2 - e.x1, e.y2 - e.y1) > 1.0 for e in edges)
+    assert point_in_polygon(140.0, 50.0, vertices)
+
+
+def test_decode_polygons_consecutive_arcs():
+    # A round pour of two half circles, each drawn from its own vertex.
+    record = _polygon((50, 0, (50, 50, 50, 270, 90)), (50, 100, (50, 50, 50, 90, 270)))
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
+    vertices = pour.vertices
+    _assert_follows_arc(vertices + vertices[:1], 50.0, 50.0, 50.0)
+    assert len(set(vertices)) == len(vertices) == len(edges)
+    assert point_in_polygon(50.0, 50.0, vertices)
+    assert point_in_polygon(5.0, 50.0, vertices) and point_in_polygon(95.0, 50.0, vertices)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("R1", None),  # KIND1=1 without its radius
+        ("EA1", "270"),  # no sweep: KiCad draws it straight too
+        ("EA1", "270.1"),
+        ("SA1", "nan"),
+        ("EA1", "inf"),
+        ("CX1", "1e999mil"),
+    ],
+)
+def test_decode_polygons_draws_a_degenerate_arc_straight(key, value):
     record = _polygon(*D_SHAPE)
-    del record["R1"]
-    ((pour,), _) = decode_polygons([record], {"top": 1})
+    if value is None:
+        del record[key]
+    else:
+        record[key] = value
+    ((pour,), edges) = decode_polygons([record], {"top": 1})
     assert pour.vertices == [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
+    assert len(edges) == 4
 
 
 def _stream_text(records: list[dict[str, str]]) -> bytes:

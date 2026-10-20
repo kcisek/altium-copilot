@@ -367,15 +367,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   `SAn`, `EAn`). They were read as straight lines between the vertices, so a point
   near a rounded pour edge was outside the pour. Each arc now becomes chords at most
   0.25 mil inside it, as arc copper does, run counter-clockwise from start to end angle
-  and drawn from the end at its vertex, as KiCad's Altium importer does. This applies
-  to the pour outline and its zero-width outline rows, so containment and outline
-  distance follow the arcs in `get_net_neighbors` (pours), `query_pcb_region`,
-  `check_vias` (a pour around a via), `get_drc_report` (a violation's polygon net),
-  and `check_connectivity`
-  (pour outlines standing in for unread copper, split planes). Bluetooth
+  and drawn from the end at its vertex, as KiCad's Altium importer does (which also
+  draws an arc of under 0.2 degrees straight). This applies to the pour outline and
+  its zero-width outline rows, so containment and outline distance follow the arcs
+  in `get_net_neighbors` (pours), `query_pcb_region`, `check_vias` (a pour around a
+  via), `get_drc_report` (a violation's polygon net), `check_decoupling` (an
+  opposite-side capacitor pad in a pour) and `check_connectivity` (pour outlines
+  standing in for unread copper, split planes). A pour's `bbox_mil` in `get_net_pcb`
+  and where `check_pcb_health` places a pour finding include the arcs too. Bluetooth
   Sentinel's round GND pours have 3 to 5 vertices and arcs of up to 315 degrees.
-  Read straight, 13,468 of their 20,340 poured track and arc ends lay outside them;
-  now none do. On 83 real boards, 116 pours have arc edges
+  Read straight, 13,468 of their 20,340 poured track and arc ends lay more than
+  0.3 mil outside them; now none do. On 83 real boards, 116 pours have arc edges
 - `get_drc_report`: a report where several tables list a different number of rows
   than their counts ("3 tables list ...") was called incomplete instead of having counts
   that differ
