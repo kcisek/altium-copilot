@@ -1,0 +1,617 @@
+"""Offline PCB Health Check: the checks of Altium Designer's PCB Health Check Monitor
+computed from the saved PcbDoc, plus a few board-hygiene checks next to them.
+
+Each Altium check keeps Altium's id, category name (the title its Batch DRC report and
+the Health Check panel use) and level (Low, Medium, High: info, warning, error here),
+so a saved report's health section can be compared category by category. Definitions
+follow Altium Designer 26: a micro-segment is a region-shape edge shorter than 300
+internal units (0.03 mil) on a user region (not pour copper); a 360deg component has
+|rotation - 360| < 0.001; zero-area means no area at all. Checks Altium runs only in
+debug mode are opt-in; checks that need data the PcbDoc does not hold (the source
+PcbLib, embedded panels, the fonts on this PC) are listed as not checked.
+"""
+
+import math
+import re
+from collections import defaultdict
+
+try:
+    from parsers.pcb_doc import decode_fills, decode_regions
+    from services.pcb_geometry import point_in_polygon
+except ImportError:
+    from server.parsers.pcb_doc import decode_fills, decode_regions
+    from server.services.pcb_geometry import point_in_polygon
+
+MICRO_SEGMENT_MIL = 0.03  # 300 internal units, Altium's GetSmallSegments(300)
+ZERO_AREA_SQ_MIL = 1e-8  # one square internal unit
+ROTATION_360_TOLERANCE = 0.001
+GROUP_ABOVE = 25  # more items than this in one check become one grouped finding
+LISTED = 50  # objects named in a grouped finding
+FINDING_LIMIT = 100
+SELF_INTERSECTION_MAX_POINTS = 2000
+
+LEVEL_SEVERITY = {"high": "error", "medium": "warning", "low": "info"}
+_SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
+
+# key: (Altium id, category, panel group, level); id None for checks Altium lacks.
+CHECKS = {
+    "shelved_modified_polygons": (14, "Shelved/Modified Polygons", "Polygons", "high"),
+    "duplicate_designators": (11, "Duplicate Component Designators", "Components", "medium"),
+    "zero_area_polygons": (19, "Zero Area Polygons", "Polygons", "medium"),
+    "zero_area_regions": (10, "Zero Area Regions", "Regions", "medium"),
+    "self_intersecting_regions": (6, "Self-Intersecting Regions", "Regions", "medium"),
+    "micro_segments_board": (15, "Micro-Segments (Board)", "Regions", "medium"),
+    "micro_segments_copper": (16, "Micro-Segments (Copper)", "Regions", "medium"),
+    "slot_holes": (4, "Slots Hole Size > Length", "Holes", "medium"),
+    "broken_xsignals": (1, "Broken xSignals", "Signals", "medium"),
+    "rotation_360": (5, "360deg Component", "Components", "low"),
+    "reference_point_outside": (
+        7, "Reference Point Outside the Component Area", "Components", "low"),
+    "non_signal_layer_components": (8, "Components on Non-signal Layers", "Components", "low"),
+    "unused_xsignals": (17, "Unused xSignals", "Signals", "low"),
+    "invalid_rules": (0, "Invalid PCB Design Rules", "Rules", "low"),
+    "micro_segments_graphics": (
+        3, "Micro-Segments (Graphics/Mechanical)", "Regions", "low"),
+    # Not Altium Health Check items.
+    "components_outside_board": (None, "Components outside the board shape", "Extra", None),
+    "duplicate_copper": (None, "Duplicate copper", "Extra", "low"),
+    "outline_micro_segments": (None, "Board outline micro-segments", "Extra", "low"),
+}
+# Altium runs these only in debug mode, so its panel and reports never show them.
+OPT_IN = frozenset({"micro_segments_graphics"})
+# Altium checks the PcbDoc cannot answer offline: id -> (key, category, reason).
+NOT_CHECKED = {
+    2: ("mixed_layer_indexes", "Mixed Layer Indexes",
+        "Altium runs it only in debug mode; it inspects layer-stack internals."),
+    9: ("non_compatible_stackups", "Non-compatible Stackups in Panel",
+        "embedded board arrays (panels) are not read."),
+    12: ("vias_without_via_types", "Vias without Via Types Assigned",
+         "check_vias reports via spans that are not drill pairs of the stack."),
+    13: ("absent_fonts", "Absent TTF in the system, that was replaced with the default one",
+         "it depends on the fonts installed on the PC that opens the board."),
+    18: ("unused_from_tos", "Unused From-Tos",
+         "From-Tos are not read (none were found in any board checked)."),
+    20: ("mirrored_footprints", "Components with Mirrored Footprints",
+         "it compares each footprint with its source PcbLib, which is not read; Altium "
+         "turns it off by default."),
+}
+_ORDER = {key: rank for rank, key in enumerate(CHECKS)}
+_SIGNAL_LAYER = re.compile(r"^(TOP|BOTTOM|MID\d+)$")
+_ELECTRICAL = set(range(1, 33)) | set(range(39, 55)) | {74}
+_MASK_LAYERS = {35, 36, 37, 38}
+_KEEPOUT_LAYER = 56
+
+
+# ---------- shapes ----------
+
+def _arc_points(vertex, step_deg: float = 10.0) -> list[tuple[float, float]]:
+    cx, cy, radius, start, end = vertex.arc
+    sweep = (end - start) % 360.0 or 360.0
+    begin = (cx + radius * math.cos(math.radians(start)), cy + radius * math.sin(math.radians(start)))
+    finish = (cx + radius * math.cos(math.radians(end)), cy + radius * math.sin(math.radians(end)))
+    steps = max(2, int(math.ceil(sweep / step_deg)))
+    points = [
+        (cx + radius * math.cos(math.radians(start + sweep * i / steps)),
+         cy + radius * math.sin(math.radians(start + sweep * i / steps)))
+        for i in range(steps + 1)
+    ]
+    # Run the arc from the end nearer the vertex, as Altium draws it.
+    if math.dist(finish, (vertex.x, vertex.y)) < math.dist(begin, (vertex.x, vertex.y)):
+        points.reverse()
+    return points
+
+
+def contour(vertices) -> list[tuple[float, float]]:
+    """The shape as points, arcs flattened."""
+    points: list[tuple[float, float]] = []
+    for vertex in vertices:
+        if vertex.arc:
+            points.extend(_arc_points(vertex))
+        else:
+            points.append((vertex.x, vertex.y))
+    return points
+
+
+def area(points: list[tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    total = 0.0
+    for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]):
+        total += x1 * y2 - x2 * y1
+    return abs(total) / 2.0
+
+
+def short_edges(vertices, limit: float = MICRO_SEGMENT_MIL) -> list[tuple]:
+    """Edges shorter than limit: (length, (x1, y1), (x2, y2)). An arc edge measures its
+    arc length; a repeated vertex is an edge of length 0."""
+    edges = []
+    count = len(vertices)
+    if count < 2:
+        return edges
+    for index, vertex in enumerate(vertices):
+        following = vertices[(index + 1) % count]
+        if vertex.arc:
+            _, _, radius, start, end = vertex.arc
+            length = radius * math.radians((end - start) % 360.0 or 360.0)
+        else:
+            length = math.dist((vertex.x, vertex.y), (following.x, following.y))
+            if following.arc and length < 1e-9:
+                continue  # the arc starts here: no edge in Altium's shape
+        if length < limit:
+            edges.append((length, (vertex.x, vertex.y), (following.x, following.y)))
+    return edges
+
+
+def _orient(a, b, c) -> int:
+    value = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return 0 if abs(value) < 1e-12 else (1 if value > 0 else -1)
+
+
+def self_intersections(points, cap: int = SELF_INTERSECTION_MAX_POINTS) -> list | None:
+    """Crossing points of non-adjacent edges; None when the shape is too large to test."""
+    count = len(points)
+    if count > cap:
+        return None
+    found = []
+    edges = [(points[i], points[(i + 1) % count]) for i in range(count)]
+    for i in range(count):
+        a, b = edges[i]
+        for j in range(i + 2, count):
+            if i == 0 and j == count - 1:
+                continue
+            c, d = edges[j]
+            if _orient(a, b, c) * _orient(a, b, d) < 0 and _orient(c, d, a) * _orient(c, d, b) < 0:
+                denominator = (a[0] - b[0]) * (c[1] - d[1]) - (a[1] - b[1]) * (c[0] - d[0])
+                t = ((a[0] - c[0]) * (c[1] - d[1]) - (a[1] - c[1]) * (c[0] - d[0])) / denominator
+                found.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+    return found
+
+
+# ---------- the board ----------
+
+class _Board:
+    def __init__(self, pcb):
+        self.pcb = pcb
+        board = pcb.board
+        self.origin = (board.origin_x or 0.0, board.origin_y or 0.0)
+        raw = pcb.raw or {}
+        shape_based = "ShapeBasedRegions6/Data" in raw
+        data = raw.get("ShapeBasedRegions6/Data") or raw.get("Regions6/Data") or b""
+        self.regions, self.bad_regions = decode_regions(data, shape_based) if data else ([], 0)
+        self.region_stream = bool(data)
+        self.board_regions = decode_regions(raw.get("BoardRegions/Data", b""), False)[0]
+        self.fills = decode_fills(raw.get("Fills6/Data", b""))[0]
+        self.designators = {
+            component.index: component.designator or component.refdes or f"#{component.index}"
+            for component in pcb.components
+        }
+        self.layer_names = {layer.v6_id: layer.name for layer in board.layers}
+
+    def at(self, x: float, y: float) -> list[float]:
+        return [round(x - self.origin[0], 3), round(y - self.origin[1], 3)]
+
+    def layer(self, v6_id: int | None) -> str:
+        name = self.layer_names.get(v6_id)
+        return name or (f"layer {v6_id}" if v6_id is not None else "no layer")
+
+    def net(self, index: int | None) -> str | None:
+        return self.pcb.nets[index] if index is not None and index < len(self.pcb.nets) else None
+
+    def region_label(self, region) -> str:
+        owner = self.designators.get(region.component)
+        what = "Board cutout" if region.board_cutout else "Region"
+        parts = [what, f"on {self.layer(region.layer)}"]
+        if region.name:
+            parts.insert(1, f"'{region.name}'")
+        if owner:
+            parts.append(f"in {owner}")
+        return " ".join(parts)
+
+    def pour_label(self, pour) -> str:
+        net = self.net(pour.net)
+        return f"Polygon on {self.layer(pour.layer)}" + (f" ({net})" if net else " (no net)")
+
+
+def _region_category(region) -> str:
+    if region.board_cutout or region.keepout or region.layer in _MASK_LAYERS \
+            or region.layer == _KEEPOUT_LAYER:
+        return "micro_segments_board"
+    if region.layer in _ELECTRICAL:
+        return "micro_segments_copper"
+    return "micro_segments_graphics"
+
+
+def _bounds(box, x0, y0, x1, y1):
+    if box is None:
+        return [x0, y0, x1, y1]
+    box[0], box[1] = min(box[0], x0), min(box[1], y0)
+    box[2], box[3] = max(box[2], x1), max(box[3], y1)
+    return box
+
+
+def _rect_extent(width, height, rotation) -> tuple[float, float]:
+    theta = math.radians(rotation or 0.0)
+    half_w, half_h = width / 2.0, height / 2.0
+    return (abs(half_w * math.cos(theta)) + abs(half_h * math.sin(theta)),
+            abs(half_w * math.sin(theta)) + abs(half_h * math.cos(theta)))
+
+
+def _component_boxes(board: _Board) -> dict[int, list[float]]:
+    """Each component's area: the bounding box of its pads, tracks, arcs, fills and
+    regions, texts left out (this reproduced Altium's 'Reference Point Outside the
+    Component Area' rows on every saved report checked)."""
+    boxes: dict[int, list[float]] = {}
+    for prim in board.pcb.primitives:
+        if prim.component is None or prim.pour_id is not None:
+            continue
+        if prim.kind == "pad":
+            dx, dy = _rect_extent(prim.width, prim.height or prim.width, prim.rotation)
+            box = (prim.x1 - dx, prim.y1 - dy, prim.x1 + dx, prim.y1 + dy)
+        elif prim.kind in ("track", "arc"):
+            half = max(prim.width or 0.0, 0.0) / 2.0
+            box = (min(prim.x1, prim.x2) - half, min(prim.y1, prim.y2) - half,
+                   max(prim.x1, prim.x2) + half, max(prim.y1, prim.y2) + half)
+        elif prim.kind == "via":
+            half = (prim.width or 0.0) / 2.0
+            box = (prim.x1 - half, prim.y1 - half, prim.x1 + half, prim.y1 + half)
+        else:
+            continue
+        boxes[prim.component] = _bounds(boxes.get(prim.component), *box)
+    for fill in board.fills:
+        if fill.component is None:
+            continue
+        dx, dy = _rect_extent(abs(fill.x2 - fill.x1), abs(fill.y2 - fill.y1), fill.rotation)
+        cx, cy = (fill.x1 + fill.x2) / 2.0, (fill.y1 + fill.y2) / 2.0
+        boxes[fill.component] = _bounds(boxes.get(fill.component), cx - dx, cy - dy, cx + dx, cy + dy)
+    for region in board.regions:
+        if region.component is None or region.polygon is not None:
+            continue
+        points = contour(region.vertices)
+        if points:
+            xs, ys = [p[0] for p in points], [p[1] for p in points]
+            boxes[region.component] = _bounds(
+                boxes.get(region.component), min(xs), min(ys), max(xs), max(ys))
+    return boxes
+
+
+def _board_shape(board: _Board) -> tuple[list[list[tuple[float, float]]], str]:
+    """The board's shape as polygons, and where it came from."""
+    shapes = [contour(region.vertices) for region in board.board_regions]
+    shapes = [shape for shape in shapes if len(shape) >= 3]
+    if shapes:
+        return shapes, "board regions"
+    outline = contour(board.pcb.board.outline_shape) or list(board.pcb.board.outline_vertices)
+    return ([outline], "board outline") if len(outline) >= 3 else ([], "none")
+
+
+# ---------- checks ----------
+
+def _check_all(board: _Board, wanted: set[str]) -> tuple[dict[str, list[dict]], list[str]]:
+    """Items per check: {"label", "at": (x, y) | None, **fields}."""
+    pcb = board.pcb
+    items: dict[str, list[dict]] = defaultdict(list)
+    notes: list[str] = []
+
+    def add(check, label, at=None, **fields):
+        if check in wanted:
+            items[check].append({"label": label, "at": at, **fields})
+
+    for pour in pcb.pours:
+        centre = _centre(pour.vertices)
+        if pour.shelved:
+            add("shelved_modified_polygons", f"{board.pour_label(pour)} is shelved", centre,
+                state="shelved")
+        elif pour.copper_invalid:
+            add("shelved_modified_polygons",
+                f"{board.pour_label(pour)} was modified and not repoured", centre,
+                state="modified")
+        if area(contour(pour.shape) or pour.vertices) < ZERO_AREA_SQ_MIL:
+            add("zero_area_polygons", board.pour_label(pour), centre)
+
+    seen_text: set[str] = set()
+    seen_uid: set[str] = set()
+    for component in pcb.components:
+        label = board.designators[component.index]
+        at = (component.x, component.y) if component.x is not None else None
+        uid = (component.source_unique_id or "").rsplit("@", 1)[0]
+        text = component.designator or ""
+        if text and not (uid and uid in seen_uid):
+            if text in seen_text:
+                add("duplicate_designators", label, at, footprint=component.footprint)
+            seen_text.add(text)
+        if uid:
+            seen_uid.add(uid)
+        if component.rotation is not None and abs(component.rotation - 360.0) < ROTATION_360_TOLERANCE:
+            add("rotation_360", label, at)
+        if component.layer_name and not _SIGNAL_LAYER.match(component.layer_name):
+            add("non_signal_layer_components", f"{label} on {component.layer_name}", at)
+
+    if "reference_point_outside" in wanted:
+        boxes = _component_boxes(board)
+        for component in pcb.components:
+            box = boxes.get(component.index)
+            if box is None or component.x is None or component.y is None:
+                continue
+            gap = max(box[0] - component.x, component.x - box[2],
+                      box[1] - component.y, component.y - box[3])
+            if gap > 1e-6:
+                add("reference_point_outside", board.designators[component.index],
+                    (component.x, component.y), distance_mil=round(gap, 2))
+
+    for region in board.regions:
+        if region.polygon is not None:
+            continue  # pour copper: Altium checks only user regions
+        points = contour(region.vertices)
+        label = board.region_label(region)
+        if area(points) < ZERO_AREA_SQ_MIL:
+            add("zero_area_regions", label, _centre(points))
+            continue
+        if "self_intersecting_regions" in wanted:
+            crossings = self_intersections(points)
+            if crossings is None:
+                notes.append(f"{label}: too many vertices ({len(points)}) to test for "
+                             "self-intersections.")
+            elif crossings:
+                add("self_intersecting_regions", label, crossings[0], crossings=len(crossings))
+        short = short_edges(region.vertices)
+        if short:
+            add(_region_category(region), label, short[0][1], segments=len(short),
+                shortest_mil=round(min(edge[0] for edge in short), 5))
+    if not board.region_stream:
+        notes.append("The PcbDoc has no region stream: region checks found nothing to check.")
+
+    outline_short = short_edges(pcb.board.outline_shape)
+    for length, start, _ in outline_short:
+        add("outline_micro_segments", "Board outline edge", start, length_mil=round(length, 5))
+
+    pads = defaultdict(set)
+    for prim in pcb.primitives:
+        if prim.kind != "pad":
+            continue
+        if prim.component is not None:
+            pads[board.designators.get(prim.component)].add(prim.pad_name)
+        if prim.hole_shape in (1, 2) and prim.slot_length and prim.hole \
+                and prim.slot_length < prim.hole:
+            owner = board.designators.get(prim.component)
+            add("slot_holes", f"{owner}-{prim.pad_name}" if owner else f"Pad {prim.pad_name}",
+                (prim.x1, prim.y1), hole_mil=round(prim.hole, 3),
+                slot_length_mil=round(prim.slot_length, 3))
+
+    for xsignal in pcb.xsignals:
+        missing = [pin for pin in xsignal.pins
+                   if not (len(pin.rsplit("-", 1)) == 2
+                           and pin.rsplit("-", 1)[1] in pads.get(pin.rsplit("-", 1)[0], ()))]
+        if missing:
+            add("broken_xsignals", xsignal.name, None, missing_pins=missing[:10])
+    if "unused_xsignals" in wanted and pcb.xsignals:
+        used = _used_xsignals(pcb)
+        for xsignal in pcb.xsignals:
+            if used is not True and xsignal.name.lower() not in used:
+                add("unused_xsignals", xsignal.name)
+
+    names: dict[str, int] = defaultdict(int)
+    for rule in pcb.rules:
+        names[(rule.name or "").strip().lower()] += 1
+    for rule in pcb.rules:
+        key = (rule.name or "").strip().lower()
+        if not key:
+            add("invalid_rules", f"A {rule.kind} rule has no name")
+        elif names[key] > 1:
+            add("invalid_rules", f"Rule name '{rule.name}' is used by {names[key]} rules",
+                kind=rule.kind)
+            names[key] = 0  # report each name once
+
+    if "components_outside_board" in wanted:
+        _outside_board(board, add, notes)
+    if "duplicate_copper" in wanted:
+        _duplicate_copper(board, add)
+    return items, notes
+
+
+def _centre(points) -> tuple[float, float] | None:
+    if not points:
+        return None
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    return ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+
+
+_SCOPE_REF = re.compile(r"\b(InxSignal|IsxSignal|InxSignalClass|IsxSignalClass)\s*\(\s*'([^']*)'",
+                        re.IGNORECASE)
+
+
+def _used_xsignals(pcb):
+    """Lower-case names of the xSignals a rule scope uses, or True for all of them
+    (InAnyxSignal, or the class 'All xSignals')."""
+    used: set[str] = set()
+    classes = {cls.name.lower(): cls for cls in pcb.classes if cls.kind == "xsignal"}
+    for rule in pcb.rules:
+        for scope in (rule.scope1, rule.scope2):
+            text = scope or ""
+            if re.search(r"\bInAnyxSignal\b", text, re.IGNORECASE):
+                return True
+            for function, name in _SCOPE_REF.findall(text):
+                if "class" in function.lower():
+                    if name.lower() == "all xsignals":
+                        return True
+                    cls = classes.get(name.lower())
+                    used.update(member.lower() for member in (cls.members if cls else []))
+                else:
+                    used.add(name.lower())
+    return used
+
+
+def _outside_board(board: _Board, add, notes: list[str]) -> None:
+    shapes, source = _board_shape(board)
+    if not shapes:
+        notes.append("The board has no outline: components outside the board were not checked.")
+        return
+    netted = defaultdict(bool)
+    for prim in board.pcb.primitives:
+        if prim.kind == "pad" and prim.component is not None and prim.net is not None:
+            netted[prim.component] = True
+    for component in board.pcb.components:
+        if component.x is None or component.y is None:
+            continue
+        if any(point_in_polygon(component.x, component.y, shape) for shape in shapes):
+            continue
+        add("components_outside_board", board.designators[component.index],
+            (component.x, component.y), severity="warning" if netted[component.index] else "info",
+            with_nets=netted[component.index], shape=source)
+
+
+def _duplicate_copper(board: _Board, add) -> None:
+    seen: dict[tuple, int] = {}
+    for prim in board.pcb.primitives:
+        if prim.net is None or prim.poured_by is not None or prim.pour_id is not None:
+            continue
+        if prim.kind == "track" and prim.layer in _ELECTRICAL:
+            ends = tuple(sorted(((round(prim.x1, 4), round(prim.y1, 4)),
+                                 (round(prim.x2, 4), round(prim.y2, 4)))))
+            key = ("track", prim.layer, prim.net, round(prim.width, 4), ends)
+        elif prim.kind == "via":
+            key = ("via", prim.net, prim.layer, prim.layer_to,
+                   round(prim.x1, 4), round(prim.y1, 4))
+        else:
+            continue
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] == 2:
+            what = "Track" if key[0] == "track" else "Via"
+            where = f" on {board.layer(prim.layer)}" if key[0] == "track" else ""
+            add("duplicate_copper", f"{what}{where} ({board.net(prim.net)})", (prim.x1, prim.y1),
+                object=key[0])
+
+
+# ---------- result ----------
+
+def _fmt(value_mil: float, to_mm: bool) -> str:
+    return f"{value_mil * 0.0254:.4g} mm" if to_mm else f"{value_mil:.4g} mil"
+
+
+def _findings(board: _Board, check: str, items: list[dict], to_mm: bool) -> list[dict]:
+    altium_id, category, group, level = CHECKS[check]
+    out = []
+    by_severity: dict[str, list[dict]] = defaultdict(list)
+    for item in items:
+        severity = item.pop("severity", None) or LEVEL_SEVERITY.get(level, "info")
+        by_severity[severity].append(item)
+    for severity, members in by_severity.items():
+        base = {"check": check, "severity": severity, "category": category}
+        if altium_id is not None:
+            base["altium_id"] = altium_id
+        if len(members) > GROUP_ABOVE:
+            out.append({
+                **base, "count": len(members),
+                "objects": [member["label"] for member in members[:LISTED]],
+                "issue": f"{category}: {len(members)} objects"
+                + (f" (the first {LISTED} listed)." if len(members) > LISTED else "."),
+            })
+            continue
+        for member in members:
+            at = member.pop("at", None)
+            label = member.pop("label")
+            finding = {**base, "object": label}
+            if at is not None:
+                finding["at_mil"] = board.at(*at)
+            finding.update(member)
+            where = (f" ({_fmt(at[0] - board.origin[0], to_mm)}, "
+                     f"{_fmt(at[1] - board.origin[1], to_mm)})") if at is not None else ""
+            extra = ""
+            if "distance_mil" in member:
+                extra = f", {_fmt(member['distance_mil'], to_mm)} outside its pads and outline"
+            elif "shortest_mil" in member:
+                extra = (f", {member['segments']} edge(s) shorter than "
+                         f"{_fmt(MICRO_SEGMENT_MIL, to_mm)}")
+            elif "slot_length_mil" in member:
+                extra = (f", slot length {_fmt(member['slot_length_mil'], to_mm)} under the hole "
+                         f"size {_fmt(member['hole_mil'], to_mm)}")
+            elif "missing_pins" in member:
+                extra = f", pins not on the board: {', '.join(member['missing_pins'])}"
+            finding["issue"] = f"{category}: {label}{where}{extra}."
+            out.append(finding)
+    return out
+
+
+def run_health_check(
+    pcb,
+    checks: list[str] | None = None,
+    to_mm: bool = False,
+    offset: int = 0,
+    limit: int = FINDING_LIMIT,
+    report_health: dict[str, int] | None = None,
+) -> dict:
+    """The health findings for a parsed board (PcbData). report_health holds the
+    category counts of the last saved Batch DRC report's health section, if any."""
+    requested = [check.strip().lower() for check in checks or [] if check.strip()]
+    known = set(CHECKS) | {entry[0] for entry in NOT_CHECKED.values()}
+    invalid = [check for check in requested if check not in known]
+    if invalid:
+        return {"error": "invalid_checks",
+                "message": f"Unknown checks {invalid}.", "valid_checks": sorted(known)}
+    board = _Board(pcb)
+    settings = pcb.board.health_checks or {}
+    disabled = {key for key, entry in CHECKS.items()
+                if entry[0] is not None and settings.get(entry[0]) is False}
+    wanted = set(requested) if requested else set(CHECKS) - OPT_IN - disabled
+    items, notes = _check_all(board, wanted & set(CHECKS))
+    findings: list[dict] = []
+    for check in sorted(wanted & set(CHECKS), key=_ORDER.get):
+        findings += _findings(board, check, items.get(check, []), to_mm)
+    findings.sort(key=lambda f: (_SEVERITY_RANK[f["severity"]], _ORDER[f["check"]]))
+    not_checked = {
+        key: reason for key, _, reason in NOT_CHECKED.values()
+        if not requested or key in requested
+    }
+    for key in sorted(disabled - set(requested), key=_ORDER.get):
+        not_checked[key] = "turned off in this board's Health Check settings."
+    if not requested:
+        for key in OPT_IN:
+            not_checked[key] = "Altium runs it only in debug mode; name it in checks to run it."
+    counts = {
+        check: sum(f.get("count", 1) for f in findings if f["check"] == check)
+        for check in sorted(wanted & set(CHECKS), key=_ORDER.get)
+    }
+    offset = max(0, int(offset or 0))
+    result: dict = {
+        "checks_run": sorted(wanted & set(CHECKS), key=_ORDER.get),
+        "summary": {check: count for check, count in counts.items() if count},
+        "severity_counts": {level: sum(1 for f in findings if f["severity"] == level)
+                            for level in ("error", "warning", "info")},
+        "findings": findings[offset:offset + limit],
+        "total": len(findings),
+        "offset": offset,
+        "has_more": offset + limit < len(findings),
+    }
+    if result["has_more"]:
+        result["next_offset"] = offset + limit
+    if not_checked:
+        result["not_checked"] = not_checked
+    if pcb.board.health_checks is not None:
+        result["board_settings"] = (
+            "The board stores Health Check settings"
+            + (f"; turned off: {sorted(disabled)}" if disabled else "; every check is on")
+            + "."
+        )
+    if report_health is not None:
+        result["altium_report"] = _compare(report_health, counts)
+    notes.append(
+        "Coordinates are relative to the board origin. Altium also runs these checks when "
+        "the board loads (all but Components with Mirrored Footprints), and a shelved or "
+        "modified polygon stops output generation with a warning."
+    )
+    result["notes"] = notes
+    return result
+
+
+def _compare(report_health: dict[str, int], counts: dict[str, int]) -> dict:
+    """The saved report's health counts next to this check's, per Altium category."""
+    by_category = {CHECKS[key][1].lower(): key for key in CHECKS if CHECKS[key][0] is not None}
+    rows = []
+    for title, count in sorted(report_health.items()):
+        key = by_category.get(title.strip().lower())
+        rows.append({"category": title, "report": count,
+                     "offline": counts.get(key) if key else None})
+    return {
+        "categories": rows,
+        "note": "The report lists only categories with issues; a category it leaves out "
+                "had none or was not run.",
+    }

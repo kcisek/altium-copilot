@@ -6,6 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_pcb_health`: Altium's PCB Health Check Monitor run offline on the saved PcbDoc,
+  with Altium's category names, ids and levels (High error, Medium warning, Low info) so
+  a saved Batch DRC report's health section compares one to one (`altium_report`).
+  Checks: Shelved/Modified Polygons (shelved, or COPPERINVALIDATE), Duplicate Component
+  Designators, Zero Area Polygons and Regions, Self-Intersecting Regions, Micro-Segments
+  (Board, Copper; Graphics/Mechanical on request, as Altium runs it only in debug mode):
+  region edges under 0.03 mil, Slots Hole Size > Length, Broken and Unused xSignals,
+  360deg Component, Reference Point Outside the Component Area, Components on
+  Non-signal Layers, Invalid PCB Design Rules (empty or repeated names); plus parts
+  outside the board shape, duplicate copper tracks and vias, and board-outline
+  micro-segments. Checks turned off in the board's saved Health Check settings are
+  skipped; mirrored footprints, panels, fonts and From-Tos are listed as not checked.
+  On real boards it matched every saved report's health section (reference points
+  outside the component on 11 of 11 boards). The PcbDoc parser now also reads region
+  shapes (ShapeBasedRegions6, Regions6), fills, board regions, pour and outline arcs,
+  COPPERINVALIDATE, the component's layer, pad hole shapes and slot lengths, and the
+  board's Health Check settings
 - PCB design rules, classes and differential pairs, read from the `.PcbDoc` (`Rules6`,
   `Classes6`, `SignalClasses`, `DifferentialPairs6`, and xSignals from Board6). New tools:
   - `get_design_rules` — every rule's kind, priority, enabled flag and scope; per kind

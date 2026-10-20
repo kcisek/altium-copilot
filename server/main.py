@@ -53,6 +53,7 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
+    from services.pcb_health import run_health_check
     from services.clone_status import clone_status
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
@@ -96,6 +97,7 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
+    from server.services.pcb_health import run_health_check
     from server.services.clone_status import clone_status
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
@@ -326,6 +328,12 @@ component locations, distances):
     the drill table (component holes and slots are not in it); holes are as drawn
     (finished), which fabricators drill larger. Back drilling is recomputed the way
     Altium writes the drill files; stubs of nets with no back-drill rule are advice.
+17. check_pcb_health — "run a health check", board clean-up, or before fab outputs:
+    Altium's PCB Health Check Monitor offline (Altium's categories, ids and levels:
+    shelved/modified polygons, duplicate designators, zero-area and self-intersecting
+    shapes, micro-segments, 360deg components, reference points outside the part)
+    plus parts outside the board; altium_report compares the last DRC report's health
+    counts. Quote not_checked: mirrored footprints, panels and fonts need Altium.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3229,6 +3237,85 @@ def check_vias(
             {**context, **page_via_result(full, offset, limit, type_limit, class_limit)},
             to_mm,
         )
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Check PCB Health",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_pcb_health(
+    checks: list[str] | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Run Altium's PCB Health Check Monitor offline on the saved PcbDoc, plus a few
+    board-hygiene checks. Call it when the user asks for a PCB health check, board
+    clean-up or hygiene, or before generating fabrication outputs. Each finding names
+    Altium's category and id, with Altium's level as severity (High error, Medium
+    warning, Low info): shelved_modified_polygons (stops output generation in Altium),
+    duplicate_designators, zero_area_polygons, zero_area_regions,
+    self_intersecting_regions, micro_segments_board and micro_segments_copper (region
+    edges under 0.03 mil), slot_holes, broken_xsignals, rotation_360,
+    reference_point_outside, non_signal_layer_components, unused_xsignals,
+    invalid_rules; micro_segments_graphics only when named in checks (Altium runs it in
+    debug mode). Not Altium items: components_outside_board (warning when the part has
+    netted pads, often parked parts), duplicate_copper, outline_micro_segments.
+    altium_report puts the last saved Batch DRC report's health counts next to these.
+    not_checked lists what cannot be done offline (mirrored footprints, panels, fonts,
+    From-Tos) and checks turned off in the board's own Health Check settings.
+
+    checks narrows to some of these; findings are paginated (offset from next_offset),
+    errors first; many objects in one check become one finding listing them.
+    Coordinates are relative to the board origin, in units (default: board display
+    unit)."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    project, _, _ = _require_project(netlist=False)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    report_health = None
+    if paths:
+        pcb_path = Path(paths[0])
+        context["pcb_doc"] = pcb_path.name
+        if len(paths) > 1:
+            context["note"] = (
+                f"Project lists {len(paths)} PcbDocs; checked '{pcb_path.name}'."
+            )
+        try:
+            report, report_path, _, _, _ = load_report(project, pcb_path)
+        except Exception:  # a broken report must not stop the health check
+            report, report_path = None, None
+        if report is not None:
+            tables = [table for table in report.tables if table.type == "health"]
+            if tables or "health_issues" in report.totals:
+                report_health = {table.title: table.count for table in tables}
+                report_saved = report_path.stat().st_mtime
+                context["altium_report_file"] = report_path.name
+                context["altium_report_saved_utc"] = _utc(report_saved)
+                if report_saved < pcb_path.stat().st_mtime:
+                    context["altium_report_note"] = (
+                        "The report is older than the saved board: its counts may be out "
+                        "of date."
+                    )
+    for limit in (100, 40, 15, 5):
+        result = run_health_check(
+            index.pcb, checks=checks, to_mm=to_mm, offset=offset, limit=limit,
+            report_health=report_health,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        result = _convert_units({**context, **result}, to_mm)
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)
