@@ -43,7 +43,7 @@ try:
     )
     from services.sch_pcb_sync import net_matching_options, run_sync_check
     from services.drc_results import (
-        load_report, assess, summarize, other_sections, DrcLinker,
+        load_report, assess, summarize, other_sections, DrcLinker, count_problem,
     )
     from services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
@@ -53,6 +53,7 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
+    from services.pcb_health import run_health_check
     from services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
@@ -90,7 +91,7 @@ except ImportError:
     )
     from server.services.sch_pcb_sync import net_matching_options, run_sync_check
     from server.services.drc_results import (
-        load_report, assess, summarize, other_sections, DrcLinker,
+        load_report, assess, summarize, other_sections, DrcLinker, count_problem,
     )
     from server.services.bom import (
         BASE_VARIANT, build_parts as build_bom_parts, compare_variants as compare_bom_variants,
@@ -100,6 +101,7 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
+    from server.services.pcb_health import run_health_check
     from server.services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
@@ -343,6 +345,12 @@ component locations, distances):
     now; quote altium_drc's report issues before comparing with Altium's last DRC run. Nets
     connected through assumed copper (planes, split-plane or pour outlines) are in
     assumed_copper_nets; say those connections are assumed.
+18. check_pcb_health — "run a health check", board clean-up, or before fab outputs:
+    Altium's PCB Health Check Monitor offline (Altium's categories, ids and levels:
+    shelved/modified polygons, duplicate designators, zero-area and self-intersecting
+    shapes, micro-segments, 360deg components, reference points outside the part)
+    plus parts outside the board; altium_report compares the last DRC report's health
+    counts. Quote not_checked: mirrored footprints, panels and fonts need Altium.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3439,6 +3447,109 @@ def _connectivity_drc(project: dict, pcb_path: Path, index, full: dict, filtered
             "checked."
         )
     return block
+
+
+@mcp.tool(
+    title="Check PCB Health",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_pcb_health(
+    checks: list[str] | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Run Altium's PCB Health Check Monitor offline on the saved PcbDoc, plus a few
+    board-hygiene checks. Call it when the user asks for a PCB health check, board
+    clean-up or hygiene, or before generating fabrication outputs. Each finding names
+    Altium's category and id, with Altium's level as severity (High error, Medium
+    warning, Low info): shelved_modified_polygons (stops output generation in Altium),
+    duplicate_designators, zero_area_polygons, zero_area_regions,
+    self_intersecting_regions, micro_segments_board and micro_segments_copper (region
+    edges under 0.03 mil), slot_holes, broken_xsignals, rotation_360,
+    reference_point_outside, non_signal_layer_components, unused_xsignals,
+    invalid_rules; micro_segments_graphics only when named in checks (Altium runs it in
+    debug mode). Not Altium items: components_outside_board (warning when the part has
+    netted pads, often parked parts), duplicate_copper, outline_micro_segments.
+    altium_report puts the last saved Batch DRC report's health counts next to these.
+    not_checked lists what cannot be done offline (mirrored footprints, panels, fonts,
+    From-Tos) and checks turned off in the board's own Health Check settings.
+
+    checks narrows to some of these; findings are paginated (offset from next_offset),
+    errors first; many objects in one check become one finding listing them.
+    Coordinates are relative to the board origin, in units (default: board display
+    unit)."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    project, _, _ = _require_project(netlist=False)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    report_health = None
+    if paths:
+        pcb_path = Path(paths[0])
+        context["pcb_doc"] = pcb_path.name
+        if len(paths) > 1:
+            context["note"] = (
+                f"Project lists {len(paths)} PcbDocs; checked '{pcb_path.name}'."
+            )
+        try:
+            report, report_path, _, _, report_notes = load_report(project, pcb_path)
+        except Exception:  # a broken report must not stop the health check
+            report, report_path, report_notes = None, None, []
+        if report is not None:
+            context["altium_report_file"] = report_path.name
+            report_saved = report_path.stat().st_mtime
+            context["altium_report_saved_utc"] = _utc(report_saved)
+            cautions = [note["detail"] for note in report_notes if note.get("detail")]
+            tables = [table for table in report.tables if table.type == "health"]
+            broken = [problem for problem in report.problems if not count_problem(problem)]
+            listed = sum(table.count for table in tables)
+            if broken:
+                cautions.append(
+                    "The report is incomplete (empty or cut short), so it is not compared: "
+                    "run the Batch DRC again. " + "; ".join(broken[:3])
+                )
+            elif tables or "health_issues" in report.totals:
+                report_health = {table.title: table.count for table in tables}
+                if report.totals.get("health_issues", listed) > listed:
+                    cautions.append(
+                        f"The report counts {report.totals['health_issues']} health issues "
+                        f"but its tables list {listed}: the comparison may be incomplete."
+                    )
+                if report_saved < pcb_path.stat().st_mtime:
+                    cautions.append(
+                        "The report is older than the saved board: its counts may be out "
+                        "of date."
+                    )
+            else:
+                option = index.pcb.drc_options.include_health if index.pcb.drc_options else None
+                cautions.append(
+                    "The report has no PCB health section, so there is nothing to compare: "
+                    + ("'Report PCB Health Issues' is off in the Batch DRC report options."
+                       if option is False else
+                       "'Report PCB Health Issues' was off, or the Altium version that ran "
+                       "it does not offer it.")
+                )
+            if cautions:
+                context["altium_report_notes"] = cautions
+    for limit in (100, 40, 15, 5):
+        result = run_health_check(
+            index.pcb, checks=checks, to_mm=to_mm, offset=offset, limit=limit,
+            report_health=report_health,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        result = _convert_units({**context, **result}, to_mm)
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
 
 
 BOM_LINE_LIMIT = 100

@@ -4,6 +4,7 @@ Pure parsing only: OLE streams -> dataclasses. No MCP or index logic here.
 All lengths and coordinates are converted to float mils at parse time.
 """
 
+import json
 import math
 import re
 import struct
@@ -203,6 +204,10 @@ class Primitive:
     layer_copper: dict[int, PadCopper] | None = None
     # Vias only: tenting and pad stack.
     via: ViaStack | None = None
+    # Pads only: hole shape (0 round, 1 square, 2 slot) and the slot or square
+    # hole's length (mil), from the size-and-shape subrecord; None when absent.
+    hole_shape: int | None = None
+    slot_length: float | None = None
 
 
 def iter_binary_records(data: bytes):
@@ -692,6 +697,7 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
             skipped += 1
             continue
         copper = _slot_copper(raw_copper, size_shape)
+        hole_shape, slot_length = _hole_slot(size_shape)
         pin_package = None
         if len(main) >= _PAD_PIN_PACKAGE_OFFSET + 4:
             (raw_pin_package,) = struct.unpack_from(
@@ -724,9 +730,30 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                     if main[0] == MULTI_LAYER
                     else None
                 ),
+                hole_shape=hole_shape if hole > 0 else None,
+                slot_length=slot_length if hole > 0 else None,
             )
         )
     return primitives, skipped
+
+
+# Size-and-shape subrecord: 29 inner sizes x and y (232 bytes), 29 inner shapes, one
+# byte, then the hole shape (u8: 0 round, 1 square, 2 slot) and the slot length (int32).
+_PAD_HOLE_SHAPE_OFFSET = 262
+_PAD_SLOT_LENGTH_OFFSET = 263
+
+
+def _hole_slot(size_shape: bytes) -> tuple[int | None, float | None]:
+    """(hole shape, slot length in mil) from a pad's size-and-shape subrecord."""
+    if len(size_shape) < _PAD_SLOT_LENGTH_OFFSET + 4:
+        return None, None
+    shape = size_shape[_PAD_HOLE_SHAPE_OFFSET]
+    (length,) = struct.unpack_from("<i", size_shape, _PAD_SLOT_LENGTH_OFFSET)
+    if length > 0:
+        return shape, _units_to_mil(length)
+    # A square or slot hole of length 0 is a real (degenerate) slot; round holes
+    # store 0 there too, and carry no slot length.
+    return shape, 0.0 if shape in (1, 2) else None
 
 
 @dataclass
@@ -830,9 +857,65 @@ class BoardInfo:
     # Layer-stack regions (rigid/flex); each {"id", "name", "is_flex"}.
     substacks: list[dict] = field(default_factory=list)
     drill_pairs: list[DrillPair] = field(default_factory=list)
+    # The outline with its arcs (outline_vertices keeps only the vertices).
+    outline_shape: list["ShapeVertex"] = field(default_factory=list)
+    # Health Check Monitor settings saved with the board (HEALTHCHECKSTORAGE):
+    # check id -> enabled; None when the board stores none (all on but id 20).
+    health_checks: dict[int, bool] | None = None
     # Internal plane net assignments (PLANEnNETNAME): v6 layer (38 + n) ->
     # net name; planes without a net ('(No Net)') are left out.
     plane_nets: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ShapeVertex:
+    """A vertex of an outline, pour or region shape (mil). With arc set, the edge
+    from this vertex is the arc (centre x, centre y, radius, start and end angle in
+    degrees, counter-clockwise) instead of a straight line."""
+
+    x: float
+    y: float
+    arc: tuple[float, float, float, float, float] | None = None
+
+
+def shape_from_properties(properties: dict[str, str]) -> list[ShapeVertex]:
+    """VXn/VYn vertices with their KINDn=1 arcs (CXn, CYn, Rn, SAn, EAn), as Board6
+    outlines and Polygons6 pours store them."""
+    vertices: list[ShapeVertex] = []
+    index = 0
+    while f"VX{index}" in properties and f"VY{index}" in properties:
+        x = parse_dim_mil(properties[f"VX{index}"])
+        y = parse_dim_mil(properties[f"VY{index}"])
+        arc = None
+        if properties.get(f"KIND{index}", "0").strip() == "1":
+            cx = parse_dim_mil(properties.get(f"CX{index}"))
+            cy = parse_dim_mil(properties.get(f"CY{index}"))
+            radius = parse_dim_mil(properties.get(f"R{index}"))
+            start = _optional_float(properties.get(f"SA{index}"))
+            end = _optional_float(properties.get(f"EA{index}"))
+            if None not in (cx, cy, radius, start, end) and radius > 0:
+                arc = (cx, cy, radius, start, end)
+        if x is not None and y is not None:
+            vertices.append(ShapeVertex(x, y, arc))
+        index += 1
+    if len(vertices) > 1 and vertices[-1] == ShapeVertex(vertices[0].x, vertices[0].y):
+        vertices.pop()  # the closing copy of the first vertex
+    return vertices
+
+
+def _health_check_storage(raw: str | None) -> dict[int, bool] | None:
+    """Board6 HEALTHCHECKSTORAGE: comma-separated byte codes of a JSON object whose
+    healthCheckRuleEnabledDict holds {"<check id>": true|false} as JSON text."""
+    if not raw:
+        return None
+    try:
+        outer = json.loads(bytes(int(code) for code in raw.split(",") if code.strip()))
+        inner = outer.get("healthCheckRuleEnabledDict", {})
+        if isinstance(inner, str):
+            inner = json.loads(inner)
+        return {int(key): bool(value) for key, value in inner.items()}
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 @dataclass
@@ -858,6 +941,8 @@ class PcbComponent:
     # The full SOURCEUNIQUEID path (\SheetSymbol...\Component): channel copies
     # share the tail but not the path.
     source_unique_id: str | None = None
+    # The LAYER token as written (TOP, BOTTOM, MID1, ...); side folds it to two.
+    layer_name: str = ""
 
 
 @dataclass
@@ -872,9 +957,14 @@ class PolygonPour:
     # Shelved (Polygon Manager): kept in the file, with any copper, but hidden
     # from DRC and connectivity until restored. No copper for these tools.
     shelved: bool = False
+    # Modified since its copper was poured (COPPERINVALIDATE): the saved copper
+    # does not follow the outline until it is repoured.
+    copper_invalid: bool = False
     # POLYGONTYPE: 'Polygon' for a pour, 'Split Plane' for a split plane on
     # an internal plane layer; None when the record does not say.
     polygon_type: str | None = None
+    # The outline with its arcs (vertices keeps only the vertices).
+    shape: list[ShapeVertex] = field(default_factory=list)
 
 
 @dataclass
@@ -1127,6 +1217,8 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         substacks=substacks,
         impedance_profiles=decode_impedance_profiles(properties),
         drill_pairs=decode_drill_pairs(properties),
+        outline_shape=shape_from_properties(properties),
+        health_checks=_health_check_storage(properties.get("HEALTHCHECKSTORAGE")),
         plane_nets=plane_nets,
     )
 
@@ -1172,6 +1264,7 @@ def decode_components(
                 footprint=record.get("PATTERN") or None,
                 kind=_component_kind(record),
                 source_unique_id=source_uid or None,
+                layer_name=record.get("LAYER", "").strip().upper(),
             )
         )
     return components
@@ -1255,7 +1348,9 @@ def decode_polygons(
             hatch_style=record.get("HATCHSTYLE"),
             vertices=vertices,
             shelved=record.get("SHELVED", "").strip().upper() == "TRUE",
+            copper_invalid=record.get("COPPERINVALIDATE", "").strip().upper() == "TRUE",
             polygon_type=(record.get("POLYGONTYPE") or "").strip() or None,
+            shape=shape_from_properties(record),
         )
         pours.append(pour)
         if layer is None or len(vertices) < 3 or pour.shelved:
@@ -1548,6 +1643,8 @@ class PcbRule:
     unique_id: str | None
     from_schematic: bool
     properties: dict[str, str] = field(default_factory=dict)
+    # The record had no NAME (name above is then '<kind> #n').
+    unnamed: bool = False
 
 
 @dataclass
@@ -1627,6 +1724,7 @@ def decode_rules(
         rules.append(
             PcbRule(
                 name=record.get("NAME") or f"{kind} #{len(rules) + 1}",
+                unnamed=not (record.get("NAME") or "").strip(),
                 kind=kind,
                 kind_id=kind_id,
                 enabled=record.get("ENABLED", "TRUE").upper() != "FALSE",
@@ -1777,6 +1875,152 @@ def decode_diff_pairs(records: list[dict[str, str]]) -> list[DiffPair]:
 
 
 @dataclass
+class PcbRegion:
+    """A ShapeBasedRegions6, Regions6 or BoardRegions record (mil)."""
+
+    index: int
+    layer: int
+    net: int | None
+    polygon: int | None  # Polygons6 index of the pour it is copper of
+    component: int | None
+    keepout: bool
+    kind: int  # KIND: 0 copper or graphics, 1 polygon cutout, 2 dashed, 3 board cutout
+    board_cutout: bool
+    vertices: list[ShapeVertex]
+    holes: list[list[tuple[float, float]]]
+    name: str = ""
+
+
+@dataclass
+class PcbFill:
+    """A Fills6 rectangle (mil): corners before rotation about their centre."""
+
+    layer: int
+    net: int | None
+    component: int | None
+    keepout: bool
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    rotation: float
+
+
+def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int]:
+    """Region records: u8 layer, u8 flags, u8 flags2 (2 = keepout), u16 net, u16
+    polygon, u16 component, hole count u16 at 14, properties (u32 length) at 18, u32
+    vertex count, then vertices (Regions6 and BoardRegions: double x, y; shape-based:
+    count + 1 of u8 round, int32 x, y, cx, cy, r, double start, end angle), then holes
+    (u32 count + double x, y)."""
+    regions: list[PcbRegion] = []
+    skipped = 0
+    consumed = 0
+    for index, (record_type, payload) in enumerate(iter_binary_records(data)):
+        consumed += 5 + len(payload)
+        try:
+            if record_type != 11 or len(payload) < 22:
+                raise ValueError
+            net, polygon, component = struct.unpack_from("<HHH", payload, 3)
+            (hole_count,) = struct.unpack_from("<H", payload, 14)
+            (text_length,) = struct.unpack_from("<I", payload, 18)
+            properties = _parse_text_properties(payload[22 : 22 + text_length])
+            position = 22 + text_length
+            (count,) = struct.unpack_from("<I", payload, position)
+            position += 4
+            vertices: list[ShapeVertex] = []
+            if shape_based:
+                for _ in range(count + 1):
+                    round_flag = payload[position]
+                    x, y, cx, cy, radius = struct.unpack_from("<iiiii", payload, position + 1)
+                    start, end = struct.unpack_from("<dd", payload, position + 21)
+                    position += 37
+                    arc = (
+                        (_units_to_mil(cx), _units_to_mil(cy), _units_to_mil(radius), start, end)
+                        if round_flag and radius > 0 else None
+                    )
+                    vertices.append(ShapeVertex(_units_to_mil(x), _units_to_mil(y), arc))
+                # The closing copy of the first vertex (written without its arc
+                # when the first vertex is one).
+                if len(vertices) > 1 and (vertices[-1].x, vertices[-1].y) == (
+                    vertices[0].x, vertices[0].y
+                ) and vertices[-1].arc in (None, vertices[0].arc):
+                    vertices.pop()
+            else:
+                for _ in range(count):
+                    x, y = struct.unpack_from("<dd", payload, position)
+                    position += 16
+                    vertices.append(ShapeVertex(x / ALTIUM_UNITS_PER_MIL, y / ALTIUM_UNITS_PER_MIL))
+                if len(vertices) > 1 and vertices[-1] == vertices[0]:
+                    vertices.pop()  # the closing copy of the first vertex
+            holes = []
+            for _ in range(hole_count):
+                (points,) = struct.unpack_from("<I", payload, position)
+                position += 4
+                holes.append([
+                    (x / ALTIUM_UNITS_PER_MIL, y / ALTIUM_UNITS_PER_MIL)
+                    for x, y in struct.iter_unpack("<dd", payload[position : position + 16 * points])
+                ])
+                position += 16 * points
+        except (ValueError, struct.error, IndexError):
+            skipped += 1
+            continue
+        if not _valid_layer(payload[0]):
+            skipped += 1
+            continue
+        kind = _optional_int(properties.get("KIND")) or 0
+        regions.append(PcbRegion(
+            index=index,
+            layer=payload[0],
+            net=_optional_index(net, NO_NET),
+            polygon=_optional_index(polygon, 0xFFFF),
+            component=_optional_index(component, NO_COMPONENT),
+            keepout=payload[2] == 2,
+            kind=kind,
+            board_cutout=properties.get("ISBOARDCUTOUT", "").upper() == "TRUE" or kind == 3,
+            vertices=vertices,
+            holes=holes,
+            name=properties.get("NAME", ""),
+        ))
+    if consumed < len(data):
+        skipped += 1  # a record cut short at the end of the stream
+    return regions, skipped
+
+
+def decode_fill_records(data: bytes) -> tuple[list[PcbFill], int]:
+    """Fills6 records: layer at 0, flags2 at 2 (2 = keepout), net 3, component 7,
+    corners int32 at 13 and 21, rotation double at 29."""
+    fills: list[PcbFill] = []
+    skipped = 0
+    consumed = 0
+    for record_type, payload in iter_binary_records(data):
+        consumed += 5 + len(payload)
+        if record_type != 6 or len(payload) < 37 or not _valid_layer(payload[0]):
+            skipped += 1
+            continue
+        net = struct.unpack_from("<H", payload, 3)[0]
+        component = struct.unpack_from("<H", payload, 7)[0]
+        x1, y1, x2, y2 = struct.unpack_from("<iiii", payload, 13)
+        (rotation,) = struct.unpack_from("<d", payload, 29)
+        fills.append(PcbFill(
+            layer=payload[0],
+            net=_optional_index(net, NO_NET),
+            component=_optional_index(component, NO_COMPONENT),
+            keepout=payload[2] == 2,
+            x1=_units_to_mil(x1), y1=_units_to_mil(y1),
+            x2=_units_to_mil(x2), y2=_units_to_mil(y2),
+            rotation=rotation if math.isfinite(rotation) else 0.0,
+        ))
+    if consumed < len(data):
+        skipped += 1  # a record cut short at the end of the stream
+    return fills, skipped
+
+
+# Streams kept raw on PcbData and decoded only by the checks that need them (they
+# are large on poured boards): region shapes, fills and the board's stack regions.
+LAZY_STREAMS = ("ShapeBasedRegions6/Data", "Regions6/Data", "Fills6/Data", "BoardRegions/Data")
+
+
+@dataclass
 class PcbData:
     """Parsed PCB content ready for indexing."""
 
@@ -1795,6 +2039,8 @@ class PcbData:
     # Rules6 kind ids checked by the board's batch DRC; None when unknown.
     drc_rule_kinds: set[int] | None = None
     drc_options: DrcOptions | None = None
+    # LAZY_STREAMS as read, for decode_region_records and decode_fill_records.
+    raw: dict[str, bytes] = field(default_factory=dict)
     # Copper regions and fills (a shelved pour's dropped, a pour's copper
     # given its net); area_streams names the streams read ('Regions6',
     # 'Fills6'), so a missing stream is not mistaken for no area copper.
@@ -2062,6 +2308,7 @@ def parse_streams(streams: dict[str, bytes]) -> PcbData:
         xsignals=xsignals,
         drc_rule_kinds=drc_rule_kinds,
         drc_options=drc_options,
+        raw={stream: streams[stream] for stream in LAZY_STREAMS if stream in streams},
         areas=valid_areas,
         area_streams=tuple(area_streams),
     )
@@ -2095,7 +2342,9 @@ def parse_pcb_doc(path: str) -> PcbData:
     read_warnings: list[str] = []
     with olefile.OleFileIO(path) as ole:
         available = {"/".join(stream) for stream in ole.listdir()}
-        for stream in _WANTED_STREAMS:
+        wanted = [*_WANTED_STREAMS,
+                  *(stream for stream in LAZY_STREAMS if stream not in _WANTED_STREAMS)]
+        for stream in wanted:
             if stream in available:
                 try:
                     streams[stream] = ole.openstream(stream).read()

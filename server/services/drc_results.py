@@ -78,7 +78,7 @@ _STOP_NOTICE = re.compile(
     r"DRC was stopped|violations detected, DRC|maximum violation", re.IGNORECASE
 )
 
-_COUNT_PROBLEMS = ("1 table lists", "the rule counts")  # and 'N tables list'
+_COUNT_PROBLEMS = re.compile(r"(?:1 table lists|\d+ tables list|the rule counts) ")
 _PAD = re.compile(r"\bPad (\S+?)\(")
 _COMPONENT = re.compile(r"\bComponent (\S+)")
 _NET = re.compile(r"\b(?:Between|And) Net (\S+)")  # Matched Lengths rows
@@ -225,11 +225,16 @@ def _same_file(first: str, second: Path) -> bool | None:
         return None
 
 
+def count_problem(problem: str) -> bool:
+    """A count that does not add up, as against a report that is empty or cut short."""
+    return bool(_COUNT_PROBLEMS.match(problem))
+
+
 def assess(report, report_path: Path, pcb_path: Path, project: dict, pcb=None) -> list[dict]:
     """What limits trust in the report: incomplete, stopped early, kinds not checked,
     older than the board, another board, rules changed since."""
     issues: list[dict] = []
-    broken = [p for p in report.problems if not p.startswith(_COUNT_PROBLEMS)]
+    broken = [p for p in report.problems if not count_problem(p)]
     if broken:
         issues.append(_issue(
             "report_incomplete", "error",
