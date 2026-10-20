@@ -11,6 +11,7 @@ from server.parsers.pcb_doc import (
     Primitive,
 )
 from server.services.pcb_index import PcbIndex
+from server.parsers.pcb_doc import decode_polygons
 
 
 def _layer(v6, name, order, kind="copper", **kwargs):
@@ -490,6 +491,120 @@ def test_region_query_excludes_pour_when_only_bbox_is_near(pcb_data):
     index = PcbIndex(data, NETLIST)
     result = index.region_query(90.0, 90.0, radius=5.0, layer=2)
     assert result["pours"] == []
+
+
+def _add_pour(data, net, layer, vertices):
+    """Add a pour and its zero-width outline rows the way parse_streams does."""
+    record = {"NET": str(net), "LAYER": layer, "HATCHSTYLE": "Solid"}
+    for vertex, (x, y) in enumerate(vertices):
+        record[f"VX{vertex}"] = f"{x}mil"
+        record[f"VY{vertex}"] = f"{y}mil"
+    (pour,), edges = decode_polygons([record], data.layer_name_to_v6)
+    pour.pour_id = len(data.pours)
+    for edge in edges:
+        edge.pour_id = pour.pour_id
+    data.pours.append(pour)
+    data.primitives.extend(edges)
+
+
+@pytest.fixture
+def outline_data(pcb_data):
+    """PLANE (net 4) pours on Top Layer; its outline's left edge (x = 650)
+    crosses SIG's track, the rest of SIG lies inside. NEAR stops 2 mil short of
+    the outline, outside it."""
+    data = deepcopy(pcb_data)
+    data.nets.extend(["SIG", "PLANE", "NEAR"])
+    data.primitives.extend([
+        _track(net=3, layer=1, x1=600, y1=600, x2=700, y2=600),
+        _track(net=5, layer=1, x1=600, y1=800, x2=645, y2=800),
+    ])
+    _add_pour(
+        data, 4, "TOP", [(650, 500), (900, 500), (900, 900), (650, 900)]
+    )
+    return data
+
+
+def test_pour_outline_is_not_a_copper_neighbor(outline_data):
+    index = PcbIndex(outline_data, NETLIST)
+    result = index.net_neighbors("SIG", distance=10.0)
+    assert "PLANE" not in [n["net"] for n in result["neighbors"]]
+    assert result["pours"] == [
+        {
+            "net": "PLANE",
+            "layer": "Top Layer",
+            "inside_pour": True,
+            "min_outline_distance_mil": 0.0,
+        }
+    ]
+    assert result["pour_count"] == 1
+    assert result["pours_has_more"] is False
+    # The pour's own outline is not PLANE copper either.
+    plane = index.net_neighbors("PLANE", distance=10.0)
+    assert plane["neighbors"] == []
+    assert plane["pours"] == []
+
+
+def test_pour_outline_reports_inside_and_distance_separately(outline_data):
+    index = PcbIndex(outline_data, NETLIST)
+    near = index.net_neighbors("NEAR", distance=10.0)
+    assert near["neighbors"] == []
+    assert near["pours"] == [
+        {
+            "net": "PLANE",
+            "layer": "Top Layer",
+            "inside_pour": False,
+            "min_outline_distance_mil": 2.0,
+        }
+    ]
+    assert index.net_neighbors("NEAR", distance=1.0)["pours"] == []
+    # Deep inside the pour, the outline is beyond the search distance.
+    outline_data.nets.append("DEEP")
+    outline_data.primitives.append(
+        _track(net=6, layer=1, x1=750, y1=700, x2=800, y2=700)
+    )
+    deep = PcbIndex(outline_data, NETLIST).net_neighbors("DEEP", 10.0)
+    assert deep["pours"] == [
+        {
+            "net": "PLANE",
+            "layer": "Top Layer",
+            "inside_pour": True,
+            "min_outline_distance_mil": None,
+        }
+    ]
+
+
+def test_pour_outline_respects_the_layer_filter(outline_data):
+    index = PcbIndex(outline_data, NETLIST)
+    assert index.net_neighbors("SIG", distance=10.0, layer=3)["pours"] == []
+
+
+def test_poured_copper_stays_a_neighbor(outline_data):
+    # A hatched pour's tracks come from Tracks6 with their width and no
+    # pour_id: real copper, measured edge to edge (608 - 603 = 5 mil).
+    outline_data.primitives.append(
+        _track(net=4, layer=1, x1=660, y1=612, x2=900, y2=612, width=8.0)
+    )
+    index = PcbIndex(outline_data, NETLIST)
+    result = index.net_neighbors("SIG", distance=10.0)
+    plane = next(n for n in result["neighbors"] if n["net"] == "PLANE")
+    assert plane["min_edge_distance_mil"] == pytest.approx(5.0)
+    assert plane["close_segments"] == 1
+    assert result["pours"][0]["min_outline_distance_mil"] == 0.0
+
+
+def test_region_query_lists_pour_outline_only_under_pours(outline_data):
+    index = PcbIndex(outline_data, NETLIST)
+    # The outline (x = 650) is 5 mil away: within the radius, but not copper.
+    result = index.region_query(655.0, 600.0, radius=5.0, layer=1)
+    assert [net["net"] for net in result["nets"]] == ["SIG"]
+    assert result["pours"] == [
+        {
+            "net": "PLANE",
+            "layer": "Top Layer",
+            "inside_pour": True,
+            "min_distance_mil": 0.0,
+        }
+    ]
 
 
 def test_component_without_coordinates_does_not_appear_at_origin(pcb_data):

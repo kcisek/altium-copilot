@@ -1013,9 +1013,12 @@ class PcbIndex:
         net_id = self.net_id(name)
         if net_id is None:
             return None
+        # Pour outline rows (pour_id set) are the drawn polygon boundary, not
+        # copper: the net's own are never targets, other nets' go to pours.
         targets = self.db.execute(
             "SELECT * FROM prims "
-            "WHERE net_id = ? AND kind IN ('track','arc','via','pad')",
+            "WHERE net_id = ? AND kind IN ('track','arc','via','pad') "
+            "AND pour_id IS NULL",
             (net_id,),
         ).fetchall()
         if layer is not None:
@@ -1026,6 +1029,7 @@ class PcbIndex:
             ]
 
         aggregates: dict[tuple[int, int], dict] = {}
+        outline_near: dict[int, float] = {}
         for target in targets:
             target_layers = self._primitive_layers(target)
             if layer is not None:
@@ -1064,6 +1068,13 @@ class PcbIndex:
                         candidate,
                     )
                     if edge_distance > distance:
+                        continue
+                    pour_id = candidate["pour_id"]
+                    if pour_id is not None:
+                        outline_near[pour_id] = min(
+                            outline_near.get(pour_id, edge_distance),
+                            edge_distance,
+                        )
                         continue
                     overlap = (
                         parallel_overlap(
@@ -1120,12 +1131,12 @@ class PcbIndex:
         has_more = len(neighbors) > self.MAX_NEIGHBORS
         neighbors = neighbors[: self.MAX_NEIGHBORS]
 
+        pours = self._neighbor_pours(net_id, targets, layer, outline_near)
+        pour_count = len(pours)
+
         target_boxes: dict[int, dict[str, float]] = {}
         for target in targets:
-            if (
-                target["kind"] not in {"track", "arc"}
-                or target["pour_id"] is not None
-            ):
+            if target["kind"] not in {"track", "arc"}:
                 continue
             for target_layer in self._primitive_layers(target):
                 if layer is not None and target_layer != layer:
@@ -1150,6 +1161,7 @@ class PcbIndex:
                     "SELECT DISTINCT n.name "
                     "FROM prims p JOIN nets n ON n.id = p.net_id "
                     "WHERE p.layer = ? AND p.net_id != ? "
+                    "AND p.pour_id IS NULL "
                     "AND p.maxx >= ? AND p.minx <= ? "
                     "AND p.maxy >= ? AND p.miny <= ? "
                     "UNION "
@@ -1195,10 +1207,77 @@ class PcbIndex:
             "distance_mil": distance,
             "neighbors": neighbors,
             "has_more": has_more,
+            "pour_count": pour_count,
+            "pours": pours[: self.MAX_NEIGHBORS],
+            "pours_has_more": pour_count > self.MAX_NEIGHBORS,
             "broadside_count": broadside_count,
             "broadside": broadside_entries,
             "broadside_has_more": broadside_has_more,
         }
+
+    def _neighbor_pours(
+        self,
+        net_id: int,
+        targets: list,
+        layer: int | None,
+        outline_near: dict[int, float],
+    ) -> list[dict]:
+        """Other nets' pours on the target net's layers, by outline only.
+
+        inside_pour: a pad or via centre or a track or arc end of the net lies
+        within the outline. min_outline_distance_mil: the closest approach of the net's
+        copper to the outline when within the search distance, else None. The
+        outline is the drawn polygon boundary, not copper: poured copper keeps
+        the pour's clearance from the net and is not measured here.
+        """
+        points: dict[int, set[tuple[float, float]]] = defaultdict(set)
+        for target in targets:
+            ends = {(target["x1"], target["y1"])}
+            if target["kind"] in ("track", "arc"):
+                ends.add((target["x2"], target["y2"]))
+            for target_layer in self._primitive_layers(target):
+                if layer is None or target_layer == layer:
+                    points[target_layer].update(ends)
+        entries: dict[tuple[str, int], dict] = {}
+        rows = self.db.execute(
+            "SELECT po.*, n.name AS net_name "
+            "FROM pours po JOIN nets n ON n.id = po.net_id "
+            "WHERE po.net_id != ?",
+            (net_id,),
+        )
+        for row in rows:
+            on_layer = points.get(row["layer"])
+            if not on_layer:
+                continue
+            vertices = json.loads(row["vertices"])
+            inside = len(vertices) >= 3 and any(
+                row["minx"] <= x <= row["maxx"]
+                and row["miny"] <= y <= row["maxy"]
+                and point_in_polygon(x, y, vertices)
+                for x, y in on_layer
+            )
+            near = outline_near.get(row["id"])
+            if not inside and near is None:
+                continue
+            entry = entries.setdefault(
+                (row["net_name"], row["layer"]),
+                {
+                    "net": row["net_name"],
+                    "layer": self.layer_name(row["layer"]),
+                    "inside_pour": False,
+                    "min_outline_distance_mil": None,
+                },
+            )
+            entry["inside_pour"] = entry["inside_pour"] or inside
+            if near is not None:
+                previous = entry["min_outline_distance_mil"]
+                entry["min_outline_distance_mil"] = round(
+                    near if previous is None else min(previous, near), 2
+                )
+        return sorted(
+            entries.values(),
+            key=lambda entry: (entry["layer"], entry["net"]),
+        )
 
     MAX_REGION_RESULTS = 25
 
@@ -1215,11 +1294,12 @@ class PcbIndex:
             y - radius,
             y + radius,
         ]
+        # Copper only: pour outline rows are reported under pours instead.
         if self._has_rtree:
             rows = self.db.execute(
                 "SELECT p.* FROM prims p "
                 "JOIN prims_rtree r ON r.id = p.id "
-                "WHERE p.net_id IS NOT NULL "
+                "WHERE p.net_id IS NOT NULL AND p.pour_id IS NULL "
                 "AND r.maxx >= ? AND r.minx <= ? "
                 "AND r.maxy >= ? AND r.miny <= ?",
                 parameters,
@@ -1227,7 +1307,7 @@ class PcbIndex:
         else:
             rows = self.db.execute(
                 "SELECT * FROM prims "
-                "WHERE net_id IS NOT NULL "
+                "WHERE net_id IS NOT NULL AND pour_id IS NULL "
                 "AND maxx >= ? AND minx <= ? "
                 "AND maxy >= ? AND miny <= ?",
                 parameters,
