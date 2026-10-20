@@ -241,6 +241,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   stored in the variants. A cached netlist older than the sheets is not used
   (`netlist_stale`). After a partial load, `refresh_netlist` loads the project again,
   fully once Altium has it open
+- Altium 365 clone status, offline. When the project folder is in a Git clone whose
+  origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`, every
+  `set_project_dir` response carries an `altium365` block, and the new read-only tool
+  `get_clone_status` reads it again: workspace and project GUID, the last fetch
+  (`FETCH_HEAD` time, else the remote-tracking branch's reflog), commits ahead of and
+  behind the remote-tracking branch as of that fetch, uncommitted changes by kind with a
+  sample (design files first) and the last commit's date and message. Warnings: last
+  fetch older than 30 days or unknown, behind, ahead, no remote branch to compare with,
+  and uncommitted changes to the design files the tools read (`.PrjPcb`, `.SchDoc`,
+  `.PcbDoc`, `.PCBDwf`, `.Annotation`); other local files such as `.PrjPcbStructure` are
+  counted without a warning. Nothing is fetched and no credential is used: every `git`
+  call runs with `--no-optional-locks` (the index is not rewritten),
+  `protocol.allow=never` (no transport, so no lazy fetch either), no prompts and
+  `core.fsmonitor` off. A missing `git` or a git error is reported, never fails a load;
+  credentials in the remote URL are never echoed. On 55 local Altium 365 clones it
+  recognises all 55 and warns about 50 fetched more than 30 days ago and 2 with an
+  uncommitted `.PcbDoc`, in about 0.3 s per clone
 
 ### Changed
 - The session-start instructions read the design notes (`get_design_notes`) before

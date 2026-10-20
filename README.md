@@ -53,6 +53,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"What did we note about the power input?"* | Schematic notes, text frames and labels, with the parts they sit next to | `get_design_notes` |
 | *"What are the fabrication notes?"* | Draftsman notes, tables, view titles, drill table and layer stack notes | `get_design_notes` |
 | *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images | `get_design_image` |
+| *"Is my copy of this Altium 365 project up to date?"* | Where the local Git clone stands, read offline: when it was last updated from Altium 365, commits ahead or behind as of that update, design files changed locally, the last commit. Never fetches | `get_clone_status` |
 | *"Package this project for the firmware team"* | A SQLite snapshot your teammates open without Altium (see [Sharing with your team](#-new-sharing-with-your-team)) | `package_for_xfn` |
 
 ---
@@ -120,6 +121,7 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not) and hatched pours' tracks and arcs, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings |
 | `.PCBDwf` (Draftsman) | Notes, free text, tables, view titles, pictures, drill table, layer stack notes |
 | `Design Rule Check - <PcbDoc>.html` or `.drc` | Altium's last Batch DRC report, from the project's output folder |
+| Git clone of an Altium 365 project (`.git`) | When the origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`: the project GUID, the last fetch time (`FETCH_HEAD`), the local commit against the remote-tracking branch as of that fetch, uncommitted changes and the last commit. Read with local `git` commands that cannot open a connection (`protocol.allow=never`) and do not rewrite the index (`--no-optional-locks`); nothing is fetched and no credential is used |
 
 Not read: schematic wires (connectivity comes from the netlist), ERC results, OutJob
 outputs and the DRC XML report, ActiveBOM and supply-chain data (lifecycle, stock,
@@ -134,6 +136,7 @@ price), and Altium 365 review comments. The copilot never runs Altium's ERC or D
   - A project whose netlist is still up to date loads with Altium closed; the board, rule, DRC report, BOM and notes tools only read the saved files
   - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the project loads partially: the board, rule, length, differential-pair, via, DRC report, notes, picture and variant tools work. Nets, components, sheet context, BOM, decoupling, schematic-PCB sync, schematic review and the team snapshot need the netlist: open the project in Altium once, then load it again
   - Altium Designer 17 and older (`DXP.exe`) are detected too
+- [Git](https://git-scm.com/download/win) (optional) — only to report where an Altium 365 project's local clone stands; without it everything else works
 - [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code) — works with Pro and Enterprise subscriptions
 
 ---
@@ -169,7 +172,7 @@ After you save schematic changes in Altium, tell Claude: it calls `refresh_netli
 
 ## Privacy
 
-Your data stays yours. The MCP server runs locally and sends no telemetry: its only network request is a check for a new release on GitHub, at most once a day, and it carries no project data. It keeps the list of projects you loaded in `%USERPROFILE%\.ee-in-a-box\`, and its warnings go to your MCP client's log. All schematic data is sent only to Claude via your own Enterprise or Pro subscription.
+Your data stays yours. The MCP server runs locally and sends no telemetry: its only network request is a check for a new release on GitHub, at most once a day, and it carries no project data. For Altium 365 projects it runs local `git` commands in the project's clone, which are blocked from contacting any server. It keeps the list of projects you loaded in `%USERPROFILE%\.ee-in-a-box\`, and its warnings go to your MCP client's log. All schematic data is sent only to Claude via your own Enterprise or Pro subscription.
 
 ---
 
