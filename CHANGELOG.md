@@ -239,23 +239,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   parts are not linked to schematic parts (`sch_refdes` is empty, `get_board_info` says
   so instead of counting every part as unmatched), and DNP comes from the designators
   stored in the variants. A cached netlist older than the sheets is not used
-  (`netlist_stale`). After a partial load, `refresh_netlist` loads the project again,
-  fully once Altium has it open
+  (`netlist_stale`). With Altium closed, a `.NET` that is newer than every source but
+  not the one the registry recorded (Altium regenerated it on its own, the folder moved,
+  a new registry) now loads fully instead of partially, and is recorded. After a partial
+  load, `refresh_netlist` loads the project again, fully once Altium has it open; it
+  keeps the active variant (or says it is gone in `variant_note`), and when the full
+  load fails (e.g. Altium is busy) the partial load is restored (`partial_load_kept`)
 - Altium 365 clone status, offline. When the project folder is in a Git clone whose
   origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`, every
   `set_project_dir` response carries an `altium365` block, and the new read-only tool
   `get_clone_status` reads it again: workspace and project GUID, the last fetch
   (`FETCH_HEAD` time, else the remote-tracking branch's reflog), commits ahead of and
   behind the remote-tracking branch as of that fetch, uncommitted changes by kind with a
-  sample (design files first) and the last commit's date and message. Warnings: last
+  sample (design files first; files in new folders are listed one by one, so a new
+  folder of sheets counts) and the last commit's date and message. Warnings: last
   fetch older than 30 days or unknown, behind, ahead, no remote branch to compare with,
   and uncommitted changes to the design files the tools read (`.PrjPcb`, `.SchDoc`,
   `.PcbDoc`, `.PCBDwf`, `.Annotation`); other local files such as `.PrjPcbStructure` are
   counted without a warning. Nothing is fetched and no credential is used: every `git`
   call runs with `--no-optional-locks` (the index is not rewritten),
-  `protocol.allow=never` (no transport, so no lazy fetch either), no prompts and
-  `core.fsmonitor` off. A missing `git` or a git error is reported, never fails a load;
-  credentials in the remote URL are never echoed. On 55 local Altium 365 clones it
+  `protocol.allow=never` (no transport, so no lazy fetch either) and no prompts, and
+  starts nothing the configuration names: `core.fsmonitor` off, filter drivers blanked
+  for `git status` (a clean filter such as git-lfs could otherwise run and write to
+  `.git`), submodules ignored, no signature checks in `git log`. A git that hangs past
+  10 s is stopped with everything it started. A missing `git` or a git error is
+  reported, never fails a load; whether the folder is an Altium 365 clone then comes
+  from `.git/config`, so other repositories get no `altium365` block. Credentials in the
+  remote URL are never echoed. On 55 local Altium 365 clones it
   recognises all 55 and warns about 50 fetched more than 30 days ago and 2 with an
   uncommitted `.PcbDoc`, in about 0.3 s per clone
 
