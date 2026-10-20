@@ -311,9 +311,10 @@ component locations, distances):
     get_rules_for_net; for circuit correctness schematic_review.
 15. check_decoupling — "are my ICs decoupled?", "is C12 close enough to U3?", decoupling
     or bypass capacitors in a schematic or layout review: rails with no capacitor to
-    ground, only Not Fitted ones, or fed through a ferrite without their own; with the
-    PcbDoc, capacitors farther than 5 mm from IC power pads. It is advice: rails come
-    from net and pin names, and the datasheet decides how many capacitors a part needs.
+    ground, only Not Fitted ones, or behind a ferrite without their own; with the PcbDoc,
+    each IC rail's nearest capacitor and a warning above 5 mm (name the IC in ic= for
+    its 5 nearest). It is advice: rails come from net and pin names, and the datasheet
+    decides how many capacitors a part needs.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -2851,21 +2852,23 @@ def check_decoupling(
     """Check decoupling offline: which capacitors decouple each IC's power pins, and the
     gaps. Call it when the user asks about decoupling or bypass capacitors, whether an
     IC's power pins are decoupled, or for a design or layout review. Per rail: no
-    capacitor to ground, only capacitors Not Fitted in the active variant, a rail fed
-    through a ferrite or resistor with no capacitor of its own (warnings); only
-    capacitors to other nets (bootstrap, reference), no small (<1 uF) capacitor,
-    unreadable values (info); no_bulk_capacitor only when named in checks (bulk is often
-    upstream; each rail's counts are in rails). With a PcbDoc, per IC and rail: the nearest
-    fitted capacitor farther than max_distance (default 5 mm; straight line, pad edge to
-    pad edge), power pads far from every capacitor, and an opposite-side capacitor with
-    no via found near its pad.
+    capacitor to ground, only capacitors Not Fitted in the active variant, a rail joined
+    through a ferrite or resistor to capacitors with none of its own (warnings); only
+    capacitors to other nets (bootstrap, another rail, a 0 ohm link), no small (<1 uF)
+    capacitor, unreadable values (info); no_bulk_capacitor only when named in checks
+    (bulk is often upstream; each rail's counts are in rails). With a PcbDoc, pairs gives
+    each IC rail's nearest capacitor (and nearest under 1 uF) with its distance, and a
+    warning when the nearest fitted capacitor is farther than max_distance (straight
+    line, pad edge to pad edge); power pads far from every capacitor, and an
+    opposite-side capacitor with no via or pour found at its pad, are info. Naming ICs in
+    ic lists their 5 nearest capacitors ('is C12 close enough to U3?').
 
     It is advice, not DRC: rails are inferred from net and pin names, ICs are U and IC
-    parts (ic also takes others, e.g. a connector), the datasheet decides how many
-    capacitors a part needs, and pours, regions and planes are not read. ic and rail take
-    comma-separated names; checks narrows to the names in summary. Findings are
-    paginated (offset from next_offset), warnings first; distances in units (default:
-    the board's)."""
+    parts fitted in the variant (ic also takes others, e.g. a connector), the datasheet
+    decides how many capacitors a part needs, and regions and planes are not read. ic and
+    rail take comma-separated names; checks narrows to the names in summary. Findings
+    are paginated (offset from next_offset), warnings first. max_distance and every
+    distance are in units, default mm (max_distance default 5 mm)."""
     try:
         project, netlist, variant_state = _require_project()
     except ValueError as error:
@@ -2874,17 +2877,16 @@ def check_decoupling(
     if no_components:
         return json.dumps(no_components)
     index, pcb_unavailable = None, None
-    to_mm, resolved = units == "mm", units or "mm"
+    if units not in (None, "mm", "mil"):
+        return json.dumps({"error": "invalid_units", "message": "units must be 'mil' or 'mm'."})
+    resolved = units or "mm"  # decoupling guidance is in mm, whatever the board shows
+    to_mm = resolved == "mm"
     if project.get("pcb_doc_paths"):
         index, error = _pcb_session.get(project, netlist)
         if error:
             pcb_unavailable = f"{error['error']}: {error.get('message', '')}".strip(": ")
     else:
         pcb_unavailable = "the project lists no PcbDoc"
-    if index is not None:
-        to_mm, resolved, error = _pcb_units_or_error(index, units)
-        if error:
-            return json.dumps(error)
     max_mil = DEFAULT_MAX_DISTANCE_MIL
     if max_distance is not None:
         if not _finite_nonnegative(max_distance) or max_distance == 0:

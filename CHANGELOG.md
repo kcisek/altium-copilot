@@ -157,17 +157,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Added
 - `check_decoupling`: offline decoupling coverage. From the compiled netlist and pin names
   it finds the rails (nets named like power, or reaching an IC supply, reference or
-  capacitor pin; never a net carrying EN, PG or SENSE), the IC power pins on them and the
-  capacitors to ground, fitted in the active variant. Per rail it reports no capacitor
-  to ground, only Not Fitted ones, a rail fed through a ferrite or resistor with no
-  capacitor of its own (warnings), and only capacitors to other nets (bootstrap,
-  reference), no capacitor under 1 µF, unreadable values and, when asked, no bulk
-  capacitor (info). With the PcbDoc it measures each IC rail's nearest fitted capacitor
-  (straight line, pad edge to pad edge; under 1 µF when there is one) and warns above
-  5 mm, reports power pads far from every capacitor, and an opposite-side capacitor with
-  no via or pour found at its pad. Rules and thresholds were calibrated on real boards
-  (88% of IC rails have a capacitor within 5 mm); pours, regions and planes are not read,
-  so it is advice, not DRC. Filters by IC and rail; any part can be checked as an IC
+  capacitor pin; never a net carrying EN, PG or SENSE), the power pins of ICs fitted in
+  the active variant, and the fitted capacitors to ground (two-pin, arrays and
+  feed-throughs); a 0 ohm link joins two rails. Per rail it reports no capacitor to
+  ground, only Not Fitted ones, a rail joined through a ferrite or resistor to
+  capacitors with none of its own (warnings), and only capacitors to other nets
+  (bootstrap, another rail, a 0 ohm link), no capacitor under 1 µF, unreadable values
+  and, when asked, no bulk capacitor (info). With the PcbDoc it lists each IC rail's
+  nearest capacitor (and nearest under 1 µF) with its distance, straight line, pad edge
+  to pad edge, warns above 5 mm, and reports power pads far from every capacitor and an
+  opposite-side capacitor with no via or pour found at its pad; naming an IC lists its
+  5 nearest capacitors. Rules and thresholds were calibrated on real boards (85% of the
+  IC rails measured have a capacitor within 5 mm); regions and planes are not read, so
+  it is advice, not DRC. Filters by IC and rail; any part can be checked as an IC
 - Bill of materials per variant. `get_bom` lists lines (quantity, designators, Comment,
   description, value, footprint, manufacturer, manufacturer part number) built from the
   compiled parts, so compile-masked parts stay out, without Graphical, Net Tie and

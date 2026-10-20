@@ -107,6 +107,109 @@ def test_small_and_bulk_capacitor_advice():
     assert run_decoupling_check(_netlist(parts), checks=["nope"])["error"] == "invalid_checks"
 
 
+@pytest.mark.parametrize("name, role", [
+    ("+VS", "supply"), ("-VS", "supply"), ("+VIN", "supply"), ("VIN-", "other"),
+    ("IN+", "other"), ("-IN", "other"), ("3.3 V", "supply"), ("VDD(3V3)", "supply"),
+    ("VDD_1.8V", "supply"), ("VCC3.3", "supply"), ("12", "none"), ("V", "other"),
+    ("V-", "supply"), ("VREF+", "ref"), ("BST", "other"),
+])
+def test_pin_name_spellings(name, role):
+    assert pin_role(name) == role
+
+
+def test_capacitance_spellings():
+    assert capacitance("0.1UF") == pytest.approx(1e-7)
+    assert capacitance("100NF") == pytest.approx(1e-7)
+    assert capacitance("4U7") == pytest.approx(4.7e-6)
+    assert capacitance("1N4148", "10UH") is None
+
+
+def _rails(parts, **kwargs):
+    result = run_decoupling_check(_netlist(parts), **kwargs)
+    return result, {(f["check"], f.get("rail")) for f in result["findings"]}
+
+
+def test_feeders_need_capacitors_on_a_rail():
+    mcu = ("U1", {"1": ("VDD", "+3V3"), "2": ("NRST", "NRST"), "3": ("GND", "GND")}, {})
+    pull_up = ("R1", {"1": ("1", "+3V3"), "2": ("2", "NRST")}, {"value": "10k"})
+    reset_cap = ("C2", {"1": ("1", "NRST"), "2": ("2", "GND")}, {"value": "100nF"})
+    # A reset RC on the far side of a pull-up is no supply: +3V3 simply has no capacitor.
+    result, found = _rails([mcu, pull_up, reset_cap])
+    assert found == {("no_capacitor", "+3V3")}
+    assert "filtered_to" not in result["rails"][0]
+    # Ferrite with no capacitors on either side: no claim about capacitors upstream.
+    parts = [("U1", {"1": ("VDD", "+3V3"), "2": ("VDDA", "VDDA"), "3": ("GND", "GND")}, {}),
+             ("FB1", {"1": ("1", "+3V3"), "2": ("2", "VDDA")}, {"description": "Ferrite"})]
+    _, found = _rails(parts)
+    assert found == {("no_capacitor", "+3V3"), ("no_capacitor", "VDDA")}
+    # A Not Fitted ferrite joins nothing.
+    parts.append(("C1", {"1": ("1", "+3V3"), "2": ("2", "GND")}, {"value": "100nF"}))
+    _, found = _rails(parts, plan=VariantPlan(name="V", not_fitted={"FB1"}))
+    assert found == {("no_capacitor", "VDDA")}
+    _, found = _rails(parts)
+    assert found == {("filtered_rail", "VDDA")}
+
+
+def test_a_zero_ohm_link_joins_rails():
+    parts = [("U1", {"1": ("VDD", "+3V3_MCU"), "2": ("GND", "GND")}, {}),
+             ("R1", {"1": ("1", "+3V3"), "2": ("2", "+3V3_MCU")}, {"value": "0R"}),
+             ("C1", {"1": ("1", "+3V3"), "2": ("2", "GND")}, {"value": "100nF"})]
+    result, found = _rails(parts)
+    assert found == {("capacitor_elsewhere", "+3V3_MCU")}
+    assert "R1 (0 ohm) to +3V3, with C1" in result["findings"][0]["issue"]
+    assert result["rails"][0]["linked_to"] == ["R1 to +3V3"]
+
+
+def test_not_fitted_ics_are_not_checked():
+    parts = [("U5", {"1": ("VDD", "+3V3_OPT"), "2": ("GND", "GND")}, {}),
+             ("C5", {"1": ("1", "+3V3_OPT"), "2": ("2", "GND")}, {"value": "100nF"})]
+    plan = VariantPlan(name="Lite", not_fitted={"U5", "C5"})
+    result, found = _rails(parts, plan=plan)
+    assert found == set() and "1 ICs Not Fitted in variant Lite" in result["notes"][0]
+    result, _ = _rails(parts, plan=plan, ics=["U5"])
+    assert "U5 is Not Fitted in variant Lite: not checked." in result["notes"]
+
+
+def test_rail_recognition_edge_cases():
+    # A TL431 reference on a divider node, with no capacitor, is no rail.
+    shunt = [("U4", {"1": ("REF", "NetR3_2"), "2": ("A", "GND"), "3": ("K", "VSHUNT")}, {}),
+             ("R3", {"1": ("1", "+5V"), "2": ("2", "NetR3_2")}, {"value": "10k"})]
+    assert _rails(shunt)[1] == set()
+    # A VSS pin on a negative rail named like power is a supply pin.
+    switch = [("U8", {"1": ("VDD", "+15V"), "2": ("VSS", "-15V"), "3": ("GND", "GND")}, {}),
+              ("C1", {"1": ("1", "+15V"), "2": ("2", "GND")}, {"value": "100nF"})]
+    assert _rails(switch)[1] == {("no_capacitor", "-15V")}
+    # A charge pump's output on a VSS pin is a negative rail, not ground.
+    pump = [("U7", {"1": ("VOUT", "NetU7_1"), "2": ("GND", "GND")}, {}),
+            ("U8", {"1": ("VSS", "NetU7_1"), "2": ("VDD", "+5V")}, {}),
+            ("C8", {"1": ("1", "+5V"), "2": ("2", "NetU7_1")}, {"value": "100nF"})]
+    assert ("no_capacitor", "+5V") in _rails(pump)[1]
+    # A supply pin on a net that carries a signal token is no rail.
+    assert _rails([("U1", {"1": ("VDD", "3V3_EN"), "2": ("GND", "GND")}, {})])[1] == set()
+
+
+def test_capacitor_arrays_and_feed_throughs():
+    parts = [("U1", {"1": ("VDD", "+3V3"), "2": ("VDDA", "+1V8"), "3": ("GND", "GND")}, {}),
+             ("CA1", {"1": ("1", "+3V3"), "2": ("2", "+1V8"), "3": ("3", "GND"),
+                      "4": ("4", "GND")}, {"description": "Capacitor array 100nF"}),
+             ("U2", {"1": ("VDD", "VDD_RF"), "2": ("GND", "GND")}, {}),
+             ("C10", {"1": ("1", "+5V"), "2": ("2", "GND"), "3": ("3", "VDD_RF")},
+              {"description": "Feedthrough capacitor 1uF"})]
+    result, found = _rails(parts)
+    assert not any(check == "no_capacitor" for check, _ in found)
+
+
+def test_bootstrap_capacitors_versus_signal_pins():
+    buck = [("U3", {"1": ("VDDB", "NetU3_1"), "2": ("SW", "SW_NODE"), "3": ("VIN", "+12V"),
+                    "4": ("GND", "GND")}, {}),
+            ("C1", {"1": ("1", "+12V"), "2": ("2", "GND")}, {"value": "10uF"}),
+            ("C4", {"1": ("1", "NetU3_1"), "2": ("2", "SW_NODE")}, {"value": "100nF"})]
+    assert ("capacitor_elsewhere", "NetU3_1") in _rails(buck)[1]
+    adc = [("U3", {"1": ("VDD", "+5V"), "2": ("AIN", "AIN"), "3": ("GND", "GND")}, {}),
+           ("C4", {"1": ("1", "+5V"), "2": ("2", "AIN")}, {"value": "100nF"})]
+    assert _rails(adc)[1] == {("no_capacitor", "+5V")}
+
+
 def test_filters_by_ic_and_rail():
     result = run_decoupling_check(_netlist(), ics=["u3"])
     assert {f["rail"] for f in result["findings"]} == {"+1V8", "VREF"}
@@ -118,6 +221,16 @@ def test_filters_by_ic_and_rail():
     parts = [*PARTS, ("J1", {"1": ("1", "+12V"), "2": ("2", "GND")}, {})]
     result = run_decoupling_check(_netlist(parts), ics=["J1"])
     assert [(f["check"], f["rail"]) for f in result["findings"]] == [("no_capacitor", "+12V")]
+    # An IC whose pins are only numbered is checked on named rails when named.
+    parts = [*PARTS, ("U9", {"1": ("1", "+12V"), "2": ("2", "GND")}, {})]
+    result = run_decoupling_check(_netlist(parts), ics=["U9"])
+    assert [(f["check"], f["rail"]) for f in result["findings"]] == [("no_capacitor", "+12V")]
+    # Nothing to check says so.
+    parts = [*PARTS, ("U9", {"1": ("PA1", "SIG"), "2": ("2", "GND")}, {})]
+    result = run_decoupling_check(_netlist(parts), ics=["U9"])
+    assert "U9: no pin on a power rail was recognised." in result["notes"]
+    result = run_decoupling_check(_netlist(), rails=["+3V3", "+5V"], ics=["U3"])
+    assert "+3V3: no fitted IC power pin on it." in result["notes"]
 
 
 # ---------- PCB ----------
@@ -163,13 +276,13 @@ BOARD_PARTS = [
 ]
 
 
-def _placements(c1=(400.0, 0.0, "top")):
+def _placements(c1=(400.0, 0.0, "top"), c2=(3000.0, 0.0)):
     x, y, side = c1
     return [
         ("U1", "top", 0.0, 0.0, {"1": ("+3V3", 0, 0), "2": ("+3V3", 0, 600),
                                  "3": ("GND", 0, 40)}),
         ("C1", side, x, y, {"1": ("+3V3", 0, 0), "2": ("GND", 40, 0)}),
-        ("C2", "top", 40.0, 0.0, {"1": ("+3V3", 0, 0), "2": ("GND", 40, 0)}),
+        ("C2", "top", *c2, {"1": ("+3V3", 0, 0), "2": ("GND", 40, 0)}),
         ("C9", "top", 2000.0, 0.0, {"1": ("+3V3", 0, 0), "2": ("GND", 40, 0)}),
     ]
 
@@ -180,13 +293,14 @@ def _run(placements, plan=None, vias=(), pours=(), **kwargs):
     return run_decoupling_check(netlist, plan, index=index, **kwargs)
 
 
-def test_far_capacitor_measures_the_small_ones():
+def test_far_capacitor():
     result = _run(_placements())
     (far,) = _checks(result, "far_capacitor")
-    # C2 (10 uF) sits next to U1, but the nearest small capacitor C1 is 380 mil off.
     assert far["nearest"]["designator"] == "C1"
     assert far["nearest"]["distance_mil"] == pytest.approx(380.0)
     assert result["pcb"]["pairs_measured"] == 1 and result["pcb"]["within_mm"]["10"] == 1
+    (pair,) = result["pairs"]
+    assert (pair["ic"], pair["rail"], pair["pins"]) == ("U1", "+3V3", ["1", "2"])
     close = _run(_placements(c1=(60.0, 0.0, "top")))
     assert not _checks(close, "far_capacitor")
     # U1's second VDD pad is 600 mil from every capacitor.
@@ -194,6 +308,23 @@ def test_far_capacitor_measures_the_small_ones():
     assert (pads["pads_far"], pads["pads"]) == (1, 2)
     wide = _run(_placements(), max_distance_mil=400.0)
     assert not _checks(wide, "far_capacitor")
+
+
+def test_a_bulk_capacitor_at_the_pin_counts():
+    # A regulator's 10 uF input capacitor beside the pin: no warning, though the nearest
+    # 100 nF is 380 mil away (it is listed as nearest_under_1uF).
+    result = _run(_placements(c2=(40.0, 0.0)))
+    assert not _checks(result, "far_capacitor")
+    (pair,) = result["pairs"]
+    assert pair["nearest"]["designator"] == "C2"
+    assert pair["nearest_under_1uF"]["designator"] == "C1"
+
+
+def test_naming_an_ic_lists_its_nearest_capacitors():
+    result = _run(_placements(), ics=["U1"])
+    (pair,) = result["pairs"]
+    assert [cap["designator"] for cap in pair["capacitors"]] == ["C1", "C9", "C2"]
+    assert _run(_placements(), ics=["C1"])["error"] == "not_an_ic"
 
 
 def test_not_fitted_nearer_capacitor_is_named():
@@ -213,6 +344,15 @@ def test_opposite_side_capacitor_needs_a_via_or_pour():
     square = [(-100.0, -100.0), (100.0, -100.0), (100.0, 200.0), (-100.0, 200.0)]
     assert not _checks(_run(_placements(c1=under), pours=[("+3V3", 32, square)]),
                        "opposite_side_no_via")
+
+
+def test_every_board_copy_of_a_part_is_measured():
+    # Two PCB components carry C1 (an out-of-sync board): the near one counts.
+    placements = [*_placements(), ("C1", "top", 60.0, 0.0,
+                                   {"1": ("+3V3", 0, 0), "2": ("GND", 40, 0)})]
+    result = _run(placements)
+    assert not _checks(result, "far_capacitor")
+    assert result["pairs"][0]["nearest"]["distance_mil"] == pytest.approx(40.0)
 
 
 def test_parts_missing_on_the_pcb_are_listed():
@@ -276,6 +416,11 @@ def test_check_decoupling_tool(board):
     assert result["pcb"]["max_distance_mm"] == pytest.approx(5.0, abs=1e-3)
     wide = json.loads(main_mod.check_decoupling(max_distance=400, units="mil"))
     assert not _checks(wide, "far_capacitor")
+    # Without units everything is in mm, max_distance included (the board shows mil).
+    default = json.loads(main_mod.check_decoupling(max_distance=10))
+    assert default["units"] == "mm" and not _checks(default, "far_capacitor")
+    assert default["pairs"][0]["nearest"]["distance_mm"] == pytest.approx(9.652)
+    assert json.loads(main_mod.check_decoupling(units="inch"))["error"] == "invalid_units"
     assert json.loads(main_mod.check_decoupling(max_distance=-1))["error"] == \
         "invalid_max_distance"
     assert json.loads(main_mod.check_decoupling(ic="U7"))["error"] == "ic_not_found"
