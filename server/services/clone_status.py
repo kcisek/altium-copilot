@@ -7,12 +7,16 @@ network, no credentials. What the clone knows about Altium 365 (its remote-track
 branch) is as of the last fetch, so ahead and behind are too.
 
 Every git call runs with --no-optional-locks (git status does not rewrite the index),
-protocol.allow=never (no command can open a connection, a lazy fetch included), no
-prompts and core.fsmonitor off (a repository's config cannot start a program).
+protocol.allow=never (no command can open a connection, a lazy fetch included) and no
+prompts. Nothing the configuration names is started: core.fsmonitor is off, git status
+runs with every filter driver blanked (a clean filter such as git-lfs would otherwise
+run, and could write to .git) and without submodules, and git log never checks
+signatures. A git that hangs is stopped with everything it started.
 """
 import os
 import re
 import shutil
+import signal
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,8 +31,9 @@ GIT_TIMEOUT_S = 10
 # Optional user info is accepted and never reported.
 A365_REMOTE = re.compile(
     r"^https://(?:[^@/]+@)?(?P<workspace>[A-Za-z0-9-]+)\.365\.altium\.com/git/"
-    r"(?P<guid>[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})"
-    r"(?:\.git)?/?$"
+    r"(?P<guid>[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})"
+    r"(?:\.git)?/?$",
+    re.IGNORECASE,
 )
 
 _GIT_ENV = {
@@ -38,6 +43,7 @@ _GIT_ENV = {
     "GIT_NO_LAZY_FETCH": "1",
 }
 _GIT_CONFIG = ("-c", "protocol.allow=never", "-c", "core.fsmonitor=false")
+_POSIX = os.name != "nt"
 
 # git status --porcelain XY codes, by what changed.
 _KINDS = (("conflicted", "U"), ("added", "A"), ("deleted", "D"), ("renamed", "RC"),
@@ -54,32 +60,103 @@ def parse_a365_remote(url: str) -> tuple[str, str] | None:
     match = A365_REMOTE.match(url.strip())
     if match is None:
         return None
-    return match["workspace"], match["guid"].upper()
+    return match["workspace"].lower(), match["guid"].upper()
 
 
 def _has_git_dir(path: Path) -> bool:
     return any((folder / ".git").exists() for folder in (path, *path.parents))
 
 
-def _git(git: str, cwd: Path, *args: str, check: bool = True) -> str | None:
-    """stdout of a local git command; None (check False) or GitError when it fails."""
+_SECTION = re.compile(r"\s*\[")
+_ORIGIN_SECTION = re.compile(r'\s*\[\s*remote\s+"origin"\s*\]', re.IGNORECASE)
+_URL_KEY = re.compile(r"\s*url\s*=\s*(.*?)\s*$", re.IGNORECASE)
+
+
+def _origin_url_from_files(path: Path) -> str | None:
+    """remote.origin.url read from the repository's config file itself, for when git is
+    missing or refuses the repository (e.g. dubious ownership)."""
+    for folder in (path, *path.parents):
+        dot_git = folder / ".git"
+        try:
+            if dot_git.is_dir():
+                git_dir = dot_git
+            elif dot_git.is_file():  # a worktree or submodule: "gitdir: <path>"
+                match = re.match(r"gitdir:\s*(.+)", dot_git.read_text(encoding="utf-8").strip())
+                if match is None:
+                    return None
+                git_dir = _absolute(folder, match[1].strip())
+                common = git_dir / "commondir"
+                if common.is_file():
+                    git_dir = _absolute(git_dir, common.read_text(encoding="utf-8").strip())
+            else:
+                continue
+            text = (git_dir / "config").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        in_origin = False
+        for line in text.splitlines():
+            if _SECTION.match(line):
+                in_origin = _ORIGIN_SECTION.match(line) is not None
+            elif in_origin and (url := _URL_KEY.match(line)):
+                return url[1].strip('"')
+        return None
+    return None
+
+
+def _git(git: str, cwd: Path, *args: str, check: bool = True,
+         config: list[tuple[str, str]] | None = None) -> str | None:
+    """stdout of a local git command; None (check False) or GitError when it fails.
+    config entries go through GIT_CONFIG_KEY_n, which takes a key verbatim (a -c
+    argument is split at its first '=', which a filter driver's name may contain)."""
+    env = {**os.environ, **_GIT_ENV}
+    if config:
+        env["GIT_CONFIG_COUNT"] = str(len(config))
+        for n, (key, value) in enumerate(config):
+            env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"] = key, value
     try:
-        result = subprocess.run(  # noqa: S603 - fixed git subcommands, no shell
-            [git, "--no-optional-locks", *_GIT_CONFIG, "-C", str(cwd), *args],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=GIT_TIMEOUT_S, stdin=subprocess.DEVNULL, env={**os.environ, **_GIT_ENV},
+        proc = subprocess.Popen(  # noqa: S603 - fixed git subcommands, no shell
+            [git, "--no-pager", "--no-optional-locks", *_GIT_CONFIG, "-C", str(cwd), *args],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            start_new_session=_POSIX,
         )
-    except subprocess.TimeoutExpired as error:
-        raise GitError(f"git {args[0]} did not answer within {GIT_TIMEOUT_S} s") from error
     except OSError as error:
         raise GitError(f"git could not be started: {error}") from error
-    if result.returncode != 0:
+    try:
+        stdout, stderr = proc.communicate(timeout=GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as error:
+        _kill_tree(proc)
+        raise GitError(f"git {args[0]} did not answer within {GIT_TIMEOUT_S} s") from error
+    if proc.returncode != 0:
         if check:
-            first_line = (result.stderr.strip().splitlines() or [""])[0]
+            first_line = (stderr.strip().splitlines() or [""])[0]
             raise GitError(first_line or f"git {args[0]} failed")
         return None
-    return result.stdout
+    return stdout
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Stop git and whatever it started. On Windows the git.exe on PATH is a launcher
+    whose child would keep the pipes open, and the wait with it, after a plain kill."""
+    try:
+        if _POSIX:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            system_root = Path(os.environ.get("SystemRoot", "C:/Windows"))
+            subprocess.run(  # noqa: S603 - fixed system tool, no shell
+                [str(system_root / "System32" / "taskkill.exe"), "/F", "/T", "/PID",
+                 str(proc.pid)],
+                capture_output=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    proc.kill()
+    try:
+        proc.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _utc(timestamp: float) -> str:
@@ -138,13 +215,22 @@ def _last_fetch(git: str, cwd: Path, fetch_head: Path,
     return None, None
 
 
-def _uncommitted(git: str, cwd: Path) -> dict:
+def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
     """Uncommitted changes: counts per kind, how many are design files the tools read,
-    and a sample of paths, design files first."""
-    out = _git(git, cwd, "status", "--porcelain", "-z", "--untracked-files=normal")
+    and a sample of paths, design files first. Files in new folders are listed one by
+    one, so a new folder of sheets counts as design files.
+
+    Filter drivers are blanked, so a filtered file (git-lfs and the like) whose stat data
+    changed is compared raw with its stored, cleaned content and would look modified:
+    such unstaged changes are counted as unverified, not as changes."""
+    blank = [(f"filter.{name}.{key}", value) for name in sorted(filters)
+             for key, value in (("clean", ""), ("smudge", ""), ("process", ""),
+                                ("required", "false"))]
+    out = _git(git, top, "status", "--porcelain", "-z", "--untracked-files=all",
+               "--ignore-submodules=all", config=blank)
     entries = out.split("\0")
-    counts: dict[str, int] = {}
-    paths: list[str] = []
+    changes: list[tuple[str, str]] = []
+    worktree_only: list[str] = []
     i = 0
     while i < len(entries):
         entry = entries[i]
@@ -161,16 +247,38 @@ def _uncommitted(git: str, cwd: Path) -> dict:
                          if code[0] in letters or code[1] in letters), "modified")
         if "R" in code or "C" in code:
             i += 1  # the rename's source path follows
+        if code[0] == " " and code[1] in "MT":
+            worktree_only.append(path)
+        changes.append((kind, path))
+    filtered = _filtered(git, top, worktree_only, filters) if filters else set()
+    counts: dict[str, int] = {}
+    for kind, path in changes:
+        kind = "unverified" if path in filtered else kind
         counts[kind] = counts.get(kind, 0) + 1
-        paths.append(path)
-    design = [path for path in paths if Path(path).suffix.lower() in DESIGN_EXTENSIONS]
-    others = [path for path in paths if Path(path).suffix.lower() not in DESIGN_EXTENSIONS]
+    paths = [path for _, path in changes]
+    design = [path for path in paths
+              if path not in filtered and Path(path).suffix.lower() in DESIGN_EXTENSIONS]
+    others = [path for path in paths if path not in design]
     return {"count": len(paths), "by_kind": counts, "design_files": len(design),
-            "sample": (design + others)[:UNCOMMITTED_SAMPLE]}
+            "unverified": len(filtered), "sample": (design + others)[:UNCOMMITTED_SAMPLE]}
+
+
+def _filtered(git: str, top: Path, paths: list[str], filters: set[str]) -> set[str]:
+    """The paths whose filter attribute names a configured (here blanked) driver."""
+    found: set[str] = set()
+    for start in range(0, len(paths), 100):
+        out = _git(git, top, "check-attr", "-z", "filter", "--", *paths[start:start + 100],
+                   check=False) or ""
+        fields = out.split("\0")
+        for path, _, value in zip(fields[0::3], fields[1::3], fields[2::3]):
+            if value in filters:
+                found.add(path)
+    return found
 
 
 def _commit(git: str, cwd: Path, rev: str) -> dict | None:
-    out = _git(git, cwd, "log", "-1", "--format=%h%x1f%ct%x1f%s", rev, "--", check=False)
+    out = _git(git, cwd, "log", "-1", "--no-show-signature", "--format=%h%x1f%ct%x1f%s", rev,
+               "--", check=False)
     if not out or not out.strip():
         return None
     short, timestamp, subject = out.rstrip("\n").split("\x1f", 2)
@@ -187,37 +295,54 @@ def clone_status(project_dir: str | Path, now: datetime | None = None,
     cwd = Path(project_dir)
     git = git or shutil.which("git")
     if git is None:
-        if _has_git_dir(cwd):
-            return {"error": "git_not_found",
-                    "message": "The project is in a Git clone, but git is not installed or "
-                               "not on PATH, so its Altium 365 status cannot be read."}
-        return {"altium365": False, "reason": "not_a_git_repository"}
+        return _without_git(cwd, "git_not_found",
+                            "The project is in a Git clone, but git is not installed or not "
+                            "on PATH, so its Altium 365 status cannot be read.")
     try:
         top, fetch_head = _git(git, cwd, "rev-parse", "--show-toplevel",
                                "--git-path", "FETCH_HEAD").splitlines()[:2]
     except GitError as error:
-        if not _has_git_dir(cwd):
-            return {"altium365": False, "reason": "not_a_git_repository"}
-        return {"error": "git_failed", "message": str(error)}
-    url = _git(git, cwd, "config", "--get", "remote.origin.url", check=False) or ""
+        return _without_git(cwd, "git_failed", str(error))
+    url, filters = "", set()
+    config = _git(git, cwd, "config", "--get-regexp",
+                  r"^(remote\.origin\.url|filter\..*)$", check=False)
+    for line in (config or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "remote.origin.url":
+            url = value
+        elif key.startswith("filter.") and key.count(".") >= 2:
+            filters.add(key[len("filter."):key.rindex(".")])
     remote = parse_a365_remote(url)
     if remote is None:
         return {"altium365": False, "reason": "origin_is_not_altium365"}
     workspace, guid = remote
     try:
-        return _a365_status(git, cwd, Path(top), _absolute(cwd, fetch_head), workspace,
-                            guid, now or datetime.now(timezone.utc), stale_after_days)
+        return _a365_status(git, cwd, Path(top), _absolute(cwd, fetch_head), filters,
+                            workspace, guid, now or datetime.now(timezone.utc),
+                            stale_after_days)
     except GitError as error:
         return {"altium365": True, "workspace": workspace, "project_guid": guid,
                 "error": "git_failed", "message": str(error)}
 
 
-def _a365_status(git: str, cwd: Path, top: Path, fetch_head: Path, workspace: str,
-                 guid: str, now: datetime, stale_after_days: int) -> dict:
+def _without_git(cwd: Path, error: str, message: str) -> dict:
+    """Status when git is missing or fails: whether the folder is an Altium 365 clone
+    comes from the repository's config file, so other repositories stay silent."""
+    if not _has_git_dir(cwd):
+        return {"altium365": False, "reason": "not_a_git_repository"}
+    remote = parse_a365_remote(_origin_url_from_files(cwd) or "")
+    if remote is None:
+        return {"altium365": False, "reason": "origin_is_not_altium365"}
+    return {"altium365": True, "workspace": remote[0], "project_guid": remote[1],
+            "error": error, "message": message}
+
+
+def _a365_status(git: str, cwd: Path, top: Path, fetch_head: Path, filters: set[str],
+                 workspace: str, guid: str, now: datetime, stale_after_days: int) -> dict:
     branch, upstream, default, existing = _refs(git, cwd)
     remote_ref = _remote_ref(branch, upstream, default, existing)
     fetched, fetch_source = _last_fetch(git, cwd, fetch_head, remote_ref)
-    changes = _uncommitted(git, cwd)
+    changes = _uncommitted(git, top, filters)
     status: dict = {
         "altium365": True,
         "workspace": workspace,
@@ -237,6 +362,11 @@ def _a365_status(git: str, cwd: Path, top: Path, fetch_head: Path, workspace: st
     if changes["count"]:
         status["uncommitted"] = changes["by_kind"]
         status["uncommitted_design_files"] = changes["design_files"]
+        if changes["unverified"]:
+            status["uncommitted_unverified_note"] = (
+                f"{changes['unverified']} file(s) stored through a filter (e.g. git-lfs) "
+                "look changed, but filters are not run here, so they are not verified."
+            )
         status["uncommitted_sample"] = changes["sample"]
     try:
         subfolder = cwd.resolve().relative_to(top.resolve())

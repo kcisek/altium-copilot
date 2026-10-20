@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -85,6 +86,7 @@ def warnings_of(status: dict) -> list[str]:
     URL.removesuffix(".git"),
     URL + "/",
     URL.lower(),
+    URL.replace("example-ws.365.altium.com", "Example-WS.365.Altium.com"),
     f"https://someone:secret@example-ws.365.altium.com/git/{GUID}.git",
 ])
 def test_altium365_remote_urls(url):
@@ -191,6 +193,19 @@ def test_files_the_tools_do_not_read_are_counted_without_a_warning(clone):
     assert warnings_of(status) == []
 
 
+def test_new_folder_of_sheets_counts_as_design_files(clone):
+    new = clone / "NewSheets"
+    new.mkdir()
+    (new / "Power.SchDoc").write_text("p", encoding="utf-8")
+    (new / "IO.SchDoc").write_text("i", encoding="utf-8")
+    status = clone_status(clone, now=NOW)
+    assert status["uncommitted"] == {"untracked": 2}
+    assert status["uncommitted_design_files"] == 2
+    assert sorted(status["uncommitted_sample"]) == ["NewSheets/IO.SchDoc",
+                                                   "NewSheets/Power.SchDoc"]
+    assert warnings_of(status) == ["uncommitted_changes"]
+
+
 def test_no_fetch_head_falls_back_to_the_remote_branch_reflog(tmp_path):
     root = make_clone(tmp_path / "Board")
     status = clone_status(root, now=datetime.now(timezone.utc))
@@ -257,38 +272,115 @@ def test_credentials_in_the_url_are_never_reported(tmp_path):
 
 
 def test_git_not_installed(clone, tmp_path):
+    other = make_clone(tmp_path / "Other", url="https://github.com/example/board.git")
+    plain = tmp_path / "Plain"
+    plain.mkdir()
     with patch.object(clone_module.shutil, "which", return_value=None):
-        assert clone_status(clone)["error"] == "git_not_found"
-        plain = tmp_path / "Plain"
-        plain.mkdir()
+        status = clone_status(clone)
+        # Whether it is an Altium 365 clone comes from .git/config without git.
+        assert status["error"] == "git_not_found"
+        assert (status["altium365"], status["project_guid"]) == (True, GUID)
+        assert clone_status(other) == {"altium365": False, "reason": "origin_is_not_altium365"}
         assert clone_status(plain) == {"altium365": False, "reason": "not_a_git_repository"}
 
 
-def test_git_failure_is_reported(clone):
+def test_git_failure_is_reported(clone, tmp_path):
+    other = make_clone(tmp_path / "Other", url="https://github.com/example/board.git")
+
     def broken(*args, **kwargs):
         raise OSError("access denied")
-    with patch.object(clone_module.subprocess, "run", side_effect=broken):
+    with patch.object(clone_module.subprocess, "Popen", side_effect=broken):
         status = clone_status(clone)
-    assert status == {"error": "git_failed", "message": "git could not be started: access denied"}
+        assert clone_status(other) == {"altium365": False, "reason": "origin_is_not_altium365"}
+    assert status == {"altium365": True, "workspace": "example-ws", "project_guid": GUID,
+                      "error": "git_failed",
+                      "message": "git could not be started: access denied"}
+
+
+def test_origin_url_from_a_worktree_config(clone, tmp_path):
+    worktree = tmp_path / "Second"
+    git(clone, "worktree", "add", "-q", "--detach", str(worktree))
+    assert (worktree / ".git").is_file()
+    assert clone_module._origin_url_from_files(worktree / "sub") == URL
+    with patch.object(clone_module.shutil, "which", return_value=None):
+        assert clone_status(worktree)["project_guid"] == GUID
 
 
 def test_only_local_read_only_git_commands(clone):
     calls = []
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def recording_run(args, **kwargs):
+    def recording_popen(args, **kwargs):
         calls.append(args)
-        return real_run(args, **kwargs)
+        return real_popen(args, **kwargs)
 
-    with patch.object(clone_module.subprocess, "run", side_effect=recording_run):
+    with patch.object(clone_module.subprocess, "Popen", side_effect=recording_popen):
         clone_status(clone, now=NOW)
     assert calls
     for args in calls:
-        assert args[1] == "--no-optional-locks"
+        assert args[1:3] == ["--no-pager", "--no-optional-locks"]
         assert "protocol.allow=never" in args and "core.fsmonitor=false" in args
         subcommand = args[args.index("-C") + 2]
         assert subcommand in {"rev-parse", "config", "for-each-ref", "status", "log",
-                              "rev-list"}
+                              "rev-list", "check-attr"}
+        if subcommand == "log":
+            assert "--no-show-signature" in args
+        if subcommand == "status":
+            assert "--ignore-submodules=all" in args
+
+
+@pytest.mark.parametrize("driver", ["probe", "a=b"])
+def test_repository_filters_do_not_run(clone, tmp_path, driver):
+    # A clean filter (git-lfs is one) runs on git status for a file whose stat data
+    # changed; it could write to .git. Required drivers must not make status fail either.
+    # A driver name may contain '=', which a -c argument would split.
+    marker = tmp_path / "filter-ran"
+    (clone / ".gitattributes").write_text(f"*.txt filter={driver}\n", encoding="utf-8")
+    git(clone, "config", f"filter.{driver}.clean", f"touch '{marker.as_posix()}'; cat")
+    git(clone, "config", f"filter.{driver}.required", "true")
+    commit(clone, "Notes.txt", "abc\n", "Add notes")
+    git(clone, "add", ".gitattributes")
+    git(clone, "commit", "-q", "-m", "Attributes")
+    git(clone, "update-ref", "refs/remotes/origin/master", "HEAD")
+    marker.unlink(missing_ok=True)
+    os.utime(clone / "Notes.txt", (NOW.timestamp(), NOW.timestamp()))
+    status = clone_status(clone, now=NOW)
+    assert "error" not in status
+    assert status["uncommitted_count"] == 0
+    assert not marker.exists()
+    assert not (clone / ".git" / "lfs").exists()
+    git(clone, "--no-optional-locks", "status", "--porcelain")  # control: the filter runs
+    assert marker.exists()
+
+
+def test_a_hanging_git_is_stopped_with_its_children(clone, monkeypatch, tmp_path):
+    marker = tmp_path / "child-survived"
+    git(clone, "config", "alias.hang", f"!sleep 3; touch '{marker.as_posix()}'")
+    monkeypatch.setattr(clone_module, "GIT_TIMEOUT_S", 1)
+    start = time.monotonic()
+    with pytest.raises(clone_module.GitError, match="did not answer within 1 s"):
+        clone_module._git(shutil.which("git"), clone, "hang")
+    assert time.monotonic() - start < 3
+    time.sleep(max(0.0, start + 5 - time.monotonic()))  # the child would be done by now
+    assert not marker.exists()
+
+
+def test_filtered_files_that_only_look_changed_are_unverified(clone):
+    # git-lfs stores a pointer: with its clean filter blanked, a file whose stat data
+    # changed is compared raw with the pointer and looks modified.
+    (clone / ".gitattributes").write_text("*.PcbDoc filter=ptr\n", encoding="utf-8")
+    git(clone, "config", "filter.ptr.clean", "cat >/dev/null; echo pointer")
+    git(clone, "config", "filter.ptr.smudge", "cat")
+    commit(clone, "Board.PcbDoc", "real board data", "Add board")
+    git(clone, "add", ".gitattributes")
+    git(clone, "commit", "-q", "-m", "Attributes")
+    git(clone, "update-ref", "refs/remotes/origin/master", "HEAD")
+    os.utime(clone / "Board.PcbDoc", (NOW.timestamp(), NOW.timestamp()))
+    status = clone_status(clone, now=NOW)
+    assert status["uncommitted"] == {"unverified": 1}
+    assert status["uncommitted_design_files"] == 0
+    assert "not verified" in status["uncommitted_unverified_note"]
+    assert warnings_of(status) == []
 
 
 def test_git_calls_cannot_reach_a_remote(clone, tmp_path):
@@ -350,6 +442,20 @@ def test_clone_status_never_fails_a_load(main_env, clone):
         result = json.loads(main.set_project_dir(str(clone)))
     assert result["loaded"] is True
     assert "altium365" not in result
+
+
+def test_load_outside_altium365_without_git_has_no_altium365_block(main_env, tmp_path):
+    root = make_clone(tmp_path / "Board", url="https://github.com/example/board.git")
+    with patch.object(clone_module.shutil, "which", return_value=None):
+        result = json.loads(main.set_project_dir(str(root)))
+    assert result["loaded"] is True
+    assert "altium365" not in result
+
+
+def test_get_clone_status_never_raises(main_env, clone):
+    with patch.object(main, "clone_status", side_effect=ValueError("odd output")):
+        result = json.loads(main.get_clone_status(str(clone)))
+    assert result == {"error": "clone_status_failed", "message": "ValueError: odd output"}
 
 
 def test_get_clone_status_arguments(main_env, clone, tmp_path):
