@@ -9,9 +9,9 @@
 
 > Read the full writeup → [maisamp.github.io](https://maisamp.github.io/posts/altium-copilot/)
 
-Altium Copilot gives Claude real-time read access to your open Altium project. Ask it about component values, trace a net across sheets, review your schematic, brainstorm a circuit — all from your Claude chat interface, grounded in your actual design files.
+Altium Copilot gives Claude read access to your Altium project: schematics, board, design rules, BOM, DRC report and design notes. Ask it about component values, trace a net across sheets, check a net's routing against its rules, pull a per-variant BOM, review your schematic, brainstorm a circuit — all from your Claude chat interface, grounded in your actual design files.
 
-For now, the copilot is read-only. It only extracts data. It cannot modify your schematic, move components, or overwrite your `.PrjPcb` file, **more features coming soon.**
+For now, the copilot is read-only. It only extracts data. It cannot modify your schematic, move components, or overwrite your `.PrjPcb` file, **more features coming soon.** The only files it creates are the Protel netlist it asks Altium to export and, when you ask for one, a `package_for_xfn` snapshot.
 
 Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 
@@ -23,31 +23,37 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 
 ## What it does
 
-| What you ask | What happens |
-|---|---|
-| *"What's connected to the 3.3V net?"* | Traces the net across all sheets |
-| *"What's different in the Prototype variant?"* | Compares DNP lists between variants |
-| *"Review this power supply circuit"* | Structured multi-phase schematic review |
-| *"What does U12 do?"* | Pulls component, all pins, connected nets |
-| *"Where does RMII_REF_CLK route?"* | Layers, routed length per layer, vias, endpoints |
-| *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths |
-| *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material |
-| *"Give me the BOM for the Lite variant"* | Per-variant BOM from the compiled parts with MPN and manufacturer, variant differences, CSV; `check_bom` for missing or inconsistent part numbers |
-| *"Are my ICs decoupled? Is C12 close enough to U3?"* | Decoupling coverage per rail and IC: rails with no capacitor to ground, only Not Fitted ones, or behind a ferrite without their own; with the PcbDoc, each IC rail's nearest capacitors and their distance, and a warning above 5 mm |
-| *"What vias does this board use? Any fab issues?"* | Via types by span, hole and pad with counts per type and net class, depth and aspect ratio from the stackup, annular ring, vias in pads, tenting, drill pairs and back drilling, and the via stubs left on differential pairs |
-| *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, component or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board |
-| *"Is the PCB in sync with the schematic?"* | Offline Show Differences: missing or extra parts, footprint and comment changes, pads on the wrong net, and pins Update PCB would fail on |
-| *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them |
-| *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts |
-| *"What width and clearance apply to USB_D_P?"* | The effective design rule per kind, resolved by priority, with values per layer |
-| *"Which nets are in the HighSpeed class?"* | Net, component and diff-pair classes with their members |
-| *"List my differential pairs and their skew"* | Pairs, classes, length per leg (pad-to-pad path plus via barrels), and the routing rule for each |
-| *"Do my tracks and vias meet their rules?"* | Widths per layer, via sizes, holes and routing layers checked against the rule that applies to each object |
-| *"Are my DDR length groups within tolerance?"* | Length and matched-length rules evaluated like Altium, xSignals through series parts included |
-| *"Any polarity swaps or missing AC caps on my pairs?"* | Undeclared pairs, swapped P/N at pins, asymmetric series parts, in-pair skew against the rule |
-| *"What did we note about the power input?"* | Schematic notes, text frames and labels, with the parts they sit next to |
-| *"What are the fabrication notes?"* | Draftsman notes, tables, drill table and title-block data |
-| *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images |
+| What you ask | What happens | Tool |
+|---|---|---|
+| *"What's on the power sheet?"* | Every component on the sheet with its pins and nets, one-hop cross-sheet neighbours, and the sheet's notes | `get_sheet_context` |
+| *"What's connected to the 3.3V net?"* | Traces the net across all sheets | `query_net` |
+| *"What's different in the Prototype variant?"* | Compares DNP lists between variants; the BOM adds varied values and alternate parts | `list_variants`, `get_bom` |
+| *"Review this power supply circuit"* | Structured multi-phase schematic review | `schematic_review` |
+| *"What does U12 do?"* | Pulls component, MPN, value, DNP status, all pins, connected nets | `get_component` |
+| *"Find every 10k resistor"* | Regex search over refdes, MPN or description, grouped by MPN | `search_components` |
+| *"Where does RMII_REF_CLK route?"* | Layers, routed length per layer, vias, endpoints | `get_net_pcb` |
+| *"What runs within 10 mil of CLK on L3?"* | Crosstalk proximity with parallel run lengths | `get_net_neighbors` |
+| *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material | `get_board_info` |
+| *"Give me the BOM for the Lite variant"* | Per-variant BOM from the compiled parts with MPN and manufacturer, variant differences, CSV; `check_bom` for missing or inconsistent part numbers | `get_bom`, `check_bom` |
+| *"Are my ICs decoupled? Is C12 close enough to U3?"* | Decoupling coverage per rail and IC: rails with no capacitor to ground, only Not Fitted ones, or fed through a ferrite or resistor without their own; with the PcbDoc, each IC rail's nearest capacitors and their distance, and a warning above 5 mm. Advice, not DRC: rails come from net and pin names | `check_decoupling` |
+| *"What vias does this board use? Any fab issues?"* | Via types by span, hole and pad with counts per type and net class, depth and aspect ratio from the stackup, annular ring, vias in pads, tenting, drill pairs and back drilling, and the via stubs left on differential pairs | `check_vias` |
+| *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, component or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board | `get_drc_report` |
+| *"Is the PCB in sync with the schematic?"* | Offline Show Differences: missing or extra parts, footprint and comment changes, pads on the wrong net, and pins Update PCB would fail on | `check_sch_pcb_sync` |
+| *"Is my USB pair routed for 90 ohm?"* | Impedance profiles: target, solved width/gap and calculated impedance per layer, and which rules use them; the pair's routed widths checked against its rule | `get_board_info`, `check_rule_compliance` |
+| *"Where is U12? What's next to it?"* | Placement, side, rotation, nearest parts | `get_component_placement` |
+| *"What's at X 1200, Y 850?"* | Nets, components and saved pour outlines near a board coordinate | `query_pcb_region` |
+| *"What width and clearance apply to USB_D_P?"* | The effective design rule per kind, resolved by priority, with values per layer | `get_rules_for_net` |
+| *"Which rules point at classes that no longer exist?"* | Every rule's kind, priority, scope and values, with scope names that match no net, class, pair or room | `get_design_rules` |
+| *"Which nets are in the HighSpeed class?"* | Net, component, diff-pair, pad, polygon and xSignal classes with their members | `get_classes` |
+| *"List my differential pairs and their skew"* | Pairs, classes, length per leg (pad-to-pad path plus via barrels), and the routing rule for each | `list_diff_pairs` |
+| *"Do my tracks and vias meet their rules?"* | Widths per layer, via sizes, holes, annular rings, routing layers and length windows checked against the rule that applies to each object; optional approximate clearance spot-check | `check_rule_compliance` |
+| *"Are my DDR length groups within tolerance?"* | Length and matched-length rules evaluated like Altium, xSignals through series parts included | `check_lengths` |
+| *"How long is the path from U1-5 to J1-3?"* | One net, pair, xSignal or pin-to-pin path measured on the saved copper, via barrels included | `get_signal_length` |
+| *"Any polarity swaps or missing AC caps on my pairs?"* | Undeclared pairs, swapped P/N at pins, asymmetric series parts, in-pair skew against the rule | `check_diff_pairs` |
+| *"What did we note about the power input?"* | Schematic notes, text frames and labels, with the parts they sit next to | `get_design_notes` |
+| *"What are the fabrication notes?"* | Draftsman notes, tables, view titles, drill table and layer stack notes | `get_design_notes` |
+| *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images | `get_design_image` |
+| *"Package this project for the firmware team"* | A SQLite snapshot your teammates open without Altium (see [Sharing with your team](#-new-sharing-with-your-team)) | `package_for_xfn` |
 
 ---
 
@@ -58,24 +64,33 @@ Claude activates these automatically based on what you say — no commands neede
 | Mode | Triggers when you say... | What happens |
 |---|---|---|
 | `schematic_review` | *"review this"*, *"is this correct?"*, *"check my power supply"* | 3-phase structured audit: Claude reads datasheets and confirms its understanding before flagging anything. Every finding cites a datasheet value or a netlist fact. Ask Claude to write the report to a file if you want one. |
-| `constraints_review` | *"check my high-speed constraints"*, *"are my DDR length rules right?"*, *"review the diff pairs before fab"* | 4-phase PCB constraints audit: Claude identifies each interface from its parts and pins, takes targets from the chip's own layout guide (typical values only as a labelled fallback), checks that pairs, classes and rules encode them, then spot-checks widths, lengths, skew and neighbours on the saved copper. Checks the saved rules and copper; quotes Altium's last DRC report only with its assessment. |
-| `brainstorm_circuits` | *"I want to add a new circuit, lets brainstorm"*, *"How would i improve this circuit"*, *"What power supply topology should I use here?"*  | 5-phase design session: reads your loaded schematic first, then asks one question at a time — problem, constraints, proposes 2–3 topologies with tradeoffs, checks your existing design before recommending anything new. |
+| `constraints_review` | *"check my high-speed constraints"*, *"are my DDR length rules right?"*, *"review the diff pairs before fab"* | 4-phase PCB constraints audit: Claude identifies each interface from its parts and pins, takes targets from the chip's own layout guide (typical values only as a labelled fallback), checks that pairs, classes, impedance profiles and rules encode them, then spot-checks widths, lengths, skew and neighbours on the saved copper. Checks the saved rules and copper; quotes Altium's last DRC report only with its assessment. |
+| `brainstorm_circuits` | *"I want to add a new circuit, lets brainstorm"*, *"How would i improve this circuit"*, *"What power supply topology should I use here?"*  | 5-phase design session: reads your loaded schematic first (it also works without a loaded project), then asks one question at a time — problem, constraints, proposes 2–3 topologies with tradeoffs, checks your existing design before recommending anything new. |
 
 ---
 
 ## 🆕 PCB awareness
 
-Altium Copilot now reads your `.PcbDoc` directly. Ask where nets
-route, what's near what (crosstalk), your full stackup, and where components sit.
-It also reads the board's design rules, classes and differential pairs, and works out
+Altium Copilot now reads your `.PcbDoc` directly (the first one listed in the project).
+Ask where nets route, what's near what (crosstalk), your full stackup and impedance
+profiles, and where components sit.
+It also reads the board's design rules, classes, differential pairs and xSignals, and works out
 which rule applies to a net the way Altium does — including rules that only apply to
 some of a net's objects (its vias, one layer, a room) and scopes that point at classes
 or pairs that no longer exist. It also checks the saved copper against those rules —
-widths, vias, routing layers, length groups and diff-pair consistency — and on the DRC
-reports we compared, its counts matched Altium's. It reads the saved file and never runs
-Altium's DRC; `get_drc_report` reads the last DRC report Altium saved.
+widths, vias, holes, annular rings, routing layers, length groups and diff-pair
+consistency — and on the DRC reports we compared, its width, via, hole and
+routing-layer counts matched Altium's. `check_sch_pcb_sync` compares the board with
+the compiled schematic the way Show Differences does, without running an ECO.
+It reads the saved file and never runs Altium's DRC; `get_drc_report` reads the last
+DRC report Altium saved and says when it should not be trusted.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
+
+Not modelled: poured copper (pours are their saved outlines, so repour and save before
+asking about them), fills, regions and planes, pad slot holes and per-layer pad sizes
+(pad holes and rings are not checked), and diff-pair uncoupled length. The checks list
+what they left out in their results.
 
 ---
 
@@ -91,11 +106,33 @@ workspace, not in the project files, so they are not available.
 
 ---
 
+## What it reads
+
+Everything comes from the files Altium saves. Nothing is written back to your design.
+
+| File | What is read |
+|---|---|
+| `.PrjPcb` | Sheet list (subfolders, `..\` paths and device sheets included), variants, project parameters, output folder, Comparator settings |
+| `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks |
+| Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel |
+| `.Annotation` | Board designators of board-annotated and multi-channel designs |
+| `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings |
+| `.PCBDwf` (Draftsman) | Notes, free text, tables, view titles, pictures, drill table, layer stack notes |
+| `Design Rule Check - <PcbDoc>.html` or `.drc` | Altium's last Batch DRC report, from the project's output folder |
+
+Not read: schematic wires (connectivity comes from the netlist), ERC results, OutJob
+outputs and the DRC XML report, ActiveBOM and supply-chain data (lifecycle, stock,
+price), and Altium 365 review comments. The copilot never runs Altium's ERC or DRC.
+
+---
+
 ## Requirements
 
 - Windows
-- [Altium Designer](https://www.altium.com/altium-designer) (must be running with a project open)
-- [Claude Desktop](https://claude.com/download) — works with Pro and Enterprise subscriptions
+- [Altium Designer](https://www.altium.com/altium-designer) — running with the project open and a schematic sheet active whenever the netlist has to be generated: the first time a project is loaded and after schematic changes
+  - A project whose netlist is still up to date loads with Altium closed; the board, rule, DRC report, BOM and notes tools only read the saved files
+  - Altium Designer 17 and older (`DXP.exe`) are detected too
+- [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code) — works with Pro and Enterprise subscriptions
 
 ---
 
@@ -113,7 +150,9 @@ workspace, not in the project files, so they are not available.
 
 ## Usage
 
-Once installed, open Claude and ask anything about your schematic — the copilot detects your running Altium instance and orients itself to your project automatically.
+Once installed, open Claude and ask anything about your schematic — the copilot detects your running Altium instance and orients itself to your project automatically. With Altium closed, it offers the projects you loaded before. It asks which variant to work in, and every answer follows that variant's fitted and Not Fitted parts.
+
+After you save schematic changes in Altium, tell Claude: it calls `refresh_netlist` to pick them up. Board changes are picked up on the next question after you save the `.PcbDoc`.
 
 **Example prompts:**
 - *"What's connected to the 3.3V net?"*
@@ -121,12 +160,14 @@ Once installed, open Claude and ask anything about your schematic — the copilo
 - *"What's different between my schematic variants?"*
 - *"How should i improve this circuit?"*
 - *"Is this power supply circuit correct?"* — triggers a structured design review automatically
+- *"Is the PCB in sync with the schematic?"*
+- *"Give me the BOM for this variant as CSV"*
 
 ---
 
 ## Privacy
 
-Your data stays yours. The MCP server runs locally, doesn't log anything, and doesn't phone home. All schematic data is sent only to Claude via your own Enterprise or Pro subscription.
+Your data stays yours. The MCP server runs locally and sends no telemetry: its only network request is a check for a new release on GitHub, at most once a day, and it carries no project data. It keeps the list of projects you loaded in `%USERPROFILE%\.ee-in-a-box\`, and its warnings go to your MCP client's log. All schematic data is sent only to Claude via your own Enterprise or Pro subscription.
 
 ---
 
@@ -138,7 +179,9 @@ Ask Claude to package your project:
 
 > *"Package this Altium project to share with the cross functional team"* / *"Export this Altium project for sharing"*
 
-Claude calls `package_for_xfn`, which writes a portable SQLite snapshot (`.db`) next to your `.PrjPcb`. Share that file with your team via Confluence, Slack, or a shared drive.
+Claude calls `package_for_xfn`, which writes a portable SQLite snapshot (`<project>-pcb-copilot.db`) next to your `.PrjPcb`. Share that file with your team via Confluence, Slack, or a shared drive.
+
+The snapshot holds the schematic side: sheets, variants, components, nets, pins and the design notes (pictures as metadata only, and file names instead of local folders). Board, rule, BOM and DRC data are not in it.
 
 Your teammates open it with **[pcb-copilot](https://github.com/ee-in-a-box/pcb-copilot)** — a companion MCP server that gives Claude the same schematic Q&A tools against the snapshot, no Altium license required. Pairs well with the free [Altium 365 Viewer](https://www.altium.com/altium-365/viewer) for visual reference alongside the AI Q&A.
 
@@ -162,7 +205,6 @@ Drop a `CLAUDE.md` file in the same folder as your `.PrjPcb` file — it's loade
 
 ## What i'm experimenting with next
 
-- **PCB layout understanding** — same live-access model, extended to the board layer
 - **Simulator** — walks you through simulating and validating your design before you spin a board
 - **Librarian** — periodic audits of your component libraries, flags stale or discontinued entries
 - **Supply Chain Expert** — component availability, lead times, alternatives, and sourcing risk
