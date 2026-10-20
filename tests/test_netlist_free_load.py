@@ -62,6 +62,7 @@ WORKING_TOOL_CALLS = {
     "get_signal_length": lambda: main.get_signal_length("CLK_A"),
     "check_diff_pairs": lambda: main.check_diff_pairs(),
     "check_vias": lambda: main.check_vias(),
+    "check_connectivity": lambda: main.check_connectivity(),
     "get_drc_report": lambda: main.get_drc_report(),
     "constraints_review": lambda: main.constraints_review(),
     "get_design_notes": lambda: main.get_design_notes(),
