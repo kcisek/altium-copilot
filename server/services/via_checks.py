@@ -1,12 +1,17 @@
 """Via inventory and fabrication review over a PcbIndex.
 
-Pure logic, no MCP. Lengths are mils under *_mil keys, so callers can convert units.
+Pure logic, no MCP. Lengths are mils under *_mil keys, so callers can convert units;
+issue texts are written in the units asked for.
 
-The inventory is what a fabricator asks for: via types by span (first and last copper
-layer in stack order), hole and pad diameter; counts per type and per net class; the
-drilled depth and aspect ratio from the stack's copper and dielectric heights; the
-smallest annular ring over the layers that keep a pad; tenting; vias in SMD pads; the
-drill pairs; and back drilling.
+The inventory is what a fabricator asks about the vias: types by span (first and last
+copper layer in stack order), hole as drawn (Altium's finished hole) and pad diameter;
+counts per type and per net class; depth and aspect ratio from the stack's copper and
+dielectric heights (copper to copper, no solder mask); the smallest annular ring over the
+layers that keep a pad; tenting; vias in SMD pads; drill pairs; and back drilling.
+
+A microvia follows IPC-T-50 / IPC-2226A: a blind or buried via over one dielectric, no
+deeper than 0.25 mm from the capture land's foil to the target land, with an aspect ratio
+of at most 1:1 (or a hole of at most 0.15 mm when the stack has no heights).
 
 Back drilling follows Altium's Controlled Depth Drilling: the Layer Stack Manager's back
 drills (Board6 LAYERPAIRn with BACKDRILL=TRUE) are drilled from their outer layer and
@@ -15,20 +20,24 @@ candidate vias, and a candidate is drilled by a pair only when it has no connect
 the layers that pair drills. Altium computes this when it writes the drill files, so it
 is recomputed here. Connections are same-net tracks, arcs and SMD pads touching the
 via's pad on a layer (its hole where the pad is removed), same-net pours whose outline
-holds the via, and same-net vias stacked on it. Internal planes are not read, so a via
-whose only connection is a plane shows no stub. A stub runs from the face of the last
-connected copper layer to the end of the barrel (the stop layer's far face when back
-drilled).
+holds the via, and same-net vias stacked on it. Internal planes, fills and regions are
+not read: a candidate with no connection found is reported, not judged. A stub runs from
+the face of the last connected copper layer to the end of the barrel. After back
+drilling the drill tip stops somewhere in the dielectric before the stop layer, so the
+residual stub is a range: stub_min_mil if it reaches the stop layer, stub_mil if it only
+just clears the first drilled layer; stub_mil is compared with the rule.
 
-Limits: aspect ratio warns above 10:1 and notes above 8:1 (through and mechanically
-drilled blind/buried vias; drilled depth over hole); microvias (one dielectric, hole up
-to 0.15 mm, IPC-2226) warn above 1:1 (dielectric over hole). The annular ring is
-(pad - hole) / 2 like Altium's Minimum Annular Ring rule, checked against that rule,
-else against 0.1 mm as a note. Stubs of differential-pair nets (and the nets asked
-for) not covered by a back-drill rule are noted above 10 mil, Altium's signal-integrity
-guidance for residual stubs.
+Default limits: aspect ratio warns above 10:1 and notes above 8:1 for drilled vias
+(depth over the hole as drawn; a fabricator drilling larger gets a lower ratio), notes a
+mechanically drilled blind via above 1:1 (controlled-depth drilling); microvias warn
+above 1:1 and note above 0.8:1. The annular ring is (pad - hole) / 2 on the finished
+hole like Altium's Minimum Annular Ring rule, checked against that rule and the
+requested minimum, else noted below 0.1 mm (0.05 mm for microvias). Stubs on
+differential-pair nets (and the nets asked for) that no back-drill rule covers are noted
+above 40 mil (1 mm), with their quarter-wave resonance.
 """
 
+import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
@@ -52,15 +61,30 @@ CHECKS = (
 EPS_MIL = 0.001
 MM = 1 / 0.0254
 MICROVIA_MAX_HOLE_MIL = 0.15 * MM
+MICROVIA_MAX_DEPTH_MIL = 0.25 * MM
 ASPECT_NOTE = 8.0
 ASPECT_WARNING = 10.0
+MICROVIA_ASPECT_NOTE = 0.8
 MICROVIA_ASPECT_WARNING = 1.0
+CONTROLLED_DEPTH_ASPECT = 1.0
 DEFAULT_MIN_RING_MIL = 0.1 * MM
-DEFAULT_MAX_STUB_MIL = 10.0
-PAD_SAMPLE = 5
+MICROVIA_MIN_RING_MIL = 0.05 * MM
+DEFAULT_MAX_STUB_MIL = 40.0
+# Solder mask does not reliably bridge larger holes; larger plated holes drawn as
+# vias are mostly mounting holes.
+TENT_MAX_HOLE_MIL = 0.5 * MM
+LARGE_HOLE_MIL = 1.0 * MM
+# A pad this large, holding this many vias or the footprint's own vias, is a
+# thermal pad with a via array.
+THERMAL_PAD_MIL = 2.0 * MM
+THERMAL_VIAS = 4
+SAMPLE = 5
+DEFAULT_DK = 4.0
+LIGHT_INCH_PER_NS = 11.8
 
 _MODES = {0: "simple", 1: "top-middle-bottom", 2: "full stack"}
 _SEVERITY_ORDER = {"warning": 0, "info": 1}
+_KIND_ORDER = {"through": 0, "blind": 1, "buried": 2, "unknown": 3}
 
 
 def _round(value: float | None, digits: int = 4) -> float | None:
@@ -84,8 +108,9 @@ class _Stack:
         self.top: dict[int, float] | None = None
         self.bottom: dict[int, float] | None = None
         self.thickness_mil: float | None = None
+        self.dielectrics: list[tuple[float, float, float | None]] = []
         rows = index.db.execute(
-            "SELECT v6_id, kind, copper_thick_mil, diel_height_mil FROM layers "
+            "SELECT v6_id, kind, copper_thick_mil, diel_height_mil, diel_const FROM layers "
             "WHERE stack_order IS NOT NULL ORDER BY stack_order"
         ).fetchall()
         copper = [number for number, row in enumerate(rows) if row["kind"] == "copper"]
@@ -93,6 +118,7 @@ class _Stack:
             return
         top: dict[int, float] = {}
         bottom: dict[int, float] = {}
+        dielectrics = []
         depth = 0.0
         for row in rows[copper[0] : copper[-1] + 1]:
             is_copper = row["kind"] == "copper"
@@ -102,8 +128,11 @@ class _Stack:
             if is_copper and row["v6_id"] is not None:
                 top[row["v6_id"]] = depth
                 bottom[row["v6_id"]] = depth + thickness
+            elif not is_copper:
+                dielectrics.append((depth, depth + thickness, row["diel_const"]))
             depth += thickness
         self.top, self.bottom, self.thickness_mil = top, bottom, depth
+        self.dielectrics = dielectrics
 
     @property
     def has_heights(self) -> bool:
@@ -112,24 +141,46 @@ class _Stack:
     def name(self, position: int) -> str:
         return self.index.layer_name(self.order[position])
 
+    def top_face(self, position: int) -> float:
+        return self.top[self.order[position]]
+
+    def bottom_face(self, position: int) -> float:
+        return self.bottom[self.order[position]]
+
     def span_depth(self, low: int, high: int) -> float | None:
         """Copper and dielectric from the low layer's top face to the high
         layer's bottom face."""
         if not self.has_heights:
             return None
-        return self.bottom[self.order[high]] - self.top[self.order[low]]
+        return self.bottom_face(high) - self.top_face(low)
 
-    def dielectric(self, low: int, high: int) -> float | None:
-        """Dielectric between two layers (a microvia's laser depth)."""
+    def from_top(self, low: int, high: int) -> bool:
+        """Is a one-hop via drilled from the top side (nearer the top)?"""
+        return low == 0 or (high != self.last and low <= self.last - high)
+
+    def capture_depth(self, low: int, high: int) -> float | None:
+        """A microvia's depth: capture land foil plus dielectric."""
         if not self.has_heights:
             return None
-        return self.top[self.order[high]] - self.bottom[self.order[low]]
+        if self.from_top(low, high):
+            return self.top_face(high) - self.top_face(low)
+        return self.bottom_face(high) - self.bottom_face(low)
+
+    def dk_between(self, start: float, end: float) -> float:
+        """Thickness-weighted Dk of the dielectric between two depths."""
+        low, high = sorted((start, end))
+        weight = total = 0.0
+        for top, bottom, dk in self.dielectrics:
+            overlap = min(high, bottom) - max(low, top)
+            if overlap > 0 and dk:
+                weight += overlap
+                total += overlap * dk
+        return total / weight if weight else DEFAULT_DK
 
     def resolve(self, token: str) -> int | None:
         """A stored layer token (TOP, MID4, BOTTOM, PLANE2 or a layer name) as a
         stack position."""
         text = (token or "").strip().lower()
-        layer = None
         if text == "top":
             layer = 1
         elif text == "bottom":
@@ -156,16 +207,28 @@ class _Via:
     microvia: bool
     ring_mil: float
     type_key: tuple
+    last: int = 0  # the stack's last position
     type_id: str = ""
     connected: set | None = None
-    back_drilled: str | None = None  # pair label
-    back_drill_hole: float | None = None
-    in_pad: list = field(default_factory=list)
+    drilled: list = field(default_factory=list)  # back-drill labels
+    drill_holes: dict = field(default_factory=dict)  # label -> back-drill diameter
+    pad_sides: set = field(default_factory=set)  # v6 layers of SMD pads it sits in
     facts: object = None
 
     @property
     def stack(self):
         return self.prim.via
+
+    @property
+    def outer_sides(self) -> tuple:
+        """The board faces the barrel reaches."""
+        if self.low is None:
+            return ("top", "bottom")
+        return tuple(
+            side
+            for side, reached in (("top", self.low == 0), ("bottom", self.high == self.last))
+            if reached
+        )
 
     def row(self) -> dict:
         prim = self.prim
@@ -194,21 +257,48 @@ class _Via:
         )
         return (diameter if diameter else prim.hole or 0.0) / 2.0
 
+    def reach(self) -> float:
+        """Largest copper radius on any layer."""
+        sizes = [self.prim.width]
+        if self.stack is not None and self.stack.layer_diameters:
+            sizes.extend(self.stack.layer_diameters)
+        return max(sizes) / 2.0
+
+    def tented(self, side: str) -> bool | None:
+        if self.stack is None:
+            return None
+        return self.stack.tent_top if side == "top" else self.stack.tent_bottom
+
+    def test_point(self) -> bool:
+        stack = self.stack
+        return bool(stack and (stack.test_fab_top or stack.test_fab_bottom))
+
 
 class _Review:
-    def __init__(self, index, selection: set[str] | None, limits: dict, checks: set):
+    def __init__(self, index, selection: set[str] | None, limits: dict, checks: set,
+                 units: str):
         self.index = index
         self.stack = _Stack(index)
         self.selection = selection
         self.limits = limits
         self.checks = checks
+        self.units = units
         self.checker = RuleChecker(index, 1)
         self.findings: list[dict] = []
         self.notes: list[str] = []
         self.undecided: Counter = Counter()
         self._enabled_rules: dict[str, list] = {}
+        self.stacked: list[_Via] = []
+        self.pad_hits: dict[int, dict] = {}
         self.vias = self._collect()
         self.types = self._types()
+
+    # --- formatting ---
+
+    def _len(self, mil: float, digits: int = 2) -> str:
+        if self.units == "mm":
+            return f"{mil * 0.0254:.{max(digits, 3)}f} mm"
+        return f"{mil:.{digits}f} mil"
 
     # --- collection ---
 
@@ -237,29 +327,30 @@ class _Review:
                 else:
                     kind = "buried"
                 key_span = (stack.order[low], stack.order[high])
-            microvia = (
-                kind in ("blind", "buried")
-                and high - low == 1
-                and 0 < hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL
-            )
             via = _Via(
                 prim=prim,
                 net=net,
                 low=low,
                 high=high,
                 kind=kind,
-                microvia=microvia,
+                microvia=self._is_microvia(kind, low, high, hole),
                 ring_mil=0.0,
-                type_key=(
-                    {"through": 0, "blind": 1, "buried": 2, "unknown": 3}[kind],
-                    key_span,
-                    round(hole, 3),
-                    round(prim.width, 3),
-                ),
+                type_key=(_KIND_ORDER[kind], key_span, round(hole, 3), round(prim.width, 3)),
+                last=stack.last,
             )
             via.ring_mil = self._ring(via)
             vias.append(via)
         return vias
+
+    def _is_microvia(self, kind: str, low, high, hole: float) -> bool:
+        if kind not in ("blind", "buried") or high - low != 1 or hole <= 0:
+            return False
+        depth = self.stack.capture_depth(low, high)
+        if depth is None:
+            return hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL
+        return depth <= MICROVIA_MAX_DEPTH_MIL + EPS_MIL and (
+            hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL or depth / hole <= 1.0 + 1e-9
+        )
 
     def _ring(self, via: _Via) -> float:
         """Smallest (pad - hole) / 2 over the signal layers in the span that
@@ -294,7 +385,7 @@ class _Review:
         if via.low is None:
             return None
         if via.microvia:
-            return self.stack.dielectric(via.low, via.high)
+            return self.stack.capture_depth(via.low, via.high)
         return self.stack.span_depth(via.low, via.high)
 
     def _types(self) -> dict[tuple, dict]:
@@ -322,6 +413,9 @@ class _Review:
                 "aspect": depth / hole if depth is not None and hole > 0 else None,
             }
         return types
+
+    def _type_of(self, type_id: str) -> dict:
+        return next(info for info in self.types.values() if info["id"] == type_id)
 
     # --- rules ---
 
@@ -352,9 +446,11 @@ class _Review:
     # --- spatial ---
 
     def _near(self, x: float, y: float, reach: float, where: str, params: tuple):
+        # CROSS JOIN keeps SQLite on the rtree: with a net filter it would
+        # otherwise scan every primitive of the net for each via.
         if self.index._has_rtree:
             sql = (
-                "SELECT p.* FROM prims_rtree r JOIN prims p ON p.id = r.id "
+                "SELECT p.* FROM prims_rtree r CROSS JOIN prims p ON p.id = r.id "
                 "WHERE r.minx <= ? AND r.maxx >= ? AND r.miny <= ? AND r.maxy >= ? "
             )
         else:
@@ -372,34 +468,39 @@ class _Review:
             return None
         return position
 
+    def _designator(self, component) -> str | None:
+        if component is None or not 0 <= component < len(self.index.pcb.components):
+            return None
+        return self.index.designator(component)
+
     # --- inventory ---
 
+    def _tent_state(self, via: _Via) -> str:
+        """tented, top_only, bottom_only, untented, in_pad, buried or unknown,
+        judged on the board faces the via reaches outside SMD pads."""
+        sides = via.outer_sides
+        if not sides:
+            return "buried"
+        if via.pad_sides:
+            return "in_pad"
+        states = [via.tented(side) for side in sides]
+        if None in states:
+            return "unknown"
+        if all(states):
+            return "tented"
+        if not any(states):
+            return "untented"
+        return "top_only" if via.tented("top") else "bottom_only"
+
     def inventory(self) -> dict:
-        drilled = Counter(via.type_id for via in self.vias if via.back_drilled)
-        in_pad = Counter(via.type_id for via in self.vias if via.in_pad)
         entries = []
         for info in self.types.values():
             members = info["vias"]
             nets = {via.net for via in members if via.net}
-            tented = Counter()
-            modes = Counter()
-            test_points = removed = 0
-            for via in members:
-                stack = via.stack
-                if stack is None:
-                    tented["unknown"] += 1
-                    continue
-                if stack.tent_top and stack.tent_bottom:
-                    tented["both"] += 1
-                elif stack.tent_top:
-                    tented["top_only"] += 1
-                elif stack.tent_bottom:
-                    tented["bottom_only"] += 1
-                else:
-                    tented["none"] += 1
-                modes[_MODES.get(stack.mode, f"mode {stack.mode}")] += 1
-                test_points += stack.test_fab_top or stack.test_fab_bottom
-                removed += bool(stack.removed_pads)
+            tented = Counter(self._tent_state(via) for via in members)
+            modes = Counter(
+                _MODES.get(via.stack.mode, "simple") for via in members if via.stack
+            )
             entry = {
                 "type": info["id"],
                 "span": info["span"],
@@ -411,6 +512,8 @@ class _Review:
             }
             if info["microvia"]:
                 entry["microvia"] = True
+            if info["hole"] >= LARGE_HOLE_MIL - EPS_MIL:
+                entry["large_hole"] = True
             no_net = sum(1 for via in members if via.net is None)
             if no_net:
                 entry["no_net"] = no_net
@@ -420,14 +523,18 @@ class _Review:
             entry["tented"] = dict(tented)
             if modes and set(modes) != {"simple"}:
                 entry["pad_stack"] = dict(modes)
+            test_points = sum(1 for via in members if via.test_point())
             if test_points:
                 entry["test_points"] = test_points
+            removed = sum(1 for via in members if via.stack and via.stack.removed_pads)
             if removed:
                 entry["with_removed_pads"] = removed
-            if in_pad[info["id"]]:
-                entry["in_pad"] = in_pad[info["id"]]
-            if drilled[info["id"]]:
-                entry["back_drilled"] = drilled[info["id"]]
+            in_pad = sum(1 for via in members if via.pad_sides)
+            if in_pad:
+                entry["in_pad"] = in_pad
+            drilled = sum(1 for via in members if via.drilled)
+            if drilled:
+                entry["back_drilled"] = drilled
             if info["kind"] in ("blind", "buried"):
                 pair = self._pair_of(members[0])
                 if pair is not None:
@@ -443,7 +550,11 @@ class _Review:
                 classes[name][via.type_id] += 1
         class_entries = sorted(
             (
-                {"class": name, "vias": sum(counts.values()), "types": dict(counts)}
+                {
+                    "class": name,
+                    "vias": sum(counts.values()),
+                    "types": dict(counts.most_common()),
+                }
                 for name, counts in classes.items()
             ),
             key=lambda entry: (-entry["vias"], entry["class"].lower()),
@@ -452,13 +563,7 @@ class _Review:
 
     def summary(self) -> dict:
         kinds = Counter(via.kind for via in self.vias)
-        tented = Counter()
-        for via in self.vias:
-            stack = via.stack
-            if stack is None:
-                continue
-            sides = stack.tent_top + stack.tent_bottom
-            tented[("untented", "one_side_tented", "tented")[sides]] += 1
+        tented = Counter(self._tent_state(via) for via in self.vias)
         summary = {
             "vias": len(self.vias),
             "types": len(self.types),
@@ -468,11 +573,13 @@ class _Review:
             "microvias": sum(1 for via in self.vias if via.microvia),
             "no_net": sum(1 for via in self.vias if via.net is None),
             "tented": tented["tented"],
-            "one_side_tented": tented["one_side_tented"],
+            "one_side_tented": tented["top_only"] + tented["bottom_only"],
             "untented": tented["untented"],
-            "in_pad": sum(1 for via in self.vias if via.in_pad),
-            "back_drilled": sum(1 for via in self.vias if via.back_drilled),
+            "in_pad": tented["in_pad"],
+            "back_drilled": sum(1 for via in self.vias if via.drilled),
         }
+        if self.stacked:
+            summary["stacked_microvias"] = len(self.stacked)
         if kinds["unknown"]:
             summary["unknown_span"] = kinds["unknown"]
         return summary
@@ -480,7 +587,7 @@ class _Review:
     def board(self) -> dict:
         board = {
             "copper_layers": len(self.stack.order),
-            "thickness_mil": _round(self.stack.thickness_mil, 2),
+            "stack_thickness_mil": _round(self.stack.thickness_mil, 2),
         }
         if not self.stack.has_heights:
             board["stack_heights"] = "missing: depths, aspect ratios and stubs not computed"
@@ -491,7 +598,7 @@ class _Review:
     # --- drill pairs ---
 
     def drill_pairs(self) -> list[dict]:
-        """Resolved Board6 drill pairs: (low, high, back_drill, pair)."""
+        """Resolved Board6 drill pairs: {pair, low, high} (stack positions)."""
         if not hasattr(self, "_pairs"):
             self._pairs = []
             for pair in getattr(self.index.pcb.board, "drill_pairs", []):
@@ -539,45 +646,64 @@ class _Review:
     def check_aspect(self) -> None:
         if not self.stack.has_heights:
             return
-        explicit = self.limits["max_aspect_ratio"] is not None
-        warn = self.limits["max_aspect_ratio"] or ASPECT_WARNING
-        micro_warn = self.limits["max_microvia_aspect_ratio"] or MICROVIA_ASPECT_WARNING
+        explicit = self.limits["max_aspect_ratio"]
+        warn = explicit or ASPECT_WARNING
+        explicit_micro = self.limits["max_microvia_aspect_ratio"]
+        micro_warn = explicit_micro or MICROVIA_ASPECT_WARNING
         for info in self.types.values():
             aspect = info["aspect"]
             if aspect is None:
                 continue
+            shown = round(aspect, 2)
+            # Thresholds compare the ratio to one decimal, as fabricators quote it.
+            judged = round(aspect, 1)
             fields = {
                 "type": info["id"],
                 "span": info["span"],
                 "count": len(info["vias"]),
                 "hole_mil": _round(info["hole"]),
                 "depth_mil": _round(info["depth"], 2),
-                "aspect_ratio": round(aspect, 2),
+                "aspect_ratio": shown,
             }
             if info["microvia"]:
-                if aspect > micro_warn + 1e-9:
+                if judged > micro_warn:
                     self._finding(
                         "aspect_ratio", "warning",
-                        f"Microvia aspect ratio {aspect:.2f}:1 is above {micro_warn:g}:1 "
-                        "(dielectric depth over hole); laser vias this deep plate poorly. "
-                        "Use a larger hole or a thinner dielectric, or check the "
-                        "fabricator's microvia limit.",
+                        f"Microvia aspect ratio {shown:.2f}:1 is above {micro_warn:g}:1 "
+                        "(capture foil and dielectric over the hole): laser vias this "
+                        "deep plate poorly. Use a larger hole or a thinner dielectric.",
+                        **fields,
+                    )
+                elif explicit_micro is None and judged > MICROVIA_ASPECT_NOTE:
+                    self._finding(
+                        "aspect_ratio", "info",
+                        f"Microvia aspect ratio {shown:.2f}:1 is above the 0.8:1 many "
+                        "fabricators prefer for copper-filled microvias.",
                         **fields,
                     )
                 continue
-            if aspect > warn + 1e-9:
+            if judged > warn:
                 self._finding(
                     "aspect_ratio", "warning",
-                    f"Aspect ratio {aspect:.2f}:1 is above {warn:g}:1 (drilled depth over "
-                    "hole): beyond most fabricators' plating limit. Use a larger hole or "
-                    "confirm the fabricator's capability.",
+                    f"Aspect ratio {shown:.2f}:1 is above {warn:g}:1 (copper-to-copper "
+                    "depth over the hole as drawn): beyond what most fabricators plate. "
+                    "Use a larger hole or confirm the fabricator's capability.",
                     **fields,
                 )
-            elif not explicit and aspect > ASPECT_NOTE + 1e-9:
+            elif explicit is None and judged > ASPECT_NOTE:
                 self._finding(
                     "aspect_ratio", "info",
-                    f"Aspect ratio {aspect:.2f}:1 is above the 8:1 many fabricators quote "
-                    "as standard (10:1 and more is advanced); confirm with the fabricator.",
+                    f"Aspect ratio {shown:.2f}:1 is above the 8:1 many fabricators quote "
+                    "as standard (on the hole as drawn; a fabricator drilling larger gets "
+                    "a lower ratio). Confirm with the fabricator.",
+                    **fields,
+                )
+            elif info["kind"] == "blind" and judged > CONTROLLED_DEPTH_ASPECT:
+                self._finding(
+                    "aspect_ratio", "info",
+                    f"Mechanically drilled blind via at {shown:.2f}:1: controlled-depth "
+                    "drilling is limited to about 1:1, so this span needs sequential "
+                    "lamination (drill and plate the sub-laminate first).",
                     **fields,
                 )
 
@@ -586,23 +712,30 @@ class _Review:
         groups: dict[tuple, dict] = {}
         for via in self.vias:
             rule = self._rule("MinimumAnnularRing", via)
-            minimum = (
+            rule_min = (
                 self.checker.values(rule).get("min_ring_mil") if rule is not None else None
             )
-            if minimum is None:
-                minimum = explicit if explicit is not None else DEFAULT_MIN_RING_MIL
-                source = "parameter" if explicit is not None else "default"
+            candidates = []
+            if rule_min is not None:
+                candidates.append((rule_min, "rule"))
+            if explicit is not None:
+                candidates.append((explicit, "parameter"))
+            if candidates:
+                minimum, source = max(candidates, key=lambda item: item[0])
             else:
-                source = "rule"
+                minimum = MICROVIA_MIN_RING_MIL if via.microvia else DEFAULT_MIN_RING_MIL
+                source = "default"
             if via.ring_mil >= minimum - EPS_MIL:
                 continue
-            key = (via.type_id, rule.name if rule else None, round(via.ring_mil, 3))
+            rule_name = rule.name if rule is not None and source == "rule" else None
+            key = (via.type_id, rule_name, source, round(via.ring_mil, 3))
             group = groups.get(key)
             if group is None:
                 groups[key] = group = {
                     "type": via.type_id,
-                    "rule": rule.name if rule else None,
+                    "rule": rule_name,
                     "source": source,
+                    "microvia": via.microvia,
                     "ring": via.ring_mil,
                     "minimum": minimum,
                     "count": 0,
@@ -613,22 +746,25 @@ class _Review:
             if via.net:
                 group["nets"].add(via.net)
         for group in groups.values():
-            severity = "info" if group["source"] == "default" else "warning"
             against = {
-                "rule": f"the {group['rule']} rule's",
-                "parameter": "the requested",
-                "default": "the common 0.1 mm",
+                "rule": f"the {group['rule']} rule's minimum",
+                "parameter": "the requested minimum",
+                "default": (
+                    "the 0.05 mm commonly allowed on microvia capture pads"
+                    if group["microvia"] else "a common 0.1 mm fabrication minimum"
+                ),
             }[group["source"]]
             self._finding(
-                "annular_ring", severity,
-                f"Annular ring {group['ring']:.2f} mil is below {against} minimum "
-                f"{group['minimum']:.2f} mil.",
+                "annular_ring", "info" if group["source"] == "default" else "warning",
+                f"Annular ring {self._len(group['ring'])} (pad minus finished hole) is "
+                f"below {against} of {self._len(group['minimum'])}; drilling oversize "
+                "for plating leaves less.",
                 type=group["type"],
                 rule=group["rule"],
                 count=group["count"],
                 annular_ring_mil=_round(group["ring"]),
                 min_annular_ring_mil=_round(group["minimum"]),
-                nets=sorted(group["nets"])[:PAD_SAMPLE] or None,
+                nets=sorted(group["nets"])[:SAMPLE] or None,
                 x_mil=round(group["at"][0], 3),
                 y_mil=round(group["at"][1], 3),
             )
@@ -661,9 +797,7 @@ class _Review:
                 continue
             key = (via.type_id, rule.name, tuple(problems))
             group = groups.setdefault(
-                key,
-                {"rule": rule, "values": values, "problems": problems, "count": 0,
-                 "via": via, "nets": set()},
+                key, {"values": values, "count": 0, "via": via, "nets": set()}
             )
             group["count"] += 1
             if via.net:
@@ -677,13 +811,21 @@ class _Review:
                 "span": self._span_label(via),
                 "rule": rule_name,
                 "count": group["count"],
-                "nets": sorted(group["nets"])[:PAD_SAMPLE] or None,
+                "nets": sorted(group["nets"])[:SAMPLE] or None,
             }
             if size:
-                self._finding(
-                    "via_style", "warning",
+                large = (via.prim.hole or 0.0) >= LARGE_HOLE_MIL - EPS_MIL
+                issue = (
                     f"Outside the {rule_name} Routing Via Style sizes: "
-                    + ", ".join(problem.replace("_", " ") for problem in size) + ".",
+                    + ", ".join(problem.replace("_", " ") for problem in size) + "."
+                )
+                if large:
+                    issue += (
+                        f" A {self._len(via.prim.hole or 0.0)} plated hole drawn as a via "
+                        "is usually a mounting hole: a pad or a rule for it is cleaner."
+                    )
+                self._finding(
+                    "via_style", "info" if large else "warning", issue,
                     problems=size,
                     diameter_mil=_round(via.prim.width),
                     hole_mil=_round(via.prim.hole),
@@ -735,123 +877,214 @@ class _Review:
                 count=len(info["vias"]),
             )
 
-    def check_in_pad(self) -> None:
-        groups: dict[tuple, dict] = {}
+    def find_in_pads(self) -> None:
+        """Mark vias whose hole overlaps an SMD pad on a layer of its span."""
         for via in self.vias:
             prim = via.prim
             hole = prim.hole or 0.0
             if hole <= 0 or via.low is None:
                 continue
-            rows = self._near(
+            for pad in self._near(
                 prim.x1, prim.y1, hole / 2.0,
-                "AND p.kind = 'pad' AND p.layer != 74 AND COALESCE(p.hole, 0) = 0",
-                (),
-            )
-            for pad in rows:
+                "AND p.kind = 'pad' AND p.layer != 74 AND COALESCE(p.hole, 0) = 0", (),
+            ):
                 if self._in_span(via, pad["layer"]) is None:
                     continue
-                if self.index._point_primitive_distance(prim.x1, prim.y1, pad) >= hole / 2.0 - EPS_MIL:
+                distance = self.index._point_primitive_distance(prim.x1, prim.y1, pad)
+                if distance >= hole / 2.0 - EPS_MIL:
                     continue
-                same_net = pad["net_id"] == prim.net and prim.net is not None
-                via.in_pad.append(pad)
-                component = pad["component"]
-                designator = (
-                    self.index.designator(component)
-                    if component is not None and 0 <= component < len(self.index.pcb.components)
-                    else None
+                via.pad_sides.add(pad["layer"])
+                hit = self.pad_hits.setdefault(pad["id"], {"pad": pad, "vias": []})
+                hit["vias"].append(via)
+
+    def check_in_pad(self) -> None:
+        groups: dict[tuple, dict] = {}
+        for hit in self.pad_hits.values():
+            pad = hit["pad"]
+            vias = hit["vias"]
+            pad_net = pad["net_id"]
+            designator = self._designator(pad["component"])
+            thermal = (
+                len(vias) >= THERMAL_VIAS
+                or max(pad["width"], pad["height"] or pad["width"]) >= THERMAL_PAD_MIL - EPS_MIL
+                or any(
+                    via.prim.component is not None
+                    and via.prim.component == pad["component"]
+                    for via in vias
                 )
-                facts = self.index.object_facts(pad)
-                pad_net = (
-                    self.index.pcb.nets[pad["net_id"]] if pad["net_id"] is not None else None
-                )
-                allowed = None
-                if self._enabled("ViasUnderSMD"):
-                    rule, undecided = self.checker.resolver(
-                        "ViasUnderSMD", pad_net
-                    ).resolve(facts)
-                    if undecided:
-                        self.undecided["ViasUnderSMD"] += 1
-                    elif rule is not None:
-                        allowed = (rule.name, self.checker.values(rule).get("allowed"))
-                key = (designator, via.type_id, same_net, allowed)
-                group = groups.setdefault(
-                    key,
-                    {"pads": [], "count": 0, "layer": pad["layer"],
-                     "footprint_vias": 0, "untented": 0},
-                )
-                group["count"] += 1
-                if prim.component is not None and prim.component == component:
-                    group["footprint_vias"] += 1
-                stack = via.stack
-                if stack is not None:
-                    tented = stack.tent_top if pad["layer"] == 1 else stack.tent_bottom
-                    group["untented"] += not tented
-                name = pad["pad_name"]
-                if name and name not in group["pads"]:
-                    group["pads"].append(name)
-                break
-        for (designator, type_id, same_net, allowed), group in groups.items():
+            )
+            nets = {via.prim.net for via in vias}
+            if any(net is not None and pad_net is not None and net != pad_net
+                   for net in nets):
+                status = "short"
+            elif any((net is None) != (pad_net is None) for net in nets):
+                status = "net_mismatch"
+            else:
+                status = "same_net"
+            rule = None
+            if self._enabled("ViasUnderSMD"):
+                pad_net_name = self.index.pcb.nets[pad_net] if pad_net is not None else None
+                found, undecided = self.checker.resolver(
+                    "ViasUnderSMD", pad_net_name
+                ).resolve(self.index.object_facts(pad))
+                if undecided:
+                    self.undecided["ViasUnderSMD"] += 1
+                elif found is not None:
+                    rule = (found.name, self.checker.values(found).get("allowed"))
+            category = "thermal" if thermal else "via_in_pad"
+            key = (designator, category, status, rule)
+            group = groups.setdefault(
+                key,
+                {"pads": [], "pad_count": 0, "vias": 0, "types": Counter(),
+                 "layer": pad["layer"], "other_side": 0, "other_side_tented": 0},
+            )
+            group["pad_count"] += 1
+            group["vias"] += len(vias)
+            for via in vias:
+                group["types"][via.type_id] += 1
+                other = "bottom" if pad["layer"] == 1 else "top"
+                if other in via.outer_sides and not via.pad_sides & {1 if other == "top" else 32}:
+                    group["other_side"] += 1
+                    group["other_side_tented"] += bool(via.tented(other))
+            name = pad["pad_name"]
+            if name and name not in group["pads"]:
+                group["pads"].append(name)
+        for (designator, category, status, rule), group in groups.items():
             fields = {
                 "designator": designator,
-                "type": type_id,
                 "layer": self.index.layer_name(group["layer"]),
-                "count": group["count"],
-                "pads": group["pads"][:PAD_SAMPLE] or None,
-                "footprint_vias": group["footprint_vias"] or None,
-                "untented": group["untented"] or None,
+                "pads": group["pad_count"],
+                "count": group["vias"],
+                "pad_names": group["pads"][:SAMPLE] or None,
+                "types": [type_id for type_id, _ in group["types"].most_common(SAMPLE)],
+                "thermal_pad": category == "thermal" or None,
             }
-            if allowed is not None:
-                fields["rule"] = allowed[0]
-            if not same_net:
+            if group["other_side"]:
+                fields["tented_on_other_side"] = (
+                    f"{group['other_side_tented']} of {group['other_side']}"
+                )
+            if rule is not None:
+                fields["rule"] = rule[0]
+            if status == "short":
                 self._finding(
                     "via_in_pad", "warning",
-                    "Via hole inside an SMD pad of another net: a short.",
+                    "Via hole inside an SMD pad of another net: a short.", **fields,
+                )
+                continue
+            if rule is not None and rule[1] is False:
+                self._finding(
+                    "via_in_pad", "warning",
+                    f"Via in SMD pad where the {rule[0]} rule does not allow vias under "
+                    "SMD pads.",
                     **fields,
                 )
-            elif allowed is not None and allowed[1] is False:
-                self._finding(
-                    "via_in_pad", "warning",
-                    f"Via in SMD pad where the {allowed[0]} rule does not allow vias "
-                    "under SMD pads.",
-                    **fields,
+                continue
+            prefix = (
+                "The pad and the via in it are not on the same net (one has no net): "
+                "check the connection. "
+                if status == "net_mismatch" else ""
+            )
+            if category == "thermal":
+                issue = (
+                    prefix + "Via array in a thermal pad: open holes wick solder from the "
+                    "joint. Specify on the fabrication drawing what the package guidance "
+                    "asks for (small open vias, vias tented or plugged from the other "
+                    "side, or filled and capped, IPC-4761 Type VII) unless already done."
                 )
             else:
-                self._finding(
-                    "via_in_pad", "info",
-                    "Via in SMD pad: open or only tented, it wicks solder from the "
-                    "joint. Specify filled and capped (IPC-4761 Type VII) or plugged "
-                    "vias on the fabrication drawing.",
-                    **fields,
+                issue = (
+                    prefix + "Via in SMD pad: an open or tented hole wicks solder from "
+                    "the joint. Specify filled and capped vias (IPC-4761 Type VII) on "
+                    "the fabrication drawing unless already done."
                 )
+            self._finding("via_in_pad", "info", issue, **fields)
 
     def check_tenting(self) -> None:
-        groups: dict[tuple, int] = Counter()
-        for via in self.vias:
-            stack = via.stack
-            if stack is None or (stack.tent_top and stack.tent_bottom):
-                continue
-            if stack.test_fab_top or stack.test_fab_bottom:
-                continue
-            state = "one_side" if stack.tent_top or stack.tent_bottom else "none"
-            side = "top" if stack.tent_top else "bottom" if stack.tent_bottom else None
-            groups[(via.type_id, state, side)] += 1
-        for (type_id, state, side), count in groups.items():
-            if state == "none":
-                issue = (
-                    "Untented on both sides and not a test point: the ring is exposed "
-                    "to solder. Fine if intended (thermal or probing vias), otherwise "
-                    "tent or plug them."
-                )
-            else:
-                issue = (
-                    f"Tented on the {side} only: IPC-4761 advises against one-sided "
-                    "tenting, which can trap process chemistry in the hole. Tent both "
-                    "sides or plug."
-                )
+        eligible = [
+            via for via in self.vias
+            if via.outer_sides and not via.pad_sides and not via.test_point()
+            and via.stack is not None
+        ]
+        small = [via for via in eligible if (via.prim.hole or 0.0) <= TENT_MAX_HOLE_MIL + EPS_MIL]
+        states = Counter(self._tent_state(via) for via in small)
+        if small and states["untented"] == len(small):
             self._finding(
-                "tenting", "info", issue, type=type_id, count=count,
-                tented=side if state == "one_side" else "none",
+                "tenting", "info",
+                "No via on the board is tented: the rings are exposed to solder. Fine "
+                "if that is the house style; otherwise tent or plug them.",
+                count=len(small),
             )
+        else:
+            groups = Counter()
+            for via in small:
+                state = self._tent_state(via)
+                if state in ("untented", "top_only", "bottom_only"):
+                    groups[(via.type_id, state)] += 1
+            for (type_id, state), count in groups.items():
+                if state == "untented":
+                    issue = (
+                        "Untented and not a test point: the ring is exposed to solder. "
+                        "Fine if intended (probing or heat), otherwise tent or plug them."
+                    )
+                    tented = "none"
+                else:
+                    tented = "top" if state == "top_only" else "bottom"
+                    issue = (
+                        f"Tented on the {tented} only: IPC-4761 advises against "
+                        "one-sided tenting, which can trap process chemistry in the "
+                        "hole. Tent both sides or plug."
+                    )
+                self._finding("tenting", "info", issue, type=type_id, count=count,
+                              tented=tented)
+        large = Counter(
+            via.type_id for via in eligible
+            if (via.prim.hole or 0.0) > TENT_MAX_HOLE_MIL + EPS_MIL
+            and self._tent_state(via) in ("tented", "top_only", "bottom_only")
+        )
+        for type_id, count in large.items():
+            hole = self._type_of(type_id)["hole"]
+            self._finding(
+                "tenting", "info",
+                f"Tented {self._len(hole)} holes: solder mask does not reliably bridge "
+                f"holes above {self._len(TENT_MAX_HOLE_MIL)}. Plug them or leave them "
+                "open.",
+                type=type_id, count=count, hole_mil=_round(hole),
+            )
+
+    def check_stacked(self) -> None:
+        """Microvias stacked on another via (same centre, a shared layer)."""
+        microvias = [via for via in self.vias if via.microvia]
+        if not microvias:
+            return
+        by_point = defaultdict(list)
+        for via in self.vias:
+            if via.low is not None:
+                by_point[(round(via.prim.x1, 1), round(via.prim.y1, 1))].append(via)
+        for via in microvias:
+            for other in by_point[(round(via.prim.x1, 1), round(via.prim.y1, 1))]:
+                if other is not via and (
+                    other.low in (via.low, via.high) or other.high in (via.low, via.high)
+                ):
+                    self.stacked.append(via)
+                    break
+        if not self.stacked:
+            return
+        allowed = [
+            self.checker.values(rule).get("allow_stacked_microvias")
+            for rule in self._enabled("HoleToHoleClearance")
+        ]
+        forbidden = allowed and all(value is False for value in allowed)
+        self._finding(
+            "aspect_ratio", "warning" if forbidden else "info",
+            "Microvias stacked on another via: they must be copper filled and are a "
+            "known reliability risk; confirm the fabricator builds them"
+            + (
+                ", and the Hole To Hole Clearance rule does not allow stacked microvias, "
+                "so Altium's DRC flags them." if forbidden else "."
+            ),
+            count=len(self.stacked),
+            types=sorted({via.type_id for via in self.stacked}),
+        )
 
     # --- back drilling and stubs ---
 
@@ -866,8 +1099,7 @@ class _Review:
             return connected
         x, y = prim.x1, prim.y1
         rows = self._near(
-            x, y, prim.width / 2.0,
-            "AND p.net_id = ? AND (p.pour_id IS NULL)", (prim.net,),
+            x, y, via.reach(), "AND p.net_id = ? AND p.pour_id IS NULL", (prim.net,),
         )
         for row in rows:
             kind = row["kind"]
@@ -876,7 +1108,9 @@ class _Review:
                 if position is None:
                     continue
                 reach = via.pad_radius(row["layer"]) + row["width"] / 2.0
-                if point_seg_distance(x, y, row["x1"], row["y1"], row["x2"], row["y2"]) <= reach + EPS_MIL:
+                if point_seg_distance(
+                    x, y, row["x1"], row["y1"], row["x2"], row["y2"]
+                ) <= reach + EPS_MIL:
                     connected.add(position)
             elif kind == "pad":
                 if row["layer"] == 74:
@@ -884,12 +1118,19 @@ class _Review:
                 position = self._in_span(via, row["layer"])
                 if position is None:
                     continue
-                if self.index._point_primitive_distance(x, y, row) <= via.pad_radius(row["layer"]) + EPS_MIL:
+                if self.index._point_primitive_distance(
+                    x, y, row
+                ) <= via.pad_radius(row["layer"]) + EPS_MIL:
                     connected.add(position)
             elif kind == "via":
-                if row["x1"] == x and row["y1"] == y and row["layer"] == prim.layer and row["layer_to"] == prim.layer_to:
+                if (
+                    row["x1"] == x and row["y1"] == y and row["layer"] == prim.layer
+                    and row["layer_to"] == prim.layer_to
+                ):
                     continue
-                if ((row["x1"] - x) ** 2 + (row["y1"] - y) ** 2) ** 0.5 > (row["width"] + prim.width) / 2.0 + EPS_MIL:
+                if math.hypot(row["x1"] - x, row["y1"] - y) > (
+                    row["width"] + prim.width
+                ) / 2.0 + EPS_MIL:
                     continue
                 for layer in (row["layer"], row["layer_to"]):
                     position = self._in_span(via, layer)
@@ -912,7 +1153,9 @@ class _Review:
         return self._pours
 
     def back_drill_pairs(self) -> list[dict]:
-        """Back drills as {pair, side, start, stop} (stack positions)."""
+        """Back drills as {pair, side, stop} (stop: stack position)."""
+        if hasattr(self, "_back_drills"):
+            return self._back_drills
         result = []
         for entry in self.drill_pairs():
             pair = entry["pair"]
@@ -926,19 +1169,20 @@ class _Review:
                 elif high == self.stack.last and low != 0:
                     item.update(side="bottom", stop=low)
             result.append(item)
+        self._back_drills = result
         return result
 
     def _pair_label(self, item: dict) -> str:
         outer = "Top" if item["side"] == "top" else "Bottom"
         return f"{outer} -> before {self.stack.name(item['stop'])}"
 
-    def _stub(self, via: _Via, side: str, connection: int, end: int) -> float | None:
+    def _barrel(self, side: str, connection: int, end: int) -> float | None:
+        """Barrel length from the connected layer's face to the end layer's face."""
         if not self.stack.has_heights:
             return None
-        order = self.stack.order
         if side == "bottom":
-            return self.stack.bottom[order[end]] - self.stack.bottom[order[connection]]
-        return self.stack.top[order[connection]] - self.stack.top[order[end]]
+            return self.stack.bottom_face(end) - self.stack.bottom_face(connection)
+        return self.stack.top_face(connection) - self.stack.top_face(end)
 
     def _side_stub(self, via: _Via, side: str, rule_values: dict | None) -> dict | None:
         """The stub at one end of the via after any back drill, None without one."""
@@ -955,48 +1199,87 @@ class _Review:
                 return None
         record = {
             "side": side,
+            "connection": connection,
             "connected_layer": self.stack.name(connection),
             "barrel_end": self.stack.name(end),
             "stub_layers": abs(end - connection),
+            "stub_mil": self._barrel(side, connection, end),
         }
+        if rule_values is None:
+            return record
+        use = rule_values.get(f"use_{side}_back_drill", True)
+        outer = via.high == self.stack.last if side == "bottom" else via.low == 0
+        candidates = [
+            item for item in self.back_drill_pairs()
+            if item["side"] == side and item["stop"] is not None
+        ]
+        usable = [
+            item for item in candidates
+            if (connection <= item["stop"] < end if side == "bottom"
+                else end < item["stop"] <= connection)
+        ]
         reason = None
-        if rule_values is not None:
-            use = rule_values.get(f"use_{side}_back_drill", True)
-            outer = via.high == self.stack.last if side == "bottom" else via.low == 0
-            candidates = [
-                item for item in self.back_drill_pairs()
-                if item["side"] == side and item["stop"] is not None
-            ]
-            usable = [
-                item for item in candidates
-                if (connection <= item["stop"] < end if side == "bottom"
-                    else end < item["stop"] <= connection)
-            ]
-            if not use:
-                reason = f"the rule does not use {side} back drills"
-            elif not outer:
-                reason = f"the via does not reach the {side} layer"
-            elif not candidates:
-                reason = f"the stack has no back drill from the {side}"
-            elif not usable:
-                reason = (
-                    f"connected on {self.stack.name(connection)}, inside the range every "
-                    f"{side} back drill removes"
+        if not use:
+            reason = f"the rule does not use {side} back drills"
+        elif not outer:
+            reason = f"the via does not reach the {side} layer"
+        elif not candidates:
+            reason = f"the stack has no back drill from the {side}"
+        elif not usable:
+            reason = (
+                f"connected on {self.stack.name(connection)}, inside the layers every "
+                f"{side} back drill removes"
+            )
+        if reason:
+            record["not_back_drilled"] = reason
+            return record
+        best = (
+            min(usable, key=lambda item: item["stop"]) if side == "bottom"
+            else max(usable, key=lambda item: item["stop"])
+        )
+        stop = best["stop"]
+        label = self._pair_label(best)
+        via.drilled.append(label)
+        oversize = rule_values.get("oversize_mil") or 0.0
+        via.drill_holes[label] = (via.prim.hole or 0.0) + 2 * oversize
+        # The tip stops in the dielectric between the stop layer and the first
+        # drilled layer.
+        first_drilled = stop + 1 if side == "bottom" else stop - 1
+        record.update(
+            back_drilled=label,
+            barrel_end=self.stack.name(stop),
+            stub_layers=abs(stop - connection),
+            stub_min_mil=self._barrel(side, connection, stop),
+        )
+        if self.stack.has_heights:
+            near_face = (
+                self.stack.top_face(first_drilled) if side == "bottom"
+                else self.stack.bottom_face(first_drilled)
+            )
+            record["stub_mil"] = abs(
+                near_face - (
+                    self.stack.bottom_face(connection) if side == "bottom"
+                    else self.stack.top_face(connection)
                 )
-            else:
-                best = (
-                    min(usable, key=lambda item: item["stop"]) if side == "bottom"
-                    else max(usable, key=lambda item: item["stop"])
-                )
-                end = best["stop"]
-                via.back_drilled = self._pair_label(best)
-                record["back_drilled"] = via.back_drilled
-                record["barrel_end"] = self.stack.name(end)
-                record["stub_layers"] = abs(end - connection)
-            if reason:
-                record["not_back_drilled"] = reason
-        record["stub_mil"] = _round(self._stub(via, side, connection, end), 2)
+            )
+        else:
+            record["stub_mil"] = None
         return record
+
+    def _resonance_ghz(self, stub: dict) -> float | None:
+        """Quarter-wave resonance of a stub: c / (4 L sqrt(Dk)), Dk of the
+        dielectric along it."""
+        length = stub.get("stub_mil")
+        if not length or not self.stack.has_heights:
+            return None
+        if stub["side"] == "bottom":
+            start = self.stack.bottom_face(stub["connection"])
+            end = start + length
+        else:
+            start = self.stack.top_face(stub["connection"])
+            end = start - length
+        dk = self.stack.dk_between(start, end)
+        return LIGHT_INCH_PER_NS / (4 * (length / 1000.0) * math.sqrt(dk))
 
     def check_back_drill(self) -> dict:
         rules = self._enabled("BackDrilling")
@@ -1010,18 +1293,19 @@ class _Review:
         for via in self.vias:
             if via.kind == "unknown" or via.net is None:
                 continue
-            rule = None
-            if rules:
-                rule = self._rule("BackDrilling", via)
-            high_speed = bool(self.index.diff_pairs_of(via.net)) or (
-                self.selection is not None
-            )
+            rule = self._rule("BackDrilling", via) if rules else None
+            pair_of = self.index.diff_pairs_of(via.net)
+            high_speed = bool(pair_of) or self.selection is not None
             if rule is None and not high_speed:
                 continue
             checked += 1
             values = self.checker.values(rule) if rule is not None else None
             if rule is not None:
                 rule_stats[rule.name]["candidates"] += 1
+            if not self._connected(via):
+                if rule is not None:
+                    rule_stats[rule.name]["no_connection_found"] += 1
+                continue
             stubs = [
                 stub for stub in (
                     self._side_stub(via, "top", values),
@@ -1029,46 +1313,43 @@ class _Review:
                 )
                 if stub is not None
             ]
-            if rule is not None and via.back_drilled:
+            if rule is not None and via.drilled:
                 rule_stats[rule.name]["back_drilled"] += 1
-                via.back_drill_hole = (via.prim.hole or 0.0) + 2 * (
-                    values.get("oversize_mil") or 0.0
-                )
-            if not stubs:
-                continue
-            worst = max(stubs, key=lambda stub: (stub["stub_mil"] or 0, stub["stub_layers"]))
-            if rule is not None:
-                limit = values.get("max_stub_length_mil")
-                stub = worst["stub_mil"]
-                if limit is None or stub is None or stub <= limit + EPS_MIL:
+            for stub in stubs:
+                length = stub["stub_mil"]
+                if length is None:
                     continue
-                severity, source = "warning", rule.name
-            else:
-                stub = worst["stub_mil"]
-                if stub is None or stub <= high_speed_limit + EPS_MIL:
-                    continue
-                severity, source, limit = "info", None, high_speed_limit
-            key = (via.net, source, worst["side"], worst["connected_layer"],
-                   worst.get("not_back_drilled"), worst.get("back_drilled"))
-            group = groups.get(key)
-            if group is None:
-                pairs_of = self.index.diff_pairs_of(via.net)
-                groups[key] = group = {
-                    "severity": severity,
-                    "net": via.net,
-                    "pair": pairs_of[0]["name"] if pairs_of else None,
-                    "rule": source,
-                    "limit": limit,
-                    "stub": worst,
-                    "count": 0,
-                    "types": set(),
-                    "at": (via.prim.x1, via.prim.y1),
-                }
-            group["count"] += 1
-            group["types"].add(via.type_id)
-            if (worst["stub_mil"] or 0) > (group["stub"]["stub_mil"] or 0):
-                group["stub"] = worst
-                group["at"] = (via.prim.x1, via.prim.y1)
+                if rule is not None:
+                    limit = values.get("max_stub_length_mil")
+                    if limit is None or length <= limit + EPS_MIL:
+                        continue
+                    severity, source = "warning", rule.name
+                else:
+                    limit = high_speed_limit
+                    if length <= limit + EPS_MIL:
+                        continue
+                    severity, source = "info", None
+                owner = pair_of[0]["name"] if pair_of and source is None else via.net
+                key = (owner, source, stub["side"], stub["connected_layer"],
+                       stub.get("not_back_drilled"), stub.get("back_drilled"))
+                group = groups.get(key)
+                if group is None:
+                    groups[key] = group = {
+                        "severity": severity,
+                        "pair": pair_of[0]["name"] if pair_of else None,
+                        "nets": set(),
+                        "rule": source,
+                        "limit": limit,
+                        "stub": stub,
+                        "via": via,
+                        "count": 0,
+                        "types": set(),
+                    }
+                group["count"] += 1
+                group["nets"].add(via.net)
+                group["types"].add(via.type_id)
+                if length > group["stub"]["stub_mil"]:
+                    group["stub"], group["via"] = stub, via
 
         if rules and not [item for item in pairs if item["side"]]:
             self._finding(
@@ -1091,49 +1372,66 @@ class _Review:
                     f"Back drill {pair.low} - {pair.high} does not start at an outer "
                     "layer (or names a layer not in the stack); it was not applied.",
                 )
+        unconnected = sum(stats["no_connection_found"] for stats in rule_stats.values())
+        if unconnected:
+            self.notes.append(
+                f"{unconnected} back-drill candidate via(s) have no connection found "
+                "(planes, fills and regions are not read), so whether Altium drills them "
+                "was not decided."
+            )
         for group in groups.values():
             stub = group["stub"]
+            length = stub["stub_mil"]
+            ghz = self._resonance_ghz(stub)
+            nets = sorted(group["nets"])
             if group["rule"]:
                 issue = (
-                    f"Stub {stub['stub_mil']:.1f} mil below {stub['connected_layer']} "
+                    f"Stub {self._len(length, 1)} past {stub['connected_layer']} "
                     f"({stub['side']} end) exceeds the {group['rule']} rule's max stub "
-                    f"{group['limit']:.1f} mil"
+                    f"{self._len(group['limit'], 1)}"
                 )
                 if stub.get("not_back_drilled"):
                     issue += f": not back drilled, {stub['not_back_drilled']}."
                 else:
-                    issue += f" after back drilling ({stub['back_drilled']})."
+                    issue += (
+                        f" even when back drilled ({stub['back_drilled']}): the drill tip "
+                        "may stop anywhere in the dielectric before the stop layer."
+                    )
             else:
+                owner = f"pair {group['pair']}" if group["pair"] else f"net {nets[0]}"
                 issue = (
-                    f"{'Differential-pair' if group['pair'] else 'Selected'} net with a "
-                    f"{stub['stub_mil']:.1f} mil via stub past {stub['connected_layer']} "
-                    f"({stub['side']} end) and no back-drilling rule. Stubs resonate at "
-                    "multi-gigabit rates; route to the far layer, back drill, or ignore "
-                    "for slower signals."
+                    f"Via stubs of {owner} reach {self._len(length, 1)} past "
+                    f"{stub['connected_layer']} ({stub['side']} end), quarter-wave "
+                    f"resonance about {ghz:.0f} GHz, and no back-drill rule covers them. "
+                    "That matters when the signal has energy near it (multi-gigabit "
+                    "links): route to the far layer or back drill; slower signals can "
+                    "ignore it."
                 )
             self._finding(
                 "back_drill", group["severity"], issue,
-                net=group["net"],
                 pair=group["pair"],
+                nets=nets[:SAMPLE],
                 rule=group["rule"],
                 count=group["count"],
-                types=sorted(group["types"]),
+                types=sorted(group["types"])[:SAMPLE],
                 side=stub["side"],
                 connected_layer=stub["connected_layer"],
                 barrel_end=stub["barrel_end"],
-                stub_mil=stub["stub_mil"],
+                stub_mil=_round(length, 2),
+                stub_min_mil=_round(stub.get("stub_min_mil"), 2),
                 max_stub_mil=_round(group["limit"]),
-                x_mil=round(group["at"][0], 3),
-                y_mil=round(group["at"][1], 3),
+                resonance_ghz=_round(ghz, 1),
+                x_mil=round(group["via"].prim.x1, 3),
+                y_mil=round(group["via"].prim.y1, 3),
             )
 
         report: dict = {"vias_checked_for_stubs": checked}
-        pair_report = []
-        drilled = Counter(via.back_drilled for via in self.vias if via.back_drilled)
+        drilled = Counter(label for via in self.vias for label in via.drilled)
         holes: dict[str, set] = defaultdict(set)
         for via in self.vias:
-            if via.back_drilled and via.back_drill_hole is not None:
-                holes[via.back_drilled].add(round(via.back_drill_hole, 3))
+            for label, hole in via.drill_holes.items():
+                holes[label].add(round(hole, 3))
+        pair_report = []
         for item in pairs:
             pair = item["pair"]
             if item["side"] is None:
@@ -1144,19 +1442,21 @@ class _Review:
             if item["side"] == "bottom":
                 drilled_layers = range(stop + 1, self.stack.last + 1)
                 depth = (
-                    self.stack.thickness_mil - self.stack.bottom[self.stack.order[stop]]
+                    self.stack.thickness_mil - self.stack.bottom_face(stop)
                     if self.stack.has_heights else None
                 )
             else:
                 drilled_layers = range(0, stop)
-                depth = self.stack.top[self.stack.order[stop]] if self.stack.has_heights else None
+                depth = self.stack.top_face(stop) if self.stack.has_heights else None
+            names = [self.stack.name(position) for position in drilled_layers]
             pair_report.append(
                 {
                     "back_drill": label,
                     "from_layer": "Top" if item["side"] == "top" else "Bottom",
                     "stops_before": self.stack.name(stop),
-                    "drilled_layers": [self.stack.name(position) for position in drilled_layers],
-                    "depth_mil": _round(depth, 2),
+                    "drilled_layers": len(names),
+                    "first_and_last_drilled": [names[0], names[-1]] if names else [],
+                    "depth_to_stop_layer_mil": _round(depth, 2),
                     "vias": drilled[label],
                     "drill_diameters_mil": sorted(holes[label]) or None,
                 }
@@ -1167,18 +1467,16 @@ class _Review:
             report["rules"] = []
             for rule in rules:
                 values = self.checker.values(rule)
-                report["rules"].append(
-                    {
-                        "rule": rule.name,
-                        "scope": rule.scope1,
-                        "max_stub_length_mil": values.get("max_stub_length_mil"),
-                        "oversize_mil": values.get("oversize_mil"),
-                        "use_top_back_drill": values.get("use_top_back_drill"),
-                        "use_bottom_back_drill": values.get("use_bottom_back_drill"),
-                        "candidate_vias": rule_stats[rule.name]["candidates"],
-                        "back_drilled_vias": rule_stats[rule.name]["back_drilled"],
-                    }
-                )
+                entry = {"rule": rule.name, "scope": rule.scope1}
+                for key in ("max_stub_length_mil", "oversize_mil", "tolerance_plus_mil",
+                            "tolerance_minus_mil", "use_top_back_drill",
+                            "use_bottom_back_drill"):
+                    entry[key] = values.get(key)
+                entry["candidate_vias"] = rule_stats[rule.name]["candidates"]
+                entry["back_drilled_vias"] = rule_stats[rule.name]["back_drilled"]
+                if rule_stats[rule.name]["no_connection_found"]:
+                    entry["no_connection_found"] = rule_stats[rule.name]["no_connection_found"]
+                report["rules"].append(entry)
         return report
 
 
@@ -1210,6 +1508,7 @@ def review_vias(
     max_microvia_aspect_ratio: float | None = None,
     min_annular_ring_mil: float | None = None,
     max_stub_mil: float | None = None,
+    units: str = "mil",
 ) -> dict:
     """The whole review, unpaged (page_result pages it), or an error."""
     selected = list(dict.fromkeys(checks)) if checks else list(CHECKS)
@@ -1239,9 +1538,11 @@ def review_vias(
             "max_stub_mil": max_stub_mil,
         },
         set(selected),
+        units,
     )
-    # Via-in-pad and back drilling also feed the inventory, so they always run.
-    review.check_in_pad()
+    # Pads, stacking and back drilling also feed the inventory, so they always run.
+    review.find_in_pads()
+    review.check_stacked()
     back_drill = review.check_back_drill()
     if "aspect_ratio" in selected:
         review.check_aspect()
@@ -1251,6 +1552,8 @@ def review_vias(
         review.check_style()
     if "drill_pairs" in selected:
         review.check_drill_pairs()
+    if "via_in_pad" in selected:
+        review.check_in_pad()
     if "tenting" in selected:
         review.check_tenting()
 
@@ -1261,7 +1564,7 @@ def review_vias(
             CHECKS.index(finding["check"]),
             -finding.get("count", 1),
             str(finding.get("type", "")),
-            str(finding.get("net", "")),
+            str(finding.get("nets", "")),
         ),
     )
     result: dict = {
@@ -1284,10 +1587,9 @@ def review_vias(
             "those vias were not checked against that rule kind."
         )
     result["notes"] = review.notes + [
-        "Plugging and filling (IPC-4761 types beyond tenting) are not decoded from the "
-        "PcbDoc; tenting is.",
-        "Back drilling is recomputed the way Altium does when it writes drill files; "
-        "internal planes are not read, so a via connected only to a plane shows no stub.",
+        "Holes are as drawn (Altium's finished hole); fabricators drill larger for "
+        "plating. Plugging and filling (IPC-4761 beyond tenting) are not decoded from "
+        "the PcbDoc; tenting is, and vias in SMD pads are counted apart.",
     ]
     return result
 
@@ -1299,15 +1601,35 @@ def page_result(
     type_limit: int = 60,
     class_limit: int = 30,
 ) -> dict:
-    """A page of review_vias' result: findings from offset, the most used via
-    types and net classes."""
+    """A page of review_vias' result: findings from offset; the most used via
+    types, net classes (each with its most used types), drill pairs and back
+    drills."""
     result = dict(full)
     offset = max(0, offset)
     findings = full["findings"]
-    for key, cap in (("via_types", type_limit), ("net_classes", class_limit)):
+    for key, cap in (
+        ("via_types", type_limit),
+        ("net_classes", class_limit),
+        ("drill_pairs", type_limit),
+    ):
         if len(full[key]) > cap:
             result[key] = full[key][:cap]
             result[f"{key}_total"] = len(full[key])
+    result["net_classes"] = [
+        {
+            **entry,
+            "types": dict(list(entry["types"].items())[:type_limit]),
+            "types_total": len(entry["types"]),
+        }
+        if len(entry["types"]) > type_limit else entry
+        for entry in result["net_classes"]
+    ]
+    back_drill = dict(full["back_drill"])
+    for key in ("pairs", "rules"):
+        if len(back_drill.get(key, [])) > class_limit:
+            back_drill[f"{key}_total"] = len(back_drill[key])
+            back_drill[key] = back_drill[key][:class_limit]
+    result["back_drill"] = back_drill
     notes = result.pop("notes")
     result["findings"] = findings[offset : offset + limit]
     result["total"] = len(findings)
@@ -1327,6 +1649,7 @@ def run_via_check(
     max_microvia_aspect_ratio: float | None = None,
     min_annular_ring_mil: float | None = None,
     max_stub_mil: float | None = None,
+    units: str = "mil",
     offset: int = 0,
     limit: int = 100,
     type_limit: int = 60,
@@ -1335,7 +1658,7 @@ def run_via_check(
     """Via inventory and fab-review findings, paged (see the module docstring)."""
     full = review_vias(
         index, checks, nets, max_aspect_ratio, max_microvia_aspect_ratio,
-        min_annular_ring_mil, max_stub_mil,
+        min_annular_ring_mil, max_stub_mil, units,
     )
     if "error" in full:
         return full

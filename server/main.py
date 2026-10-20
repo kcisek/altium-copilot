@@ -320,9 +320,10 @@ component locations, distances):
 16. check_vias — "what vias does this board use?", a fab or drill review, aspect
     ratio, annular ring, via-in-pad, tenting, blind/buried/microvias, back drilling or
     via stubs: via types with counts per type and net class, depth and aspect ratio from
-    the stack, drill pairs and back drills, with findings. Quote via_types for the
-    fabricator's drill questions; back drilling is recomputed the way Altium writes the
-    drill files, and stubs of nets with no back-drill rule are advice.
+    the stack, drill pairs and back drills, with findings. via_types is the via part of
+    the drill table (component holes and slots are not in it); holes are as drawn
+    (finished), which fabricators drill larger. Back drilling is recomputed the way
+    Altium writes the drill files; stubs of nets with no back-drill rule are advice.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -2944,31 +2945,27 @@ def check_vias(
     units: PcbUnits | None = None,
     offset: int = 0,
 ) -> str:
-    """Via inventory and fabrication review of the PcbDoc. Call it for "what vias does
-    this board use?", a fab or drill review, blind/buried/microvias, aspect ratio,
-    annular ring, via-in-pad, tenting, or back drilling and via stubs.
+    """Via inventory and fab review of the PcbDoc: "what vias does this board use?", a
+    drill review, blind/buried/microvias, aspect ratio, annular ring, via-in-pad,
+    tenting, back drilling, via stubs.
 
-    via_types lists each type (span by stack layers, hole, pad diameter) with count, nets,
-    drilled depth and aspect ratio from the stack heights, smallest annular ring over the
-    layers keeping a pad, tenting, vias in SMD pads and back-drilled vias; net_classes
-    counts types per net class; drill_pairs and back_drill give the stack's drill pairs,
-    back drills (drilled layers, depth, drill sizes) and Max Via Stub Length rules.
-    Findings: aspect_ratio (warning above 10:1, info above 8:1; microvias above 1:1),
-    annular_ring (below the Minimum Annular Ring rule; info below 0.1 mm without one),
-    via_style (sizes outside the Routing Via Style rule; info for a blind/buried via
-    under a through-hole style), drill_pairs (a blind/buried span with no drill pair),
-    via_in_pad (filling/capping needed; warning when ViasUnderSMD forbids it or the pad
-    is another net), tenting (untented or one side only, test points excepted),
-    back_drill (stub after back drilling above the rule's max, rules without back drills;
-    info for differential-pair nets, or the nets in net, with a stub above max_stub,
-    default 10 mil, and no back-drill rule). Back drilling is recomputed like Altium:
-    a via in the rule's scope is drilled by a back drill when it has no connection on
-    the layers it removes.
+    via_types: each type (span by stack layers, hole as drawn, pad) with count, nets,
+    copper-to-copper depth, aspect ratio, smallest annular ring, tenting, in-pad and
+    back-drilled counts; net_classes counts types per class; drill_pairs and back_drill
+    give the stack's drill pairs, back drills and back-drill rules. Findings, warnings
+    first: aspect_ratio (above max_aspect_ratio, default 10:1, info above 8:1; microvias
+    above max_microvia_aspect_ratio, default 1:1), annular_ring (below the Minimum
+    Annular Ring rule or min_annular_ring, whichever is larger; info under 0.1 mm),
+    via_style (outside the Routing Via Style sizes), drill_pairs (blind/buried span
+    without a drill pair), via_in_pad (fill and cap advice; warning for another net's
+    pad or a ViasUnderSMD rule forbidding it), tenting, back_drill (stub above the rule's
+    max even when back drilled; info for differential pairs, or the nets in net, with
+    stubs above max_stub, default 40 mil). Back drilling is recomputed like Altium: a
+    via in the rule's scope is drilled when it has no connection on the layers removed.
 
-    net narrows to comma-separated nets, differential pairs or net classes and checks
-    their stubs; checks narrows the findings. Findings are paginated (offset from
-    next_offset), warnings first. min_annular_ring, max_stub and lengths use units
-    (default: board display unit). Plugging and filling are not read; tenting is."""
+    net narrows to comma-separated nets, pairs or net classes; checks narrows the
+    findings, paginated (offset from next_offset). min_annular_ring, max_stub and
+    lengths use units (default: board display unit). Plugging and filling are not read."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)
@@ -2985,9 +2982,10 @@ def check_vias(
         if value is None:
             continue
         if not _finite_nonnegative(value) or (value == 0 and name != "min_annular_ring"):
+            kind = "non-negative" if name == "min_annular_ring" else "positive"
             return json.dumps({
                 "error": f"invalid_{name}",
-                "message": f"{name} must be a positive number.",
+                "message": f"{name} must be a {kind} number.",
             })
         limits[name] = value
     full = review_vias(
@@ -3000,6 +2998,7 @@ def check_vias(
             _input_to_mil(min_annular_ring, resolved) if "min_annular_ring" in limits else None
         ),
         max_stub_mil=_input_to_mil(max_stub, resolved) if "max_stub" in limits else None,
+        units=resolved,
     )
     if "error" in full:
         return json.dumps(full)

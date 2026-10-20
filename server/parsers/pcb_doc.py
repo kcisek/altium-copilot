@@ -92,13 +92,16 @@ def read_kind_prefixed_text_records(
 class ViaStack:
     """A Vias6 record's mask and pad-stack fields (see decode_vias)."""
 
+    # Tented: the via's tenting flag, or a manual solder mask expansion that
+    # leaves no opening wider than the hole on that side.
     tent_top: bool
     tent_bottom: bool
     test_fab_top: bool
     test_fab_bottom: bool
     # 0 Simple, 1 Top-Middle-Bottom, 2 Full Stack.
     mode: int = 0
-    # Pad diameter (mil) per v6 layer 1..32; None in records too short to hold it.
+    # Pad diameter (mil) per v6 layer 1..32, kept for Top-Middle-Bottom and
+    # Full Stack vias only (simple vias use the nominal diameter everywhere).
     layer_diameters: tuple[float, ...] | None = None
     # v6 layers whose pad is removed: Remove Unused Pad Shapes, and the
     # non-functional pads Altium removes on back-drilled layers.
@@ -109,7 +112,7 @@ class ViaStack:
         if layer in self.removed_pads:
             return None
         sizes = self.layer_diameters
-        if self.mode == 0 or sizes is None or not 1 <= layer <= 32:
+        if self.mode not in (1, 2) or sizes is None or not 1 <= layer <= 32:
             return diameter
         if self.mode == 1:
             size = sizes[0] if layer == 1 else sizes[31] if layer == 32 else sizes[1]
@@ -217,30 +220,54 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
 # Vias6 record offsets beyond the common primitive header (KiCad's AVIA6 reads
 # the same ones): flags1 at 1 (0x20 tented top, 0x40 tented bottom, 0x80
 # fabrication test point top), flags2 at 2 (0x01 test point bottom), the
-# stack mode at 74 and 32 int32 pad diameters (v6 layers 1..32) from 75.
+# solder mask expansion (int32 at 54; 66 bit 0x02 manual, 67 bit 0x01 measured
+# from the hole edge; 241 bit 0x01 bottom linked to top, else int32 at 242),
+# the stack mode at 74 and 32 int32 pad diameters (v6 layers 1..32) from 75.
 # Bytes 209..240 (208 + v6 id) mark layers whose pad is removed: on the MiniPC
 # example they are exactly the layers below its back-drill pair's stop layer on
 # the vias its BackDrilling rule selects, where Altium removes the
 # non-functional pads; elsewhere single layers marked by Remove Unused Pad Shapes.
+_VIA_MASK_AT = 54
+_VIA_MASK_FLAGS_AT = 66
+_VIA_MASK_LINKED_AT = 241
+_VIA_MASK_BOTTOM_AT = 242
 _VIA_MODE_AT = 74
 _VIA_DIAMETERS_AT = 75
 _VIA_REMOVED_PADS_AT = 208
 
 
-def _via_stack(payload: bytes) -> ViaStack:
+def _mask_covers(payload: bytes, diameter: int, hole: int) -> tuple[bool, bool]:
+    """(top, bottom): a manual mask expansion leaves no opening wider than the
+    hole (KiCad treats such a via side as tented)."""
+    if len(payload) < _VIA_MASK_FLAGS_AT + 2 or not payload[_VIA_MASK_FLAGS_AT] & 0x02:
+        return False, False
+    (top,) = struct.unpack_from("<i", payload, _VIA_MASK_AT)
+    bottom = top
+    if (
+        len(payload) >= _VIA_MASK_BOTTOM_AT + 4
+        and not payload[_VIA_MASK_LINKED_AT] & 0x01
+    ):
+        (bottom,) = struct.unpack_from("<i", payload, _VIA_MASK_BOTTOM_AT)
+    base = hole if payload[_VIA_MASK_FLAGS_AT + 1] & 0x01 else diameter
+    return base + 2 * top <= hole, base + 2 * bottom <= hole
+
+
+def _via_stack(payload: bytes, diameter: int, hole: int) -> ViaStack:
     flags1, flags2 = payload[1], payload[2]
+    mask_top, mask_bottom = _mask_covers(payload, diameter, hole)
     stack = ViaStack(
-        tent_top=bool(flags1 & 0x20),
-        tent_bottom=bool(flags1 & 0x40),
+        tent_top=bool(flags1 & 0x20) or mask_top,
+        tent_bottom=bool(flags1 & 0x40) or mask_bottom,
         test_fab_top=bool(flags1 & 0x80),
         test_fab_bottom=bool(flags2 & 0x01),
     )
     if len(payload) >= _VIA_DIAMETERS_AT + 32 * 4:
         stack.mode = payload[_VIA_MODE_AT]
-        stack.layer_diameters = tuple(
-            _units_to_mil(value)
-            for value in struct.unpack_from("<32i", payload, _VIA_DIAMETERS_AT)
-        )
+        if stack.mode in (1, 2):
+            stack.layer_diameters = tuple(
+                _units_to_mil(value)
+                for value in struct.unpack_from("<32i", payload, _VIA_DIAMETERS_AT)
+            )
     if len(payload) > _VIA_REMOVED_PADS_AT + 32:
         stack.removed_pads = frozenset(
             layer
@@ -283,7 +310,7 @@ def decode_vias(data: bytes) -> tuple[list[Primitive], int]:
                 y2=y_mil,
                 width=_units_to_mil(diameter),
                 hole=_units_to_mil(hole),
-                via=_via_stack(payload),
+                via=_via_stack(payload, diameter, hole),
             )
         )
     return primitives, skipped
@@ -697,6 +724,24 @@ def decode_impedance_profiles(properties: dict[str, str]) -> list[ImpedanceProfi
     return list(profiles.values())
 
 
+def _copper_v6(layer_id: int | None) -> int | None:
+    """The v6 id of a copper stack layer from its V7 LAYERID: signal layers
+    0x0100nnnn (n, 0xFFFF = Bottom = 32), internal planes 0x0101nnnn (38 + n).
+
+    Names cannot be trusted for this: boards keep stale LAYERnNAME entries
+    (e.g. old plane slots) that repeat a signal layer's name."""
+    if layer_id is None:
+        return None
+    kind, number = layer_id >> 16, layer_id & 0xFFFF
+    if kind == 0x0100:
+        if number == 0xFFFF:
+            return 32
+        return number if 1 <= number <= 31 else None
+    if kind == 0x0101 and 1 <= number <= 16:
+        return 38 + number
+    return None
+
+
 def decode_board(records: list[dict[str, str]]) -> BoardInfo:
     """Decode Board6 text properties into coordinate and stackup metadata."""
     properties = records[0] if records else {}
@@ -731,9 +776,11 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         else:
             kind = "non-stack"
         dielectric_constant = properties.get(f"{prefix}DIELCONST")
+        layer_id = _optional_int(properties.get(f"{prefix}LAYERID"))
+        v6_id = _copper_v6(layer_id) if kind == "copper" else None
         layers.append(
             PcbLayer(
-                v6_id=name_to_v6.get(name.lower()),
+                v6_id=v6_id if v6_id is not None else name_to_v6.get(name.lower()),
                 name=name,
                 kind=kind,
                 stack_order=order,
@@ -745,17 +792,18 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
                     else None
                 ),
                 material=properties.get(f"{prefix}DIELMATERIAL"),
-                v7_id=_optional_int(properties.get(f"{prefix}LAYERID")),
+                v7_id=layer_id,
             )
         )
         order += 1
 
     stack_names = {layer.name.lower() for layer in layers}
+    stack_ids = {layer.v6_id for layer in layers}
     for layer_name, v6_id in sorted(
         name_to_v6.items(),
         key=lambda item: item[1],
     ):
-        if layer_name not in stack_names:
+        if layer_name not in stack_names and v6_id not in stack_ids:
             layers.append(
                 PcbLayer(
                     v6_id=v6_id,

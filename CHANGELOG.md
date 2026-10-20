@@ -6,6 +6,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Fixed
+- Stack layers get their layer ids from the stack's LAYERID, not from the layer name.
+  Boards keep stale names in old layer slots (e.g. internal planes once named like a
+  signal layer), and the name lookup put those signal layers on the plane ids: on
+  Altium's MiniPC example 8 of the 16 copper layers, so their tracks fell outside the
+  stack for lengths, barrels and rule scopes
 - A variant's Not Fitted entry (Kind=1) that still carries an AlternatePart (Altium leaves
   some behind, e.g. 'NP') now makes the part DNP; it was read as fitted
 - Compile-masked parts are recognised (inside a sheet's compile mask, RECORD=211). A
@@ -154,29 +159,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   window with "Altium Designer" in its title got the keystrokes, which could be a
   browser tab
 
+### Changed
+- `get_design_rules` and `get_rules_for_net` name the values of Back Drilling rules
+  (max_stub_length_mil, oversize_mil, tolerances, use_top_back_drill,
+  use_bottom_back_drill), ViasUnderSMD (allowed), LayerPairs (enforce) and the stacked
+  microvia flag of Hole To Hole Clearance (allow_stacked_microvias); they were under
+  other / other_mil. Only Back Drilling is among get_rules_for_net's default kinds
+
 ### Added
 - `check_vias`: via inventory and fabrication review. Via types by span (first and last
-  layer in stack order: through, blind, buried, microvia), hole and pad diameter, with
-  counts per type and per net class, drilled depth and aspect ratio from the stack's
-  copper and dielectric heights, the smallest annular ring over the layers that keep a
-  pad, tenting, vias in SMD pads and the stack's drill pairs. Back drilling is
-  recomputed the way Altium writes the drill files: the Layer Stack Manager's back
-  drills (drilled from the outer layer, stopping before the other one) apply to vias
-  in a Max Via Stub Length (Back Drilling) rule's scope that have no connection on the
-  layers they remove; each back drill lists its drilled layers, depth and drill sizes
-  (hole plus twice the oversize). Findings: aspect ratio above 10:1 (info above 8:1;
-  microvias above 1:1), annular ring below the Minimum Annular Ring rule (info below
-  0.1 mm without one), sizes outside the Routing Via Style rule, blind or buried spans
-  with no drill pair, vias in SMD pads (filling and capping on the drawing; warning when
-  a ViasUnderSMD rule forbids it), untented or one-side tented vias, stubs above the
-  back-drill rule's maximum, and stubs over 10 mil on differential-pair nets without a
-  back-drill rule. On Altium's MiniPC example the recomputed back drill selects the
-  same 16 vias whose pads Altium removed on the drilled layers
-- The PcbDoc parser reads each via's tenting, test-point flags, pad stack mode and per-layer
-  pad diameters, the layers whose pads are removed, and the stack's drill pairs and back
-  drills (Board6 LAYERPAIRn); BackDrilling, ViasUnderSMD, LayerPairs and the stacked
-  microvia flag of HoleToHoleClearance rules show named values in `get_rules_for_net` and
-  `get_design_rules`
+  layer in stack order: through, blind, buried, microvia per IPC-2226A: one dielectric,
+  at most 0.25 mm deep and 1:1), hole as drawn and pad diameter, with counts per type and
+  per net class, copper-to-copper depth and aspect ratio from the stack heights, the
+  smallest annular ring over the layers that keep a pad, tenting, vias in SMD pads,
+  stacked microvias and the stack's drill pairs. Back drilling is recomputed the way
+  Altium writes the drill files: the Layer Stack Manager's back drills (drilled from the
+  outer layer, stopping before the other one) apply to vias in a Max Via Stub Length
+  (Back Drilling) rule's scope that have no connection on the layers they remove; each
+  back drill lists its drilled layers, depth to the stop layer and drill sizes (hole
+  plus twice the oversize). Findings: aspect ratio above 10:1 (info above 8:1, and for a
+  mechanically drilled blind via above 1:1; microvias above 1:1, info above 0.8:1),
+  annular ring below the Minimum Annular Ring rule or the requested minimum (info below
+  0.1 mm, 0.05 mm on microvias), sizes outside the Routing Via Style rule (info for
+  holes of 1 mm and up drawn as vias), blind or buried spans without a drill pair, vias
+  in SMD pads (fill and cap advice, one note per thermal via array; warning for another
+  net's pad or a ViasUnderSMD rule forbidding it), untented or one-side tented vias and
+  tented holes above 0.5 mm, stubs above a back-drill rule's maximum (the residual after
+  back drilling is taken as the worst case, the drill tip stopping just past the first
+  drilled layer), back-drill rules without back drills, and stubs over 40 mil with their
+  quarter-wave resonance on differential pairs no back-drill rule covers. On Altium's
+  MiniPC example the recomputed back drill selects the same 16 vias whose pads Altium
+  removed on the drilled layers
+- The PcbDoc parser reads each via's tenting (with a manual solder mask expansion that
+  covers the ring counted as tented), test-point flags, pad stack mode, per-layer pad
+  diameters and removed pads, and the stack's drill pairs and back drills (Board6
+  LAYERPAIRn)
 - `check_decoupling`: offline decoupling coverage. From the compiled netlist and pin names
   it finds the rails (nets named like power, or reaching an IC supply, reference or
   capacitor pin; never a net carrying EN, PG or SENSE), the power pins of ICs fitted in
