@@ -16,6 +16,7 @@ from server.parsers.pcb_doc import (
     PcbClass,
     PcbRule,
     Primitive,
+    ViaStack,
 )
 from server.services.pcb_compliance import (
     CLEARANCE_MAX_NETS,
@@ -25,7 +26,6 @@ from server.services.pcb_compliance import (
 from server.services.pcb_index import PcbIndex
 from server.services.pcb_rules import MULTI_LAYER, ObjectFacts
 from server.services.via_checks import run_via_check
-from server.parsers.pcb_doc import ViaStack
 from tests.test_pcb_index import NETLIST, pcb_data  # noqa: F401
 
 
