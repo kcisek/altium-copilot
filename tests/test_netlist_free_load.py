@@ -247,12 +247,90 @@ def test_without_a_project_tools_still_say_no_project(env):
     assert json.loads(main.constraints_review())["error"] == "no_project"
 
 
+LITE_VARIANT = "[ProjectVariant2]\nDescription=Lite\nVariationCount=0\n"
+ALTIUM_HAS_BOARD = {"running": True, "project_file": "Board.PrjPcb", "tab_type": "schematic"}
+
+
+def _load_with_lite_active(root: Path) -> None:
+    (root / "Board.PrjPcb").write_text(PRJ_TEXT + LITE_VARIANT, encoding="utf-8")
+    _load(root)
+    main.set_active_variant("Lite")
+
+
 def test_refresh_netlist_without_altium_stays_partial(env):
     root, _, _ = env
-    _load(root)
+    _load_with_lite_active(root)
     result = json.loads(main.refresh_netlist())
     assert result["partial"] is True
+    assert result["active_variant"] == "Lite"
     assert main._project["name"] == "Board"
+    assert json.loads(main.list_variants())["active_variant"] == "Lite"
+
+
+def test_refresh_netlist_reports_a_variant_that_is_gone(env):
+    root, _, _ = env
+    _load_with_lite_active(root)
+    (root / "Board.PrjPcb").write_text(PRJ_TEXT, encoding="utf-8")
+    result = json.loads(main.refresh_netlist())
+    assert result["active_variant"] == "Prod"
+    assert "'Lite' is no longer in the project" in result["variant_note"]
+
+
+def test_failed_full_load_keeps_the_partial_load(env):
+    root, _, _ = env
+    _load_with_lite_active(root)
+    with patch.object(main._altium, "get_status", return_value=ALTIUM_HAS_BOARD), \
+         patch.object(main._altium, "generate_netlist", side_effect=RuntimeError("Altium busy")):
+        result = json.loads(main.refresh_netlist())
+    assert result["error"] == "netlist_generation_failed"
+    assert result["partial_load_kept"] is True
+    assert "partial load is kept" in result["message"]
+    assert json.loads(main.get_board_info()).get("error") is None
+    assert json.loads(main.list_variants())["active_variant"] == "Lite"
+
+
+def test_unregistered_netlist_in_the_output_folder_wins(env):
+    # An archived copy of the project carries its own, newer Board.NET.
+    root, _, _ = env
+    old = root / "Archive" / "Project Outputs for Board" / "Board.NET"
+    net = root / "Project Outputs for Board" / "Board.NET"
+    for path, text in ((old, "(\nVCC\nR2-1\n)\n"), (net, "(\nGND\nR1-1\n)\n")):
+        path.parent.mkdir(parents=True)
+        path.write_text(text, encoding="utf-8")
+    newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file() and f.suffix != ".NET")
+    os.utime(net, (newest + 100, newest + 100))
+    os.utime(old, (newest + 200, newest + 200))
+    result = _load(root)
+    assert "partial" not in result
+    assert json.loads(main.query_net("GND"))["pin_count"] == 1
+    assert json.loads(main.query_net("VCC"))["error"] == "net_not_found"
+
+
+def test_ambiguous_unregistered_netlists_load_partially(env):
+    root, _, _ = env
+    for folder in ("CopyA", "CopyB"):
+        path = root / folder / "Board.NET"
+        path.parent.mkdir()
+        path.write_text("(\nGND\nR1-1\n)\n", encoding="utf-8")
+        newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file())
+        os.utime(path, (newest + 100, newest + 100))
+    assert _load(root)["partial"] is True
+
+
+def test_up_to_date_netlist_missing_from_the_registry_loads_fully(env):
+    # E.g. Altium regenerated the netlist itself, or the folder moved: the registry
+    # has no matching netlist_mtime, but the .NET is newer than every source.
+    root, upsert, _ = env
+    net = root / "Project Outputs for Board" / "Board.NET"
+    net.parent.mkdir()
+    net.write_text("(\nGND\nR1-1\n)\n", encoding="utf-8")
+    newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file() and f != net)
+    os.utime(net, (newest + 100, newest + 100))
+    result = _load(root)
+    assert result["loaded"] is True
+    assert "partial" not in result
+    assert json.loads(main.query_net("GND"))["pin_count"] == 1
+    upsert.assert_called_once_with("Board.PrjPcb", str(root), netlist_mtime=net.stat().st_mtime)
 
 
 def test_refresh_netlist_loads_fully_once_altium_has_the_project(env):
@@ -267,12 +345,15 @@ def test_refresh_netlist_loads_fully_once_altium_has_the_project(env):
         }
         return True
 
-    status = {"running": True, "project_file": "Board.PrjPcb", "tab_type": "schematic"}
-    with patch.object(main._altium, "get_status", return_value=status), \
+    (root / "Board.PrjPcb").write_text(PRJ_TEXT + LITE_VARIANT, encoding="utf-8")
+    _load(root)
+    main.set_active_variant("Lite")
+    with patch.object(main._altium, "get_status", return_value=ALTIUM_HAS_BOARD), \
          patch.object(main._altium, "generate_netlist", side_effect=generate):
         result = json.loads(main.refresh_netlist())
     assert result["loaded"] is True
     assert "partial" not in result
+    assert result["active_variant"] == "Lite"
     assert json.loads(main.query_net("GND"))["pin_count"] == 1
 
 
