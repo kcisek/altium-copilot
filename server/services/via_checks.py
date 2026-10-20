@@ -195,6 +195,43 @@ class _Stack:
         return self.position.get(layer)
 
 
+def via_span(stack: _Stack, prim) -> tuple[int | None, int | None, str]:
+    """(low, high, kind) of a via: its first and last stack positions and through,
+    blind, buried, or unknown (an end not in the stack; positions None)."""
+    a, b = stack.position.get(prim.layer), stack.position.get(prim.layer_to)
+    if a is None or b is None:
+        return None, None, "unknown"
+    low, high = sorted((a, b))
+    if low == 0 and high == stack.last:
+        return low, high, "through"
+    if low == 0 or high == stack.last:
+        return low, high, "blind"
+    return low, high, "buried"
+
+
+def is_microvia(stack: _Stack, kind: str, low, high, hole: float) -> bool:
+    """A blind or buried via over one dielectric that is a microvia (see the module
+    docstring); without stack heights only the hole decides."""
+    if kind not in ("blind", "buried") or high - low != 1 or hole <= 0:
+        return False
+    depth = stack.capture_depth(low, high)
+    if depth is None:
+        return hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL
+    return depth <= MICROVIA_MAX_DEPTH_MIL + EPS_MIL and (
+        hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL or depth / hole <= 1.0 + 1e-9
+    )
+
+
+def via_depth(stack: _Stack, low, high, microvia: bool) -> float | None:
+    """The depth an aspect ratio divides: a microvia's capture depth, else the span's
+    copper-to-copper depth; None without stack heights or a known span."""
+    if low is None:
+        return None
+    if microvia:
+        return stack.capture_depth(low, high)
+    return stack.span_depth(low, high)
+
+
 # ---------- vias ----------
 
 
@@ -313,20 +350,11 @@ class _Review:
             net = nets[prim.net] if prim.net is not None and prim.net < len(nets) else None
             if self.selection is not None and (net is None or net.lower() not in self.selection):
                 continue
-            a, b = stack.position.get(prim.layer), stack.position.get(prim.layer_to)
             hole = prim.hole or 0.0
-            if a is None or b is None:
-                low = high = None
-                kind = "unknown"
+            low, high, kind = via_span(stack, prim)
+            if low is None:
                 key_span = tuple(sorted((prim.layer, prim.layer_to)))
             else:
-                low, high = sorted((a, b))
-                if low == 0 and high == stack.last:
-                    kind = "through"
-                elif low == 0 or high == stack.last:
-                    kind = "blind"
-                else:
-                    kind = "buried"
                 key_span = (stack.order[low], stack.order[high])
             via = _Via(
                 prim=prim,
@@ -344,14 +372,7 @@ class _Review:
         return vias
 
     def _is_microvia(self, kind: str, low, high, hole: float) -> bool:
-        if kind not in ("blind", "buried") or high - low != 1 or hole <= 0:
-            return False
-        depth = self.stack.capture_depth(low, high)
-        if depth is None:
-            return hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL
-        return depth <= MICROVIA_MAX_DEPTH_MIL + EPS_MIL and (
-            hole <= MICROVIA_MAX_HOLE_MIL + EPS_MIL or depth / hole <= 1.0 + 1e-9
-        )
+        return is_microvia(self.stack, kind, low, high, hole)
 
     def _ring(self, via: _Via) -> float:
         """Smallest (pad - hole) / 2 over the signal layers in the span that
@@ -370,11 +391,7 @@ class _Review:
         return f"{self.stack.name(via.low)} -> {self.stack.name(via.high)}"
 
     def _depth(self, via: _Via) -> float | None:
-        if via.low is None:
-            return None
-        if via.microvia:
-            return self.stack.capture_depth(via.low, via.high)
-        return self.stack.span_depth(via.low, via.high)
+        return via_depth(self.stack, via.low, via.high, via.microvia)
 
     def _types(self) -> dict[tuple, dict]:
         groups: dict[tuple, list[_Via]] = defaultdict(list)

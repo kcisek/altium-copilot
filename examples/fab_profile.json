@@ -1,0 +1,50 @@
+{
+  "comment": [
+    "check_dfm fab profile template: fill in YOUR fabricator's published numbers.",
+    "Save it in the project folder (next to the .PrjPcb) as fab_profile.json to use it by default, or as <name>.json and pass profile='<name>'.",
+    "Every limit below is null until you fill it in; a limit left null (or deleted) is not checked.",
+    "Lengths end in _mm or _mil (min_trace_mm or min_trace_mil, not both); ratios, percentages and counts take no suffix. Board sizes are a number or [a, b] either way round; layer_counts is a list of copper layer counts.",
+    "_specific_limits lists the limits that fall back to a generic one: to set one, add its key to limits with a number. Leave it out to use the generic limit; null would stop the fallback and leave it unchecked.",
+    "based_on is left out, so nothing is inherited. Add \"based_on\": \"altimade\" only if your fab's table matches Altimade's for every limit you leave out.",
+    "Keys starting with _ are ignored."
+  ],
+  "name": "My fab, standard class",
+  "source": "URL or document of the fab's capability table",
+  "source_updated": "date or revision of that table",
+  "limits": {
+    "min_trace_mm": null,
+    "min_spacing_mm": null,
+    "min_annular_ring_mm": null,
+    "min_drill_mm": null,
+    "max_drill_mm": null,
+    "min_hole_to_hole_mm": null,
+    "min_copper_to_edge_mm": null,
+    "min_route_size_mm": null,
+    "drill_allowance_mm": null,
+    "max_aspect_ratio": null,
+    "max_microvia_aspect_ratio": null,
+    "tolerance_percent": null,
+    "layer_counts": null,
+    "min_board_size_mm": null,
+    "max_board_size_mm": null,
+    "max_drill_sizes": null,
+    "copper_oz": null,
+    "_specific_limits": {
+      "min_via_annular_ring_mm": "falls back to min_annular_ring_mm",
+      "min_pth_annular_ring_mm": "falls back to min_annular_ring_mm",
+      "min_via_drill_mm": "falls back to min_drill_mm",
+      "min_pth_drill_mm": "falls back to min_drill_mm",
+      "min_npth_drill_mm": "falls back to min_drill_mm",
+      "min_via_hole_to_hole_mm": "falls back to min_hole_to_hole_mm",
+      "min_pad_hole_to_hole_mm": "falls back to min_hole_to_hole_mm",
+      "min_hole_to_copper_mm": "falls back to min_spacing_mm",
+      "min_hole_to_edge_mm": "falls back to min_copper_to_edge_mm"
+    },
+    "_notes": {
+      "min_route_size_mm": "the narrowest routed slot; a narrower slot is info",
+      "drill_allowance_mm": "drilled = finished hole + allowance, for a second aspect ratio",
+      "tolerance_percent": "a miss within this percentage of a limit is marginal (default 2)",
+      "copper_oz": "the heaviest copper weight the fab offers, in oz"
+    }
+  }
+}
