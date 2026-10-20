@@ -387,6 +387,10 @@ otherwise your data may be stale.
 
 ## Error Recovery
 
+- netlist_required → the project was loaded without a netlist (partial load). Tell the user
+  this answer needs the project opened in Altium Designer once, then set_project_dir again.
+  Do not retry, and do not answer schematic questions (parts, values, pins, nets) from PCB
+  data without saying it is PCB data only
 - no_components_loaded (from set_project_dir, refresh_netlist or any component tool) → nets
   loaded but no schematic component metadata did. Tell the user, name any sheet_errors, and do
   not answer component questions from the nets alone or retry search_components in a loop
@@ -421,9 +425,49 @@ _netlist_last_updated: str | None = None
 _design_notes = DesignNotesCache()
 
 
-def _require_project():
-    if _project is None or _altium._netlist is None or _variant_state is None:
-        raise ValueError("No project loaded. Call set_project_dir first.")
+# Tools that need the compiled netlist; after a netlist-free load they answer
+# netlist_required. Every other tool works from the project files alone.
+NETLIST_TOOLS = (
+    "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
+    "check_bom", "check_decoupling", "check_sch_pcb_sync", "schematic_review",
+    "package_for_xfn",
+)
+
+
+class ProjectNotReady(ValueError):
+    """Raised by _require_project; payload is the structured tool error."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload["message"])
+        self.payload = payload
+
+
+def _netlist_required_error() -> dict:
+    name = (_project or {}).get("name")
+    return {
+        "error": "netlist_required",
+        "message": (
+            f"Project '{name}' was loaded without a netlist: Altium Designer was not "
+            "running and no up-to-date cached netlist was found. This tool needs the "
+            "schematic connectivity of the netlist, which only Altium Designer can "
+            "generate. Open the project in Altium Designer once, then call set_project_dir "
+            "again; later loads reuse the cached netlist without Altium. Board, design-rule, "
+            "length, differential-pair, via, DRC report, design-notes, picture and variant "
+            "tools work now."
+        ),
+    }
+
+
+def _require_project(netlist: bool = True):
+    """The loaded (project, netlist, variant_state). A netlist-free load has netlist
+    None: with netlist=False it is returned as is, otherwise netlist_required is raised."""
+    if _project is None or _variant_state is None:
+        raise ProjectNotReady({
+            "error": "no_project",
+            "message": "No project loaded. Call set_project_dir first.",
+        })
+    if netlist and _altium._netlist is None:
+        raise ProjectNotReady(_netlist_required_error())
     return _project, _altium._netlist, _variant_state
 
 
@@ -650,11 +694,96 @@ def detect_altium_project() -> str:
 
 # ---------- set_project_dir ----------
 
+def _project_context(project_dir: str) -> str | None:
+    """The project folder's CLAUDE.md, if any."""
+    claude_md = list(Path(project_dir).glob("CLAUDE.md")) + list(Path(project_dir).glob("claude.md"))
+    return claude_md[0].read_text(encoding="utf-8") if claude_md else None
+
+
+def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool) -> dict:
+    """Load the project from its files alone: Altium Designer is not running and no
+    up-to-date cached netlist exists. Board, rule, notes, picture and variant tools work;
+    the NETLIST_TOOLS answer netlist_required."""
+    global _project, _variant_state, _netlist_last_updated
+    _project = None
+    _variant_state = None
+    _altium._netlist = None
+    _netlist_last_updated = None
+    _pcb_session.__init__()
+
+    prj_data = parse_prj_pcb(prj_pcb_path)
+    if not prj_data.sheet_paths and not prj_data.pcb_doc_paths:
+        return {
+            "error": "no_documents",
+            "message": (
+                "The .PrjPcb lists no .SchDoc sheet and no .PcbDoc, so there is nothing to "
+                "load without Altium. Check the .PrjPcb file."
+            ),
+        }
+    sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
+    _project = {
+        "name": Path(prj_pcb_path).stem,
+        "root_dir": project_dir,
+        "prj_pcb_path": prj_pcb_path,
+        "sheets": sheets,
+        **_project_documents(prj_data),
+    }
+    _variant_state = VariantState(prj_data.variants)
+    _resolve_dnp_uids(_variant_state, None)
+    upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
+
+    message = (
+        "Partial load: Altium Designer is not running and no up-to-date cached netlist was "
+        "found, so the project was loaded from its files without a netlist. The tools in "
+        "netlist_required_tools need it and answer netlist_required; board, design-rule, "
+        "length, differential-pair, via, DRC report, design-notes, picture and variant "
+        "tools work. PCB parts are not linked to schematic parts (sch_refdes is empty) and "
+        "DNP comes from the designators stored in the variants. To load fully, open the "
+        "project in Altium Designer once and call set_project_dir again; later loads "
+        "reuse the cached netlist without Altium."
+    )
+    if not prj_data.pcb_doc_paths:
+        message += " The project lists no .PcbDoc, so the board tools answer no_pcb_document."
+    if netlist_stale:
+        message += (
+            " A cached netlist exists, but the project or its schematic sheets were saved "
+            "after it was generated, so it is not used."
+        )
+    response = {
+        "loaded": True,
+        "partial": True,
+        "load_mode": "netlist_free",
+        "project": _project["name"],
+        "sheets": [s["name"] for s in sheets],
+        "sheet_count": len(sheets),
+        "variants": [v.name for v in prj_data.variants],
+        "variant_count": len(prj_data.variants),
+        "pcb_doc": Path(prj_data.pcb_doc_paths[0]).name if prj_data.pcb_doc_paths else None,
+        "netlist_updated_utc": None,
+        "netlist_required_tools": list(NETLIST_TOOLS),
+        "message": message,
+        "session_start": (
+            "Tell the user the load is partial and why. Skip get_sheet_context: summarize "
+            "the board from get_design_notes and get_board_info instead."
+        ),
+        **_design_info(prj_data),
+    }
+    if netlist_stale:
+        response["netlist_stale"] = True
+    context = _project_context(project_dir)
+    if context is not None:
+        response["project_context"] = context
+    return response
+
+
 @mcp.tool(title="Load Project", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 def set_project_dir(project_dir: str) -> str:
     """Load an Altium project from disk. Must be called before any other tool.
     If the netlist cache is valid, loads from disk without requiring Altium to be open.
-    Otherwise requires Altium Designer to be running with the project open."""
+    Otherwise generates the netlist in Altium Designer, which must have the project open.
+    When Altium is not running, loads the project without a netlist (partial: true):
+    board, rule, notes, picture and variant tools work, the tools listed in
+    netlist_required_tools answer netlist_required."""
     global _project, _variant_state, _netlist_last_updated
 
     # Find .PrjPcb upfront — needed by both the cache shortcut and the Altium flow.
@@ -725,31 +854,19 @@ def set_project_dir(project_dir: str) -> str:
                                     **_load_diagnostics(_altium._netlist or {}),
                                     **_design_info(prj_data),
                                 }
-                                _claude_md = (
-                                    list(Path(project_dir).glob("CLAUDE.md")) +
-                                    list(Path(project_dir).glob("claude.md"))
-                                )
-                                if _claude_md:
-                                    response["project_context"] = _claude_md[0].read_text(encoding="utf-8")
+                                _context = _project_context(project_dir)
+                                if _context is not None:
+                                    response["project_context"] = _context
                                 return json.dumps(response, indent=2)
                     except Exception as e:
                         logging.warning("Registry cache shortcut failed: %s", e)
             break
 
-    # Full Altium flow — required when cache is absent or stale.
+    # Full Altium flow — required when cache is absent or stale. Without Altium the
+    # project still loads from its files, without a netlist.
     status = _altium.get_status()
     if not status.get("running"):
-        response = {
-            "error": "altium_not_running",
-            "message": "Altium Designer is not running. Open Altium with your project before loading.",
-        }
-        if _stale_cache:
-            response["netlist_stale"] = True
-            response["message"] += (
-                " The project or its schematic sheets were saved after the cached netlist "
-                "was generated, so it must be regenerated in Altium."
-            )
-        return json.dumps(response)
+        return json.dumps(_load_netlist_free(project_dir, prj_pcb_path, _stale_cache), indent=2)
     if status.get("warning") == "no_sheet_open":
         return json.dumps({
             "error": "no_sheet_open",
@@ -839,12 +956,9 @@ def set_project_dir(project_dir: str) -> str:
         **_design_info(prj_data),
     }
 
-    claude_md_files = (
-        list(Path(project_dir).glob("CLAUDE.md")) +
-        list(Path(project_dir).glob("claude.md"))
-    )
-    if claude_md_files:
-        response["project_context"] = claude_md_files[0].read_text(encoding="utf-8")
+    context = _project_context(project_dir)
+    if context is not None:
+        response["project_context"] = context
 
     return json.dumps(response, indent=2)
 
@@ -855,12 +969,16 @@ def set_project_dir(project_dir: str) -> str:
 def refresh_netlist() -> str:
     """Refresh the netlist after the user has saved schematic changes in Altium.
     Call this when the user says they changed, added, or saved anything in the schematic.
-    Do not call speculatively — only when the user confirms they have saved."""
+    Do not call speculatively — only when the user confirms they have saved.
+    After a netlist-free load (partial: true) it loads the project again, fully
+    when Altium Designer now has it open."""
     global _netlist_last_updated, _variant_state
     try:
-        project, _, variant_state = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    if netlist is None:
+        return set_project_dir(project["root_dir"])
     # Re-read the sheet list so sheets added, moved or removed since load are picked up
     # and the sheet names stay in step with the components' sheet attribution.
     prj_data = None
@@ -1009,8 +1127,8 @@ def query_net(pattern: str) -> str:
     discover net names or trace a specific net across sheets."""
     try:
         _, netlist, _ = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return _query_net_impl(netlist, pattern)
 
 
@@ -1068,8 +1186,8 @@ def get_component(refdes: str) -> str:
     part has that name."""
     try:
         _, netlist, variant_state = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return _get_component_impl(netlist, variant_state, refdes)
 
 
@@ -1145,8 +1263,8 @@ def search_components(pattern: str, search_by: str = "description") -> str:
     Returns components grouped by MPN with counts. Use get_component for full pin detail."""
     try:
         _, netlist, _ = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return _search_components_impl(netlist, pattern, search_by)
 
 
@@ -1228,8 +1346,8 @@ def get_sheet_context(sheet_name: str | None = None, offset: int = 0) -> str:
     and repeat until has_more:false. Accumulate all pages before answering the user."""
     try:
         project, netlist, variant_state = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
 
     altium_status = _altium.get_status() if sheet_name is None else {}
     return _get_sheet_context_impl(project, netlist, variant_state, sheet_name, altium_status,
@@ -1261,9 +1379,9 @@ def get_design_notes(document: str | None = None, offset: int = 0) -> str:
     Results are paginated by character budget. If the response contains has_more:true,
     call again with the offset from the next: line until has_more:false."""
     try:
-        project, _, _ = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+        project, _, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return build_design_notes(_design_notes, project, document, offset)
 
 
@@ -1351,9 +1469,9 @@ def get_design_image(document: str, index: int = 0) -> Image | str:
     get_sheet_context list as [image N] / [picture N]. Schematic pictures are stored as
     bitmaps and returned as PNG."""
     try:
-        project, _, _ = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+        project, _, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     result = _get_design_image_impl(project, _design_notes, document, index)
     return json.dumps(result) if isinstance(result, dict) else result
 
@@ -1380,9 +1498,9 @@ def list_variants() -> str:
     """List all project variants and their DNP component lists.
     Call this at session start so the user can choose which variant to work in."""
     try:
-        _, _, variant_state = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+        _, _, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return _list_variants_impl(variant_state)
 
 
@@ -1406,9 +1524,9 @@ def set_active_variant(variant_name: str) -> str:
     """Switch the active variant. DNP annotations on get_component and get_sheet_context
     will reflect the new variant immediately."""
     try:
-        _, _, variant_state = _require_project()
-    except ValueError as e:
-        return json.dumps({"error": "no_project", "message": str(e)})
+        _, _, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     return _set_active_variant_impl(variant_state, variant_name)
 
 
@@ -1480,6 +1598,12 @@ def _finite_nonnegative(value: float) -> bool:
     return math.isfinite(value) and value >= 0.0
 
 
+NETLIST_FREE_PCB_NOTE = (
+    "Not loaded (netlist-free load): PCB designators are not linked to schematic parts, "
+    "so sch_refdes is empty, and DNP flags come from the designators stored in the "
+    "project's variants."
+)
+
 PCB_POLYGON_GEOMETRY_NOTE = (
     "Repour polygons in Altium and save the PcbDoc before relying on polygon "
     "results. These tools model saved nominal polygon outlines and the tracks "
@@ -1512,9 +1636,9 @@ def get_board_info(units: PcbUnits | None = None) -> str:
     board's display unit.
     """
     try:
-        project, netlist, _ = _require_project()
-    except ValueError as error:
-        return json.dumps({"error": "no_project", "message": str(error)})
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
     index, error = _pcb_session.get(project, netlist)
     if error:
         return json.dumps(error)
@@ -1601,12 +1725,15 @@ def get_board_info(units: PcbUnits | None = None) -> str:
         "counts": index.counts(),
         "design_rules": _design_rule_counts(index),
         "components_per_side": sides,
-        "refdes_mapping_unmatched": index.unmatched_components(),
         "warnings": index.pcb.warnings,
         "skipped_records": index.pcb.skipped_records,
     }
-    if result["refdes_mapping_unmatched"]:
-        result["refdes_mapping_unmatched_sample"] = index.unmatched_refdes(10)
+    if netlist is None:
+        result["netlist"] = NETLIST_FREE_PCB_NOTE
+    else:
+        result["refdes_mapping_unmatched"] = index.unmatched_components()
+        if result["refdes_mapping_unmatched"]:
+            result["refdes_mapping_unmatched_sample"] = index.unmatched_refdes(10)
     renamed = index.renamed_components()
     if renamed:
         result["refdes_differs_from_logical"] = renamed
@@ -1626,9 +1753,9 @@ def get_board_info(units: PcbUnits | None = None) -> str:
 
 def _pcb_index_or_error():
     try:
-        project, netlist, _ = _require_project()
-    except ValueError as error:
-        return None, {"error": "no_project", "message": str(error)}
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return None, error.payload
     return _pcb_session.get(project, netlist)
 
 
@@ -2729,7 +2856,7 @@ def check_diff_pairs(
     to_mm, _, units_error = _pcb_units_or_error(index, units)
     if units_error:
         return json.dumps(units_error)
-    _, netlist, variant_state = _require_project()
+    _, netlist, variant_state = _require_project(netlist=False)
     result = run_diff_pair_checks(
         index,
         netlist,
@@ -2809,10 +2936,13 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
 
     checks narrows to components, pins, nets. Findings are paginated (offset from
     next_offset), errors first; each names the Altium difference type in altium_names."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)
-    project, netlist, variant_state = _require_project()
     no_components = _no_components_error(netlist)
     if no_components:
         return json.dumps(no_components)
@@ -2904,8 +3034,8 @@ def check_decoupling(
     distance are in units, default mm (max_distance default 5 mm)."""
     try:
         project, netlist, variant_state = _require_project()
-    except ValueError as error:
-        return json.dumps({"error": "no_project", "message": str(error)})
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
     no_components = _no_components_error(netlist)
     if no_components:
         return json.dumps(no_components)
@@ -3027,7 +3157,7 @@ def check_vias(
     )
     if "error" in full:
         return json.dumps(full)
-    project, _, _ = _require_project()
+    project, _, _ = _require_project(netlist=False)
     paths = project.get("pcb_doc_paths") or []
     context: dict = {"units": resolved}
     if paths:
@@ -3129,8 +3259,8 @@ def get_bom(
     returns the page as CSV text. Lines are paginated (offset from next_offset)."""
     try:
         project, netlist, variant_state = _require_project()
-    except ValueError as error:
-        return json.dumps({"error": "no_project", "message": str(error)})
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
     no_components = _no_components_error(netlist)
     if no_components:
         return json.dumps(no_components)
@@ -3196,8 +3326,8 @@ def check_bom(
     (offset from next_offset), errors first."""
     try:
         project, netlist, variant_state = _require_project()
-    except ValueError as error:
-        return json.dumps({"error": "no_project", "message": str(error)})
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
     no_components = _no_components_error(netlist)
     if no_components:
         return json.dumps(no_components)
@@ -3253,9 +3383,9 @@ def get_drc_report(
     origin_*, the frame query_pcb_region takes); a message's own coordinates are relative
     to the origin. Locations use units (default: board display unit)."""
     try:
-        project, netlist, _ = _require_project()
-    except ValueError as error:
-        return json.dumps({"error": "no_project", "message": str(error)})
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
     if group_by == "part":
         group_by = "component"
     if group_by not in ("rule", "component", "net"):
@@ -3455,14 +3585,10 @@ def constraints_review() -> str:
     the layout's constraints, design rules or high-speed routing ('check my high-speed
     rules', 'are my DDR length rules right?', 'review the diff pairs before fab'). Not for
     one net's rule (get_rules_for_net) or a schematic review (schematic_review)."""
-    if _project is None or _altium._netlist is None or _variant_state is None:
-        return json.dumps({
-            "error": "no_project",
-            "message": (
-                "No project loaded. Run the session-start flow first: "
-                "detect_altium_project → set_project_dir → list_variants → set_active_variant."
-            ),
-        })
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady:
+        return json.dumps(REVIEW_NO_PROJECT_ERROR)
     index, error = _pcb_index_or_error()
     if error:
         error["hint"] = (
@@ -3470,7 +3596,30 @@ def constraints_review() -> str:
             "use schematic_review."
         )
         return json.dumps(error)
-    return build_constraints_review(_project, _variant_state.active.name, index)
+    review = build_constraints_review(project, variant_state.active.name, index)
+    if netlist is None:
+        review += CONSTRAINTS_REVIEW_NETLIST_FREE_NOTE
+    return review
+
+
+REVIEW_NO_PROJECT_ERROR = {
+    "error": "no_project",
+    "message": (
+        "No project loaded. Run the session-start flow first: "
+        "detect_altium_project → set_project_dir → list_variants → set_active_variant."
+    ),
+}
+
+CONSTRAINTS_REVIEW_NETLIST_FREE_NOTE = """
+---
+
+Netlist-free load: this project was loaded without a netlist (Altium Designer was not
+running), so search_components, get_component and query_net answer netlist_required.
+Find the interfaces from the board instead: list_diff_pairs, get_classes and net names,
+then get_component_placement for the parts on those nets (its pins list each pad's net).
+The PCB holds no part descriptions or pin names: ask the user which parts are the
+interface ICs, and say in the report that pins were not checked against the schematic.
+"""
 
 
 @mcp.tool(title="Schematic Review", annotations=ToolAnnotations(readOnlyHint=True))
@@ -3478,14 +3627,12 @@ def schematic_review() -> str:
     """Start a structured schematic review. Call when the user explicitly asks to review
     or verify the schematic (e.g. 'review this', 'check my schematic', 'do a design review',
     'is this correct?', 'does this look right?'). Do not call for general questions."""
-    if _project is None or _altium._netlist is None or _variant_state is None:
-        return json.dumps({
-            "error": "no_project",
-            "message": (
-                "No project loaded. Run the session-start flow first: "
-                "detect_altium_project → set_project_dir → list_variants → set_active_variant."
-            ),
-        })
+    try:
+        _require_project()
+    except ProjectNotReady as e:
+        if e.payload["error"] == "netlist_required":
+            return json.dumps(e.payload)
+        return json.dumps(REVIEW_NO_PROJECT_ERROR)
 
     sheets = [s["name"] for s in _project["sheets"]]
     active_variant = _variant_state.active.name
@@ -3649,7 +3796,9 @@ def package_for_xfn() -> str:
     engineers. Do not call speculatively."""
     try:
         project, netlist, variant_state = _require_project()
-    except ValueError:
+    except ProjectNotReady as e:
+        if e.payload["error"] == "netlist_required":
+            return json.dumps(e.payload)
         return json.dumps({
             "error": "no_project",
             "message": "No project loaded. Ask the user to open a project in Altium first.",

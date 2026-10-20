@@ -2,14 +2,17 @@ import json
 from unittest.mock import patch
 
 
-def test_set_project_dir_altium_not_running(tmp_path):
+def test_set_project_dir_altium_not_running_needs_documents(tmp_path):
+    # Without Altium the project loads netlist-free, but an empty .PrjPcb has nothing to load.
     (tmp_path / "test.PrjPcb").write_text("", encoding="utf-8")
     with patch("main._altium") as mock_altium, \
-         patch("main.read_registry", return_value={"projects": []}):
+         patch("main.read_registry", return_value={"projects": []}), \
+         patch("main.upsert_registry_entry") as mock_upsert:
         mock_altium.get_status.return_value = {"running": False}
         from main import set_project_dir
         result = json.loads(set_project_dir(str(tmp_path)))
-    assert result["error"] == "altium_not_running"
+    assert result["error"] == "no_documents"
+    mock_upsert.assert_not_called()
 
 
 def test_set_project_dir_no_sheet_open(tmp_path):
