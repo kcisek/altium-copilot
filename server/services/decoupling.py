@@ -50,7 +50,8 @@ MIL_PER_MM = 1 / 0.0254
 DEFAULT_MAX_DISTANCE_MIL = 5 * MIL_PER_MM
 VIA_NEAR_MIL = 2 * MIL_PER_MM  # a via this close to an opposite-side capacitor's pad
 SMALL_FARADS = 1e-6  # under this a capacitor is a small (high-frequency) one
-LINK_OHMS = 1.0  # a resistor up to this joins two nets
+LINK_OHMS = 0.1  # a resistor up to this joins two nets (0 ohm links, shunts)
+FILTER_OHMS = 100.0  # a resistor up to this filters a supply; above, it biases or divides
 FINDING_LIMIT = 100
 RAIL_LIMIT = 60
 DETAIL_CAPACITORS = 5  # nearest capacitors listed per pair when ICs are named
@@ -60,7 +61,7 @@ _THT_LAYER = 74
 
 _SPLIT = re.compile(r"[_\-\s/]+")
 _POWER_TOKEN = re.compile(
-    r"^(\d+V\d*[A-Z]*|\d+[.,P]\d+V?[A-Z]*|V\d+(V\d+|P\d+)?|[PNM]\d+V\d*|\w*VCC\w*|\w*VDD\w*|"
+    r"^(\d+V\d*[A-Z]*|\d+[.,P]\d+V\w*|\d+P\d+|V\d+(V\d+|P\d+)?|[PNM]\d+V\d*|\w*VCC\w*|\w*VDD\w*|"
     r"VEE\w*|VBATT?\w*|VBUS\w*|VIN\w*|VSYS\w*|VMAIN\w*|VPP|VIO\w*|PVIN\w*|VSUP\w*|VPWR|PWR|"
     r"VDC|VAUX\w*|VCORE\w*|VLED\w*|VMOT\w*|VUSB|VLOGIC|VDRIVE|VCHG|VREF\w*|VOUT\w*|VS|VM|VL|"
     r"VPOS|VNEG|VBOOST|VCHARGE|VTT|VREG\w*)$"
@@ -76,6 +77,14 @@ _SIGNAL_TOKENS = frozenset({
     "NFAULT", "CC", "CC1", "CC2", "DP", "DM", "D+", "D-", "ID", "SBU1", "SBU2",
 })
 _SIGNAL_INSIDE = re.compile(r"SENSE|SNS|PGOOD|PWRGD|ENABLE|ALERT|FAULT")
+# Tokens that make a net an enable, status or measurement net even when a supply pin is
+# on it (VBAT_SENSE, 3V3_EN); other signal tokens (SW, ADC, CLK, DRV) still name rails
+# that feed a supply pin (+3V3_SW, VDDA_ADC).
+_STATUS_TOKENS = frozenset({
+    "EN", "ENA", "ENABLE", "PG", "PGOOD", "PWRGD", "PGD", "GOOD", "OK", "SENSE", "SNS",
+    "SEN", "FB", "ALERT", "FAULT", "FLT", "NFAULT", "DET", "DETECT", "MON", "MEAS", "ISNS",
+    "ISENSE", "STAT", "STATUS", "SHDN", "DIS",
+})
 
 _PIN_GROUND = re.compile(
     r"^(\w*GND\w*|VSS\w*|EP|EPAD|E-PAD|PAD|THERMAL\w*|TAB|SLUG|0V|GROUND|EXPOSED\w*|\d*GND)$"
@@ -95,7 +104,8 @@ _PIN_CAP = re.compile(
 )
 _PIN_OUT = re.compile(r"^(VOUT\w*|OUT\w*|SW\d*|LX\d*)$")
 _PIN_IN = re.compile(r"^(IN\d*|INPUT)$")
-_PIN_INPUT_PAIR = re.compile(r"^((V|A)?IN\d*[+-]|[+-]A?IN\d*)$")  # IN+, VIN-, -IN: signals
+# IN+, VIN-, -IN, VINP, AIN_N: differential or op-amp inputs, signals.
+_PIN_INPUT_PAIR = re.compile(r"^((V|A)?IN\d*[+-]|[+-]A?IN\d*|(V|A)?IN_?[PN]\d*)$")
 _PIN_BOOTSTRAP = re.compile(r"^(BST|BOOT|BS|CB|CBOOT|SW|LX|PH|VSW)\w*$")
 _PAIR_ROLES = frozenset({"supply", "ref", "cap"})
 
@@ -129,11 +139,16 @@ def _net_kind(net: str) -> dict:
     stripped = [token.strip("+-") for token in tokens]
     signal = any(token in _SIGNAL_TOKENS or token.rstrip("+-") in _SIGNAL_TOKENS
                  for token in tokens) or any(_SIGNAL_INSIDE.search(token) for token in tokens)
+    status = any(token.rstrip("+-") in _STATUS_TOKENS for token in tokens) or any(
+        _SIGNAL_INSIDE.search(token) for token in tokens)
     ground = any(_GROUND_TOKEN.match(token) for token in stripped)
     power = any(_POWER_TOKEN.match(token) for token in stripped) or bool(
         re.match(r"^[+-]\d", net.strip())
     )
-    return {"ground": ground, "power": power and not ground, "signal": signal}
+    if len(tokens) > 1 and tokens[-1] in ("P", "N"):
+        power = False  # a differential pair's half (A10_HLVDDI_P)
+    return {"ground": ground, "power": power and not ground, "signal": signal,
+            "status": status}
 
 
 def _first_function(name: str) -> str:
@@ -154,10 +169,14 @@ def pin_role(name: str | None) -> str:
         return "other"  # VCCSENSE, VDD_PGOOD, VIN- of an ADC or a current monitor
     if first[0] in "+-" and len(first) > 1:
         first = first[1:]  # +VS, -VIN
+        if first == "V":
+            return "supply"  # +V, -V of an op amp
     for role, pattern in (("ground", _PIN_GROUND), ("ref", _PIN_REF), ("cap", _PIN_CAP),
                           ("supply", _PIN_SUPPLY), ("out", _PIN_OUT), ("in", _PIN_IN)):
         if pattern.match(first):
             return role
+    if first[-1] in "+-" and _PIN_SUPPLY.match(first[:-1]):
+        return "supply"  # VCC-, VDD+, VEE-
     return "other"
 
 
@@ -229,7 +248,7 @@ class _Design:
     caps: dict[str, list[_Cap]]  # rail -> capacitors to ground
     between: dict[str, list[_Cap]]  # net -> capacitors to another non-ground net
     filters: dict[str, list[tuple[str, str]]]  # net -> fitted (filter, the other net)
-    links: dict[str, list[tuple[str, str]]]  # net -> fitted (0 ohm link, the other net)
+    links: dict[str, list[tuple[str, str, float]]]  # net -> fitted (link, other net, ohms)
     ic_nets: dict[str, set[str]]
     bootstrap_nets: dict[str, set[str]]  # IC -> nets of its BST/SW/LX/out pins
     pin_to_net: dict[str, dict[str, str]]
@@ -272,7 +291,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
     caps: dict[str, list[_Cap]] = defaultdict(list)
     between: dict[str, list[_Cap]] = defaultdict(list)
     filters: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    links: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    links: dict[str, list[tuple[str, str, float]]] = defaultdict(list)
     capacitors: set[str] = set()
     for ref in refs:
         connected = pin_to_net[ref]
@@ -295,11 +314,19 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
         if is_filter:
             if len(connected) == 2 and len(part_nets) == 2 and fitted[ref]:
                 net_a, net_b = part_nets
-                ohms = normalize_value(part.value or part.comment) if part and prefix == "R" \
-                    else None
-                kind = links if isinstance(ohms, float) and ohms <= LINK_OHMS else filters
-                kind[net_a].append((ref, net_b))
-                kind[net_b].append((ref, net_a))
+                if prefix != "R":
+                    filters[net_a].append((ref, net_b))
+                    filters[net_b].append((ref, net_a))
+                    continue
+                # A resistor: a link up to LINK_OHMS, a supply filter up to FILTER_OHMS;
+                # pull-ups, dividers and unreadable values join nothing.
+                ohms = normalize_value(part.value or part.comment) if part else None
+                if isinstance(ohms, float) and ohms <= LINK_OHMS:
+                    links[net_a].append((ref, net_b, ohms))
+                    links[net_b].append((ref, net_a, ohms))
+                elif isinstance(ohms, float) and ohms <= FILTER_OHMS:
+                    filters[net_a].append((ref, net_b))
+                    filters[net_b].append((ref, net_a))
             continue
         is_cap = prefix == "C" or (
             prefix.startswith("C") and prefix not in _NOT_CAP_PREFIXES
@@ -326,13 +353,16 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
 
     rails: dict[str, list[str]] = {}
     for net, members in nets.items():
-        if net in grounds or kinds[net]["signal"]:
+        if net in grounds or kinds[net]["status"]:
             continue
-        evidence = ["name"] if kinds[net]["power"] else []
+        evidence = ["name"] if kinds[net]["power"] and not kinds[net]["signal"] else []
         roles = {pin_role(pin_name(ref, pin)) for ref, pin in members if ref in all_ics}
-        # A reference pin alone (a TL431 divider node) makes a rail only with a capacitor.
-        if roles & {"supply", "cap"} or ("ref" in roles and (caps.get(net) or between.get(net))):
+        if roles & {"supply", "cap"}:
             evidence.append("ic_pin")
+        elif "ref" in roles and caps.get(net):
+            # A reference pin alone (a TL431 divider node) makes a rail only with a
+            # capacitor to ground.
+            evidence.append("ref_pin")
         if evidence:
             rails[net] = evidence
 
@@ -363,15 +393,19 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
     )
 
 
+def _ohms_text(ohms: float) -> str:
+    return "0 ohm" if ohms == 0 else f"{ohms * 1000:g} mOhm"
+
+
 def _linked_caps(design: _Design, rail: str) -> list[tuple[str, str, list[_Cap]]]:
-    """Fitted capacitors on nets joined to the rail by a 0 ohm link: (link, net, caps)."""
+    """Fitted capacitors on nets joined to the rail by a link: ('R1 (0 ohm)', net, caps)."""
     out = []
-    for part, other in design.links.get(rail, []):
+    for part, other, ohms in design.links.get(rail, []):
         if other in design.grounds:
             continue
         found = [cap for cap in design.caps.get(other, []) if cap.fitted]
         if found:
-            out.append((part, other, found))
+            out.append((f"{part} ({_ohms_text(ohms)})", other, found))
     return out
 
 
@@ -381,6 +415,7 @@ def _feeders(design: _Design, rail: str) -> list[tuple[str, str]]:
     return [
         (part, other) for part, other in design.filters.get(rail, [])
         if other not in design.grounds and other in design.rails
+        and design.rails[other] != ["ref_pin"]  # a reference divider node feeds nothing
         and any(cap.fitted for cap in design.caps.get(other, []))
     ]
 
@@ -417,14 +452,14 @@ def _schematic_findings(design: _Design, pairs: list[_Pair], variant: str) -> li
         fitted = own + [cap for _, _, found in linked for cap in found]
         unknown.update(cap.designator for cap in own if cap.farads is None)
         if not own and linked:
-            joined = "; ".join(f"{part} (0 ohm) to {other}, with "
+            joined = "; ".join(f"{part} to {other}, with "
                                f"{_names(c.designator for c in found)}"
                                for part, other, found in linked[:4])
             findings.append(_finding(
                 "capacitor_elsewhere",
                 f"{rail} ({shown}) has no capacitor of its own; it is joined through "
                 f"{joined}, which decouple it.",
-                [*ics, *(part for part, _, _ in linked)], rail=rail, ics=ics,
+                [*ics, *(part.split(" ")[0] for part, _, _ in linked)], rail=rail, ics=ics,
             ))
         if fitted:
             if all(cap.farads is not None and not cap.small() for cap in fitted):
@@ -593,8 +628,8 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
         stats["pairs_measured"] += 1
         distances.append(distance)
         measured = {"ic": pair.ic, "rail": pair.rail, "pins": pair.pins, "nearest": describe(best)}
-        small = [item for item in fitted if item[0].farads is None or item[0].small()]
-        if small and not best[1].small():
+        small = [item for item in fitted if item[0].small()]
+        if small and best[1].farads is not None and not best[1].small():
             measured["nearest_under_1uF"] = describe(
                 min((nearest(pad, small) for pad, _ in power), key=lambda item: item[0])
             )
@@ -755,7 +790,8 @@ def run_decoupling_check(
     if wanted_rails is not None:
         pairs = [pair for pair in pairs if pair.rail in wanted_rails]
         for rail in sorted(wanted_rails - {pair.rail for pair in pairs}, key=natural_key):
-            notes.append(f"{rail}: no fitted IC power pin on it.")
+            whose = f"of {_names(wanted_ics)}" if wanted_ics is not None else "of a fitted IC"
+            notes.append(f"{rail}: no power pin {whose} on it.")
     if unknown_ics or unknown_rails:
         notes.append(f"Not found: {', '.join([*unknown_ics, *unknown_rails])}.")
     if design.not_fitted_ics and wanted_ics is None:

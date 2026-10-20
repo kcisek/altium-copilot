@@ -111,7 +111,9 @@ def test_small_and_bulk_capacitor_advice():
     ("+VS", "supply"), ("-VS", "supply"), ("+VIN", "supply"), ("VIN-", "other"),
     ("IN+", "other"), ("-IN", "other"), ("3.3 V", "supply"), ("VDD(3V3)", "supply"),
     ("VDD_1.8V", "supply"), ("VCC3.3", "supply"), ("12", "none"), ("V", "other"),
-    ("V-", "supply"), ("VREF+", "ref"), ("BST", "other"),
+    ("V-", "supply"), ("VREF+", "ref"), ("BST", "other"), ("+V", "supply"), ("-V", "supply"),
+    ("VCC-", "supply"), ("VEE-", "supply"), ("VINP", "other"), ("VIN_N", "other"),
+    ("AINP1", "other"), ("PVIN", "supply"),
 ])
 def test_pin_name_spellings(name, role):
     assert pin_role(name) == role
@@ -157,7 +159,16 @@ def test_a_zero_ohm_link_joins_rails():
     result, found = _rails(parts)
     assert found == {("capacitor_elsewhere", "+3V3_MCU")}
     assert "R1 (0 ohm) to +3V3, with C1" in result["findings"][0]["issue"]
-    assert result["rails"][0]["linked_to"] == ["R1 to +3V3"]
+    assert result["rails"][0]["linked_to"] == ["R1 (0 ohm) to +3V3"]
+    # A 10 mOhm shunt is a link too; 1 ohm filters (an RC filter without its C).
+    parts[1] = ("R1", {"1": ("1", "+3V3"), "2": ("2", "+3V3_MCU")}, {"value": "10mR"})
+    result, found = _rails(parts)
+    assert "R1 (10 mOhm)" in result["findings"][0]["issue"]
+    parts[1] = ("R1", {"1": ("1", "+3V3"), "2": ("2", "+3V3_MCU")}, {"value": "1R"})
+    assert _rails(parts)[1] == {("filtered_rail", "+3V3_MCU")}
+    # Dividers and pull-ups (240 ohm and up) join nothing.
+    parts[1] = ("R1", {"1": ("1", "+3V3"), "2": ("2", "+3V3_MCU")}, {"value": "240R"})
+    assert _rails(parts)[1] == {("no_capacitor", "+3V3_MCU")}
 
 
 def test_not_fitted_ics_are_not_checked():
@@ -184,8 +195,21 @@ def test_rail_recognition_edge_cases():
             ("U8", {"1": ("VSS", "NetU7_1"), "2": ("VDD", "+5V")}, {}),
             ("C8", {"1": ("1", "+5V"), "2": ("2", "NetU7_1")}, {"value": "100nF"})]
     assert ("no_capacitor", "+5V") in _rails(pump)[1]
-    # A supply pin on a net that carries a signal token is no rail.
+    # A supply pin on an enable or sense net is no rail; on a switched or analog rail it is.
     assert _rails([("U1", {"1": ("VDD", "3V3_EN"), "2": ("GND", "GND")}, {})])[1] == set()
+    assert _rails([("U1", {"1": ("VBAT", "VBAT_SENSE"), "2": ("GND", "GND")}, {})])[1] == set()
+    for rail in ("+3V3_SW", "VDDA_ADC", "VDD_CLK", "+12V_DRV"):
+        assert _rails([("U1", {"1": ("VDD", rail), "2": ("GND", "GND")}, {})])[1] == {
+            ("no_capacitor", rail)}
+    # A TL431 with a compensation capacitor to its cathode: the REF node is still no rail.
+    shunt.append(("C3", {"1": ("1", "VSHUNT"), "2": ("2", "NetR3_2")}, {"value": "10nF"}))
+    assert _rails(shunt)[1] == set()
+    # Crystal nets and differential halves are not named like power.
+    clock = [("U2", {"1": ("1", "32.768K_IN"), "2": ("2", "A10_HLVDDI_P"),
+                     "3": ("3", "+3V3"), "4": ("4", "GND")}, {}),
+             ("C1", {"1": ("1", "+3V3"), "2": ("2", "GND")}, {"value": "100nF"})]
+    result, found = _rails(clock, ics=["U2"])
+    assert {row["rail"] for row in result["rails"]} == {"+3V3"}
 
 
 def test_capacitor_arrays_and_feed_throughs():
@@ -230,7 +254,9 @@ def test_filters_by_ic_and_rail():
     result = run_decoupling_check(_netlist(parts), ics=["U9"])
     assert "U9: no pin on a power rail was recognised." in result["notes"]
     result = run_decoupling_check(_netlist(), rails=["+3V3", "+5V"], ics=["U3"])
-    assert "+3V3: no fitted IC power pin on it." in result["notes"]
+    assert "+3V3: no power pin of U3 on it." in result["notes"]
+    result = run_decoupling_check(_netlist(), rails=["+3V3", "VREF"], ics=["U3"])
+    assert "+3V3: no power pin of U3 on it." in result["notes"]
 
 
 # ---------- PCB ----------
@@ -318,6 +344,13 @@ def test_a_bulk_capacitor_at_the_pin_counts():
     (pair,) = result["pairs"]
     assert pair["nearest"]["designator"] == "C2"
     assert pair["nearest_under_1uF"]["designator"] == "C1"
+    # Unread values are never called under 1 uF, and the nearest is not repeated.
+    BOARD_PARTS[2] = ("C2", BOARD_PARTS[2][1], {"value": "104"})
+    try:
+        (pair,) = _run(_placements(c2=(40.0, 0.0)))["pairs"]
+        assert pair["nearest"]["designator"] == "C2" and "nearest_under_1uF" not in pair
+    finally:
+        BOARD_PARTS[2] = ("C2", BOARD_PARTS[2][1], {"value": "10uF"})
 
 
 def test_naming_an_ic_lists_its_nearest_capacitors():
