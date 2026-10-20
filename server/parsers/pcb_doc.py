@@ -238,7 +238,7 @@ _VIA_REMOVED_PADS_AT = 208
 
 def _mask_covers(payload: bytes, diameter: int, hole: int) -> tuple[bool, bool]:
     """(top, bottom): a manual mask expansion leaves no opening wider than the
-    hole (KiCad treats such a via side as tented)."""
+    hole, so no copper of the via is exposed on that side."""
     if len(payload) < _VIA_MASK_FLAGS_AT + 2 or not payload[_VIA_MASK_FLAGS_AT] & 0x02:
         return False, False
     (top,) = struct.unpack_from("<i", payload, _VIA_MASK_AT)

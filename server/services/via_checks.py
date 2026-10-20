@@ -11,7 +11,8 @@ layers that keep a pad; tenting; vias in SMD pads; drill pairs; and back drillin
 
 A microvia follows IPC-T-50 / IPC-2226A: a blind or buried via over one dielectric, no
 deeper than 0.25 mm from the capture land's foil to the target land, with an aspect ratio
-of at most 1:1 (or a hole of at most 0.15 mm when the stack has no heights).
+of at most 1:1 or a hole of at most 0.15 mm (a laser via that is too deep is still a
+microvia, and its aspect ratio is flagged). Without stack heights only the hole decides.
 
 Back drilling follows Altium's Controlled Depth Drilling: the Layer Stack Manager's back
 drills (Board6 LAYERPAIRn with BACKDRILL=TRUE) are drilled from their outer layer and
@@ -655,7 +656,8 @@ class _Review:
             if aspect is None:
                 continue
             shown = round(aspect, 2)
-            # Thresholds compare the ratio to one decimal, as fabricators quote it.
+            # Default thresholds compare the ratio to one decimal, as fabricators
+            # quote it; a requested limit is compared as shown.
             judged = round(aspect, 1)
             fields = {
                 "type": info["id"],
@@ -666,7 +668,7 @@ class _Review:
                 "aspect_ratio": shown,
             }
             if info["microvia"]:
-                if judged > micro_warn:
+                if (shown if explicit_micro else judged) > micro_warn:
                     self._finding(
                         "aspect_ratio", "warning",
                         f"Microvia aspect ratio {shown:.2f}:1 is above {micro_warn:g}:1 "
@@ -682,7 +684,7 @@ class _Review:
                         **fields,
                     )
                 continue
-            if judged > warn:
+            if (shown if explicit else judged) > warn:
                 self._finding(
                     "aspect_ratio", "warning",
                     f"Aspect ratio {shown:.2f}:1 is above {warn:g}:1 (copper-to-copper "
@@ -986,7 +988,7 @@ class _Review:
             )
             if category == "thermal":
                 issue = (
-                    prefix + "Via array in a thermal pad: open holes wick solder from the "
+                    prefix + "Vias in a thermal pad: open holes wick solder from the "
                     "joint. Specify on the fabrication drawing what the package guidance "
                     "asks for (small open vias, vias tented or plugged from the other "
                     "side, or filled and capped, IPC-4761 Type VII) unless already done."
@@ -1010,8 +1012,10 @@ class _Review:
         if small and states["untented"] == len(small):
             self._finding(
                 "tenting", "info",
-                "No via on the board is tented: the rings are exposed to solder. Fine "
-                "if that is the house style; otherwise tent or plug them.",
+                f"None of the {len(small)} vias checked (holes up to "
+                f"{self._len(TENT_MAX_HOLE_MIL)}, outside SMD pads, not test points) is "
+                "tented: the rings are exposed to solder. Fine if that is the house "
+                "style; otherwise tent or plug them.",
                 count=len(small),
             )
         else:
@@ -1052,7 +1056,9 @@ class _Review:
             )
 
     def check_stacked(self) -> None:
-        """Microvias stacked on another via (same centre, a shared layer)."""
+        """Microvias stacked on a blind or buried via (same centre, a shared
+        layer). One sharing its centre with a through via is a drill clash, which
+        Altium's hole-to-hole rule reports."""
         microvias = [via for via in self.vias if via.microvia]
         if not microvias:
             return
@@ -1062,7 +1068,7 @@ class _Review:
                 by_point[(round(via.prim.x1, 1), round(via.prim.y1, 1))].append(via)
         for via in microvias:
             for other in by_point[(round(via.prim.x1, 1), round(via.prim.y1, 1))]:
-                if other is not via and (
+                if other is not via and other.kind in ("blind", "buried") and (
                     other.low in (via.low, via.high) or other.high in (via.low, via.high)
                 ):
                     self.stacked.append(via)
@@ -1354,9 +1360,10 @@ class _Review:
         if rules and not [item for item in pairs if item["side"]]:
             self._finding(
                 "back_drill", "warning",
-                "Back-drilling rules exist but the layer stack has no back drill "
+                "Back-drilling rules exist but the layer stack has no usable back drill "
                 "(Layer Stack Manager, Back Drills tab), so nothing is back drilled.",
-                rule=", ".join(rule.name for rule in rules),
+                rule=", ".join(rule.name for rule in rules[:SAMPLE])
+                + (f" and {len(rules) - SAMPLE} more" if len(rules) > SAMPLE else ""),
             )
         if pairs and not rules:
             self._finding(
@@ -1449,6 +1456,7 @@ class _Review:
                 drilled_layers = range(0, stop)
                 depth = self.stack.top_face(stop) if self.stack.has_heights else None
             names = [self.stack.name(position) for position in drilled_layers]
+            sizes = sorted(holes[label])
             pair_report.append(
                 {
                     "back_drill": label,
@@ -1458,9 +1466,11 @@ class _Review:
                     "first_and_last_drilled": [names[0], names[-1]] if names else [],
                     "depth_to_stop_layer_mil": _round(depth, 2),
                     "vias": drilled[label],
-                    "drill_diameters_mil": sorted(holes[label]) or None,
+                    "drill_diameters_mil": sizes[:SAMPLE * 2] or None,
                 }
             )
+            if len(sizes) > SAMPLE * 2:
+                pair_report[-1]["drill_diameters_total"] = len(sizes)
         if pair_report:
             report["pairs"] = pair_report
         if rules:

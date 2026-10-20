@@ -169,7 +169,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Added
 - `check_vias`: via inventory and fabrication review. Via types by span (first and last
   layer in stack order: through, blind, buried, microvia per IPC-2226A: one dielectric,
-  at most 0.25 mm deep and 1:1), hole as drawn and pad diameter, with counts per type and
+  at most 0.25 mm deep, and 1:1 or a hole up to 0.15 mm), hole as drawn and pad
+  diameter, with counts per type and
   per net class, copper-to-copper depth and aspect ratio from the stack heights, the
   smallest annular ring over the layers that keep a pad, tenting, vias in SMD pads,
   stacked microvias and the stack's drill pairs. Back drilling is recomputed the way

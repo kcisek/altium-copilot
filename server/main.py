@@ -2953,9 +2953,10 @@ def check_vias(
     copper-to-copper depth, aspect ratio, smallest annular ring, tenting, in-pad and
     back-drilled counts; net_classes counts types per class; drill_pairs and back_drill
     give the stack's drill pairs, back drills and back-drill rules. Findings, warnings
-    first: aspect_ratio (above max_aspect_ratio, default 10:1, info above 8:1; microvias
-    above max_microvia_aspect_ratio, default 1:1), annular_ring (below the Minimum
-    Annular Ring rule or min_annular_ring, whichever is larger; info under 0.1 mm),
+    first: aspect_ratio (above max_aspect_ratio, default 10:1, info above 8:1 and for a
+    blind via above 1:1; microvias above max_microvia_aspect_ratio, default 1:1, info
+    above 0.8:1; stacked microvias), annular_ring (below the Minimum Annular Ring rule
+    or min_annular_ring, whichever is larger; info under 0.1 mm, microvias 0.05 mm),
     via_style (outside the Routing Via Style sizes), drill_pairs (blind/buried span
     without a drill pair), via_in_pad (fill and cap advice; warning for another net's
     pad or a ViasUnderSMD rule forbidding it), tenting, back_drill (stub above the rule's

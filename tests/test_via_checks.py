@@ -348,6 +348,16 @@ def test_aspect_ratio_limits():
     assert result["checks_run"] == ["aspect_ratio"]
 
 
+def test_requested_aspect_limit_is_compared_as_shown():
+    # 65.6 / 6.574 = 9.979: shown 9.98, judged 10.0 against the defaults.
+    index = _index([_via("SIG", 0, 0, hole=6.574, diameter=14.0)])
+    assert run_via_check(index, checks=["aspect_ratio"],
+                         max_aspect_ratio=9.98)["findings"] == []
+    (warning,) = run_via_check(index, checks=["aspect_ratio"],
+                               max_aspect_ratio=9.97)["findings"]
+    assert warning["severity"] == "warning" and warning["aspect_ratio"] == 9.98
+
+
 def test_mechanical_blind_via_above_one_to_one():
     # Top -> L3, 0.3 mm hole: 17.8 mil deep, too deep for a microvia.
     index = _index([_via("SIG", 0, 0, layer_from=1, layer_to=3, hole=12.0, diameter=24.0)],
@@ -374,6 +384,16 @@ def test_stacked_microvias():
         checks=["aspect_ratio"], max_microvia_aspect_ratio=5,
     )
     assert forbidden["findings"][0]["severity"] == "warning"
+
+
+def test_microvia_on_a_through_via_is_not_stacked():
+    index = _index([
+        _via("SIG", 0, 0, layer_from=1, layer_to=2, hole=4.0, diameter=10.0),
+        _via("SIG", 0, 0),
+    ], drill_pairs=[THROUGH, DrillPair("TOP", "MID1")])
+    result = run_via_check(index, checks=["aspect_ratio"], max_microvia_aspect_ratio=5)
+    assert "stacked_microvias" not in result["summary"]
+    assert not [f for f in result["findings"] if "stacked" in f["issue"]]
 
 
 def test_no_stack_heights_skips_depths():
@@ -518,7 +538,7 @@ def test_a_board_with_no_tented_via_gets_one_note():
     index = _index([_via("SIG", x * 100.0, 0, stack=UNTENTED, hole=6.0 + x)
                     for x in range(4)])
     (note,) = run_via_check(index, checks=["tenting"])["findings"]
-    assert note["count"] == 4 and "No via on the board is tented" in note["issue"]
+    assert note["count"] == 4 and "None of the 4 vias checked" in note["issue"]
 
 
 # ---------- back drilling and stubs ----------
@@ -627,6 +647,15 @@ def test_candidate_without_a_connection_is_reported():
     assert any("no connection found" in note for note in result["notes"])
 
 
+def test_back_drill_lists_are_capped():
+    rules = [_rule("BackDrilling", priority=n, scope1="InNet('SIG')", name=f"BD{n}",
+                   MAXSTUBLENGTH="10mil") for n in range(1, 9)]
+    result = run_via_check(_index(_signal_via(), rules=rules), checks=["back_drill"])
+    (finding,) = [f for f in _findings(result, "back_drill", "warning")
+                  if "usable back drill" in f["issue"]]
+    assert finding["rule"] == "BD1, BD2, BD3, BD4, BD5 and 3 more"
+
+
 def test_back_drill_rule_side_switch():
     index = _index(_signal_via(), rules=[_back_drill_rule(USEBOTTOMBACKDRILL="FALSE")],
                    drill_pairs=[THROUGH, BACK_DRILL])
@@ -638,7 +667,7 @@ def test_back_drill_rule_without_back_drills_and_the_reverse():
     rule_only = run_via_check(_index(_signal_via(), rules=[_back_drill_rule()]),
                               checks=["back_drill"])
     messages = [f["issue"] for f in _findings(rule_only, "back_drill", "warning")]
-    assert any("layer stack has no back drill" in message for message in messages)
+    assert any("layer stack has no usable back drill" in message for message in messages)
     assert any("the stack has no back drill from the bottom" in message
                for message in messages)
     pairs_only = run_via_check(_index(_signal_via(), drill_pairs=[THROUGH, BACK_DRILL]),
