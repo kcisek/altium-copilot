@@ -1,12 +1,15 @@
 """In-memory SQLite spatial index over parsed PCB data."""
 
+import functools
 import json
 import math
 import sqlite3
 from collections import defaultdict
 
 try:
-    from parsers.pcb_doc import PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PcbData
+    from parsers.pcb_doc import (
+        PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PadCopper, PcbData, pad_copper_on,
+    )
     from services.pcb_rules import (
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
     )
@@ -22,7 +25,7 @@ try:
     )
 except ImportError:
     from server.parsers.pcb_doc import (
-        PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PcbData,
+        PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PadCopper, PcbData, pad_copper_on,
     )
     from server.services.pcb_rules import (
         MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
@@ -84,6 +87,7 @@ CREATE TABLE prims (
     rotation REAL,
     shape INTEGER,
     corner_radius REAL,
+    layer_copper TEXT,
     source_id INTEGER,
     hole REAL,
     pad_name TEXT,
@@ -111,6 +115,36 @@ CREATE TABLE pours (
 """
 
 
+def _encode_layer_copper(copper: dict[int, PadCopper] | None) -> str | None:
+    if not copper:
+        return None
+    return json.dumps(
+        {
+            str(layer): [item.width, item.height, item.shape, item.corner_radius]
+            for layer, item in copper.items()
+        }
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _decode_layer_copper(text: str) -> dict[int, PadCopper]:
+    return {
+        int(layer): PadCopper(*values) for layer, values in json.loads(text).items()
+    }
+
+
+def layer_copper(primitive) -> dict[int, PadCopper] | None:
+    """Primitive.layer_copper of a Primitive, prims row or dict: per-layer
+    copper of a multi-layer pad, None when one copper serves every layer."""
+    try:
+        value = primitive["layer_copper"]
+    except (IndexError, KeyError, TypeError):
+        value = getattr(primitive, "layer_copper", None)
+    if isinstance(value, str):
+        return _decode_layer_copper(value)
+    return value or None
+
+
 class PcbIndex:
     """Queryable in-memory representation of parsed PCB data."""
 
@@ -123,15 +157,24 @@ class PcbIndex:
         except (IndexError, KeyError, TypeError):
             return getattr(primitive, name)
 
-    def _primitive_geometry(self, primitive):
+    def _primitive_geometry(self, primitive, layer: int | None = None):
         """Return (segment, radius, polygon) for exact copper distance.
 
         The copper is the segment or the polygon grown by radius: a track or
         arc chord is its centreline grown by half its width, a round or
         oblong pad a capsule, a rectangle its polygon (radius 0), and a
         rounded rectangle its core rectangle (each side shorter by twice the
-        corner radius) grown by the corner radius.
+        corner radius) grown by the corner radius. layer picks a multi-layer
+        pad's copper on that layer; without it a pad has its main (top-layer)
+        copper.
         """
+        copper = None
+        if layer is not None and self._field(primitive, "kind") == "pad":
+            copper = pad_copper_on(layer_copper(primitive), layer)
+        return self._copper_geometry(primitive, copper)
+
+    def _copper_geometry(self, primitive, copper: PadCopper | None):
+        """_primitive_geometry with a pad's copper given (None: its main one)."""
         kind = self._field(primitive, "kind")
         x1 = self._field(primitive, "x1")
         y1 = self._field(primitive, "y1")
@@ -141,19 +184,27 @@ class PcbIndex:
         if kind != "pad":
             return (x1, y1, x2, y2), width / 2.0, None
 
-        height = self._field(primitive, "height") or width
         rotation = self._field(primitive, "rotation") or 0.0
-        shape = self._field(primitive, "shape")
-        minor = min(width, height)
         corner = 0.0
-        if shape == PAD_SHAPE_ROUNDRECT:
-            # A row without the column (a hand-built one) reads as a sharp
-            # rectangle: more copper, so distances err small.
-            try:
-                corner = self._field(primitive, "corner_radius") or 0.0
-            except AttributeError:
-                corner = 0.0
-            corner = max(0.0, min(corner, minor / 2.0))
+        if copper is not None:
+            width, height, shape = copper.width, copper.height, copper.shape
+            corner = copper.corner_radius or 0.0
+        else:
+            height = self._field(primitive, "height") or width
+            shape = self._field(primitive, "shape")
+            if shape == PAD_SHAPE_ROUNDRECT:
+                # A row without the column (a hand-built one) reads as a
+                # sharp rectangle: more copper, so distances err small.
+                try:
+                    corner = self._field(primitive, "corner_radius") or 0.0
+                except AttributeError:
+                    corner = 0.0
+        minor = min(width, height)
+        corner = (
+            max(0.0, min(corner, minor / 2.0))
+            if shape == PAD_SHAPE_ROUNDRECT
+            else 0.0
+        )
         if shape == PAD_SHAPE_ROUND or (
             corner > 0 and corner >= minor / 2.0 - 1e-9
         ):
@@ -178,7 +229,22 @@ class PcbIndex:
         return None, corner, polygon
 
     def _primitive_bounds(self, primitive):
-        segment, radius, polygon = self._primitive_geometry(primitive)
+        """Bounding box of the copper on every layer (a multi-layer pad's
+        inner copper can be the larger)."""
+        boxes = [
+            self._geometry_bounds(self._copper_geometry(primitive, copper))
+            for copper in (None, *set((layer_copper(primitive) or {}).values()))
+        ]
+        return (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+
+    @staticmethod
+    def _geometry_bounds(geometry):
+        segment, radius, polygon = geometry
         if polygon is not None:
             x_values = [point[0] for point in polygon]
             y_values = [point[1] for point in polygon]
@@ -196,13 +262,48 @@ class PcbIndex:
             max(y1, y2) + radius,
         )
 
-    def _primitive_distance(self, first, second) -> float:
-        first_segment, first_radius, first_polygon = (
-            self._primitive_geometry(first)
-        )
-        second_segment, second_radius, second_polygon = (
-            self._primitive_geometry(second)
-        )
+    @staticmethod
+    def _layer_groups(layers, *primitives) -> list[tuple]:
+        """(layer, group) pairs splitting layers into groups on which each
+        primitive keeps one copper, layer standing for its group. Without
+        per-layer copper (every primitive but multi-layer pads in a
+        top-middle-bottom or full stack) one measurement serves every layer:
+        [(None, layers)]."""
+        maps = [layer_copper(primitive) for primitive in primitives]
+        if not layers or not any(maps):
+            return [(None, layers)]
+        groups: dict[tuple, list[int]] = {}
+        for layer in layers:
+            key = tuple(pad_copper_on(copper, layer) for copper in maps)
+            groups.setdefault(key, []).append(layer)
+        return [(group[0], group) for group in groups.values()]
+
+    def _closest_layers(self, first, second, layers=None) -> tuple:
+        """(edge-to-edge copper distance, list of the layers it occurs on)
+        over layers, each pad measured with its copper on the layer. Without
+        per-layer copper that is every layer given; without layers each pad
+        has its main (top-layer) copper and the layers are None."""
+        best, at = math.inf, None
+        for layer, group in self._layer_groups(layers, first, second):
+            distance = self._geometry_distance(
+                self._primitive_geometry(first, layer),
+                self._primitive_geometry(second, layer),
+            )
+            if distance < best - 1e-9:
+                best, at = distance, None if group is None else list(group)
+            elif distance <= best + 1e-9:
+                at.extend(group)
+        return best, at
+
+    def _primitive_distance(self, first, second, layers=None) -> float:
+        """Edge-to-edge copper distance, the smallest over layers when they
+        are given (see _closest_layers)."""
+        return self._closest_layers(first, second, layers)[0]
+
+    @staticmethod
+    def _geometry_distance(first, second) -> float:
+        first_segment, first_radius, first_polygon = first
+        second_segment, second_radius, second_polygon = second
         if first_polygon is not None and second_polygon is not None:
             distance = polygon_polygon_distance(first_polygon, second_polygon)
         elif first_polygon is not None:
@@ -224,13 +325,29 @@ class PcbIndex:
         x: float,
         y: float,
         primitive,
+        layers=None,
     ) -> float:
-        segment, radius, polygon = self._primitive_geometry(primitive)
-        if polygon is not None:
-            distance = point_polygon_distance(x, y, polygon)
-        else:
-            distance = point_seg_distance(x, y, *segment)
-        return max(0.0, distance - radius)
+        """Distance from a point to the copper, the smallest over layers
+        when they are given (see _point_layer_distances)."""
+        return min(
+            distance
+            for distance, _ in self._point_layer_distances(x, y, primitive, layers)
+        )
+
+    def _point_layer_distances(self, x: float, y: float, primitive, layers=None):
+        """(distance, layers) from a point to the copper for each group of
+        layers with the same copper: a single pair with the layers as given
+        unless the primitive is a multi-layer pad with per-layer copper.
+        Without layers a pad has its main (top-layer) copper."""
+        result = []
+        for layer, group in self._layer_groups(layers, primitive):
+            segment, radius, polygon = self._primitive_geometry(primitive, layer)
+            if polygon is not None:
+                distance = point_polygon_distance(x, y, polygon)
+            else:
+                distance = point_seg_distance(x, y, *segment)
+            result.append((max(0.0, distance - radius), group))
+        return result
 
     def __init__(self, pcb: PcbData, netlist: dict | None):
         self.pcb = pcb
@@ -278,10 +395,10 @@ class PcbIndex:
                 "INSERT INTO prims ("
                 "kind, net_id, layer, layer_to, component, pour_id, "
                 "x1, y1, x2, y2, width, height, rotation, shape, "
-                "corner_radius, source_id, "
+                "corner_radius, layer_copper, source_id, "
                 "hole, pad_name, length, pin_package, "
                 "minx, miny, maxx, maxy"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     primitive.kind,
                     primitive.net,
@@ -298,6 +415,7 @@ class PcbIndex:
                     primitive.rotation,
                     primitive.shape,
                     primitive.corner_radius,
+                    _encode_layer_copper(layer_copper(primitive)),
                     primitive.source_id,
                     primitive.hole,
                     primitive.pad_name,
@@ -1086,6 +1204,7 @@ class PcbIndex:
                     edge_distance = self._primitive_distance(
                         target,
                         candidate,
+                        [target_layer],
                     )
                     if edge_distance > distance:
                         continue
@@ -1339,9 +1458,21 @@ class PcbIndex:
                 if layer not in occupied_layers:
                     continue
                 occupied_layers = [layer]
-            edge_distance = self._point_primitive_distance(x, y, row)
-            if edge_distance > radius:
+            # A multi-layer pad's copper can differ per layer: only the
+            # layers where it reaches the radius count.
+            hits = [
+                (distance, group)
+                for distance, group in self._point_layer_distances(
+                    x, y, row, occupied_layers
+                )
+                if distance <= radius
+            ]
+            if not hits:
                 continue
+            edge_distance = min(distance for distance, _ in hits)
+            occupied_layers = [
+                occupied for _, group in hits for occupied in group
+            ]
             entry = per_net.setdefault(
                 row["net_id"],
                 {

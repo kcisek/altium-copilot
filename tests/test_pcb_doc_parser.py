@@ -5,8 +5,13 @@ import pytest
 
 from server.parsers.pcb_doc import (
     NO_NET,
+    PAD_INNER_LAYERS,
+    PAD_SHAPE_RECT,
+    PAD_SHAPE_ROUND,
     PAD_SHAPE_ROUNDRECT,
+    PadCopper,
     PcbData,
+    pad_copper_on,
     decode_arcs,
     decode_board,
     decode_components,
@@ -522,6 +527,99 @@ def test_decode_pads_bottom_pad_of_simple_stack_uses_top_slot():
         PAD_SHAPE_ROUNDRECT,
     )
     assert pad.corner_radius == pytest.approx(10.0)
+
+
+STACK_MID = PadCopper(20.0, 30.0, PAD_SHAPE_ROUNDRECT, 5.0)
+STACK_BOTTOM = PadCopper(40.0, 60.0, PAD_SHAPE_ROUNDRECT, 10.0)
+STACK_MID_LAYER_3 = PadCopper(50.0, 70.0, PAD_SHAPE_ROUNDRECT, 5.0)
+
+
+def test_decode_pads_multi_layer_top_mid_bottom_keeps_per_layer_copper():
+    (pad,), skipped = decode_pads(_stack_pad(74, 1))
+    assert skipped == 0
+    # The main copper is the top slot's.
+    assert (pad.layer, pad.width, pad.height, pad.shape) == (74, 2.4, 3.5, 1)
+    assert pad.corner_radius is None
+    assert pad.layer_copper == {PAD_INNER_LAYERS: STACK_MID, 32: STACK_BOTTOM}
+    # Every inner layer (internal planes too) has the mid copper; the full
+    # stack's inner slots do not count in a top-middle-bottom stack.
+    assert [
+        pad_copper_on(pad.layer_copper, layer) for layer in (1, 2, 4, 31, 32, 39)
+    ] == [None, STACK_MID, STACK_MID, STACK_MID, STACK_BOTTOM, STACK_MID]
+
+
+def test_decode_pads_multi_layer_full_stack_keeps_each_inner_slot():
+    (pad,), skipped = decode_pads(_stack_pad(74, 2))
+    assert skipped == 0
+    assert (pad.width, pad.height, pad.shape) == (2.4, 3.5, 1)
+    # Mid-Layer 3 (v6 4) has its own slot; Mid-Layer 1 is the main
+    # subrecord's mid, and the fixture's empty slots inherit it.
+    assert pad.layer_copper == {
+        PAD_INNER_LAYERS: STACK_MID,
+        4: STACK_MID_LAYER_3,
+        32: STACK_BOTTOM,
+    }
+    assert [
+        pad_copper_on(pad.layer_copper, layer) for layer in (1, 2, 3, 4, 5, 32)
+    ] == [None, STACK_MID, STACK_MID, STACK_MID_LAYER_3, STACK_MID, STACK_BOTTOM]
+
+
+def test_decode_pads_full_stack_inner_slot_like_the_top_is_kept():
+    # An inner slot equal to the top copper still differs from the mid one.
+    (pad,), _ = decode_pads(
+        _pad_record(
+            layer=74,
+            sx=60_0000,
+            sy=60_0000,
+            shape=1,
+            mode=2,
+            mid_size=(40_0000, 40_0000),
+            extra_sub=_size_and_shape(
+                inner={k: (40_0000, 40_0000, 1) for k in range(29)}
+                | {0: (60_0000, 60_0000, 1)},
+                length=596,
+            ),
+        )
+    )
+    mid = PadCopper(40.0, 40.0, PAD_SHAPE_ROUND)
+    assert pad.layer_copper == {
+        PAD_INNER_LAYERS: mid,
+        3: PadCopper(60.0, 60.0, PAD_SHAPE_ROUND),
+    }
+    assert pad_copper_on(pad.layer_copper, 3) == PadCopper(60.0, 60.0, 1)
+    assert pad_copper_on(pad.layer_copper, 2) == mid
+
+
+def test_decode_pads_multi_layer_rect_top_round_mid():
+    (pad,), _ = decode_pads(
+        _pad_record(
+            layer=74, sx=60_0000, sy=60_0000, shape=2, mode=1,
+            mid_size=(50_0000, 50_0000), mid_shape=1,
+        )
+    )
+    assert (pad.width, pad.shape) == (60.0, PAD_SHAPE_RECT)
+    assert pad.layer_copper == {
+        PAD_INNER_LAYERS: PadCopper(50.0, 50.0, PAD_SHAPE_ROUND),
+    }
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        # A simple stack has one copper on every layer.
+        _stack_pad(74, 0),
+        # A per-layer stack whose slots all hold the top copper.
+        _pad_record(layer=74, mode=1),
+        # Single-layer pads keep only their own slot.
+        _stack_pad(5, 1),
+        _stack_pad(32, 2),
+    ],
+    ids=["simple", "uniform", "inner-pad", "bottom-pad"],
+)
+def test_decode_pads_without_per_layer_copper(record):
+    (pad,), _ = decode_pads(record)
+    assert pad.layer_copper is None
+    assert pad_copper_on(pad.layer_copper, 3) is None
 
 
 def _pad_record_with_main(main_length: int, pin_package: int | None) -> bytes:

@@ -8,7 +8,15 @@ from dataclasses import replace
 import pytest
 
 import server.main as main_mod
-from server.parsers.pcb_doc import DiffPair, PcbClass, PcbRule, Primitive
+from server.parsers.pcb_doc import (
+    PAD_INNER_LAYERS,
+    PAD_SHAPE_ROUND,
+    DiffPair,
+    PadCopper,
+    PcbClass,
+    PcbRule,
+    Primitive,
+)
 from server.services.pcb_compliance import (
     CLEARANCE_MAX_NETS,
     check_compliance,
@@ -352,6 +360,35 @@ def test_clearance_spot_check_applies_rule_and_object_matrix(pcb_data):
     assert {(e["rule"], e["objects"]) for e in clearance["by_rule"]} == {
         ("Clk_Pair", 2), ("Default", 1),
     }
+
+
+def _through_pad(net, x):
+    """A Multi-Layer pad, 60 mil round on top, 40 mil round on the inner
+    layers and the bottom (a top-middle-bottom stack)."""
+    inner = PadCopper(40.0, 40.0, PAD_SHAPE_ROUND)
+    return Primitive(kind="pad", layer=MULTI_LAYER, net=net, component=None,
+                     x1=x, y1=0.0, x2=x, y2=0.0, width=60.0, height=60.0,
+                     shape=PAD_SHAPE_ROUND, hole=30.0, pad_name="1",
+                     layer_copper={PAD_INNER_LAYERS: inner, 32: inner})
+
+
+def test_clearance_measures_through_pads_on_the_shared_layer(pcb_data):
+    rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE="12mil")]
+    primitives = [
+        _through_pad(1, 0.0),
+        _through_pad(2, 70.0),  # 10 mil apart on top, 30 mil on the others
+        # 13 mil from the inner copper on L3-SIG (3 mil from the top size).
+        _track(2, 3, -36.0, -50.0, -36.0, 50.0, 6.0),
+    ]
+    index = _index(pcb_data, rules, primitives=primitives)
+    clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
+                      "Clearance")
+    (violation,) = clearance["violations"]
+    assert (violation["objects"], violation["actual_mil"]) == ("THPad-THPad", 10.0)
+    # Only the top layer is that close.
+    assert violation["layer"] == "Top Layer"
+    # The track is beyond the 12 mil search distance on its layer.
+    assert clearance["objects_checked"] == 1
 
 
 def test_clearance_needs_a_small_net_set(pcb_data):

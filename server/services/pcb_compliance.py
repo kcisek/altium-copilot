@@ -881,9 +881,13 @@ class _Checker:
                     shared = layers & layers_of(candidate)
                     if not shared:
                         continue
-                    distance = index._primitive_distance(row, candidate)
+                    # Measured on the shared layers (a multi-layer pad's
+                    # copper can differ per layer); shared keeps the ones
+                    # the gap is smallest on.
+                    distance, at = index._closest_layers(row, candidate, shared)
                     if distance >= reach:
                         continue
+                    shared = frozenset(at)
                     ids = (_object_id(row), _object_id(candidate))
                     pair_key = tuple(sorted(ids))
                     best = closest.get(pair_key)
@@ -1378,7 +1382,8 @@ def _approximations(
             "Clearance spot-check: tracks, arcs, vias and pads of nets only; "
             "pours, fills, regions, text, holes, keepouts and no-net copper are "
             "not modelled; octagonal pads are rectangles and through-hole pads "
-            "use their top-layer size on every layer; arcs are chords "
+            "have each layer's size and shape (top-middle-bottom and full "
+            "stacks); arcs are chords "
             "(<= 0.25 mil sagitta); gaps within "
             f"{CLEARANCE_TOLERANCE_MIL} mil of the limit are not reported. The "
             "object matrix (Track/Arc/Via/SMDPad/THPad) is applied per object "

@@ -555,11 +555,17 @@ class DrcLinker:
         reach = ((box[2] - box[0]) ** 2 + (box[3] - box[1]) ** 2) ** 0.5 / 2 + margin
         nets = []
         for row in rows:
-            if named and not (set(self.index._primitive_layers(row)) & named) and not (
+            row_layers = self.index._primitive_layers(row)
+            on_named = [layer for layer in row_layers if layer in named]
+            if named and not on_named and not (
                 _MULTI_LAYER in named and row["layer"] == _MULTI_LAYER
             ):
                 continue
-            if self.index._point_primitive_distance(centre[0], centre[1], row) > reach:
+            # A multi-layer pad's copper can differ per layer: measured on
+            # the named layers, else on every layer it occupies.
+            if self.index._point_primitive_distance(
+                centre[0], centre[1], row, on_named or row_layers
+            ) > reach:
                 continue
             nets.append(row["net_name"])
         nets = list(dict.fromkeys(nets))
