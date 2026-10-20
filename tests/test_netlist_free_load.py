@@ -68,6 +68,7 @@ WORKING_TOOL_CALLS = {
     "get_design_image": lambda: main.get_design_image("Fab.PCBDwf"),
     "list_variants": lambda: main.list_variants(),
     "set_active_variant": lambda: main.set_active_variant("Prod"),
+    "get_clone_status": lambda: main.get_clone_status(),
 }
 
 
@@ -168,8 +169,9 @@ def test_other_tools_work_without_netlist(env, tool):
         error = json.loads(result).get("error")
     except ValueError:  # constraints_review returns a prompt, not JSON
         error = None
-    # There is no DRC report in the project folder; everything else answers.
-    assert error in (None, "no_drc_report")
+    # There is no DRC report in the project folder, and it is no Altium 365 clone;
+    # everything else answers.
+    assert error in (None, "no_drc_report", "not_an_altium365_clone")
     assert all(netlist is None for netlist in loads)
 
 

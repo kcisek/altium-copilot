@@ -53,6 +53,7 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
+    from services.clone_status import clone_status
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -95,6 +96,7 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
+    from server.services.clone_status import clone_status
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -385,6 +387,10 @@ The netlist reflects the last-saved state of the schematic files. If the user ha
 changes in Altium Designer, ask them to save first (Ctrl+S in Altium) before you answer —
 otherwise your data may be stale.
 
+For an Altium 365 project, set_project_dir's altium365 block says where the local copy
+stands (read offline, nothing fetched). Pass its warnings on before answering: an old last
+fetch, a copy behind Altium 365, local changes not committed. get_clone_status re-reads it.
+
 ## Error Recovery
 
 - netlist_required → the project was loaded without a netlist (partial load). Tell the user
@@ -558,6 +564,19 @@ def _design_info(prj_data) -> dict:
     return info
 
 
+def _altium365_info(project_dir: str) -> dict:
+    """The altium365 block of a load response: where the project's Altium 365 clone
+    stands, read offline. Empty when the folder is not in one; never fails a load."""
+    try:
+        status = clone_status(project_dir)
+    except Exception as error:
+        logging.warning("Altium 365 clone status failed: %s", error)
+        return {}
+    if status.get("altium365") is False:
+        return {}
+    return {"altium365": status}
+
+
 def _resolve_dnp_uids(variant_state: VariantState, netlist: dict | None) -> None:
     """Bind each variant's Not Fitted entries to the loaded parts the way get_bom does
     (UniqueId path, then its last segment, then the stored designator), so is_dnp and
@@ -692,6 +711,42 @@ def detect_altium_project() -> str:
     return json.dumps(result, indent=2)
 
 
+# ---------- get_clone_status ----------
+
+@mcp.tool(title="Altium 365 Clone Status", annotations=ToolAnnotations(readOnlyHint=True))
+def get_clone_status(project_dir: str | None = None) -> str:
+    """Where a project's local copy stands against Altium 365, read offline from its Git
+    clone: workspace and project GUID, when it was last updated from Altium 365 (last
+    fetch), commits ahead of or behind Altium 365 as of that fetch, files changed locally
+    and not committed, and the last commit. Nothing is fetched, so changes made in Altium
+    365 since then are not seen; warnings flag an old fetch, a copy behind the workspace
+    and local changes. set_project_dir returns the same block as altium365: call this
+    after the user updates or saves the project in Altium. project_dir defaults to the
+    loaded project's folder."""
+    if project_dir is None:
+        if _project is None:
+            return json.dumps({
+                "error": "no_project",
+                "message": "No project loaded. Call set_project_dir first, or pass project_dir.",
+            })
+        project_dir = _project["root_dir"]
+    if not Path(project_dir).is_dir():
+        return json.dumps({"error": "folder_not_found",
+                           "message": f"Folder not found: {project_dir}"})
+    status = clone_status(project_dir)
+    if status.get("altium365") is False:
+        return json.dumps({
+            "error": "not_an_altium365_clone",
+            "reason": status["reason"],
+            "message": (
+                "The folder is not in a Git clone whose origin is an Altium 365 project "
+                "(https://<workspace>.365.altium.com/git/<project GUID>.git), so there is "
+                "no Altium 365 status to read."
+            ),
+        })
+    return json.dumps(status, indent=2)
+
+
 # ---------- set_project_dir ----------
 
 def _project_context(project_dir: str) -> str | None:
@@ -767,6 +822,7 @@ def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool)
             "the board from get_design_notes and get_board_info instead."
         ),
         **_design_info(prj_data),
+        **_altium365_info(project_dir),
     }
     if netlist_stale:
         response["netlist_stale"] = True
@@ -853,6 +909,7 @@ def set_project_dir(project_dir: str) -> str:
                                     "netlist_updated_utc": _netlist_last_updated,
                                     **_load_diagnostics(_altium._netlist or {}),
                                     **_design_info(prj_data),
+                                    **_altium365_info(project_dir),
                                 }
                                 _context = _project_context(project_dir)
                                 if _context is not None:
@@ -954,6 +1011,7 @@ def set_project_dir(project_dir: str) -> str:
         "netlist_updated_utc": _netlist_last_updated,
         **_load_diagnostics(_altium._netlist or {}),
         **_design_info(prj_data),
+        **_altium365_info(project_dir),
     }
 
     context = _project_context(project_dir)
