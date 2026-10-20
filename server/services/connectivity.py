@@ -25,7 +25,6 @@ try:
     from parsers.drc_report import RULE
     from parsers.pcb_doc import parse_dim_mil
     from services.drc_results import rule_kind
-    from services.pcb_geometry import contour
     from services.pcb_index import PcbIndex
     from services.pcb_length import NetGraph, stack_z
     from services.pcb_rules import ObjectResolver, RuleTarget
@@ -33,7 +32,6 @@ except ImportError:
     from server.parsers.drc_report import RULE
     from server.parsers.pcb_doc import parse_dim_mil
     from server.services.drc_results import rule_kind
-    from server.services.pcb_geometry import contour
     from server.services.pcb_index import PcbIndex
     from server.services.pcb_length import NetGraph, stack_z
     from server.services.pcb_rules import ObjectResolver, RuleTarget
@@ -78,7 +76,8 @@ APPROXIMATIONS = [
     f"{CENTRE_MIL:g} mil count as meeting) where a net needs them: with that option on, "
     "its nets_joined_only_by_weak_connections would read un-routed. Altium also wants "
     "a directly connected pad or via's centre inside the pour outline; that is not "
-    "tested, nor whether the board's rule has the option on.",
+    "tested (pour outline arcs are not read), nor whether the board's rule has the "
+    "option on.",
     "Pour copper is the copper saved in the file (a solid pour's regions, a hatched "
     "pour's tracks and arcs): a pour changed since its last repour is checked as "
     "saved; a shelved pour, and one with no saved copper (never poured, or poured to "
@@ -378,15 +377,6 @@ class _Area:
         return False
 
 
-def _pour_outline(pour) -> list[tuple[float, float]]:
-    """A pour's outline as points. Its arcs are flattened to chords that cut at
-    most half of TOUCH_MIL into them, so copper touching a curved edge touches."""
-    shape = getattr(pour, "shape", None) or []
-    if any(vertex.arc for vertex in shape):
-        return contour(shape, max_sagitta=TOUCH_MIL / 2.0)
-    return list(pour.vertices)
-
-
 def _areas_touch(first: _Area, second: _Area) -> bool:
     if first.layer != second.layer:
         return False
@@ -529,10 +519,7 @@ class Connectivity:
         for pour in pcb.pours:
             if pour.shelved and pour.net is not None and pour.layer in self.copper:
                 self.shelved[pour.net].append(pour)
-            if pour.shelved or pour.net is None or pour.layer is None:
-                continue
-            outline = _pour_outline(pour)
-            if len(outline) < 3:
+            if pour.shelved or pour.net is None or pour.layer is None or len(pour.vertices) < 3:
                 continue
             if (getattr(pour, "polygon_type", None) or "").strip().lower() == "split plane":
                 if pour.layer not in self.copper:
@@ -540,7 +527,7 @@ class Connectivity:
                     self.planes_off_stack.add(pour.net)
                     continue
                 area = _Area(
-                    "split_plane", pour.layer, pour.net, outline,
+                    "split_plane", pour.layer, pour.net, pour.vertices,
                     pour_id=pour.pour_id, assumed=True,
                 )
                 split_planes[pour.layer].append(area)
@@ -552,7 +539,7 @@ class Connectivity:
             if (pour.hatch_style or "").strip().lower() == "solid" and not self.regions_read:
                 # Regions6 was not read: the outline stands in for the copper.
                 self.areas_by_net[pour.net].append(_Area(
-                    "pour_outline", pour.layer, pour.net, outline,
+                    "pour_outline", pour.layer, pour.net, pour.vertices,
                     pour_id=pour.pour_id, assumed=True,
                 ))
                 self.model["pour_outline"] += 1
@@ -656,7 +643,8 @@ class Connectivity:
         """Does an object touching a solid pour's copper meet it as 'Check for
         incomplete connections' wants? A routing track must reach it with its
         centreline. Pads and vias are not tested: Altium wants a directly
-        connected one's centre inside the pour outline."""
+        connected one's centre inside the pour outline, whose arcs are not
+        read."""
         if row["kind"] not in ("track", "arc") or row["poured_by"] is not None:
             return True
         segment, _, _, arc = self.index._primitive_geometry(row, layer)

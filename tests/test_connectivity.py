@@ -3,7 +3,6 @@ antennae and weak joins on synthetic boards, the area copper they read (Regions6
 Fills6, planes) and the MCP tool."""
 
 import json
-import math
 import struct
 from pathlib import Path
 
@@ -23,7 +22,6 @@ from server.parsers.pcb_doc import (
     PcbRule,
     PolygonPour,
     Primitive,
-    ShapeVertex,
     _build_layer_aliases,
     decode_board,
     decode_fill_records,
@@ -111,12 +109,11 @@ class Board:
             x1=x, y1=y, x2=x, y2=y, width=diameter, hole=10.0,
         ))
 
-    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon",
-             shape=()):
+    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon"):
         self.pours.append(PolygonPour(
             pour_id=len(self.pours), net=None if net is None else self.net(net),
             layer=layer, hatch_style=hatch, vertices=list(vertices), shelved=shelved,
-            polygon_type=polygon_type, shape=list(shape),
+            polygon_type=polygon_type,
         ))
         return len(self.pours) - 1
 
@@ -580,43 +577,6 @@ def test_pour_outline_stands_in_when_regions_were_not_read():
     assert result["copper_model"]["pour_outlines_assumed"] == 1
     assert result["summary"]["nets_connected_through_assumed_copper"] == 1
     assert "Regions6 stream" in result["approximations"][0]
-
-
-# A pour whose right end is a half circle about (400, 0), radius 50: it bulges 50 mil
-# past the straight edge of its vertices.
-_ROUNDED = [
-    ShapeVertex(-50, -50), ShapeVertex(400, -50, (400.0, 0.0, 50.0, 270.0, 90.0)),
-    ShapeVertex(400, 50), ShapeVertex(-50, 50),
-]
-
-
-@pytest.mark.parametrize("split_plane", [False, True])
-def test_pad_on_a_curved_pour_edge_is_joined(split_plane):
-    # U2-1's corner touches the arc at 30 degrees (gap 0), or stops 0.05 mil short of
-    # it (more than TOUCH_MIL): between two vertices of the flattened arc, and 43 mil
-    # past the vertices' straight edge.
-    angle = math.radians(30.0)
-
-    def status(gap: float, shape) -> str:
-        board = Board(["GND"])
-        layer, hole = (MULTI, 4.0) if split_plane else (1, 0.0)
-        board.pad("GND", "U1", "1", 0, 0, layer=layer, hole=hole)
-        board.pad(
-            "GND", "U2", "1", 400 + (50 + gap) * math.cos(angle) + 5,
-            (50 + gap) * math.sin(angle) + 5, layer=layer, hole=hole,
-        )
-        board.pour(
-            "GND", PLANE if split_plane else 1, [(v.x, v.y) for v in _ROUNDED],
-            hatch="None" if split_plane else "Solid",
-            polygon_type="Split Plane" if split_plane else "Polygon", shape=shape,
-        )
-        # Without Regions6, a solid pour's outline stands in for its copper.
-        index = board.index(plane=True) if split_plane else board.index(area_streams=())
-        return _status(index, "GND")
-
-    assert status(0.0, _ROUNDED) == "routed"
-    assert status(0.05, _ROUNDED) == "unrouted"
-    assert status(0.0, ()) == "unrouted"  # the vertices alone miss the pad
 
 
 def test_shelved_pour_is_named_with_the_unrouted_net():
