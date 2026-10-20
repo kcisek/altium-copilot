@@ -288,8 +288,8 @@ def _pcb(placements, vias=(), pours=()):
     primitives += [_via(net_id(net), x, y) for net, x, y in vias]
     return PcbData(
         board=_board(), nets=nets, components=components, primitives=primitives,
-        pours=[PolygonPour(i, net_id(net), layer, None, vertices)
-               for i, (net, layer, vertices) in enumerate(pours)],
+        pours=[PolygonPour(i, net_id(net), layer, None, vertices, *shelved)
+               for i, (net, layer, vertices, *shelved) in enumerate(pours)],
         layer_name_to_v6=dict(LAYERS), rules=[], classes=[], diff_pairs=[], xsignals=[],
     )
 
@@ -377,6 +377,9 @@ def test_opposite_side_capacitor_needs_a_via_or_pour():
     square = [(-100.0, -100.0), (100.0, -100.0), (100.0, 200.0), (-100.0, 200.0)]
     assert not _checks(_run(_placements(c1=under), pours=[("+3V3", 32, square)]),
                        "opposite_side_no_via")
+    # A shelved pour has no copper: it connects nothing.
+    assert _checks(_run(_placements(c1=under), pours=[("+3V3", 32, square, True)]),
+                   "opposite_side_no_via")
 
 
 def test_every_board_copy_of_a_part_is_measured():

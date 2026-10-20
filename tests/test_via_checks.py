@@ -569,7 +569,9 @@ def test_back_drill_applied():
     result = run_via_check(index)
     assert result["summary"]["back_drilled"] == 1
     assert result["via_types"][0]["back_drilled"] == 1
-    assert not _findings(result, "back_drill")
+    assert all(
+        stub.get("connected_layer") != "L4" for stub in _findings(result, "back_drill")
+    )
     (pair,) = result["back_drill"]["pairs"]
     assert pair["from_layer"] == "Bottom" and pair["stops_before"] == "L3"
     assert pair["drilled_layers"] == 3
@@ -623,6 +625,15 @@ def test_pour_counts_as_a_connection():
                    drill_pairs=[THROUGH, BACK_DRILL], pours=[pour])
     (stub,) = _findings(run_via_check(index, checks=["back_drill"]), "back_drill")
     assert stub["connected_layer"] == "L4"
+    # A shelved pour has no copper: the via is back drilled.
+    pour.shelved = True
+    index = _index(primitives, rules=[_back_drill_rule(MAXSTUBLENGTH="10mil")],
+                   drill_pairs=[THROUGH, BACK_DRILL], pours=[pour])
+    result = run_via_check(index, checks=["back_drill"])
+    assert result["summary"]["back_drilled"] == 1
+    assert all(
+        stub.get("connected_layer") != "L4" for stub in _findings(result, "back_drill")
+    )
 
 
 def test_full_stack_inner_pad_wider_than_the_record_diameter_connects():

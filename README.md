@@ -87,8 +87,9 @@ DRC report Altium saved and says when it should not be trusted.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
 
-Not modelled: poured copper (pours are their saved outlines, so repour and save before
-asking about them), fills, regions and planes, pad slot holes and per-layer pad sizes
+Not modelled: solid pours' copper (a pour is its saved outline, plus its tracks and arcs
+when hatched, so repour and save before asking about pours; shelved pours have no
+copper), fills, regions and planes, pad slot holes and per-layer pad sizes
 (pad holes and rings are not checked), and diff-pair uncoupled length. The checks list
 what they left out in their results.
 
@@ -116,7 +117,7 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks |
 | Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel |
 | `.Annotation` | Board designators of board-annotated and multi-channel designs |
-| `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings |
+| `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not) and hatched pours' tracks and arcs, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings |
 | `.PCBDwf` (Draftsman) | Notes, free text, tables, view titles, pictures, drill table, layer stack notes |
 | `Design Rule Check - <PcbDoc>.html` or `.drc` | Altium's last Batch DRC report, from the project's output folder |
 

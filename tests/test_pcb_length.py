@@ -2,6 +2,7 @@
 
 import math
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from server.parsers.pcb_doc import (
     PcbData,
     PcbLayer,
     PcbRule,
+    PolygonPour,
     Primitive,
     XSignal,
 )
@@ -386,6 +388,29 @@ def test_no_path_reports_unrouted_manhattan(index):
     whole = net_length(index, "GAP")
     assert whole["status"] == "incomplete"
     assert whole["unrouted_manhattan_mil"] == pytest.approx(230.0)
+
+
+def test_hatched_pour_copper_is_not_in_the_graph(length_data):
+    # GAP's hatched pour bridges its gap with tracks: copper, not routing, so
+    # the path stays open, the routed length is unchanged, and the pour
+    # (unless shelved: no copper) may complete the connection.
+    for shelved in (False, True):
+        data = deepcopy(length_data)
+        data.pours = [PolygonPour(
+            0, N["GAP"], 1, "Horizontal",
+            [(350.0, 750.0), (650.0, 750.0), (650.0, 880.0), (350.0, 880.0)],
+            shelved=shelved,
+        )]
+        data.primitives += [
+            replace(_track("GAP", *ends), poured_by=0)
+            for ends in ((400.0, 800.0, 600.0, 800.0), (600.0, 800.0, 600.0, 830.0))
+        ]
+        index = _index(data)
+        assert pad_to_pad(index, "GAP", "U1-6", "U2-6")["status"] == "no_path"
+        whole = net_length(index, "GAP")
+        assert whole["status"] == "incomplete"
+        assert whole["routed_mil"] == pytest.approx(800.0)
+        assert ("note" in whole) is not shelved
 
 
 def test_net_without_copper_is_unrouted(index):

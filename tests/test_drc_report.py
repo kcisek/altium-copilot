@@ -548,6 +548,9 @@ def test_shorts_ignore_the_board_sized_box():
     linked = DrcLinker(index).link(SHORT, box, "ShortCircuit")
     assert linked["location_mil"] == {"x_mil": 1500.0, "y_mil": 1500.0}
     assert linked["nets"] == ["CLK", "GND"]  # the pad's net and the pour's
+    pour.shelved = True  # no copper: it cannot be the polygon in the short
+    assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK"]
+    pour.shelved = False
     pour.vertices = [(2400, 2400), (2600, 2400), (2600, 2600), (2400, 2600)]
     assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK"]
 

@@ -454,6 +454,84 @@ def test_clearance_ignores_pour_outlines(pcb_data):
         assert _kind(result, "Clearance")["violations"] == []
 
 
+def _hatch(net, layer, x1, y1, x2, y2, width, pour=0):
+    """A hatched pour's track: Tracks6 copper owned by pour `pour` (pcb_data's
+    GND pour is index 0)."""
+    return replace(_track(net, layer, x1, y1, x2, y2, width), poured_by=pour)
+
+
+def test_width_tests_pour_copper_and_not_in_polygon_skips_it(pcb_data):
+    # Altium's Width rule tests polygon primitives; rules leave them out with
+    # Not InPolygon (as on the SL1 example board). One net, two objects: the
+    # scope is decided per object, not once for the net.
+    rules = [
+        _rule("Width", 1, "InNet('GND') and not InPolygon", name="Width_GND",
+              MINLIMIT="10mil", MAXLIMIT="20mil"),
+        _rule("Width", 9, name="Width_All", MINLIMIT="5mil", MAXLIMIT="20mil"),
+    ]
+    primitives = [
+        _track(0, 1, 0, 0, 100, 0, 6.0),  # routing: Width_GND, too thin
+        _hatch(0, 1, 0, 50, 100, 50, 4.0),  # pour copper: Width_All, too thin
+    ]
+    result = check_compliance(_index(pcb_data, rules, primitives), kinds=["Width"])
+    width = _kind(result, "Width")
+    assert {(e["rule"], e["objects"], e["violations"]) for e in width["by_rule"]} == {
+        ("Width_GND", 1, 1), ("Width_All", 1, 1),
+    }
+    assert width["pour_copper_objects"] == 1
+    hatch = next(v for v in width["violations"] if v["rule"] == "Width_All")
+    assert hatch["pour_copper"] is True and hatch["actual_mil"] == 4.0
+    routed = next(v for v in width["violations"] if v["rule"] == "Width_GND")
+    assert "pour_copper" not in routed
+    assert any("pour_copper" in note for note in result["approximations"])
+    # Pour copper is not a pair's routing, nor checked against RoutingLayers.
+    layers = _rule("RoutingLayers", 1, name="Layers", **{"TOP LAYER_V5": "FALSE"})
+    routing = _kind(
+        check_compliance(_index(pcb_data, [layers], primitives), kinds=["RoutingLayers"]),
+        "RoutingLayers",
+    )
+    assert (routing["objects_checked"], routing["violation_count"]) == (1, 1)
+
+
+def test_clearance_treats_pour_copper_as_poly(pcb_data):
+    # Object matrix: pour copper is ClearanceObj_Poly, and an InPolygon scope
+    # selects it (not the net's routing).
+    rules = [
+        _rule("Clearance", 1, "InPolygon", name="Poly_Clr", GENERICCLEARANCE="2mil"),
+        _rule("Clearance", 2, name="Default", GENERICCLEARANCE="10mil",
+              OBJECTCLEARANCES="ClearanceObj_Track-ClearanceObj_Poly:40000"),
+    ]
+    primitives = [
+        _track(1, 1, 0, 0, 100, 0, 6.0),
+        _hatch(0, 1, 0, 8, 100, 8, 4.0),  # 3 mil from CLK_A: Poly_Clr (2), passes
+        _track(0, 1, 0, -8, 100, -8, 4.0),  # 3 mil, GND routing: Default (10)
+    ]
+    index = _index(pcb_data, rules, primitives=primitives)
+    clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
+                      "Clearance")
+    by_object = {(v["objects"], v["rule"]): v for v in clearance["violations"]}
+    assert set(by_object) == {("Track-Track", "Default")}
+    assert {(e["rule"], e["objects"]) for e in clearance["by_rule"]} == {
+        ("Poly_Clr", 1), ("Default", 1),
+    }
+    # Without the InPolygon rule the matrix's Track-Poly cell (4 mil) applies.
+    index = _index(pcb_data, rules[1:], primitives=primitives)
+    clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
+                      "Clearance")
+    poly = next(v for v in clearance["violations"] if v["objects"] == "Track-Poly")
+    assert (poly["actual_mil"], poly["required_mil"]) == (3.0, 4.0)
+
+
+def test_no_net_count_leaves_out_netless_pour_copper(pcb_data):
+    primitives = [
+        _track(None, 1, 0, 0, 100, 0, 6.0),
+        _hatch(None, 1, 0, 50, 100, 50, 4.0),  # a pour without a net
+    ]
+    result = check_compliance(_index(pcb_data, [WIDTH_ALL], primitives), kinds=["Width"])
+    (no_net,) = [entry for entry in result["not_checked"] if "no-net" in entry["kind"]]
+    assert no_net["objects"] == 1
+
+
 def test_selection_errors_and_pair_expansion(pcb_data):
     index = _index(pcb_data, [WIDTH_ALL], pairs=[CLK_PAIR])
     assert check_compliance(index, kinds=["Bogus"])["error"] == "invalid_kind"
@@ -660,6 +738,26 @@ def test_clearance_counts_an_arc_once(pcb_data):
     assert _by_rule(clearance) == {("Arc_Clr", 1, 1)}
     (violation,) = clearance["violations"]
     assert (violation["count"], violation["required_mil"]) == (1, 8.0)
+
+
+def test_clearance_leaves_arc_chord_sagitta_to_the_chords(pcb_data):
+    # Chords lie up to 0.25 mil inside their arc: a gap short of the limit by
+    # no more than that (per arc) cannot be told from a violation. Tracks get
+    # no such margin.
+    rules = [_rule("Clearance", 1, name="Default", GENERICCLEARANCE="10mil")]
+    for other, expected in (
+        (_track(2, 1, 0, 15.8, 80, 15.8, 6.0), (0, 1)),  # 9.8 mil from the arc
+        (_track(2, 1, 0, 15.7, 80, 15.7, 6.0), (1, None)),  # 9.7 mil
+    ):
+        index = _index(pcb_data, rules, primitives=_arc(1, 8) + [other])
+        clearance = _kind(check_compliance(index, nets=["CLK_A"], kinds=["Clearance"]),
+                          "Clearance")
+        assert (clearance["violation_count"],
+                clearance.get("arc_chord_marginal_pairs")) == expected
+    tracks = [_track(1, 1, 0, 0, 80, 0, 6.0), _track(2, 1, 0, 15.8, 80, 15.8, 6.0)]
+    clearance = _kind(check_compliance(_index(pcb_data, rules, primitives=tracks),
+                                       nets=["CLK_A"], kinds=["Clearance"]), "Clearance")
+    assert clearance["violation_count"] == 1
 
 
 def test_violation_groups_are_paged_with_offset(pcb_data):

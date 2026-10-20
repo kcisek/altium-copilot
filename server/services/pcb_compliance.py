@@ -22,6 +22,7 @@ from collections import defaultdict
 from dataclasses import replace
 
 try:
+    from parsers.pcb_doc import ARC_MAX_SAGITTA_MIL
     from services.pcb_rules import (
         ObjectResolver,
         RuleTarget,
@@ -29,6 +30,7 @@ try:
         rule_values,
     )
 except ImportError:
+    from server.parsers.pcb_doc import ARC_MAX_SAGITTA_MIL
     from server.services.pcb_rules import (
         ObjectResolver,
         RuleTarget,
@@ -130,11 +132,16 @@ _OWNERSHIP_TERMS = (
     "incomponent", "inanycomponent", "hasfootprint", "haspad", "inpadclass",
     "comppincount",
 )
+# A hatched pour's tracks and arcs are InPolygon, the net's routing is not:
+# one net's objects can differ (inpoly also covers inpolygon, inpolygonclass).
+_POLYGON_TERMS = (
+    "inpoly", "ispoly", "innamedpolygon", "isnamedpolygon", "issplitplane",
+)
 
 
 def _per_object_scope(scope: str | None) -> bool:
     text = (scope or "").lower()
-    return any(term in text for term in _OWNERSHIP_TERMS)
+    return any(term in text for term in _OWNERSHIP_TERMS + _POLYGON_TERMS)
 
 
 # ---------- three-valued helpers ----------
@@ -238,7 +245,8 @@ class _Resolver(ObjectResolver):
     Net-level verdicts are reused for every object only when object facts
     cannot change them: scopes are decided per object for a target without
     nets (no-net vias, whose scope facts are the object's alone) and, for a
-    net, when they ask which footprint owns the object (_OWNERSHIP_TERMS).
+    net, when they ask which footprint owns the object (_OWNERSHIP_TERMS) or
+    whether it is pour copper (_POLYGON_TERMS).
     """
 
     def __init__(self, rules: list, target: RuleTarget, ctx):
@@ -623,6 +631,14 @@ class _Checker:
         for row, facts, x, y in self.routed_objects(net_ids):
             net = row["net_name"]
             layer_name = self.layer_label(row["layer"])
+            if facts.in_pour:
+                # A hatched pour's tracks and arcs: Width rules on Altium's own
+                # examples leave them out with Not InPolygon, so its Width
+                # rule tests them (the docs do not say). They are not a pair's
+                # routing, nor routing a layer must allow.
+                if width is not None:
+                    self._width_rule(width, row, facts, net, layer_name, x, y)
+                continue
             if width is not None or pairs is not None:
                 self._width_object(width, pairs, row, facts, net, layer_name, x, y)
             if layers is not None:
@@ -687,13 +703,21 @@ class _Checker:
             return
         if width is None:
             return
+        self._width_rule(width, row, facts, net, layer_name, x, y)
+
+    def _width_rule(self, width, row, facts, net, layer_name, x, y):
+        """Check one object against the Width rule that applies to it."""
         rule, undecided = self.resolver("Width", net).resolve(facts)
         if undecided:
             width.not_decided(net, undecided)
             return
         width.checked(rule)
+        flags = {}
+        if facts.in_pour:
+            width.extra_count("pour_copper_objects")
+            flags["pour_copper"] = True
         if rule is not None:
-            self.check_width(width, rule, row, net, layer_name, x, y)
+            self.check_width(width, rule, row, net, layer_name, x, y, **flags)
 
     # --- RoutingVias / HoleSize / MinimumAnnularRing ---
 
@@ -1050,6 +1074,15 @@ class _Checker:
             )
             if required is None or distance >= required - CLEARANCE_TOLERANCE_MIL:
                 continue
+            # Arc chords lie up to their sagitta inside the arc: a pour's arc
+            # wrapping a via at the limit measures that much short of it.
+            # Chords cannot tell such a gap from a violation.
+            arcs = (row["kind"] == "arc") + (candidate["kind"] == "arc")
+            if arcs and distance >= (
+                required - CLEARANCE_TOLERANCE_MIL - arcs * ARC_MAX_SAGITTA_MIL
+            ):
+                report.extra_count("arc_chord_marginal_pairs")
+                continue
             layer_name = (
                 self.layer_label(next(iter(shared)))
                 if len(shared) == 1
@@ -1142,9 +1175,12 @@ def _anchor(row) -> tuple:
 
 
 def _clearance_kind(row) -> str:
-    """Object-matrix name of a primitive (ClearanceObj_<name>)."""
+    """Object-matrix name of a primitive (ClearanceObj_<name>); a hatched
+    pour's tracks and arcs are its polygon (Poly)."""
     if row["kind"] == "pad":
         return "THPad" if (row["hole"] or 0.0) > 0 else "SMDPad"
+    if row["poured_by"] is not None:
+        return "Poly"
     return {"track": "Track", "arc": "Arc", "via": "Via"}[row["kind"]]
 
 
@@ -1320,9 +1356,10 @@ def check_compliance(
                     "kind": "Width / RoutingLayers (no-net copper)",
                     "objects": no_net,
                     "reason": (
-                        "No-net tracks and arcs are skipped: polygon-pour "
-                        "children and keepouts carry no net and cannot be told "
-                        "apart (polygon index and keepout flag are not parsed)."
+                        "No-net tracks and arcs are skipped: keepouts carry no "
+                        "net and cannot be told apart (the keepout flag is not "
+                        "parsed). Hatched-pour tracks and arcs are not among "
+                        "them: they take their pour's net."
                     ),
                 }
             )
@@ -1365,6 +1402,7 @@ def _no_net_routing(index, signal: dict) -> int:
         "SELECT SUM(kind = 'track') tracks, "
         "COUNT(DISTINCT CASE WHEN kind = 'arc' THEN source_id END) arcs "
         "FROM prims WHERE net_id IS NULL AND pour_id IS NULL "
+        "AND poured_by IS NULL "
         f"AND kind IN ('track','arc') AND layer IN ({','.join('?' * len(layers))})",
         layers,
     ).fetchone()
@@ -1410,6 +1448,14 @@ def _approximations(
                 "Width rules checking physically connected copper are tested "
                 f"per segment: {', '.join(connected)}."
             )
+        if reports["Width"].extra.get("pour_copper_objects"):
+            notes.append(
+                "A hatched pour's tracks and arcs are checked against Width "
+                "(pour_copper_objects; their violations say pour_copper), as "
+                "Width rules scoped Not InPolygon on Altium's examples imply "
+                "Altium does (its docs do not say); InPolygon scopes select "
+                "them. Solid pour copper (regions) is not read."
+            )
         if reports["Width"].extra.get("unverified_fallback_objects"):
             notes.append(
                 "Pair-member tracks with no applicable DiffPairsRouting rule are "
@@ -1444,14 +1490,17 @@ def _approximations(
         )
     if "Clearance" in kinds:
         notes.append(
-            "Clearance spot-check: tracks, arcs, vias and pads of nets only; "
-            "pours, fills, regions, text, holes, keepouts and no-net copper are "
+            "Clearance spot-check: tracks, arcs, vias and pads of nets only, "
+            "a hatched pour's tracks and arcs as Poly; solid pours, fills, "
+            "regions, text, holes, keepouts and no-net copper are "
             "not modelled; octagonal pads are rectangles and through-hole pads "
             "have each layer's size and shape (top-middle-bottom and full "
             "stacks); arcs are chords "
-            "(<= 0.25 mil sagitta); gaps within "
+            f"(<= {ARC_MAX_SAGITTA_MIL} mil sagitta), so a gap involving an arc "
+            "that falls short of the limit by no more than that per arc is "
+            "counted under arc_chord_marginal_pairs, not reported; gaps within "
             f"{CLEARANCE_TOLERANCE_MIL} mil of the limit are not reported. The "
-            "object matrix (Track/Arc/Via/SMDPad/THPad) is applied per object "
+            "object matrix (Track/Arc/Via/SMDPad/THPad/Poly) is applied per object "
             "pair; counts are object pairs."
         )
     return notes

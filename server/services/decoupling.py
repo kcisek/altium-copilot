@@ -570,7 +570,8 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
     links: dict[str, tuple[list, list]] = {}
 
     def links_of(net: str) -> tuple[list, list]:
-        """Same-net vias and through-hole pads, and the net's pour outlines."""
+        """Same-net vias and through-hole pads, and the net's pour outlines
+        (not shelved ones: they have no copper)."""
         if net not in links:
             net_id = index.net_id(net)
             vias = list(db.execute(
@@ -578,7 +579,8 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
                 "(kind = 'pad' AND layer = ?))", (net_id, _THT_LAYER),
             )) if net_id is not None else []
             pours = [dict(row) for row in db.execute(
-                "SELECT layer, vertices FROM pours WHERE net_id = ?", (net_id,),
+                "SELECT layer, vertices FROM pours WHERE net_id = ? AND NOT shelved",
+                (net_id,),
             )] if net_id is not None else []
             links[net] = (vias, pours)
         return links[net]

@@ -252,6 +252,7 @@ class ObjectFacts:
     layer: int
     span: frozenset = frozenset()
     points: tuple = ()  # track/arc endpoints; via/pad centre
+    in_pour: bool = False  # a hatched pour's track or arc (InPolygon)
     component: str | None = None
     footprint: str | None = None
     pad: str | None = None  # "u1-5"
@@ -363,6 +364,19 @@ def _object_anchor(obj: ObjectFacts) -> tuple[float, float] | None:
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
+def _pour_copper_call(node) -> tuple:
+    """A polygon term on a pour's copper (its child primitives, which rules
+    are applied to). InPolygon returns them; IsPolygon, IsNamedPolygon and
+    InPolygonClass return the polygon object only. InNamedPolygon needs the
+    pour's name and IsSplitPlane its type, which are not read."""
+    name = node[1]
+    if name in ("inpoly", "inpolygon"):
+        return _TRUE
+    if name in ("innamedpolygon", "issplitplane"):
+        return _unknown(node)
+    return _FALSE
+
+
 def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
     """Decide an object predicate for one object; None if not an object term."""
     name, args = node[1], node[2]
@@ -381,6 +395,8 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
     if name == "isfree":
         # A free primitive is one that is not part of a component.
         return _TRUE if obj.component is None else _FALSE
+    if name in _POLYGON_ONLY and obj.in_pour:
+        return _pour_copper_call(node)
     if name in _LAYER_PREDICATES:
         layer = obj.layer
         if name in ("onlayer", "existsonlayer"):
@@ -550,9 +566,7 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
         # Tracks of a pair's nets are checked through the pair (member view).
         return _TRUE if target.kind == "diff_pair" else _FALSE
     if name in _POLYGON_ONLY and target.pour_view:
-        if name in ("inpoly", "inpolygon", "ispoly", "ispolygon"):
-            return _TRUE
-        return _unknown(node)
+        return _pour_copper_call(node)
     if name in _COMPONENT_ONLY or name in _POLYGON_ONLY:
         # These select components, text or pour children, never a net's
         # routing or the pair object itself.

@@ -394,6 +394,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   signal layer), and the name lookup put those signal layers on the plane ids: on
   Altium's MiniPC example 8 of the 16 copper layers, so their tracks fell outside the
   stack for lengths, barrels and rule scopes
+- Shelved polygon pours are read (`SHELVED` in `Polygons6`). Altium hides a shelved pour
+  from DRC and connectivity, so it is no longer treated as copper: `get_net_neighbors`,
+  `query_pcb_region`, `check_decoupling` ("a pour around it"), `check_vias` (a same-net
+  pour around a via connects it on that layer), DRC violation nets, rule scopes on a
+  net's pour copper and the length tools' "pours may complete the connection" note leave
+  it out, and its outline gets no proximity rows. Copper that
+  Altium keeps in the file for a shelved pour is dropped
+  (`skipped_records.shelved_pour_copper`). `get_net_pcb` still lists the pour with
+  `shelved: true`, and `get_board_info` counts `shelved_pours`. On 2 of 83 real boards
+  every pour is shelved (12 in all); for sampled nets there, `get_net_neighbors` listed
+  292 pour entries, all from pours with no copper
+- A hatched or outline-only pour's tracks and arcs are read as the pour's copper: the
+  `Tracks6` / `Arcs6` polygon index (KiCad's `polygon` field; 0xFFFE marks board-outline
+  primitives, not a pour). Altium saves them without a net, so they were netless routing:
+  invisible to the distance tools and counted as unchecked no-net copper. They now take
+  the pour's net. `get_net_neighbors` and `query_pcb_region` measure them (counted in
+  `pour_copper_segments` with no parallel run, kind `pour`). The clearance spot-check
+  matches them as the matrix's `Poly` object, and Width checks them, with `pour_copper`
+  on violations: a Width rule on Altium's SL1 example is scoped `Not InPolygon`, though
+  Altium's docs do not say. They are not routing, so routed length, the `get_net_pcb`
+  layers, the length graph, DiffPairsRouting and RoutingLayers leave them out;
+  `get_board_info` counts them as `pour_copper`. Rule scopes are decided per object: a
+  pour's copper is InPolygon, but IsPolygon, IsNamedPolygon and InPolygonClass match only
+  the polygon object, as in Altium. On Altium's Bluetooth Sentinel example (ten
+  Horizontal GND pours: 6,473 tracks, 675 arcs) GND copper is within 10 mil of all 40 of
+  the 40 longest signal nets (was 30), 3.69 mil at the closest. The pour's arcs around
+  vias are chords that lie up to 0.25 mil inside the arc, so the clearance spot-check
+  counts gaps within the chords' sagitta of the limit as `arc_chord_marginal_pairs` (364
+  on that board) instead of reporting them. The 83 real boards have no hatched pours
 
 ## [0.3.0] - 2026-07-19
 
