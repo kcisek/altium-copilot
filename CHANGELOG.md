@@ -363,6 +363,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
+- `check_connectivity` drew pour outlines as straight edges between their vertices,
+  dropping the arcs that rounded pours have (Polygons6 `KINDn=1`). Split planes, and the
+  outlines that stand in for solid pours when Regions6 could not be read, now follow
+  their arcs (flattened to chords within 0.005 mil), so a pad that touches a curved edge
+  is joined. Results on Altium's examples are unchanged, also with Regions6 left out so
+  that 14 rounded solid pours stand in by their outlines
+- `check_pcb_health` read a Regions6 or BoardRegions record whose vertices are not
+  finite coordinates, or whose hole list runs past the record, as a region. It now
+  counts it as unread, as `check_connectivity` already did: both decode Regions6 and
+  Fills6 with one record reader. No region changes on Altium's examples or 83 real boards
 - `get_drc_report`: a report where several tables list a different number of rows
   than their counts ("3 tables list ...") was called incomplete instead of having counts
   that differ

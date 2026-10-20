@@ -1420,15 +1420,58 @@ def _read_vertices(payload: bytes, at: int) -> tuple[list[tuple[float, float]], 
     return vertices, at + 16 * count
 
 
-def decode_regions(data: bytes) -> tuple[list[CopperArea], int]:
-    """Decode the copper of Regions6 records: kind 0 regions on signal layers
-    that are not keepouts or board cutouts.
+# Regions6, ShapeBasedRegions6 and BoardRegions records (KiCad's AREGION6), u8
+# type 11 and u32 length, then a head: layer u8 at 0, flags1 (lock bits) at 1,
+# flags2 at 2 (_KEEPOUT), net u16 at 3, polygon u16 at 5 (the Polygons6 index of
+# the pour the region is copper of), component u16 at 7, hole count u16 at 14,
+# u32 text length at 18 and |KEY=VALUE text (KIND, ISBOARDCUTOUT, NAME, ...).
+# The outline follows, then each hole as u32 count + (double x, double y).
+_REGION_HEAD = 22
 
-    Payload (KiCad's AREGION6): layer u8, flags1 (lock bits), flags2 (2 =
-    keepout), net u16 at 3, pour index u16 at 5, component u16 at 7, hole
-    count u16 at 14,
-    u32 text length at 18 and |KEY=VALUE text (KIND, ISBOARDCUTOUT), then the
-    outline and each hole as u32 count + (double x, double y) vertices.
+
+@dataclass(frozen=True)
+class _RegionHead:
+    layer: int
+    keepout: bool
+    net: int | None
+    polygon: int | None  # 0xFFFF is none
+    component: int | None
+    hole_count: int
+    properties: dict[str, str]
+    shape_at: int  # offset of the outline
+
+
+def _region_heads(data: bytes):
+    """(record index, payload, head) per record of a region stream; head is None
+    for a record that is not a region (another type, or shorter than the head)
+    and for a record running past the stream, which the decoders count as
+    skipped."""
+    for index, (record_type, payload) in enumerate(_records_with_rest(data)):
+        if record_type != 11 or len(payload) < _REGION_HEAD:
+            yield index, payload, None
+            continue
+        net, polygon, component = struct.unpack_from("<HHH", payload, 3)
+        (hole_count,) = struct.unpack_from("<H", payload, 14)
+        (text_length,) = struct.unpack_from("<I", payload, 18)
+        yield index, payload, _RegionHead(
+            layer=payload[0],
+            keepout=payload[2] == _KEEPOUT,
+            net=_optional_index(net, NO_NET),
+            polygon=_optional_index(polygon, 0xFFFF),
+            component=_optional_index(component, NO_COMPONENT),
+            hole_count=hole_count,
+            properties=_parse_text_properties(
+                payload[_REGION_HEAD : _REGION_HEAD + text_length]
+            ),
+            shape_at=_REGION_HEAD + text_length,
+        )
+
+
+def decode_regions(data: bytes) -> tuple[list[CopperArea], int]:
+    """Decode the copper of Regions6 records (_region_heads): kind 0 regions on
+    signal layers that are not keepouts or board cutouts, the outline as u32
+    count + (double x, double y) vertices.
+
     Polygon cutouts (KIND 1) and other kinds are not copper. A region of
     fewer than 3 vertices has no area and is left out; unreadable records
     (a vertex not finite or past the coordinate range, a record running past
@@ -1436,26 +1479,21 @@ def decode_regions(data: bytes) -> tuple[list[CopperArea], int]:
     """
     areas: list[CopperArea] = []
     skipped = 0
-    for record_type, payload in _records_with_rest(data):
-        if record_type != 11 or len(payload) < 22:
+    for _, payload, head in _region_heads(data):
+        if head is None:
             skipped += 1
             continue
-        layer = payload[0]
-        if not _signal_layer(layer) or payload[2] == _KEEPOUT:
+        if not _signal_layer(head.layer) or head.keepout:
             continue
-        net, pour, component = struct.unpack_from("<HHH", payload, 3)
-        (hole_count,) = struct.unpack_from("<H", payload, 14)
-        (text_length,) = struct.unpack_from("<I", payload, 18)
-        properties = _parse_text_properties(payload[22 : 22 + text_length])
         if (
-            properties.get("KIND", "0").strip() != "0"
-            or properties.get("ISBOARDCUTOUT", "").strip().upper() == "TRUE"
+            head.properties.get("KIND", "0").strip() != "0"
+            or head.properties.get("ISBOARDCUTOUT", "").strip().upper() == "TRUE"
         ):
             continue
         try:
-            outline, at = _read_vertices(payload, 22 + text_length)
+            outline, at = _read_vertices(payload, head.shape_at)
             holes = []
-            for _ in range(hole_count):
+            for _ in range(head.hole_count):
                 hole, at = _read_vertices(payload, at)
                 if len(hole) >= 3:
                     holes.append(hole)
@@ -1467,35 +1505,155 @@ def decode_regions(data: bytes) -> tuple[list[CopperArea], int]:
         areas.append(
             CopperArea(
                 kind="region",
-                layer=layer,
-                net=_optional_index(net, NO_NET),
-                component=_optional_index(component, NO_COMPONENT),
+                layer=head.layer,
+                net=head.net,
+                component=head.component,
                 outline=outline,
                 holes=holes,
-                pour_id=None if pour in _NO_POLYGON else pour,
+                pour_id=None if head.polygon in _NO_POLYGON else head.polygon,
             )
         )
     return areas, skipped
 
 
-def decode_fills(data: bytes) -> tuple[list[CopperArea], int]:
-    """Decode copper Fills6 records (KiCad's AFILL6): layer u8, flags2 at 2
-    (2 = keepout), net u16 at 3, component u16 at 7, two corners (int32 x, y)
-    at 13 and a rotation (double, degrees, about the centre) at 29."""
-    areas: list[CopperArea] = []
+@dataclass
+class PcbRegion:
+    """A ShapeBasedRegions6, Regions6 or BoardRegions record (mil)."""
+
+    index: int
+    layer: int
+    net: int | None
+    polygon: int | None  # Polygons6 index of the pour it is copper of
+    component: int | None
+    keepout: bool
+    kind: int  # KIND: 0 copper or graphics, 1 polygon cutout, 2 dashed, 3 board cutout
+    board_cutout: bool
+    vertices: list[ShapeVertex]
+    holes: list[list[tuple[float, float]]]
+    name: str = ""
+
+
+def _read_shape_vertices(payload: bytes, at: int) -> tuple[list[ShapeVertex], int]:
+    """(vertices, offset after them) of a ShapeBasedRegions6 outline: u32 count,
+    then count + 1 of (u8 round, int32 x, y, cx, cy, r, double start, end angle)."""
+    (count,) = struct.unpack_from("<I", payload, at)
+    at += 4
+    vertices: list[ShapeVertex] = []
+    for _ in range(count + 1):
+        round_flag = payload[at]
+        x, y, cx, cy, radius = struct.unpack_from("<iiiii", payload, at + 1)
+        start, end = struct.unpack_from("<dd", payload, at + 21)
+        at += 37
+        arc = (
+            (_units_to_mil(cx), _units_to_mil(cy), _units_to_mil(radius), start, end)
+            if round_flag and radius > 0 else None
+        )
+        vertices.append(ShapeVertex(_units_to_mil(x), _units_to_mil(y), arc))
+    # The closing copy of the first vertex (written without its arc when the
+    # first vertex is one).
+    if len(vertices) > 1 and (vertices[-1].x, vertices[-1].y) == (
+        vertices[0].x, vertices[0].y
+    ) and vertices[-1].arc in (None, vertices[0].arc):
+        vertices.pop()
+    return vertices, at
+
+
+def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int]:
+    """Region records (_region_heads) with their shapes, on any layer: the outline
+    as u32 count + (double x, double y) vertices (Regions6, BoardRegions) or as
+    _read_shape_vertices reads it (shape_based: ShapeBasedRegions6, with arcs).
+    Unreadable records and records on no valid layer are counted as skipped."""
+    regions: list[PcbRegion] = []
     skipped = 0
-    for record_type, payload in _records_with_rest(data):
-        if record_type != 6 or len(payload) < 37:
+    for index, payload, head in _region_heads(data):
+        if head is None or not _valid_layer(head.layer):
             skipped += 1
             continue
-        layer = payload[0]
-        if not _signal_layer(layer) or payload[2] == _KEEPOUT:
+        try:
+            if shape_based:
+                vertices, at = _read_shape_vertices(payload, head.shape_at)
+            else:
+                points, at = _read_vertices(payload, head.shape_at)
+                vertices = [ShapeVertex(x, y) for x, y in points]
+                if len(vertices) > 1 and vertices[-1] == vertices[0]:
+                    vertices.pop()  # the closing copy of the first vertex
+            holes = []
+            for _ in range(head.hole_count):
+                hole, at = _read_vertices(payload, at)
+                holes.append(hole)
+        except (ValueError, struct.error, IndexError):
+            skipped += 1
+            continue
+        kind = _optional_int(head.properties.get("KIND")) or 0
+        regions.append(PcbRegion(
+            index=index,
+            layer=head.layer,
+            net=head.net,
+            polygon=head.polygon,
+            component=head.component,
+            keepout=head.keepout,
+            kind=kind,
+            board_cutout=head.properties.get("ISBOARDCUTOUT", "").upper() == "TRUE" or kind == 3,
+            vertices=vertices,
+            holes=holes,
+            name=head.properties.get("NAME", ""),
+        ))
+    return regions, skipped
+
+
+@dataclass
+class PcbFill:
+    """A Fills6 rectangle (mil): corners before rotation about their centre."""
+
+    layer: int
+    net: int | None
+    component: int | None
+    keepout: bool
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    rotation: float
+
+
+def _fill_records(data: bytes):
+    """Each Fills6 record (KiCad's AFILL6) as a PcbFill, rotation as stored (it may
+    not be finite): layer u8 at 0, flags2 at 2 (_KEEPOUT), net u16 at 3, component
+    u16 at 7, two corners (int32 x, y) at 13 and 21 and a rotation (double, degrees,
+    about the centre) at 29. None for a record that is not a fill (another type, or
+    shorter than one) and for a record running past the stream, which the decoders
+    count as skipped."""
+    for record_type, payload in _records_with_rest(data):
+        if record_type != 6 or len(payload) < 37:
+            yield None
             continue
         net, _, component = struct.unpack_from("<HHH", payload, 3)
         x1, y1, x2, y2 = (
             _units_to_mil(value) for value in struct.unpack_from("<iiii", payload, 13)
         )
         (rotation,) = struct.unpack_from("<d", payload, 29)
+        yield PcbFill(
+            layer=payload[0],
+            net=_optional_index(net, NO_NET),
+            component=_optional_index(component, NO_COMPONENT),
+            keepout=payload[2] == _KEEPOUT,
+            x1=x1, y1=y1, x2=x2, y2=y2,
+            rotation=rotation,
+        )
+
+
+def decode_fills(data: bytes) -> tuple[list[CopperArea], int]:
+    """Decode copper Fills6 records (_fill_records): fills on signal layers that
+    are not keepouts, as their rotated rectangle."""
+    areas: list[CopperArea] = []
+    skipped = 0
+    for fill in _fill_records(data):
+        if fill is None:
+            skipped += 1
+            continue
+        if not _signal_layer(fill.layer) or fill.keepout:
+            continue
+        x1, y1, x2, y2, rotation = fill.x1, fill.y1, fill.x2, fill.y2, fill.rotation
         if x1 == x2 or y1 == y2 or not math.isfinite(rotation):
             continue
         center_x, center_y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
@@ -1511,13 +1669,28 @@ def decode_fills(data: bytes) -> tuple[list[CopperArea], int]:
         areas.append(
             CopperArea(
                 kind="fill",
-                layer=layer,
-                net=_optional_index(net, NO_NET),
-                component=_optional_index(component, NO_COMPONENT),
+                layer=fill.layer,
+                net=fill.net,
+                component=fill.component,
                 outline=outline,
             )
         )
     return areas, skipped
+
+
+def decode_fill_records(data: bytes) -> tuple[list[PcbFill], int]:
+    """Fills6 records (_fill_records) on any valid layer, a rotation that is not
+    finite read as 0; records on no valid layer are counted as skipped."""
+    fills: list[PcbFill] = []
+    skipped = 0
+    for fill in _fill_records(data):
+        if fill is None or not _valid_layer(fill.layer):
+            skipped += 1
+            continue
+        if not math.isfinite(fill.rotation):
+            fill.rotation = 0.0
+        fills.append(fill)
+    return fills, skipped
 
 
 def _component_texts(data: bytes):
@@ -1872,147 +2045,6 @@ def decode_diff_pairs(records: list[dict[str, str]]) -> list[DiffPair]:
         for record in records
         if record.get("NAME")
     ]
-
-
-@dataclass
-class PcbRegion:
-    """A ShapeBasedRegions6, Regions6 or BoardRegions record (mil)."""
-
-    index: int
-    layer: int
-    net: int | None
-    polygon: int | None  # Polygons6 index of the pour it is copper of
-    component: int | None
-    keepout: bool
-    kind: int  # KIND: 0 copper or graphics, 1 polygon cutout, 2 dashed, 3 board cutout
-    board_cutout: bool
-    vertices: list[ShapeVertex]
-    holes: list[list[tuple[float, float]]]
-    name: str = ""
-
-
-@dataclass
-class PcbFill:
-    """A Fills6 rectangle (mil): corners before rotation about their centre."""
-
-    layer: int
-    net: int | None
-    component: int | None
-    keepout: bool
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    rotation: float
-
-
-def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegion], int]:
-    """Region records: u8 layer, u8 flags, u8 flags2 (2 = keepout), u16 net, u16
-    polygon, u16 component, hole count u16 at 14, properties (u32 length) at 18, u32
-    vertex count, then vertices (Regions6 and BoardRegions: double x, y; shape-based:
-    count + 1 of u8 round, int32 x, y, cx, cy, r, double start, end angle), then holes
-    (u32 count + double x, y)."""
-    regions: list[PcbRegion] = []
-    skipped = 0
-    consumed = 0
-    for index, (record_type, payload) in enumerate(iter_binary_records(data)):
-        consumed += 5 + len(payload)
-        try:
-            if record_type != 11 or len(payload) < 22:
-                raise ValueError
-            net, polygon, component = struct.unpack_from("<HHH", payload, 3)
-            (hole_count,) = struct.unpack_from("<H", payload, 14)
-            (text_length,) = struct.unpack_from("<I", payload, 18)
-            properties = _parse_text_properties(payload[22 : 22 + text_length])
-            position = 22 + text_length
-            (count,) = struct.unpack_from("<I", payload, position)
-            position += 4
-            vertices: list[ShapeVertex] = []
-            if shape_based:
-                for _ in range(count + 1):
-                    round_flag = payload[position]
-                    x, y, cx, cy, radius = struct.unpack_from("<iiiii", payload, position + 1)
-                    start, end = struct.unpack_from("<dd", payload, position + 21)
-                    position += 37
-                    arc = (
-                        (_units_to_mil(cx), _units_to_mil(cy), _units_to_mil(radius), start, end)
-                        if round_flag and radius > 0 else None
-                    )
-                    vertices.append(ShapeVertex(_units_to_mil(x), _units_to_mil(y), arc))
-                # The closing copy of the first vertex (written without its arc
-                # when the first vertex is one).
-                if len(vertices) > 1 and (vertices[-1].x, vertices[-1].y) == (
-                    vertices[0].x, vertices[0].y
-                ) and vertices[-1].arc in (None, vertices[0].arc):
-                    vertices.pop()
-            else:
-                for _ in range(count):
-                    x, y = struct.unpack_from("<dd", payload, position)
-                    position += 16
-                    vertices.append(ShapeVertex(x / ALTIUM_UNITS_PER_MIL, y / ALTIUM_UNITS_PER_MIL))
-                if len(vertices) > 1 and vertices[-1] == vertices[0]:
-                    vertices.pop()  # the closing copy of the first vertex
-            holes = []
-            for _ in range(hole_count):
-                (points,) = struct.unpack_from("<I", payload, position)
-                position += 4
-                holes.append([
-                    (x / ALTIUM_UNITS_PER_MIL, y / ALTIUM_UNITS_PER_MIL)
-                    for x, y in struct.iter_unpack("<dd", payload[position : position + 16 * points])
-                ])
-                position += 16 * points
-        except (ValueError, struct.error, IndexError):
-            skipped += 1
-            continue
-        if not _valid_layer(payload[0]):
-            skipped += 1
-            continue
-        kind = _optional_int(properties.get("KIND")) or 0
-        regions.append(PcbRegion(
-            index=index,
-            layer=payload[0],
-            net=_optional_index(net, NO_NET),
-            polygon=_optional_index(polygon, 0xFFFF),
-            component=_optional_index(component, NO_COMPONENT),
-            keepout=payload[2] == 2,
-            kind=kind,
-            board_cutout=properties.get("ISBOARDCUTOUT", "").upper() == "TRUE" or kind == 3,
-            vertices=vertices,
-            holes=holes,
-            name=properties.get("NAME", ""),
-        ))
-    if consumed < len(data):
-        skipped += 1  # a record cut short at the end of the stream
-    return regions, skipped
-
-
-def decode_fill_records(data: bytes) -> tuple[list[PcbFill], int]:
-    """Fills6 records: layer at 0, flags2 at 2 (2 = keepout), net 3, component 7,
-    corners int32 at 13 and 21, rotation double at 29."""
-    fills: list[PcbFill] = []
-    skipped = 0
-    consumed = 0
-    for record_type, payload in iter_binary_records(data):
-        consumed += 5 + len(payload)
-        if record_type != 6 or len(payload) < 37 or not _valid_layer(payload[0]):
-            skipped += 1
-            continue
-        net = struct.unpack_from("<H", payload, 3)[0]
-        component = struct.unpack_from("<H", payload, 7)[0]
-        x1, y1, x2, y2 = struct.unpack_from("<iiii", payload, 13)
-        (rotation,) = struct.unpack_from("<d", payload, 29)
-        fills.append(PcbFill(
-            layer=payload[0],
-            net=_optional_index(net, NO_NET),
-            component=_optional_index(component, NO_COMPONENT),
-            keepout=payload[2] == 2,
-            x1=_units_to_mil(x1), y1=_units_to_mil(y1),
-            x2=_units_to_mil(x2), y2=_units_to_mil(y2),
-            rotation=rotation if math.isfinite(rotation) else 0.0,
-        ))
-    if consumed < len(data):
-        skipped += 1  # a record cut short at the end of the stream
-    return fills, skipped
 
 
 # Streams kept raw on PcbData and decoded only by the checks that need them (they

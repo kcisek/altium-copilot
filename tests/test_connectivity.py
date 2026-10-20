@@ -3,6 +3,7 @@ antennae and weak joins on synthetic boards, the area copper they read (Regions6
 Fills6, planes) and the MCP tool."""
 
 import json
+import math
 import struct
 from pathlib import Path
 
@@ -22,9 +23,12 @@ from server.parsers.pcb_doc import (
     PcbRule,
     PolygonPour,
     Primitive,
+    ShapeVertex,
     _build_layer_aliases,
     decode_board,
+    decode_fill_records,
     decode_fills,
+    decode_region_records,
     decode_regions,
     parse_streams,
 )
@@ -107,11 +111,12 @@ class Board:
             x1=x, y1=y, x2=x, y2=y, width=diameter, hole=10.0,
         ))
 
-    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon"):
+    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon",
+             shape=()):
         self.pours.append(PolygonPour(
             pour_id=len(self.pours), net=None if net is None else self.net(net),
             layer=layer, hatch_style=hatch, vertices=list(vertices), shelved=shelved,
-            polygon_type=polygon_type,
+            polygon_type=polygon_type, shape=list(shape),
         ))
         return len(self.pours) - 1
 
@@ -575,6 +580,43 @@ def test_pour_outline_stands_in_when_regions_were_not_read():
     assert result["copper_model"]["pour_outlines_assumed"] == 1
     assert result["summary"]["nets_connected_through_assumed_copper"] == 1
     assert "Regions6 stream" in result["approximations"][0]
+
+
+# A pour whose right end is a half circle about (400, 0), radius 50: it bulges 50 mil
+# past the straight edge of its vertices.
+_ROUNDED = [
+    ShapeVertex(-50, -50), ShapeVertex(400, -50, (400.0, 0.0, 50.0, 270.0, 90.0)),
+    ShapeVertex(400, 50), ShapeVertex(-50, 50),
+]
+
+
+@pytest.mark.parametrize("split_plane", [False, True])
+def test_pad_on_a_curved_pour_edge_is_joined(split_plane):
+    # U2-1's corner touches the arc at 30 degrees (gap 0), or stops 0.05 mil short of
+    # it (more than TOUCH_MIL): between two vertices of the flattened arc, and 43 mil
+    # past the vertices' straight edge.
+    angle = math.radians(30.0)
+
+    def status(gap: float, shape) -> str:
+        board = Board(["GND"])
+        layer, hole = (MULTI, 4.0) if split_plane else (1, 0.0)
+        board.pad("GND", "U1", "1", 0, 0, layer=layer, hole=hole)
+        board.pad(
+            "GND", "U2", "1", 400 + (50 + gap) * math.cos(angle) + 5,
+            (50 + gap) * math.sin(angle) + 5, layer=layer, hole=hole,
+        )
+        board.pour(
+            "GND", PLANE if split_plane else 1, [(v.x, v.y) for v in _ROUNDED],
+            hatch="None" if split_plane else "Solid",
+            polygon_type="Split Plane" if split_plane else "Polygon", shape=shape,
+        )
+        # Without Regions6, a solid pour's outline stands in for its copper.
+        index = board.index(plane=True) if split_plane else board.index(area_streams=())
+        return _status(index, "GND")
+
+    assert status(0.0, _ROUNDED) == "routed"
+    assert status(0.05, _ROUNDED) == "unrouted"
+    assert status(0.0, ()) == "unrouted"  # the vertices alone miss the pad
 
 
 def test_shelved_pour_is_named_with_the_unrouted_net():
@@ -1092,6 +1134,58 @@ def test_decode_fills():
     rotated = areas[1].outline
     assert rotated[0] == pytest.approx((60.0, -40.0))
     assert rotated[2] == pytest.approx((40.0, 60.0))
+
+
+def test_both_region_decoders_read_the_same_records():
+    # decode_regions (copper for connectivity) and decode_region_records (every
+    # region, for the health check) read one record layout.
+    square = _square(0, 0, 100, 50)
+    data = (
+        _region_record(1, 0xFFFF, 3, square, holes=[_square(10, 10, 20, 20)])
+        + _region_record(32, 2, 0xFFFF, square)
+        + _region_record(33, 2, 0xFFFF, square)  # overlay: a region, not copper
+        + _region_record(1, 2, 0xFFFF, square, flags2=2)  # keepout
+        + bytes([4]) + struct.pack("<I", 3) + b"\x00\x00\x00"  # not a region record
+        + _region_record(1, 2, 0xFFFF, [(0, 0), (float("nan"), 0), (0, 10)])
+        + _region_record(1, 2, 0xFFFF, square)[:-3]  # running past the stream
+    )
+    areas, area_skipped = decode_regions(data)
+    regions, region_skipped = decode_region_records(data, False)
+    assert (area_skipped, region_skipped) == (3, 3)
+    assert [region.index for region in regions] == [0, 1, 2, 3]
+    assert [(region.layer, region.keepout) for region in regions] == [
+        (1, False), (32, False), (33, False), (1, True),
+    ]
+    assert [(a.layer, a.net, a.pour_id, a.component, a.outline, a.holes) for a in areas] == [
+        (r.layer, r.net, r.polygon, r.component, [(v.x, v.y) for v in r.vertices], r.holes)
+        for r in regions[:2]
+    ]
+    assert (regions[0].polygon, regions[0].net, regions[1].net) == (3, None, 2)
+
+
+def test_both_fill_decoders_read_the_same_records():
+    data = (
+        _fill_record(1, 4, 0, 0, 100, 20)
+        + _fill_record(32, 0xFFFF, 0, 0, 100, 20, rotation=90.0)
+        + _fill_record(33, 4, 0, 0, 100, 20)  # not copper
+        + _fill_record(1, 4, 0, 0, 100, 20, flags2=2)  # keepout
+        + _fill_record(1, 4, 0, 0, 100, 20, rotation=float("nan"))
+        + _fill_record(1, 4, 0, 0, 100, 20)[:-1]  # running past the stream
+    )
+    areas, area_skipped = decode_fills(data)
+    fills, fill_skipped = decode_fill_records(data)
+    assert (area_skipped, fill_skipped) == (1, 1)
+    assert [(fill.layer, fill.net, fill.keepout, fill.rotation) for fill in fills] == [
+        (1, 4, False, 0.0), (32, None, False, 90.0), (33, 4, False, 0.0), (1, 4, True, 0.0),
+        (1, 4, False, 0.0),  # a rotation that is not finite reads 0 here, no copper there
+    ]
+    assert [(area.layer, area.net, area.component) for area in areas] == [
+        (fill.layer, fill.net, fill.component) for fill in fills[:2]
+    ]
+    first = fills[0]
+    assert areas[0].outline == [
+        (first.x1, first.y1), (first.x2, first.y1), (first.x2, first.y2), (first.x1, first.y2),
+    ]
 
 
 def test_decode_board_reads_plane_nets_and_plane_aliases():

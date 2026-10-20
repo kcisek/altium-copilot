@@ -17,10 +17,14 @@ from collections import defaultdict
 
 try:
     from parsers.pcb_doc import decode_fill_records, decode_region_records
-    from services.pcb_geometry import point_in_polygon, point_seg_distance
+    from services.pcb_geometry import (
+        MAX_ARC_CHORDS, SNAP_MIL, contour, point_in_polygon, point_seg_distance,
+    )
 except ImportError:
     from server.parsers.pcb_doc import decode_fill_records, decode_region_records
-    from server.services.pcb_geometry import point_in_polygon, point_seg_distance
+    from server.services.pcb_geometry import (
+        MAX_ARC_CHORDS, SNAP_MIL, contour, point_in_polygon, point_seg_distance,
+    )
 
 MICRO_SEGMENT_MIL = 0.03  # 300 internal units, Altium's GetSmallSegments(300)
 ZERO_AREA_SQ_MIL = 1e-8  # one square internal unit
@@ -83,51 +87,6 @@ _KEEPOUT_LAYER = 56
 
 
 # ---------- shapes ----------
-
-SNAP_MIL = 1e-3  # points closer than this (10 internal units) are one point
-MAX_ARC_CHORDS = 720
-
-
-def _arc_points(vertex, step_deg: float = 10.0,
-                max_sagitta: float | None = None) -> list[tuple[float, float]]:
-    """The arc of an arc vertex as points, run from the end nearer the vertex (as
-    Altium draws it), its first point snapped to the stored vertex. max_sagitta (mil)
-    bounds how far a chord may cut inside the arc (up to MAX_ARC_CHORDS chords)."""
-    cx, cy, radius, start, end = vertex.arc
-    sweep = (end - start) % 360.0 or 360.0
-    steps = max(2, int(math.ceil(sweep / step_deg)))
-    if max_sagitta and radius > max_sagitta:
-        chord_deg = math.degrees(2 * math.acos(1 - max_sagitta / radius))
-        steps = min(MAX_ARC_CHORDS, max(steps, int(math.ceil(sweep / chord_deg))))
-    points = [
-        (cx + radius * math.cos(math.radians(start + sweep * i / steps)),
-         cy + radius * math.sin(math.radians(start + sweep * i / steps)))
-        for i in range(steps + 1)
-    ]
-    here = (vertex.x, vertex.y)
-    if math.dist(points[-1], here) < math.dist(points[0], here):
-        points.reverse()
-    if math.dist(points[0], here) < max(SNAP_MIL, radius * 1e-6):
-        points[0] = here
-    return points
-
-
-def contour(vertices, max_sagitta: float | None = None) -> list[tuple[float, float]]:
-    """The shape as points, arcs flattened. A stored vertex within SNAP_MIL of the
-    flattened arc's end replaces it (Altium stores both rounded to its grid), and the
-    last point is dropped when it repeats the first."""
-    points: list[tuple[float, float]] = []
-    for vertex in vertices:
-        new = (_arc_points(vertex, max_sagitta=max_sagitta) if vertex.arc
-               else [(vertex.x, vertex.y)])
-        if points and math.dist(points[-1], new[0]) < SNAP_MIL:
-            points[-1] = new[0]
-            new = new[1:]
-        points.extend(new)
-    if len(points) > 1 and math.dist(points[-1], points[0]) < SNAP_MIL:
-        points.pop()
-    return points
-
 
 def area(points: list[tuple[float, float]]) -> float:
     """The shoelace area (lobes of a self-crossing shape cancel)."""
