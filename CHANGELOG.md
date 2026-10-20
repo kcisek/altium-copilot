@@ -363,6 +363,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
 
 ### Fixed
+- `check_pcb_health` read a Regions6 or BoardRegions record whose vertices are not
+  finite coordinates, or whose hole list runs past the record, as a region. It now
+  counts it as unread, as `check_connectivity` already did: both decode Regions6 and
+  Fills6 with one record reader. No region changes on Altium's examples or 83 real boards
 - `get_drc_report`: a report where several tables list a different number of rows
   than their counts ("3 tables list ...") was called incomplete instead of having counts
   that differ
