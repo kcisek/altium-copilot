@@ -36,7 +36,8 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"Describe my stackup"* | Layer-by-layer: copper weight, dielectric, material | `get_board_info` |
 | *"Give me the BOM for the Lite variant"* | Per-variant BOM from the compiled parts with MPN and manufacturer, variant differences, CSV; `check_bom` for missing or inconsistent part numbers | `get_bom`, `check_bom` |
 | *"Are my ICs decoupled? Is C12 close enough to U3?"* | Decoupling coverage per rail and IC: rails with no capacitor to ground, only Not Fitted ones, or fed through a ferrite or resistor without their own; with the PcbDoc, each IC rail's nearest capacitors and their distance, and a warning above 5 mm. Advice, not DRC: rails come from net and pin names | `check_decoupling` |
-| *"What vias does this board use? Any fab issues?"* | Via types by span, hole and pad with counts per type and net class, depth and aspect ratio from the stackup, annular ring, vias in pads, tenting, drill pairs and back drilling, and the via stubs left on differential pairs | `check_vias` |
+| *"What vias does this board use? Is anything back drilled?"* | Via types by span, hole and pad with counts per type and net class, depth and aspect ratio from the stackup, annular ring, vias in pads, tenting, drill pairs and back drilling, and the via stubs left on differential pairs | `check_vias` |
+| *"Is this board manufacturable? Can my fab make it?"* | A design-for-manufacture check against a fabricator's capability limits: Altimade's published limits by default, or your fab's numbers from a `fab_profile.json` in the project folder (template: [examples/fab_profile.json](examples/fab_profile.json)) or given in the chat. Trace width, copper spacing, hole sizes, annular rings, aspect ratios, hole to hole, hole walls to copper, copper and holes to the board edge (edge-connector fingers and edge-plated holes noted), layer count, copper weight, board size, drill count, and board rules looser than the fab; each check's status (fail, marginal, advisory when only the default profile's ordering limits are missed, or pass), severity, limit and worst value, spacing counted in places, overlapping holes whatever the fab, the board's own minimums whatever the fab, and the drill table. A miss within 2% of a limit (at most 1 mil) is a warning; solder mask, silkscreen, plane pullback, panels and assembly are listed as not checked | `check_dfm` |
 | *"Is the board fully routed? What is left to route?"* | Per net, whether the saved copper (tracks, vias, pads, poured copper, regions, fills, internal planes) joins all its pads: routing progress with percentages, each missing connection between the nearest pads with its distance and near-miss copper gap, floating copper, and net antennae against the board's Net Antennae rule, beside Altium's last DRC report | `check_connectivity` |
 | *"Run a health check on the board"* | Altium's PCB Health Check Monitor offline, with Altium's categories and levels: shelved or modified polygons, duplicate designators, zero-area and self-intersecting shapes, micro-segments, slot holes, xSignals, 360-degree parts, reference points outside the part; plus parts outside the board shape. Compared with the last DRC report's health section | `check_pcb_health` |
 | *"What does my DRC report say? Any shorts?"* | Altium's last Batch DRC report grouped by rule, component or net, with a warning when it stopped at the violation limit, skipped checks or is older than the board | `get_drc_report` |
@@ -90,11 +91,14 @@ DRC report Altium saved and says when it should not be trusted.
 Data refreshes automatically every time you save the board in Altium. Read-only,
 like everything else.
 
-Not modelled: solid pours' copper (a pour is its saved outline, plus its tracks and arcs
-when hatched, so repour and save before asking about pours; shelved pours have no
-copper), fills, regions and planes, pad slot holes and per-layer pad sizes
-(pad holes and rings are not checked), and diff-pair uncoupled length. The checks list
-what they left out in their results.
+Not modelled by the rule checks (`check_rule_compliance`, `check_lengths`,
+`check_diff_pairs`): solid pours' copper (a pour is its saved outline, plus its tracks
+and arcs when hatched, so repour and save before asking about pours; shelved pours have
+no copper), fills, regions and planes, pad slot holes and per-layer pad sizes (pad holes
+and rings are not checked), and diff-pair uncoupled length. `check_connectivity` and
+`check_dfm` read the copper a pour was last poured into, regions and fills, and
+`check_dfm` checks pad holes, slots and rings per layer. The checks list what they left
+out in their results.
 
 ---
 
@@ -120,7 +124,8 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks |
 | Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel. With Altium closed the project loads without it (see [Requirements](#requirements)) |
 | `.Annotation` | Board designators of board-annotated and multi-channel designs |
-| `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not), the copper a pour was last poured into (solid pours' regions, hatched pours' tracks and arcs), copper regions and fills, internal plane nets, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings; for the health check also region shapes, the board shape and Health Check settings |
+| `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not), the copper a pour was last poured into (solid pours' regions, hatched pours' tracks and arcs), copper regions and fills, internal plane nets, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings; for the health check also region shapes, the board shape and Health Check settings; for the DFM check also pad holes (plated or not, a slot's angle, whether the hole is offset from the pad), bare holes such as mounting holes, board cutouts and the number of embedded board arrays (panels) |
+| `fab_profile.json` (optional) | A fabricator's limits for `check_dfm`, from the project folder (or `<name>.json` named in the chat): name, source, `based_on` and limits in mm or mil. See [examples/fab_profile.json](examples/fab_profile.json) |
 | `.PCBDwf` (Draftsman) | Notes, free text, tables, view titles, pictures, drill table, layer stack notes |
 | `Design Rule Check - <PcbDoc>.html` or `.drc` | Altium's last Batch DRC report, from the project's output folder |
 | Git clone of an Altium 365 project (`.git`) | When the origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`: the project GUID, the last fetch time (`FETCH_HEAD`), the local commit against the remote-tracking branch as of that fetch, uncommitted changes and the last commit. Read with local `git` commands that cannot open a connection (`protocol.allow=never`), do not rewrite the index (`--no-optional-locks`) and start no program the repository's configuration names (filters, fsmonitor, signature checks); nothing is fetched and no credential is used |
@@ -136,7 +141,7 @@ price), and Altium 365 review comments. The copilot never runs Altium's ERC or D
 - Windows
 - [Altium Designer](https://www.altium.com/altium-designer) — running with the project open and a schematic sheet active whenever the netlist has to be generated: the first time a project is loaded and after schematic changes
   - A project whose netlist is still up to date loads with Altium closed; the board, rule, DRC report, BOM and notes tools only read the saved files
-  - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the project loads partially: the board, rule, length, differential-pair, via, connectivity, DRC report, notes, picture and variant tools work. Nets, components, sheet context, BOM, decoupling, schematic-PCB sync, schematic review and the team snapshot need the netlist: open the project in Altium once, then load it again
+  - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the project loads partially: the board, rule, length, differential-pair, via, connectivity, health, DFM, DRC report, notes, picture and variant tools work. Nets, components, sheet context, BOM, decoupling, schematic-PCB sync, schematic review and the team snapshot need the netlist: open the project in Altium once, then load it again
   - Altium Designer 17 and older (`DXP.exe`) are detected too
 - [Git](https://git-scm.com/download/win) (optional) — only to report where an Altium 365 project's local clone stands; without it everything else works
 - [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code) — works with Pro and Enterprise subscriptions

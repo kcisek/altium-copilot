@@ -6,6 +6,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_dfm`: a design-for-manufacture check of the saved PcbDoc against a
+  fabricator's capability limits. The limits come from a profile: Altimade's published
+  limits (Altium's ordering service, page updated 2026-10-13) built in and used when
+  nothing else is chosen, said so in the result's `scope`; a `fab_profile.json` in the
+  project folder or another `<name>.json` there named by `profile` (template:
+  `examples/fab_profile.json`, a blank to fill in with your fab's numbers); or
+  `profile="none"` with only the `limits` argument. The file, the argument and the
+  echoed profile share one vocabulary: lengths end in `_mm` or `_mil`; via, PTH and
+  NPTH drills, rings and hole-to-hole distances fall back to a generic limit, a hole
+  wall to copper (`min_hole_to_copper`) to `min_spacing` and a hole to the board edge
+  (`min_hole_to_edge`) to `min_copper_to_edge`; null removes one. Every value is checked
+  by the server, from a file or the argument: numbers only (true/false and text are
+  refused, not read as numbers), and a length outside what any fab offers (a spacing
+  above 1 mm or below 0.5 mil, say) is refused, with the other unit suggested only when
+  that reading is plausible. A bad file or limit answers `invalid_profile` or
+  `invalid_limits` with what to fix and never switches to another profile; an unknown
+  profile lists the built-ins and the files found.
+  Checks: trace width; copper spacing between nets on each signal layer (pads per layer,
+  vias per layer with removed pads read as the barrel, poured copper, regions and fills;
+  net ties, no-net copper and shorts an enabled ShortCircuit rule allows are left out,
+  pad gaps inside one footprint are their own class), counted in places where two nets'
+  copper comes too close and grouped into routed and area copper; hole walls (non-plated
+  holes, plated holes without a pad) to copper; hole sizes per drill row, bare holes and
+  routed slots included; annular rings of vias and plated pads per layer; aspect ratios;
+  hole to hole, slots as capsules, with overlapping and coincident holes reported
+  whatever the profile; copper and holes to the board outline and cutouts, with
+  edge-connector fingers inside the clearance as a warning (they need the fab's
+  edge-connector option) and edge-plated holes and copper off the board as info; hole
+  walls and holes near the edge judged against the `min_spacing` or
+  `min_copper_to_edge` stand-in are warnings unless the drill cuts the copper or the
+  edge; layer
+  count; copper weight (`copper_weight`); board size; drill count; and board rules looser
+  than the profile, which Altium's DRC would let through (`rules_vs_profile`). Each check
+  gives its status, severity, limit and worst value: fail for a miss of severity error
+  or warning, marginal, advisory when its only misses are info (Altimade's service-only
+  limits for layer counts, board size and copper weight while Altimade is only the
+  default, and the drill count), pass, or not_checked with the reason. Findings are
+  classes (a width, a family of gaps, a drill row or via type) with counts, the worst
+  value and its range, and one example per place; a miss within 2% of a limit (at most
+  1 mil for a length) is a warning, and mm/mil rounding is named only where it explains
+  the miss. `board_minimums` says what the board needs from any fabricator, whatever the
+  profile, and `drills` is the drill table. Solder mask, silkscreen, acute angles, copper
+  text, plane pullback, panels and assembly are listed as not checked. The review is
+  computed once per board, profile and units, then paged to fit the result size.
+  On Altium's examples MiniPC's drill table matches its Draftsman drill table (back
+  drills aside, all 16 bare holes included), and the review takes about 2.2 s after the
+  2.5 s index (a repeat call or another page 1 ms); its result is 18 findings (6 of them
+  spacing) in 32,000 characters. On a private set of 55 real boards it ran without an
+  exception, at most 0.22 s per board after the index (median 0.05 s), with every page
+  under the 60,000-character limit
 - The PcbDoc parser reads whether a pad's hole is plated, a square or slot hole's
   angle, whether the hole is offset from the pad, pads that are bare holes (no copper,
   such as mounting holes; MiniPC has 16 that Altium's drill table lists) and the number
@@ -347,6 +397,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   uncommitted `.PcbDoc`, in about 0.3 s per clone
 
 ### Changed
+- `check_vias` is described as the via inventory and drill review, no longer a "fab
+  review", in its description, the server instructions and the README; questions about
+  a fabricator's capability ("can my fab make this?") go to `check_dfm`
 - The session-start instructions read the design notes (`get_design_notes`) before
   summarising the board, and `schematic_review` treats notes as intent to verify. The
   server instructions fit within the 4096 characters that Claude Code shows; the

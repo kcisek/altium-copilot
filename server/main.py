@@ -8,7 +8,7 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 vendor_dir = os.path.join(os.path.dirname(__file__), "vendor")
 # When bundled with PyInstaller, vendor is embedded — no sys.path injection needed.
@@ -19,6 +19,7 @@ if os.path.exists(vendor_dir):
 import httpx
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
+from pydantic import WithJsonSchema
 
 try:
     from altium import AltiumClient, is_netlist_fresh, netlist_sources
@@ -54,6 +55,8 @@ try:
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
     from services.pcb_health import run_health_check
+    from services.dfm import DRILL_ROWS_LISTED, SHRINK_STEPS, page_dfm, review_dfm
+    from services.fab_profiles import load_profile
     from services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
@@ -102,6 +105,8 @@ except ImportError:
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.pcb_health import run_health_check
+    from server.services.dfm import DRILL_ROWS_LISTED, SHRINK_STEPS, page_dfm, review_dfm
+    from server.services.fab_profiles import load_profile
     from server.services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
@@ -329,13 +334,14 @@ component locations, distances):
     each IC rail's nearest capacitor and a warning above 5 mm (name the IC in ic= for
     its 5 nearest). It is advice: rails come from net and pin names, and the datasheet
     decides how many capacitors a part needs.
-16. check_vias — "what vias does this board use?", a fab or drill review, aspect
-    ratio, annular ring, via-in-pad, tenting, blind/buried/microvias, back drilling or
-    via stubs: via types with counts per type and net class, depth and aspect ratio from
-    the stack, drill pairs and back drills, with findings. via_types is the via part of
-    the drill table (component holes and slots are not in it); holes are as drawn
-    (finished), which fabricators drill larger. Back drilling is recomputed the way
-    Altium writes the drill files; stubs of nets with no back-drill rule are advice.
+16. check_vias — "what vias does this board use?", a via or drill review (a fab's
+    capability limits: check_dfm), aspect ratio, annular ring, via-in-pad, tenting,
+    blind/buried/microvias, back drilling or via stubs: via types with counts per type
+    and net class, depth and aspect ratio from the stack, drill pairs and back drills,
+    with findings. via_types is the via part of the drill table (component holes and
+    slots are not in it); holes are as drawn (finished), which fabricators drill larger.
+    Back drilling is recomputed the way Altium writes the drill files; stubs of nets
+    with no back-drill rule are advice.
 17. check_connectivity — "is the board fully routed?", "what is left to route?", "why
     does DRC say un-routed?", floating copper, net antennae, routing progress: per net,
     whether its saved copper (tracks, vias, pads, the pour copper as last poured,
@@ -351,6 +357,15 @@ component locations, distances):
     shapes, micro-segments, 360deg components, reference points outside the part)
     plus parts outside the board; altium_report compares the last DRC report's health
     counts. Quote not_checked: mirrored footprints, panels and fonts need Altium.
+19. check_dfm — "is this board manufacturable?", "DFM check", "can <fab> make this?",
+    before ordering: copper, holes and outline against a fab profile (altimade built
+    in, fab_profile.json in the project folder, or limits). Say which profile was used
+    (scope); never present Altimade's limits as another fabricator's: ask for that
+    fab's numbers and pass profile="none" with limits. Answer from each result's status
+    and severity together (status advisory: its only misses are info, such as
+    Altimade's ordering limits while it is only the default; that is not a fabrication
+    miss, so report it as a note), quote not_checked, and say "meets <profile>'s limits
+    on the checks run", never just "manufacturable".
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3259,9 +3274,10 @@ def check_vias(
     units: PcbUnits | None = None,
     offset: int = 0,
 ) -> str:
-    """Via inventory and fab review of the PcbDoc: "what vias does this board use?", a
-    drill review, blind/buried/microvias, aspect ratio, annular ring, via-in-pad,
-    tenting, back drilling, via stubs.
+    """Via inventory and drill review of the PcbDoc: "what vias does this board use?",
+    blind/buried/microvias, aspect ratio, annular ring, via-in-pad, tenting, back
+    drilling, via stubs. A fabricator's capability limits (is the board manufacturable,
+    can my fab make it): check_dfm.
 
     via_types: each type (span by stack layers, hole as drawn, pad) with count, nets,
     copper-to-copper depth, aspect ratio, smallest annular ring, tenting, in-pad and
@@ -3461,7 +3477,8 @@ def check_pcb_health(
 ) -> str:
     """Run Altium's PCB Health Check Monitor offline on the saved PcbDoc, plus a few
     board-hygiene checks. Call it when the user asks for a PCB health check, board
-    clean-up or hygiene, or before generating fabrication outputs. Each finding names
+    clean-up or hygiene, or before generating fabrication outputs (a fabricator's
+    capability limits: check_dfm). Each finding names
     Altium's category and id, with Altium's level as severity (High error, Medium
     warning, Low info): shelved_modified_polygons (stops output generation in Altium),
     duplicate_designators, zero_area_polygons, zero_area_regions,
@@ -3550,6 +3567,146 @@ def check_pcb_health(
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
+
+
+# check_dfm's limits as a client sees them: an object of limit keys, each a number, a
+# list of numbers or null. The argument itself is typed Any, so that fab_profiles
+# checks every value: a wrong type answers invalid_limits with the valid keys instead of
+# a pydantic error, and true/false or "0.1" are refused instead of read as numbers.
+DFM_LIMITS_SCHEMA = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": {"anyOf": [
+            {"type": "number"}, {"type": "array", "items": {"type": "number"}},
+            {"type": "null"},
+        ]}},
+        {"type": "null"},
+    ],
+}
+
+
+@mcp.tool(
+    title="Check Manufacturability (DFM)",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_dfm(
+    checks: list[str] | None = None,
+    profile: str | None = None,
+    limits: Annotated[Any, WithJsonSchema(DFM_LIMITS_SCHEMA)] = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Design-for-manufacture (DFM) check of the saved PcbDoc against a fabricator's
+    capability limits: "is this board manufacturable?", "DFM check", "can my fab /
+    Altimade / JLCPCB / PCBWay make this?", "check against my fab's capabilities",
+    before ordering boards. The answer is "meets <profile>'s limits on the checks run",
+    never "manufacturable" in general: name the profile (scope says which), and never
+    present Altimade's result as another fabricator's. When the user names another fab,
+    ask for its numbers (or a fab_profile.json) and pass profile="none" with limits.
+    Not: the board's own rules against its copper (check_rule_compliance); Altium's DRC
+    result (get_drc_report); via inventory, back drills and stubs (check_vias); Altium's
+    health check (check_pcb_health).
+
+    profile: "altimade" (built in: Altium's Altimade ordering service, its published
+    limits), "none" (only limits apply) or a .json file in the project folder ("acme"
+    for acme.json). Default: the project's fab_profile.json (chosen_by project_file),
+    else altimade (chosen_by default). limits sets single values on top, with the keys
+    of the file and of the echoed profile: lengths end in _mm or _mil
+    ({"min_spacing_mm": 0.1}), ratios and counts take no suffix ({"max_aspect_ratio": 8,
+    "layer_counts": [2, 4]}); a value is a number or a list of numbers, never text, and
+    null removes a limit. min_hole_to_copper falls back to min_spacing and
+    min_hole_to_edge to min_copper_to_edge. The errors profile_not_found,
+    invalid_profile and invalid_limits say what to fix: tell the user, and never
+    substitute another profile or switch a limit's unit without the fab's table.
+
+    checks: trace_width, spacing (hole walls to copper too), hole_size, annular_ring,
+    aspect_ratio (copper-to-copper depth over the hole as drawn), hole_to_hole
+    (overlapping holes whatever the profile), copper_to_edge (holes to the edge too),
+    layer_count, copper_weight, board_size, drill_count, rules_vs_profile (a board rule
+    looser than the profile, so Altium's DRC would let it through). results gives each
+    check's status with its severity, limit and worst value: answer from status and
+    severity together. Status is fail (a miss of severity error or warning), marginal
+    (every such miss within tolerance_percent of its limit, default 2% and at most 1
+    mil, e.g. 0.1 mm against 4 mil: a warning), advisory (only info misses, such as
+    Altimade's ordering limits while Altimade is only the default: not a fabrication
+    miss, report it as a note), pass, or not_checked with a reason. board_minimums is
+    what the board needs from any fab, whatever the profile; drills is the drill table.
+    Findings are classes (a width, a family of gaps, a drill row or via type) with
+    counts (spacing counts places: spots where two nets' copper comes too close) and the
+    worst examples, errors first. Quote not_checked (solder mask, silkscreen, plane
+    pullback, panels, assembly).
+
+    checks narrows to some of these; findings are paginated (offset from next_offset).
+    Example locations (at_mil) are relative to the board origin: add origin_mil for
+    query_pcb_region. Lengths use units (default: board display unit); limits carry
+    their own unit suffix."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    project, _, _ = _require_project(netlist=False)
+    fab_profile, error = load_profile(profile, project.get("root_dir"), limits)
+    if error:
+        return json.dumps(error)
+    # Cached on the index per (checks, units, profile): paging and repeat calls reuse it.
+    full = review_dfm(index, fab_profile, checks, to_mm)
+    if "error" in full:
+        return json.dumps(full)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    if paths:
+        context["pcb_doc"] = Path(paths[0]).name
+        if len(paths) > 1:
+            context["note"] = (
+                f"Project lists {len(paths)} PcbDocs; checked '{Path(paths[0]).name}'."
+            )
+    # Every answer needs the scope, and example locations need the origin: both lead.
+    context["origin_mil"] = full["origin_mil"]
+    context["scope"] = full["scope"]
+    return _dfm_page(context, full, offset, to_mm)
+
+
+DFM_FINDINGS_OMITTED = (
+    "The result is too large even at 5 findings per page, so findings are left out: call "
+    "again with checks narrowed to one check."
+)
+
+
+def _dfm_page(context: dict, full: dict, offset: int, to_mm: bool) -> str:
+    """The largest page of check_dfm's result that fits the result size: fewer findings
+    and examples per step, then the drill table cut to its first rows, and at worst the
+    verdict without findings. Never longer than the limit."""
+    steps = [(limit, examples, None) for limit, examples in SHRINK_STEPS]
+    steps.append((*SHRINK_STEPS[-1], DRILL_ROWS_LISTED))
+    for limit, examples, drill_rows in steps:
+        result = _convert_units(
+            {**context, **page_dfm(full, offset, limit, examples, drill_rows)}, to_mm,
+        )
+        if (limit, examples) != SHRINK_STEPS[0]:
+            result["findings_limited_to"] = limit
+            result["examples_per_finding"] = examples
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    counts = {"total": len(full["findings"]), "drills_total": len(full["drills"]),
+              "findings_omitted": DFM_FINDINGS_OMITTED}
+    brief = {
+        **context,
+        **{key: full[key] for key in (
+            "checks_run", "profile", "board", "board_minimums", "results", "severity_counts",
+        )},
+        **counts,
+    }
+    rendered = json.dumps(_convert_units(brief, to_mm), indent=2)
+    if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+        return rendered
+    statuses = {check: entry["status"] for check, entry in full["results"].items()}
+    return json.dumps({
+        "units": context["units"], "scope": full["scope"], "results": statuses,
+        "severity_counts": full["severity_counts"], **counts,
+    }, indent=2)
 
 
 BOM_LINE_LIMIT = 100
