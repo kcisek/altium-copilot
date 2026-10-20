@@ -226,6 +226,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   project path is found in the sheet's folder or a parent folder
   ([ee-in-a-box/altium-copilot#5](https://github.com/ee-in-a-box/altium-copilot/issues/5)).
   The title layout has not been checked on a live DXP install yet
+- Netlist-free load: with Altium Designer closed and no up-to-date cached netlist (e.g. a
+  fresh copy of an Altium 365 project, whose `.gitignore` leaves out `Project Outputs*/`),
+  `set_project_dir` now loads the project from its files instead of answering
+  `altium_not_running`. The response says `partial: true`, `load_mode: netlist_free`,
+  why, and lists `netlist_required_tools`. Board, rule, length, differential-pair, via,
+  DRC report, design-notes, picture and variant tools work, as does `constraints_review`
+  (its prompt says how to find the interfaces without schematic parts). `query_net`,
+  `get_component`, `search_components`, `get_sheet_context`, `get_bom`, `check_bom`,
+  `check_decoupling`, `check_sch_pcb_sync`, `schematic_review` and `package_for_xfn`
+  answer `netlist_required`: open the project in Altium once, then load it again. PCB
+  parts are not linked to schematic parts (`sch_refdes` is empty, `get_board_info` says
+  so instead of counting every part as unmatched), and DNP comes from the designators
+  stored in the variants. A cached netlist older than the sheets is not used
+  (`netlist_stale`). After a partial load, `refresh_netlist` loads the project again,
+  fully once Altium has it open
 
 ### Changed
 - The session-start instructions read the design notes (`get_design_notes`) before

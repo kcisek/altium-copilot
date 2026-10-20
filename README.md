@@ -115,7 +115,7 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 |---|---|
 | `.PrjPcb` | Sheet list (subfolders, `..\` paths and device sheets included), variants, project parameters, output folder, Comparator settings |
 | `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks |
-| Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel |
+| Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel. With Altium closed the project loads without it (see [Requirements](#requirements)) |
 | `.Annotation` | Board designators of board-annotated and multi-channel designs |
 | `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not) and hatched pours' tracks and arcs, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings |
 | `.PCBDwf` (Draftsman) | Notes, free text, tables, view titles, pictures, drill table, layer stack notes |
@@ -132,6 +132,7 @@ price), and Altium 365 review comments. The copilot never runs Altium's ERC or D
 - Windows
 - [Altium Designer](https://www.altium.com/altium-designer) — running with the project open and a schematic sheet active whenever the netlist has to be generated: the first time a project is loaded and after schematic changes
   - A project whose netlist is still up to date loads with Altium closed; the board, rule, DRC report, BOM and notes tools only read the saved files
+  - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the project loads partially: the board, rule, length, differential-pair, via, DRC report, notes, picture and variant tools work. Nets, components, sheet context, BOM, decoupling, schematic-PCB sync, schematic review and the team snapshot need the netlist: open the project in Altium once, then load it again
   - Altium Designer 17 and older (`DXP.exe`) are detected too
 - [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code) — works with Pro and Enterprise subscriptions
 
