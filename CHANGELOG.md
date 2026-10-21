@@ -502,6 +502,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   Sentinel's round GND pours have 3 to 5 vertices and arcs of up to 315 degrees.
   Read straight, 13,468 of their 20,340 poured track and arc ends lay more than
   0.3 mil outside them; now none do. On 83 real boards, 116 pours have arc edges
+- The board outline's points follow its arc edges (Board6 `KINDn=1`) too: they were
+  its vertices only, so an arc bulging past them was cut off. `get_board_info` gave
+  Altium's Bluetooth Sentinel example `board_extents_mil` of 3149.6 x 196.9 mil, the
+  strip its vertices span; with its two 315-degree arcs the board is 3149.6 x 2165.4 mil.
+  The arcs become chords at most 0.25 mil inside them, as pour outlines do
+  (`check_dfm` and `check_pcb_health` already read the arcs themselves). `get_drc_report`
+  measures a violation's zoom box against the outline with its arcs: adding the copper's
+  extents, as it did, missed an arc reaching past the copper. On Altium's other examples
+  the extents do not change; on 83 real boards, 51 have outline arcs and one board's
+  extents change. An outline or pour arc whose angles are finite but too large to subtract
+  (a corrupt record) is a straight edge, as other bad arc values are; in a pour it raised
+  an error that dropped every pour ("Polygons6 parse failed")
 - `check_pcb_health` read a Regions6 or BoardRegions record whose vertices are not
   finite coordinates, or whose hole list runs past the record, as a region. It now
   counts it as unread, as `check_connectivity` already did: both decode Regions6 and
