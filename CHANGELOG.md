@@ -6,6 +6,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_fab_drawing`: the project's Draftsman drawings checked offline (roadmap #36). Each
+  .PCBDwf (or one named) is classified from its views and notes as a fabrication,
+  assembly or other drawing (with a second role when both are strong), and its notes,
+  free text, tables, document parameters and layer notes are scanned with keyword and
+  regex patterns for the fabrication checklist (IPC class with IPC-6012/6013/A-600, laminate
+  material, Tg, UL 94 flammability, surface finish families ENIG, ENEPIG, HASL/LF-HASL,
+  ImAg, ImSn, OSP and hard gold, solder mask and silkscreen colours, board thickness and
+  its tolerance, copper weights, impedance where the stack has profiles, drill table,
+  registration and tolerances, electrical test, rigid-flex items on a flex stack) and the
+  assembly one (IPC-A-610 / J-STD-001 class, BOM table, a view of each side with parts).
+  Each item is found (the line quoted briefly with its page, note and line), missing
+  (with a suggested note line built from the design's numbers, e.g. the stack's total
+  thickness, its copper weights and impedance targets; `<...>` marks a value to agree) or
+  not applicable; a missing finish, thickness, material or IPC class is a warning.
+  Cross-checks against the drawing's own PcbDoc (its source board when the project lists
+  it): stated thickness against the stack's total and copper-to-copper height (a
+  maximum or minimum as a bound, a tolerance on its own line applied to it, a number
+  without a unit read as mm, inches or mil, whichever is nearest) and a stated layer count
+  (not "inner 2 layers", a flex section or a double-sided assembly; errors when they
+  contradict it), named laminates against the stack's dielectrics (FR-4 read as a grade),
+  copper weights, impedance targets in the notes (info when the stack has no profiles to
+  confirm them) and the impedance table's cached lines against the Layer Stack Manager
+  profiles (layer, target, width, gap), the drill table against the board's holes
+  (check_dfm's drill table, summed over spans; panels not checked), the layer stack
+  legend against the stack, the BOM table's variant against the OutJob printing the
+  drawing and the active variant and its cached parts against get_bom (not-fitted parts
+  too when the table shows them; only with a netlist, otherwise not_checked says so), a
+  drawing made from another board, a board changed after the
+  drawing's last Import Changes (the last commit time in a Git clone, where file times
+  are the checkout's; a board committed with the drawing is not counted) and notes that
+  contradict each other (two finishes, thicknesses, IPC classes or colours). The
+  Draftsman parser now also reads the cached layer stack (materials, thicknesses,
+  weights, Tg, flex), the transmission lines behind an impedance table, the BOM table rows
+  of each BOM data set (scanned from the bytes of the board copy it cuts out) and the BOM
+  views' data source; `output_jobs.draftsman_outputs` names the drawing and variant each
+  OutJob prints. Validated on Altium's public Mini PC drawings and a corpus of 54 drawings
+  in 53 projects (no exceptions, at most 1.5 s per project): 50 fabrication and 4
+  assembly drawings (49 also assembly); hit rates material 50/50, copper weight 50/50,
+  Tg 46/50, surface finish 30/50, thickness 18/50 (none with a tolerance), mask and
+  silkscreen colour 5/50, drill table 4/50, impedance 4 of the 32 where it applies, IPC
+  class, flammability, electrical test and registration 0/50; all 19 stated thicknesses
+  (18 drawings), 45 material sets, 49 copper sets, 4 drill tables and 4 impedance checks
+  match the design; 1 of 46 legends and 25 drawings (24 by commit history) are older than
+  the board, 5 drawings' BOM tables show another variant than their OutJob, and 6
+  drawings were made from another board.
 - `get_output_jobs`: the project's Output Jobs offline (roadmap #37), from a new .OutJob
   parser (`parsers/out_job.py`) whose keys are mapped only where Altium's 11 public AD25
   example and template OutJobs and a corpus agree. OutJobs come from the .PrjPcb document

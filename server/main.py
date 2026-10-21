@@ -80,7 +80,10 @@ try:
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from services.project_options import build_project_options, page_project_options
     from services.project_integrity import build_project_integrity, page_project_integrity
-    from services.output_jobs import build_output_jobs, page_output_jobs
+    from services.output_jobs import build_output_jobs, draftsman_outputs, page_output_jobs
+    from services.fab_drawing import (
+        board_facts as fab_board_facts, build_fab_drawing, page_fab_drawing,
+    )
     from services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -147,7 +150,12 @@ except ImportError:
     from server.services.project_integrity import (
         build_project_integrity, page_project_integrity,
     )
-    from server.services.output_jobs import build_output_jobs, page_output_jobs
+    from server.services.output_jobs import (
+        build_output_jobs, draftsman_outputs, page_output_jobs,
+    )
+    from server.services.fab_drawing import (
+        board_facts as fab_board_facts, build_fab_drawing, page_fab_drawing,
+    )
     from server.services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -354,6 +362,18 @@ DNP reasons, fabrication requirements. Use it.
   Draftsman variants, outputs older than the design). Quote each finding's severity, fix
   and source, and not_checked; only a connected output is generated. Generating in
   Altium is the final word.
+
+## Fabrication Drawings
+
+- check_fab_drawing — "is my fab drawing complete?", "check the fabrication notes", "does
+  the drawing match the board?", "is the drawing up to date?", before sending a drawing
+  to a fabricator or assembler: each Draftsman drawing's kind, a checklist (found with
+  the line quoted and where it is, missing with a suggested note line, not applicable)
+  and cross-checks of what it states or caches against the stack, the impedance
+  profiles, the holes, the BOM and the board's save time. Quote found lines with their
+  place; offer suggested_notes as lines to add, with the user filling every <...> value
+  (never invent one). A missing item may be worded unusually: read get_design_notes
+  before calling it absent. Tables are caches from the last Import Changes.
 
 ## Project Tour
 
@@ -1969,6 +1989,110 @@ def get_output_jobs(outjob: str | None = None, offset: int = 0) -> str:
         return json.dumps(model)
     for limit, examples in ((10, 25), (4, 10), (2, 5), (1, 3), (1, 1)):
         rendered = json.dumps(page_output_jobs(model, offset, limit, examples), indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# ---------- check_fab_drawing ----------
+
+def _fab_board_reader(project: dict, netlist: dict | None):
+    """check_fab_drawing's board reader: a PcbDoc path of the project -> (BoardFacts,
+    None) or (None, why not). The first PcbDoc comes from the PCB session (cached), any
+    other is parsed for this call."""
+    first = (project.get("pcb_doc_paths") or [None])[0]
+
+    def read(path: str):
+        if path == first:
+            index, error = _pcb_session.get(project, netlist)
+            if error:
+                return None, error["message"]
+        else:
+            if not Path(path).is_file():
+                return None, f"PCB document not found on disk: {Path(path).name}"
+            try:
+                index = PcbIndex(parse_pcb_doc(path), netlist)
+            except Exception as error:
+                return None, f"{type(error).__name__}: {error}"
+        try:
+            profile, _ = load_profile("none", None)
+            drills = review_dfm(index, profile, ["drill_count"])["drills"]
+        except Exception as error:  # only the drill-table cross-check needs it
+            logging.warning("check_fab_drawing: drill table failed: %s", error)
+            drills = None
+        return fab_board_facts(index, drills, path), None
+    return read
+
+
+def _fab_bom(project: dict, netlist: dict | None, variant_state: VariantState):
+    """What check_fab_drawing compares BOM tables with: variant name -> {"variant",
+    "parts": {designator: Comment}, "not_fitted": {designator: Comment}} of the fitted and
+    not-fitted BOM parts (as get_bom builds them), or a variant_not_found error; None
+    without a netlist."""
+    if netlist is None or not netlist.get("components"):
+        return None
+    parameters = project.get("parameters") or {}
+
+    def read(variant: str) -> dict:
+        plan, _, error = _bom_plan(netlist, variant_state, variant)
+        if error:
+            return error
+        parts, _ = build_bom_parts(netlist, plan, parameters)
+        return {"variant": plan.name,
+                "parts": {part.designator: part.comment or "" for part in parts if part.fitted},
+                "not_fitted": {part.designator: part.comment or ""
+                               for part in parts if not part.fitted}}
+    return read
+
+
+@mcp.tool(
+    title="Check Fab Drawing",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_fab_drawing(document: str | None = None, offset: int = 0) -> str:
+    """Check the project's Draftsman drawings (.PCBDwf) offline: each drawing classified
+    from its content (fabrication, assembly or other; also lists a second role), then a
+    checklist read from its notes, free text, tables, document parameters and layer notes,
+    each item found (with the note line quoted and where it is: page, note and line),
+    missing (with a suggested note line built from the design's numbers where known;
+    <...> marks a value to agree, never a guess) or not_applicable. Fabrication: IPC class
+    (IPC-6012/6013, IPC-A-600), laminate material, Tg, flammability (UL 94 V-0), surface
+    finish (ENIG, ENEPIG, HASL/LF-HASL, ImAg, ImSn, OSP, hard gold), solder mask and
+    silkscreen colours, board thickness with tolerance, copper weights, impedance (a table
+    or a note with tolerance, when the stack has impedance profiles), drill table,
+    registration and tolerances, electrical test (IPC-D-356) and rigid-flex items on a
+    flex stack. Assembly: IPC-A-610 / J-STD-001 class, a BOM table, views of each side
+    with parts. Missing finish, thickness, material or IPC class is a warning (an
+    unspecified finish is often built as tin-lead HASL or silver).
+
+    Cross-checks against the design: thickness and layer count stated vs the layer stack
+    (error when a number contradicts it), materials named vs the stack's dielectrics,
+    copper weights, impedance targets in the notes and the impedance table's cached lines
+    vs the Layer Stack Manager's profiles, the drill table vs the board's holes, the layer
+    stack legend vs the stack, the BOM table's variant vs the OutJob that prints the
+    drawing and the active variant, its cached parts vs get_bom (needs a netlist; without
+    one not_checked says so), the board the drawing was made from, the board saved after
+    the drawing's last update (stale: Import Changes), and notes that contradict each
+    other (two finishes, thicknesses, IPC classes or colours). Draftsman tables are
+    caches from the last Import Changes, not live.
+
+    document (a drawing's file name or stem) checks one drawing. Findings (errors first)
+    come with the first page; per-drawing details (checklist, cross_checks,
+    suggested_notes) are paginated (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    active = variant_state.active.name if variant_state.variants else None
+    model = build_fab_drawing(project, _design_notes.draftsman,
+                              _fab_board_reader(project, netlist),
+                              draftsman_outputs(project), active,
+                              _fab_bom(project, netlist, variant_state), document)
+    if "error" in model:
+        return json.dumps(model)
+    for limit, examples in ((10, 25), (4, 10), (2, 5), (1, 3), (1, 1)):
+        rendered = json.dumps(page_fab_drawing(model, offset, limit, examples), indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered

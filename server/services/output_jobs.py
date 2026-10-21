@@ -324,6 +324,27 @@ def page_output_jobs(model: dict, offset: int, limit: int, example_limit: int) -
     return result
 
 
+def draftsman_outputs(project: dict) -> list[dict]:
+    """The Draftsman (PCBDrawing) outputs of the OutJobs the project lists, for the tools
+    that check the drawings themselves: [{outjob, output, drawing (its path; None when
+    the default source is ambiguous or the file is not found), variant, connected}].
+    [] when the .PrjPcb cannot be read."""
+    prj_path = project["prj_pcb_path"]
+    try:
+        documents = parse_prj_documents(prj_path)
+        prj = parse_prj_pcb(prj_path)
+        options = parse_prj_options(prj_path)
+    except (OSError, UnicodeDecodeError):
+        return []
+    context = _Context(project, prj, options, documents, lambda path: None)
+    return [
+        {"outjob": out.job.file, "output": out.output.name or out.output.type,
+         "drawing": _drawing_path(context, out), "variant": out.variant,
+         "connected": out.connected}
+        for out in context.outputs if out.output.type in DRAWING_TYPES
+    ]
+
+
 # ---------- shared state ----------
 
 @dataclass

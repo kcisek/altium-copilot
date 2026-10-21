@@ -76,6 +76,7 @@ WORKING_TOOL_CALLS = {
     "get_project_options": lambda: main.get_project_options(),
     "check_project_integrity": lambda: main.check_project_integrity(),
     "get_output_jobs": lambda: main.get_output_jobs(),
+    "check_fab_drawing": lambda: main.check_fab_drawing(),
     # The project folder against itself: no Git clone is needed in folder mode.
     "diff_design": lambda: main.diff_design(project_dir_a=main._project["root_dir"]),
     "list_variants": lambda: main.list_variants(),
@@ -213,6 +214,16 @@ def test_design_notes_and_pictures(env):
     assert "sheet:sheet1 notes:" in notes
     assert "draftsman:Fab.PCBDwf" in notes
     assert isinstance(main.get_design_image("Fab.PCBDwf"), Image)
+
+
+def test_fab_drawing_checks_all_but_the_bom_parts(env):
+    root, _, _ = env
+    _load(root)
+    result = json.loads(main.check_fab_drawing())
+    assert result["drawings_total"] == 1 and result["details"][0]["kind"] == "fabrication"
+    assert result["boards"][0]["pcb_doc"] == "Board.PcbDoc"
+    assert [n["check"] for n in result["not_checked"]] == ["bom_parts"]
+    assert "no netlist is loaded" in result["not_checked"][0]["reason"]
 
 
 def test_constraints_review_explains_the_missing_netlist(env):
