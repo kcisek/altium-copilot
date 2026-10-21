@@ -75,6 +75,14 @@ def components_from_stream(
     source names the sheet in logged warnings. Designators that name two or more
     different components are appended to clashes, see _merge_parts.
     """
+    return _components_from_records(_read_records(data), source, clashes)
+
+
+def _components_from_records(
+    records: list[dict[str, str]], source: str = "",
+    clashes: list[DesignatorClash] | None = None,
+) -> dict[str, ComponentMeta]:
+    """components_from_stream for the records _read_records gives (stripped values)."""
     # Parsing state
     # Key: owner_key = record_num - 1 for the RECORD=1 entry
     components_by_owner: dict[int, ComponentMeta] = {}
@@ -87,7 +95,7 @@ def components_from_stream(
     origins: dict[int, list[tuple[float, float]]] = {}  # canonical owner_key -> part origins
     masks: list[list[float]] = []          # compile mask rectangles
 
-    for record_num, props in enumerate(_read_records(data)):
+    for record_num, props in enumerate(records):
         record_type = props.get("record")
         # owner_key for a RECORD=1 at record_num is (record_num - 1),
         # matching the OwnerIndex used by child records.
@@ -239,18 +247,39 @@ def _merge_parts(
     return {refdes: held.meta for refdes, held in components.items()}
 
 
-def _parse_props(text: str) -> dict[str, str]:
+_C1_RE = re.compile("[\x80-\x9f]")
+
+
+def _ansi(value: str) -> str:
+    """A value Altium wrote in the ANSI code page (no %UTF8% copy), read as Windows-1252
+    instead of the latin-1 the record was decoded with: bytes 0x80-0x9F are then the
+    typographic characters they stand for (dashes, quotes), not C1 control codes."""
+    if not _C1_RE.search(value):
+        return value
+    out = []
+    for char in value:
+        if "\x80" <= char <= "\x9f":
+            # 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no cp1252 character: kept as read.
+            char = bytes([ord(char)]).decode("cp1252", errors="ignore") or char
+        out.append(char)
+    return "".join(out)
+
+
+def _parse_props(text: str, strip: bool = True) -> dict[str, str]:
     """`|KEY=VALUE|...` as a dict with lower-case keys.
 
     Altium writes the same key as OwnerIndex in some sheets and OWNERINDEX in others
-    (most of its AD25 examples), so keys are matched case-insensitively.
+    (most of its AD25 examples), so keys are matched case-insensitively. strip False
+    keeps each value as written (leading and trailing whitespace included) and reads
+    values without a %UTF8% copy as Windows-1252, see _ansi.
     """
     props: dict[str, str] = {}
     for part in text.split("|"):
         if "=" in part:
             key, _, val = part.partition("=")
             key = key.strip().lower()
-            val = val.strip()
+            if strip:
+                val = val.strip()
             if key.startswith("%utf8%"):
                 # The record was decoded as latin-1, so %UTF8% values are
                 # latin-1 bytes that are actually UTF-8. Re-encode→decode to
@@ -261,17 +290,17 @@ def _parse_props(text: str) -> dict[str, str]:
                     pass
                 props[key[6:]] = val
             elif key not in props:
-                props[key] = val
+                props[key] = val if strip else _ansi(val)
     return props
 
 
-def _read_records(data: bytes) -> list[dict[str, str]]:
+def _read_records(data: bytes, strip: bool = True) -> list[dict[str, str]]:
     """Split a schematic stream into property dicts with lower-case keys.
 
     Each record is a 4-byte header (24-bit length, then a type byte, 0 = text) and a
     `|KEY=VALUE|...` body. Binary records become empty dicts so that list positions,
     which OwnerIndex refers to, stay aligned. Position 0 is the stream header, and a
-    child's OwnerIndex is its owner's position minus one.
+    child's OwnerIndex is its owner's position minus one. strip: see _parse_props.
     """
     records: list[dict[str, str]] = []
     offset = 0
@@ -284,7 +313,7 @@ def _read_records(data: bytes) -> list[dict[str, str]]:
             records.append({})
             continue
         text = body.decode("latin-1").rstrip("\x00")
-        records.append(_parse_props(text))
+        records.append(_parse_props(text, strip))
     return records
 
 
@@ -1144,3 +1173,150 @@ def _group(wires: int, members: list[tuple[str, object]]) -> WireGroup:
         if kind in ("port", "entry") or value not in target:
             target.append(value)
     return group
+
+
+# ---------- integrity: the sheet size, parts and names as written ----------
+
+# SheetStyle N (Design > Sheet Properties > Standard): name, width and height in 10 mil
+# units, landscape. The table and order are KiCad's Altium importer's (ASchSheetGetSize,
+# after python-altium's format notes); an absent or unknown style is A4, as there.
+SHEET_STYLES = (
+    ("A4", 1150, 760), ("A3", 1550, 1110), ("A2", 2230, 1570), ("A1", 3150, 2230),
+    ("A0", 4460, 3150), ("A", 950, 750), ("B", 1500, 950), ("C", 2000, 1500),
+    ("D", 3200, 2000), ("E", 4200, 3200), ("Letter", 1100, 850), ("Legal", 1400, 850),
+    ("Tabloid", 1700, 1100), ("OrCAD A", 990, 790), ("OrCAD B", 1540, 990),
+    ("OrCAD C", 2060, 1560), ("OrCAD D", 3260, 2060), ("OrCAD E", 4280, 3280),
+)
+
+
+@dataclass
+class SheetName:
+    """A name on a sheet as written: not stripped, the %UTF8% copy when Altium wrote one."""
+    kind: str                 # net_label, power_port, port, sheet_entry, designator, parameter
+    text: str                 # the name (a parameter's name)
+    x_mil: float = 0.0
+    y_mil: float = 0.0
+    owner: str = ""           # the part's designator (designators, parameters), the symbol's
+    value: str | None = None  # parameters: the value as written
+
+
+@dataclass
+class SheetPart:
+    """One placed part (RECORD=1); a multi-part component has one per part."""
+    designator: str           # as written
+    unique_id: str
+    lib_reference: str
+    x_mil: float
+    y_mil: float
+    points: list[tuple[float, float]] = field(default_factory=list)  # origin, drawn pin ends
+    masked: bool = False      # its origin is inside an enabled compile mask
+
+
+@dataclass
+class SheetIntegrity:
+    sheet_style: str          # a SHEET_STYLES name, or "Custom"
+    width_mil: float
+    height_mil: float
+    portrait: bool = False
+    parts: list[SheetPart] = field(default_factory=list)
+    names: list[SheetName] = field(default_factory=list)
+    bus_wires: int = 0        # RECORD=26
+    # parse_sch_doc's components: compile_masked and masked_unique_ids as the loads see them
+    components: dict[str, ComponentMeta] = field(default_factory=dict)
+
+
+def parse_sch_integrity(path: str) -> SheetIntegrity:
+    """Read what check_project_integrity needs from a .SchDoc: the sheet size (RECORD=31
+    SheetStyle, UseCustomSheet with CustomX/CustomY, WorkspaceOrientation), every part
+    with its origin, drawn pin ends and compile-mask cover (RECORD=211), and the names as
+    written: net labels (25), power ports (17), ports (18), sheet entries (16), designators
+    (34) and component parameters (41)."""
+    with olefile.OleFileIO(path) as f:
+        return integrity_from_stream(f.openstream("FileHeader").read(), source=path)
+
+
+def _sheet_size(props: dict[str, str]) -> tuple[str, float, float, bool]:
+    portrait = props.get("workspaceorientation", "").strip() == "1"
+    if props.get("usecustomsheet", "").strip().upper() in ("T", "TRUE"):
+        # A custom size is the width and height as given. Whether Altium turns it on a
+        # portrait sheet is undocumented (KiCad's importer does); the integrity check
+        # accepts both.
+        return "Custom", _coord(props, "customx"), _coord(props, "customy"), portrait
+    style = _int(props.get("sheetstyle", "0").strip())
+    name, width, height = SHEET_STYLES[style if 0 <= style < len(SHEET_STYLES) else 0]
+    width, height = width * _UNIT_MIL, height * _UNIT_MIL
+    return name, (height if portrait else width), (width if portrait else height), portrait
+
+
+def integrity_from_stream(data: bytes, source: str = "") -> SheetIntegrity:
+    """parse_sch_integrity for the bytes of a FileHeader stream."""
+    result = SheetIntegrity(*_sheet_size({}))
+    parts: dict[int, SheetPart] = {}
+    modes: dict[int, tuple[str, str]] = {}
+    designators: dict[int, tuple[str, float, float]] = {}
+    parameters: list[tuple[int, str, str, float, float]] = []
+    symbols: dict[int, tuple[str, float, float]] = {}  # designator, top-left corner
+    entries: list[tuple[int, str, float, float]] = []
+    masks: list[list[float]] = []
+    records = _read_records(data, strip=False)
+    for pos, props in enumerate(records):
+        record = props.get("record", "").strip()
+        owner = _owner_position(props)
+        x, y = _location(props)
+        if record == "31":
+            result.sheet_style, result.width_mil, result.height_mil, result.portrait = (
+                _sheet_size(props))
+        elif record == "1":
+            parts[pos] = SheetPart("", props.get("uniqueid", "").strip(),
+                                   props.get("libreference", "").strip(), x, y, [(x, y)])
+            modes[pos] = (props.get("currentpartid", "1").strip(),
+                          props.get("displaymode", "0").strip())
+        elif record == "2" and owner in parts:
+            part, mode = modes[owner]
+            conglomerate = _int(props.get("pinconglomerate", "0").strip())
+            if (props.get("ownerpartid", part).strip() in (part, "-1", "0")
+                    and props.get("ownerpartdisplaymode", "0").strip() == mode
+                    and not conglomerate & 0x04):
+                parts[owner].points.append(_pin_end(props, conglomerate))
+        elif record == "34" and owner in parts:
+            if props.get("name", "").strip().lower() == "designator":
+                designators[owner] = (props.get("text", ""), x, y)
+        elif record == "41" and owner in parts:
+            if props.get("name", "").strip():
+                parameters.append((owner, props["name"], props.get("text", ""), x, y))
+        elif record == "211" and owner is None:
+            if props.get("collapsed", "").strip().upper() != "T":
+                masks.append(_rect(props))
+        elif record == "15" and owner is None:
+            symbols[pos] = ("", x, y)  # an entry is placed by its symbol's top-left corner
+        elif record == "32" and owner in symbols:
+            symbols[owner] = (props.get("text", "").strip(), *symbols[owner][1:])
+        elif record == "16" and owner in symbols:
+            entries.append((owner, props.get("name", ""), *symbols[owner][1:]))
+        elif owner is not None:
+            continue  # symbol graphics, template content
+        elif record in ("17", "25", "18"):
+            kind = {"17": "power_port", "25": "net_label", "18": "port"}[record]
+            text = props.get("name" if record == "18" else "text", "")
+            if text.strip():
+                result.names.append(SheetName(kind, text, x, y))
+        elif record == "26":
+            result.bus_wires += 1
+    for pos, part in parts.items():
+        text, x, y = designators.get(pos, ("", part.x_mil, part.y_mil))
+        part.designator = text
+        part.masked = any(x0 <= part.x_mil <= x1 and y0 <= part.y_mil <= y1
+                          for x0, y0, x1, y1 in masks)
+        result.parts.append(part)
+        if text:
+            result.names.append(SheetName("designator", text, x, y, owner=text.strip()))
+    for owner, name, value, x, y in parameters:
+        designator = parts[owner].designator.strip()
+        result.names.append(SheetName("parameter", name, x, y, owner=designator, value=value))
+    for owner, name, x, y in entries:
+        if name.strip():
+            result.names.append(SheetName("sheet_entry", name, x, y, owner=symbols[owner][0]))
+    # The same records stripped, as parse_sch_doc reads them (one decode of the stream).
+    result.components = _components_from_records(
+        [{key: value.strip() for key, value in props.items()} for props in records], source)
+    return result

@@ -6,6 +6,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_project_integrity`: problems in the project folder, the .PrjPcb and the strings
+  on the sheets that silently break compile, sync or saving, offline (roadmap #12). File
+  checks: schematics with legacy extensions (.Sch, .S01, .S02 ...; Altium KB: Update PCB
+  then removes every part they place) and a legacy .Pcb (a warning: the KB renames it
+  along with them), documents listed in the project but missing on disk (sheets and
+  harnesses are errors; device sheets, which Altium also looks for in the Device Sheets
+  folders set in Preferences, and other types warnings), a .Annotation file that renames parts on a design with no sheet compiled
+  more than once (the Compiled tab, PCB and BOM then differ from the editor; KB "Multiple/
+  different designators in schematic"), one that renames nothing, entries for parts that
+  are gone and a `<project>.Annotation` the .PrjPcb does not list, parts placed outside
+  the sheet (all their points beyond it: compiled but not printed) or partly outside,
+  compile-masked parts and masked copies, and variant entries that no longer fit their
+  parts (bound by `get_bom`'s plan: designator changed, UniqueId gone, no such part,
+  ambiguous, on a masked part; older [CompVar] Not Fitted lists too), with the project's ERC level for "Object not completely
+  within sheet boundaries", "Incorrect link in project variant" and "Bus range syntax
+  errors". Name checks on net labels, power ports, ports, sheet entries, designators and
+  component parameters as written: hidden characters (Unicode Cc, Cf, Co, Cn and spaces
+  other than U+0020; errors in net names and designators, the KB's CstrSchDoc save
+  failure), non-ASCII characters (not in parameter values), leading or trailing spaces,
+  brackets that are no `Name[first..last]` bus range, local parameters named
+  'Manufacturer N' / 'Manufacturer Part Number N' (reserved by ActiveBOM, overwritten from
+  Part Choices in exported BOMs per the KB) with the parts whose copilot MPN comes from
+  one (sch_doc's `_MPN_RE` reads exactly those names, and the parameter is found as it
+  does: the unnumbered name first, then the lowest N, quoted texts skipped; `get_bom`
+  reads them among other spellings), and on multi-channel
+  designs a Designator Format that puts channel text after the name on channel sheets
+  carrying buses (KB "Duplicate Net Names error on Multi-Channel buses") or writes
+  brackets, commas or spaces. Each finding groups one kind with its count, examples
+  (sheet, object, location in mil), an Altium fix and its KB source; `checks=` filters,
+  findings page under the result limit, and with a netlist the load diagnostics come
+  along. The sheet size is read from the sheet record (SheetStyle 0-17 with KiCad's
+  importer's table, UseCustomSheet with CustomX/CustomY, WorkspaceOrientation portrait;
+  a custom size on a portrait sheet is accepted either way round, as Altium does not
+  document whether it turns it);
+  names keep their spaces and use Altium's %UTF8% copy, else Windows-1252, so 0x80-0x9F
+  bytes read as the dashes and quotes they are. On Altium's 11 AD25 example projects the
+  one finding is a value holding two no-break spaces in Mini PC; their sheets (A4
+  portrait, A, B, C, D) keep every part inside. On a corpus of 63 projects (188 sheets):
+  no exceptions, median 0.07 s and at most 0.67 s per project uncached; none with errors;
+  982 compile-masked parts in 19 projects (info: usually deliberate; 945 of their 996
+  UniqueIds are not on the saved board while 1,888 of 1,919 live ones are; the other 51
+  are still on one project's board, which Update PCB would remove), 3,857 reserved
+  parameters in 39 projects (info, Altium's intended overwrite; 38 with a .BomDoc, and
+  844 of 1,941 local MPNs equal one of its Part Choices) and 1,918 parts whose copilot MPN comes from one, 9 net labels with
+  U+2212 MINUS SIGN in 8 projects, 6 stale variant entries in one project (all six agree
+  with the saved board), one missing library and one value with a trailing space; no
+  legacy extensions, hidden characters, parts outside the sheet (the 10 parts with a
+  point outside are compile-masked) or multi-channel designs.
 - `diff_design`: what changed between two states of a project, as an ECO-style changelog
   for reviews and release notes (roadmap #45). Sources: two revisions of the Git clone
   holding the loaded project (commit hashes, branches, tags, HEAD~n, or `working` for the

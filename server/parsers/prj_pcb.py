@@ -104,6 +104,28 @@ def parse_prj_options(path: str) -> PrjOptions:
     return options
 
 
+@dataclass
+class ProjectDocument:
+    """A [DocumentN] or [DeviceSheetN] entry of a .PrjPcb, whatever its file type."""
+    section: str  # e.g. Document3, DeviceSheet1
+    raw: str      # DocumentPath as written
+    path: str     # resolved against the project folder
+
+
+def parse_prj_documents(path: str) -> list[ProjectDocument]:
+    """Every document the .PrjPcb lists, in file order, with any extension (parse_prj_pcb
+    keeps only the types the tools read)."""
+    project_dir = Path(path).parent
+    documents = []
+    for header, lines in _split_sections(Path(path).read_text(encoding="utf-8-sig")):
+        if re.match(r"^(?:Document|DeviceSheet)\d+$", header, re.IGNORECASE):
+            raw = _get_field(lines, "DocumentPath") or ""
+            if raw:
+                resolved = str((project_dir / raw.replace("\\", "/")).resolve())
+                documents.append(ProjectDocument(header, raw, resolved))
+    return documents
+
+
 def _fields(lines: list[str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for line in lines:
