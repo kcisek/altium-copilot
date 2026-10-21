@@ -804,12 +804,33 @@ class SheetSymbol:
 
 
 @dataclass
+class NoErc:
+    """A No ERC directive (RECORD=22) placed on the sheet.
+
+    IsActive and SuppressAll read as KiCad's Altium importer reads them: T is true and an
+    absent key true too (records saved before Altium had the flags carry neither).
+    SuppressAll true is the generic No ERC (every violation suppressed); false is a
+    specific one, which suppresses only ErrorKindSetToSuppress (violation types) and
+    ConnectionPairsToSuppress (connection-matrix pairs), kept as written."""
+    x_mil: float = 0.0
+    y_mil: float = 0.0
+    active: bool = True
+    suppress_all: bool = True
+    symbol: str = ""            # Symbol: Thin Cross, Thick Cross, ...
+    error_kinds: str = ""       # ErrorKindSetToSuppress, raw
+    connection_pairs: str = ""  # ConnectionPairsToSuppress, raw
+    flags_written: bool = True  # IsActive, SuppressAll or Symbol present (not a legacy record)
+    wiring: WireGroup = field(default_factory=WireGroup)  # what it sits on
+
+
+@dataclass
 class SheetHierarchy:
     symbols: list[SheetSymbol] = field(default_factory=list)
     ports: list[SheetPort] = field(default_factory=list)
     groups: list[WireGroup] = field(default_factory=list)  # those of ports and entries
     power_ports: list[str] = field(default_factory=list)   # every power port name, once
     net_labels: list[str] = field(default_factory=list)    # every net label, once
+    no_ercs: list[NoErc] = field(default_factory=list)     # sheet-level No ERC directives
 
 
 def parse_sch_hierarchy(path: str) -> SheetHierarchy:
@@ -884,6 +905,19 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
             wiring.add_line(_vertices(props))
         elif record == "29":
             wiring.add_object("junction", None, [_location(props)])
+        elif record == "22":
+            no_erc = NoErc(
+                x_mil=_coord(props, "location.x"),
+                y_mil=_coord(props, "location.y"),
+                active=_flag(props, "isactive"),
+                suppress_all=_flag(props, "suppressall"),
+                symbol=props.get("symbol", ""),
+                error_kinds=props.get("errorkindsettosuppress", ""),
+                connection_pairs=props.get("connectionpairstosuppress", ""),
+                flags_written=any(k in props for k in ("isactive", "suppressall", "symbol")),
+            )
+            result.no_ercs.append(no_erc)
+            wiring.add_no_erc(no_erc, _location(props))
         elif record in ("17", "25") and props.get("text"):
             kind = "power_port" if record == "17" else "label"
             wiring.add_object(kind, props["text"], [_location(props)])
@@ -907,6 +941,12 @@ def _int(text: str) -> int:
         return int(text)
     except ValueError:
         return 0
+
+
+def _flag(props: dict[str, str], key: str) -> bool:
+    """A T/F flag, true when absent (KiCad's ReadBool(..., true) for No ERC records)."""
+    value = props.get(key)
+    return True if value is None else value.strip().upper() in ("T", "TRUE")
 
 
 def _location(props: dict[str, str]) -> tuple[float, float]:
@@ -982,6 +1022,7 @@ class _Wiring:
         self._vertical: dict[int, list[tuple[float, float, int]]] = {}
         self._other: list[tuple[float, float, float, float, int]] = []
         self._parent: list[int] = []
+        self._no_ercs: list[tuple[NoErc, tuple[float, float]]] = []
 
     def add_line(self, vertices: list[tuple[float, float]]) -> None:
         if len(vertices) < 2:
@@ -998,6 +1039,11 @@ class _Wiring:
 
     def add_object(self, kind: str, item, points: list[tuple[float, float]]) -> None:
         self._objects.append((kind, item, points))
+
+    def add_no_erc(self, item: "NoErc", point: tuple[float, float]) -> None:
+        """A No ERC marker: it joins nothing (two wires crossing under it stay apart) but
+        takes the wiring of the object at its point, else of a line through it."""
+        self._no_ercs.append((item, point))
 
     def _lines_at(self, x: float, y: float) -> set[int]:
         found = set()
@@ -1070,6 +1116,13 @@ class _Wiring:
                 index[root] = len(groups)
                 groups.append(_group(line_counts.get(root, 0), members[root]))
             (item[0] if kind == "entry" else item).group = index[root]
+        for item, (x, y) in self._no_ercs:
+            node = at.get((_key(x), _key(y)))
+            if node is None:
+                node = min(self._lines_at(x, y), default=None)
+            if node is not None:
+                root = self._find(node)
+                item.wiring = _group(line_counts.get(root, 0), members.get(root, []))
         return groups
 
 
