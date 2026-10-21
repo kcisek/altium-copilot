@@ -84,9 +84,10 @@ APPROXIMATIONS = [
     "this violation is to extend the polygon over the centre (a track's centreline is "
     "tested against the poured copper). The style is the first enabled rule by priority "
     "whose first scope matches the pad or via and second the pour. Whether Altium also "
-    "matches them the other way round is not documented, and a pour's name and class are "
-    "not read, so every rule that may come first counts: the pad or via is tested only "
-    "when they all say Direct.",
+    "matches them the other way round is not documented, a pour's name and class are "
+    "not read, and a room term on a pour is decided only when the pour lies clear of the "
+    "room, so every rule that may come first counts: the pad or via is tested only when "
+    "they all say Direct.",
     "Pour copper is the copper saved in the file (a solid pour's regions, a hatched "
     "pour's tracks and arcs): a pour changed since its last repour is checked as "
     "saved; a shelved pour, and one with no saved copper (never poured, or poured to "
@@ -729,8 +730,8 @@ class Connectivity:
         """Does a pad or via touching a pour's copper on a layer meet it as
         'Check for incomplete connections' wants? With a direct connection
         (Polygon Connect Style) its centre must be inside the pour's outline;
-        one connected by relief, or whose style is not known, is not tested.
-        Cached per pad or via and pour."""
+        one connected by relief or no connect, or whose style is not known, is
+        not tested. Cached per pad or via and pour."""
         key = (row["id"], pour_id)
         if key not in self._pour_centres:
             self._pour_centres[key] = (
@@ -1065,7 +1066,9 @@ class Connectivity:
             result["weak"].append({
                 "layer": area.layer,
                 "objects": [
-                    self._describe(row, area.layer), f"Pour copper on {self.layer_name(area.layer)}",
+                    self._describe(row, area.layer),
+                    ("Pour outline" if area.kind == "pour_outline" else "Pour copper")
+                    + f" on {self.layer_name(area.layer)}",
                 ],
                 "x": x, "y": y,
             })

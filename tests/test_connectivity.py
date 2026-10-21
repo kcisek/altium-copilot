@@ -777,6 +777,8 @@ def test_direct_pad_or_via_with_its_centre_off_the_pour_outline_is_weak(
     ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Relief", []),
     ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Direct", BOTH),
     ("InNet('GND'", "All", "Relief", "Direct", []),
+    ("InNet('GND'", "All", "Direct", "Relief", []),
+    ("InNet('GND'", "All", "Direct", "Direct", BOTH),
 ])
 def test_polygon_connect_rule_matches_the_pad_or_via_and_the_pour(
     scope1, scope2, first, otherwise, flagged
@@ -799,28 +801,47 @@ def test_polygon_connect_rules_go_by_priority_when_enabled(enabled, flagged):
     assert sorted(item["objects"][0] for item in weak) == flagged
 
 
-def test_room_rule_is_decided_on_the_pour_too():
-    # A relief rule for a room the pads, the via and the pour are all outside.
+@pytest.mark.parametrize("room, term, flagged", [
+    # A relief rule for a room that the pads, the via and the pour all lie clear of.
+    ((1000, 1000, 1200, 1200), "WithinRoom", BOTH),
+    ((1000, 1000, 1200, 1200), "TouchesRoom", BOTH),
+    # A room over the pour's middle: the pads and the via are outside it, but how
+    # much of the pour lies in it is not measured, so the relief rule may apply.
+    ((-50, -10, 50, 10), "WithinRoom", []),
+    ((-50, -10, 50, 10), "TouchesRoom", []),
+])
+def test_room_rule_is_decided_on_the_pour_only_when_it_lies_clear(room, term, flagged):
     board = _straddling_board()
-    board.rule("RoomDefinition", name="PSU", VX0="1000mil", VY0="1000mil",
-               VX1="1200mil", VY1="1000mil", VX2="1200mil", VY2="1200mil",
-               VX3="1000mil", VY3="1200mil")
-    board.rule("PolygonConnect", scope="WithinRoom('PSU')", CONNECTSTYLE="Relief")
+    x1, y1, x2, y2 = (f"{value}mil" for value in room)
+    board.rule("RoomDefinition", name="PSU", VX0=x1, VY0=y1, VX1=x2, VY1=y1,
+               VX2=x2, VY2=y2, VX3=x1, VY3=y2)
+    board.rule("PolygonConnect", scope=f"{term}('PSU')", CONNECTSTYLE="Relief")
     board.rule("PolygonConnect", CONNECTSTYLE="Direct")
     result = check_connectivity(board.index(), checks=["weak"])
     weak = _finding(result, "weak_connection", "GND")
-    assert sorted(item["objects"][0] for item in weak) == BOTH
+    assert sorted(item["objects"][0] for item in weak) == flagged
+
+
+def test_room_term_on_the_pour_side_is_not_decided_by_its_middle():
+    # The pour's middle is in the room but most of it is not: the direct rule for
+    # pours within the room may or may not apply, so nothing is tested.
+    board = _straddling_board()
+    board.rule("RoomDefinition", name="PSU", VX0="-50mil", VY0="-10mil", VX1="50mil",
+               VY1="-10mil", VX2="50mil", VY2="10mil", VX3="-50mil", VY3="10mil")
+    board.rule("PolygonConnect", scope2="WithinRoom('PSU')", CONNECTSTYLE="Direct")
+    board.rule("PolygonConnect", CONNECTSTYLE="Relief")
+    result = check_connectivity(board.index(), checks=["weak"])
+    assert _finding(result, "weak_connection", "GND") == []
 
 
 def test_pour_whose_layer_is_not_read_takes_the_copper_layer():
-    # The pour's own layer did not resolve; its copper is on the top layer.
-    # U2-1 (top) matches the direct rule; the via (Multi-Layer) only through the
-    # pour, and no other rule applies, so its style is not known.
+    # The pour's own layer did not resolve; its copper is on the top layer, which
+    # the rule's pour scope asks for.
     board = _straddling_board(pour_layer=None)
-    board.rule("PolygonConnect", scope="OnTopLayer", CONNECTSTYLE="Direct")
+    board.rule("PolygonConnect", scope2="OnTopLayer", CONNECTSTYLE="Direct")
     result = check_connectivity(board.index(), checks=["weak"])
     weak = _finding(result, "weak_connection", "GND")
-    assert sorted(item["objects"][0] for item in weak) == ["Pad U2-1"]
+    assert sorted(item["objects"][0] for item in weak) == BOTH
 
 
 def test_pour_outline_standing_in_for_unread_copper_tests_pads_too():
@@ -829,6 +850,7 @@ def test_pour_outline_standing_in_for_unread_copper_tests_pads_too():
     assert _status(index, "GND") == "routed"
     weak = _finding(result, "weak_connection", "GND")
     assert sorted(item["objects"][0] for item in weak) == BOTH
+    assert {item["objects"][1] for item in weak} == {"Pour outline on Top Layer"}
 
 
 def test_through_hole_pad_takes_the_rule_thpad_style():

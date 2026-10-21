@@ -356,14 +356,50 @@ def point_in_polygon(x: float, y: float, vertices) -> bool:
 
 def _object_anchor(obj: ObjectFacts) -> tuple[float, float] | None:
     """Point that decides room/region membership: a via or pad centre, the
-    midpoint of a track or arc chord, the mean of a polygon's outline points
-    (Altium tests pads and vias by their centre; whole-object containment for
-    straddling tracks and polygons is approximated)."""
+    midpoint of a track or arc chord (Altium tests pads and vias by their
+    centre; whole-object containment for straddling tracks is approximated)."""
     if not obj.points:
         return None
     xs = [point[0] for point in obj.points]
     ys = [point[1] for point in obj.points]
     return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def _polygon_region_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple:
+    """A room or region term on a polygon (its outline in obj.points): false
+    when the outline's bounds miss every room or region it names, else unknown
+    (how much of a pour lies in a room is not measured)."""
+    name, args = node[1], node[2]
+    if name in ("withinroom", "touchesroom", "inroom"):
+        shapes = [
+            vertices
+            for room, vertices in ctx.room_shapes.items()
+            if _any_matches(args, {room})
+        ]
+        if not shapes:
+            return _FALSE if args and not _any_matches(args, ctx.rooms) else _unknown(node)
+        boxes = [
+            (min(x for x, _ in vertices), min(y for _, y in vertices),
+             max(x for x, _ in vertices), max(y for _, y in vertices))
+            for vertices in shapes
+        ]
+    elif name in ("inregion", "inregionabsolute") and len(args) == 4:
+        try:
+            x1, y1, x2, y2 = (float(str(arg).lower().replace("mil", "")) for arg in args)
+        except ValueError:
+            return _unknown(node)
+        boxes = [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))]
+    else:
+        return _unknown(node)
+    if not obj.points:
+        return _unknown(node)
+    minx, maxx = min(x for x, _ in obj.points), max(x for x, _ in obj.points)
+    miny, maxy = min(y for _, y in obj.points), max(y for _, y in obj.points)
+    if all(
+        box[2] < minx or maxx < box[0] or box[3] < miny or maxy < box[1] for box in boxes
+    ):
+        return _FALSE
+    return _unknown(node)
 
 
 def _pour_copper_call(node) -> tuple:
@@ -428,6 +464,8 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
         if name in checks:
             return _TRUE if checks[name] else _FALSE
         return _unknown(node)
+    if name in _REGION_PREDICATES and obj.kind == "polygon":
+        return _polygon_region_call(node, obj, ctx)
     if name in ("withinroom", "touchesroom", "inroom"):
         anchor = _object_anchor(obj)
         shapes = [

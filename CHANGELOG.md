@@ -462,8 +462,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   included, within 0.5 mil. Relief connections are not tested, as in Altium's help,
   and neither is a pad or via whose style is not known. The style is that of the first
   enabled rule by priority whose first scope matches the pad or via and second the
-  pour; layer, net and IsPolygon terms are decided on the pour, its name and class are
-  not read. Altium's help does not say whether the scopes may also match the other way
+  pour. Layer, net and IsPolygon terms are decided on the pour, a room or region term
+  only when the pour lies clear of it, and its name and class are not read. Altium's
+  help does not say whether the scopes may also match the other way
   round, so every rule that may come first counts, and the pad or via is tested only
   when they all say Direct. On Altium's 6 examples, 12 of 28,988 pad and via contacts
   with solid pour copper have their centre off the outline: 7 direct vias and 5
