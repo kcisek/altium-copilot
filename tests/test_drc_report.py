@@ -13,7 +13,8 @@ from server.parsers.drc_report import (
     read_text,
 )
 from server.parsers.pcb_doc import (
-    DiffPair, DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour, decode_polygons,
+    DiffPair, DrcOptions, PcbComponent, PcbData, PcbRule, PolygonPour, decode_board,
+    decode_polygons,
 )
 from server.parsers.prj_pcb import VariantState
 from server.services.drc_results import (
@@ -21,6 +22,7 @@ from server.services.drc_results import (
     summarize,
 )
 from server.services.pcb_index import PcbIndex
+from tests.test_pcb_doc_parser import _shape_props
 from tests.test_pcb_index import _board, _pad
 
 FIXTURES = Path(__file__).parent / "fixtures" / "drc"
@@ -570,6 +572,21 @@ def test_short_to_a_polygon_finds_the_pour_by_its_arcs():
     index.pcb.pours = [pour]
     box = (-125000.0, -125000.0, 125000.0, 125000.0)
     assert DrcLinker(index).link(SHORT, box, "ShortCircuit")["nets"] == ["CLK", "GND"]
+
+
+def test_zoom_boxes_are_measured_against_the_outline_arcs():
+    # A strip 3000 x 200 mil whose bottom edge runs round a circle reaching
+    # 800 mil below it (the copper is two pads on that edge): a 600 mil tall
+    # zoom box in the circle is not larger than the board.
+    index = _index()
+    index.pcb.board.outline_vertices = decode_board([_shape_props(
+        (1000, 1500), (2100, 1500, (2500, 1200, 500, 143.130102354156, 36.869897645844)),
+        (2900, 1500), (4000, 1500), (4000, 1700), (1000, 1700),
+    )]).outline_vertices
+    linked = DrcLinker(index).link(
+        "Width Constraint: Track on Top Layer", (2400.0, 800.0, 2600.0, 1400.0), "Width",
+    )
+    assert linked["location_mil"] == {"x_mil": 2500.0, "y_mil": 1100.0}
 
 
 def test_clearance_to_a_polygon_takes_the_pours_net():

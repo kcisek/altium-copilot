@@ -903,7 +903,12 @@ def test_decode_polygons_resolves_inner_layer_via_mid_alias():
 def _polygon(*vertices, **props) -> dict[str, str]:
     """A Polygons6 record: (x, y) vertices, or (x, y, (cx, cy, r, sa, ea)) for a
     KINDn=1 arc edge from that vertex (mil and degrees, as Altium writes them)."""
-    record = {"LAYER": "TOP", "NET": "5", "HATCHSTYLE": "Solid", **props}
+    return _shape_props(*vertices, **{"LAYER": "TOP", "NET": "5", "HATCHSTYLE": "Solid", **props})
+
+
+def _shape_props(*vertices, **props) -> dict[str, str]:
+    """VXn/VYn vertices and their KINDn edges, as Polygons6 and Board6 store them."""
+    record = dict(props)
     for index, (x, y, *arc) in enumerate(vertices):
         record[f"VX{index}"] = f"{x}mil"
         record[f"VY{index}"] = f"{y}mil"
@@ -1054,6 +1059,63 @@ def test_decode_polygons_draws_a_degenerate_arc_straight(key, value):
     ((pour,), edges) = decode_polygons([record], {"top": 1})
     assert pour.vertices == [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]
     assert len(edges) == 4
+
+
+# Bluetooth Sentinel's outline in small: a strip 300 x 20 mil whose bottom edge
+# runs round a circle of radius 50 below it, an arc counter-clockwise from
+# 143.13 to 36.87 degrees (3-4-5 triangles) drawn from vertex 1, then closes
+# on a copy of vertex 0. Its vertices alone span 20 mil in y; with the arc, 100.
+STRIP_WITH_CIRCLE = (
+    (0, 0), (110, 0, (150, -30, 50, 143.130102354156, 36.869897645844)), (190, 0),
+    (300, 0), (300, 20), (0, 20), (0, 0),
+)
+
+
+def test_decode_board_outline_follows_arc_edges():
+    board = decode_board([{**BOARD_PROPS, **_shape_props(*STRIP_WITH_CIRCLE)}])
+    shape = board.outline_shape  # kept as stored, arc included
+    assert len(shape) == 6
+    assert shape[1].arc == pytest.approx((150.0, -30.0, 50.0, 143.130102354156, 36.869897645844))
+    points = board.outline_vertices
+    assert points[:2] == [(0.0, 0.0), (110.0, 0.0)]
+    assert points[-4:] == [(190.0, 0.0), (300.0, 0.0), (300.0, 20.0), (0.0, 20.0)]
+    _assert_follows_arc(points[1:-3], 150.0, -30.0, 50.0)
+    xs, ys = [x for x, _ in points], [y for _, y in points]
+    assert (min(xs), max(xs), max(ys)) == (0.0, 300.0, 20.0)
+    assert min(ys) == pytest.approx(-80.0, abs=ARC_MAX_SAGITTA_MIL)
+    assert point_in_polygon(150.0, -70.0, points)  # in the circle
+    assert point_in_polygon(150.0, 10.0, points)  # in the strip
+    assert not point_in_polygon(150.0, -81.0, points)
+    assert not point_in_polygon(50.0, -10.0, points)
+
+
+def test_decode_board_round_outline():
+    # Two half circles, each drawn from its own vertex: the two vertices alone
+    # are a line.
+    board = decode_board([{**BOARD_PROPS, **_shape_props(
+        (50, 0, (50, 50, 50, 270, 90)), (50, 100, (50, 50, 50, 90, 270)), (50, 0),
+    )}])
+    assert len(board.outline_shape) == 2
+    points = board.outline_vertices
+    _assert_follows_arc(points + points[:1], 50.0, 50.0, 50.0)
+    xs, ys = [x for x, _ in points], [y for _, y in points]
+    assert (min(ys), max(ys)) == (0.0, 100.0)
+    assert min(xs) == pytest.approx(0.0, abs=ARC_MAX_SAGITTA_MIL)
+    assert max(xs) == pytest.approx(100.0, abs=ARC_MAX_SAGITTA_MIL)
+    assert point_in_polygon(50.0, 50.0, points)
+
+
+def test_decode_board_draws_an_arc_of_huge_angles_straight():
+    # Finite angles whose difference overflows: a straight edge, as other bad
+    # arc values give, not a Board6 parse failure that loses the whole board.
+    props = _shape_props(*STRIP_WITH_CIRCLE)
+    props.update({"SA1": "1e308", "EA1": "-1e308"})
+    board = decode_board([{**BOARD_PROPS, **props}])
+    assert board.outline_shape[1].arc is None
+    assert board.outline_vertices == [
+        (0.0, 0.0), (110.0, 0.0), (190.0, 0.0), (300.0, 0.0), (300.0, 20.0), (0.0, 20.0),
+    ]
+    assert board.layers  # the rest of the board is read
 
 
 def _stream_text(records: list[dict[str, str]]) -> bytes:
