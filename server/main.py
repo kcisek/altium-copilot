@@ -77,6 +77,7 @@ try:
     from services.images import (
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
+    from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
     from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
@@ -134,6 +135,7 @@ except ImportError:
     from server.services.images import (
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
+    from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -288,6 +290,18 @@ DNP reasons, fabrication requirements. Use it.
   when source_pcb is flagged as not this project's PcbDoc.
 - Review comments made in Altium 365 are stored in the cloud workspace and cannot be
   read by these tools. If the user asks about them, say so.
+
+## Sheet Hierarchy
+
+- get_design_hierarchy — "how is the design structured?", "why is this net called X?",
+  "how does X get from sheet A to sheet B?", "why isn't this port connected?": the sheet
+  tree (sheet symbols, device sheets, Repeat channels), each sheet's ports and its
+  symbols' entries, and the Net Identifier Scope with what Automatic resolves to.
+  Explain cross-sheet connections from scope.explanation and net names from
+  scope.net_naming (name_precedence) plus each port's labels; never assume a scope.
+  With a netlist, ports and entries name their net (nets: one per channel). Issues are
+  read from the files, not Altium's compiler: quote issue_help and say Compile in
+  Altium (Messages panel) is the final word. sheet= narrows to a subtree.
 
 ## Bill of Materials
 
@@ -532,8 +546,8 @@ def _netlist_required_error() -> dict:
             "schematic connectivity of the netlist, which only Altium Designer can "
             "generate. Open the project in Altium Designer once, then call set_project_dir "
             "again; later loads reuse the cached netlist without Altium. Board, design-rule, "
-            "length, differential-pair, via, DRC report, design-notes, picture and variant "
-            "tools work now."
+            "length, differential-pair, via, DRC report, design-notes, picture, sheet-hierarchy "
+            "and variant tools work now."
         ),
     }
 
@@ -944,8 +958,8 @@ def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool)
         "Partial load: Altium Designer is not running and no up-to-date cached netlist was "
         "found, so the project was loaded from its files without a netlist. The tools in "
         "netlist_required_tools need it and answer netlist_required; board, design-rule, "
-        "length, differential-pair, via, DRC report, design-notes, picture and variant "
-        "tools work. PCB parts are not linked to schematic parts (sch_refdes is empty) and "
+        "length, differential-pair, via, DRC report, design-notes, picture, sheet-hierarchy "
+        "and variant tools work. PCB parts are not linked to schematic parts (sch_refdes is empty) and "
         "DNP comes from the designators stored in the variants. To load fully, open the "
         "project in Altium Designer once and call set_project_dir again; later loads "
         "reuse the cached netlist without Altium."
@@ -1681,6 +1695,52 @@ def get_design_image(document: str, index: int = 0) -> Image | str:
         return json.dumps(e.payload)
     result = _get_design_image_impl(project, _design_notes, document, index)
     return json.dumps(result) if isinstance(result, dict) else result
+
+
+# ---------- get_design_hierarchy ----------
+
+@mcp.tool(
+    title="Get Design Hierarchy",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_design_hierarchy(sheet: str | None = None, offset: int = 0) -> str:
+    """The project's sheet hierarchy offline, like Altium's Report Project Hierarchy: the
+    sheet tree from the top sheet(s) (sheets no sheet symbol places) down through the
+    sheet symbols, with device sheets, Repeat(...) channels and their counts marked; per
+    sheet its ports (name, I/O type, harness) and its sheet symbols with their entries
+    (name, I/O type, harness; port_io when the child's port differs or is missing); and
+    the project's Net
+    Identifier Scope (the .PrjPcb setting, what Automatic resolves to for this project,
+    how nets cross sheets under it, and the net naming options). Use it to explain why a
+    net has its name and how it crosses sheets. With a compiled netlist each port and
+    entry names the net (or one net per channel) it joins; labels lists the net labels
+    and power ports on its wiring. Issues: symbols pointing at missing files, entries
+    without a port in the child and ports without an entry, I/O and harness mismatches,
+    ports on a top sheet under a hierarchical scope, duplicate symbols or entries,
+    sheets placed several times, cycles, unwired ports and entries (issue_help explains
+    each kind; findings of one kind on one symbol or sheet are listed together in
+    entries or ports, and summary counts each one).
+
+    sheet (a sheet name or file name) narrows the tree, sheets and issues to its
+    subtree. Sheet details are paginated (offset from next_offset); the tree and issues
+    come with the first page."""
+    try:
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    model = build_design_hierarchy(project, _design_notes.hierarchy, netlist, sheet)
+    if "error" in model:
+        return json.dumps(model)
+    if netlist is not None:
+        model["netlist_updated_utc"] = _netlist_last_updated
+    # Sheet details shrink first; the issues (errors first) only when that is not enough.
+    for limit, issue_limit in ((40, 150), (15, 150), (5, 150), (5, 60), (1, 60), (1, 20)):
+        rendered = json.dumps(page_design_hierarchy(model, offset, limit, issue_limit),
+                              indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
 
 
 # ---------- list_variants ----------

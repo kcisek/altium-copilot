@@ -724,3 +724,370 @@ def image_from_storage(data: bytes, file_name: str) -> bytes:
         if file_name in names:
             return zlib.decompress(body[6 + name_len : 6 + name_len + size])
     raise KeyError(file_name)
+
+
+# ---------- hierarchy: sheet symbols, sheet entries, ports and their wiring ----------
+
+IO_TYPES = {"0": "Unspecified", "1": "Output", "2": "Input", "3": "Bidirectional"}
+_SIDES = {"0": "left", "1": "right", "2": "top", "3": "bottom"}
+# A sheet symbol designator Repeat(Name, First, Last) places the child once per channel;
+# a sheet entry Repeat(Name) splits its bus or harness across the channels.
+REPEAT_RE = re.compile(r"^\s*repeat\s*\(\s*([^,()]+?)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s*$",
+                       re.IGNORECASE)
+ENTRY_REPEAT_RE = re.compile(r"^\s*repeat\s*\(\s*([^,()]+?)\s*\)\s*$", re.IGNORECASE)
+_EPS_MIL = 0.01  # points closer than this are one point
+
+
+@dataclass
+class WireGroup:
+    """What one piece of wiring joins on a sheet: wires, buses and signal harnesses
+    joined end to line, and the pins, labels, power ports, ports and entries on them."""
+    wires: int = 0
+    pins: list[tuple[str, str]] = field(default_factory=list)  # (sheet designator, pin)
+    labels: list[str] = field(default_factory=list)            # net labels (RECORD=25)
+    power_ports: list[str] = field(default_factory=list)       # power ports (RECORD=17)
+    ports: list[str] = field(default_factory=list)
+    entries: list[tuple[str, str]] = field(default_factory=list)  # (symbol, entry name)
+
+    @property
+    def wired(self) -> bool:
+        """Something besides one port or entry is attached."""
+        return bool(self.wires or self.pins or self.labels or self.power_ports
+                    or len(self.ports) + len(self.entries) > 1)
+
+
+@dataclass
+class SheetPort:
+    name: str
+    io_type: str = "Unspecified"
+    harness_type: str = ""
+    group: int = -1  # index into SheetHierarchy.groups
+
+
+@dataclass
+class SheetEntry:
+    name: str
+    io_type: str = "Unspecified"
+    side: str = "left"
+    harness_type: str = ""
+    group: int = -1
+
+    @property
+    def port_name(self) -> str:
+        """The name of the child sheet's port it connects to (Repeat(X) -> X)."""
+        m = ENTRY_REPEAT_RE.match(self.name)
+        return m.group(1) if m else self.name
+
+    @property
+    def repeated(self) -> bool:
+        return bool(ENTRY_REPEAT_RE.match(self.name))
+
+
+@dataclass
+class SheetSymbol:
+    designator: str = ""
+    file_name: str = ""
+    unique_id: str = ""
+    symbol_type: str = ""     # Normal, or Design Item for a sheet placed from a server
+    design_item_id: str = ""
+    entries: list[SheetEntry] = field(default_factory=list)
+    x_mil: float = 0.0        # top-left corner; Altium's Y axis points up
+    y_mil: float = 0.0
+    width_mil: float = 0.0
+    height_mil: float = 0.0
+
+    @property
+    def channel(self) -> tuple[str, int, int] | None:
+        """(name, first, last) of a Repeat(name, first, last) designator, else None."""
+        m = REPEAT_RE.match(self.designator)
+        return (m.group(1), int(m.group(2)), int(m.group(3))) if m else None
+
+
+@dataclass
+class SheetHierarchy:
+    symbols: list[SheetSymbol] = field(default_factory=list)
+    ports: list[SheetPort] = field(default_factory=list)
+    groups: list[WireGroup] = field(default_factory=list)  # those of ports and entries
+    power_ports: list[str] = field(default_factory=list)   # every power port name, once
+    net_labels: list[str] = field(default_factory=list)    # every net label, once
+
+
+def parse_sch_hierarchy(path: str) -> SheetHierarchy:
+    """Read a sheet's sheet symbols (RECORD=15 with their designator 32, file name 33 and
+    sheet entries 16), its ports (18), and the wiring each port and entry is on: the
+    component pins, net labels (25) and power ports (17) joined to it by wires (27),
+    buses (26), signal harnesses (218, in the Additional stream) and junctions (29)."""
+    with olefile.OleFileIO(path) as f:
+        additional = f.openstream("Additional").read() if f.exists("Additional") else b""
+        return hierarchy_from_stream(f.openstream("FileHeader").read(), additional)
+
+
+def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarchy:
+    """parse_sch_hierarchy for the bytes of a FileHeader stream and an Additional one,
+    where Altium keeps the harness objects."""
+    result = SheetHierarchy()
+    symbols: dict[int, SheetSymbol] = {}
+    parts: dict[int, tuple[str, str]] = {}  # component position -> (part id, display mode)
+    designators: dict[int, str] = {}
+    pins: list[tuple[int, str, tuple[float, float]]] = []  # (owner, pin, electrical end)
+    wiring = _Wiring()
+
+    for pos, props in enumerate(_read_records(data)):
+        record = props.get("record")
+        owner = _owner_position(props)
+        if record == "1":
+            parts[pos] = (props.get("currentpartid", "1"), props.get("displaymode", "0"))
+        elif record == "2" and owner in parts:
+            part, mode = parts[owner]
+            conglomerate = _int(props.get("pinconglomerate", "0"))
+            if (props.get("ownerpartid", part) in (part, "-1", "0")
+                    and props.get("ownerpartdisplaymode", "0") == mode
+                    and not conglomerate & 0x04 and props.get("designator")):  # 4: hidden
+                pins.append((owner, props["designator"], _pin_end(props, conglomerate)))
+        elif record == "34" and owner in parts and props.get("name", "").lower() == "designator":
+            designators[owner] = props.get("text", "")
+        elif record == "15" and owner is None:
+            symbols[pos] = SheetSymbol(
+                unique_id=props.get("uniqueid", ""),
+                symbol_type=props.get("symboltype", ""),
+                design_item_id=props.get("designitemid", ""),
+                x_mil=_coord(props, "location.x"),
+                y_mil=_coord(props, "location.y"),
+                width_mil=_coord(props, "xsize"),
+                height_mil=_coord(props, "ysize"),
+            )
+            result.symbols.append(symbols[pos])
+        elif record in ("32", "33") and owner in symbols:
+            name = "designator" if record == "32" else "file_name"
+            setattr(symbols[owner], name, props.get("text", "").strip())
+        elif record == "16" and owner in symbols:
+            symbol = symbols[owner]
+            entry = SheetEntry(
+                name=props.get("name", "").strip(),
+                io_type=IO_TYPES.get(props.get("iotype", "0"), "Unspecified"),
+                side=_SIDES.get(props.get("side", "0"), "left"),
+                harness_type=props.get("harnesstype", ""),
+            )
+            symbol.entries.append(entry)
+            wiring.add_object("entry", (entry, symbol), [_entry_point(symbol, entry, props)])
+        elif owner is not None:
+            continue  # symbol graphics, template content
+        elif record == "18":
+            port = SheetPort(
+                name=props.get("name", "").strip(),
+                io_type=IO_TYPES.get(props.get("iotype", "0"), "Unspecified"),
+                harness_type=props.get("harnesstype", ""),
+            )
+            result.ports.append(port)
+            wiring.add_object("port", port, _port_ends(props))
+        elif record in ("26", "27", "218"):
+            wiring.add_line(_vertices(props))
+        elif record == "29":
+            wiring.add_object("junction", None, [_location(props)])
+        elif record in ("17", "25") and props.get("text"):
+            kind = "power_port" if record == "17" else "label"
+            wiring.add_object(kind, props["text"], [_location(props)])
+            names = result.power_ports if record == "17" else result.net_labels
+            if props["text"] not in names:
+                names.append(props["text"])
+
+    for props in _read_records(additional) if additional else ():
+        if props.get("record") == "218":
+            wiring.add_line(_vertices(props))
+    for owner, pin, point in pins:
+        refdes = designators.get(owner, "")
+        if refdes and "?" not in refdes:
+            wiring.add_object("pin", (refdes, pin), [point])
+    result.groups = wiring.resolve()
+    return result
+
+
+def _int(text: str) -> int:
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
+def _location(props: dict[str, str]) -> tuple[float, float]:
+    return _coord(props, "location.x"), _coord(props, "location.y")
+
+
+def _vertices(props: dict[str, str]) -> list[tuple[float, float]]:
+    count = _int(props.get("locationcount", "0"))
+    return [(_coord(props, f"x{i}"), _coord(props, f"y{i}")) for i in range(1, count + 1)]
+
+
+def _pin_end(props: dict[str, str], conglomerate: int) -> tuple[float, float]:
+    """A pin's electrical end: Location is where it meets the body, and the pin points
+    PinLength away in the direction PinConglomerate bits 0-1 give (0 right, 1 up, 2 left,
+    3 down)."""
+    x, y = _location(props)
+    length = _coord(props, "pinlength")
+    dx, dy = ((1, 0), (0, 1), (-1, 0), (0, -1))[conglomerate & 0x03]
+    return x + dx * length, y + dy * length
+
+
+def _entry_point(symbol: SheetSymbol, entry: SheetEntry, props: dict[str, str]) -> tuple[float, float]:
+    """Where a sheet entry sits on its symbol's edge. DistanceFromTop counts from the top
+    edge (left and right sides) or the left edge (top and bottom) in units of 100 mil,
+    plus DistanceFromTop_Frac1 in 1/100000 of a 10 mil unit."""
+    distance = (_int(props.get("distancefromtop", "0")) * 10
+                + _int(props.get("distancefromtop_frac1", "0")) / 100_000) * _UNIT_MIL
+    x, y = symbol.x_mil, symbol.y_mil
+    if entry.side == "right":
+        return x + symbol.width_mil, y - distance
+    if entry.side == "top":
+        return x + distance, y
+    if entry.side == "bottom":
+        return x + distance, y - symbol.height_mil
+    return x, y - distance
+
+
+def _port_ends(props: dict[str, str]) -> list[tuple[float, float]]:
+    """A port's two connection points: Width to the right of Location for the horizontal
+    styles (0-3), above it for the vertical ones (4-7)."""
+    x, y = _location(props)
+    width = _coord(props, "width")
+    if _int(props.get("style", "0")) >= 4:
+        return [(x, y), (x, y + width)]
+    return [(x, y), (x + width, y)]
+
+
+def _key(value: float) -> int:
+    return round(value / _EPS_MIL)
+
+
+def _on_segment(x: float, y: float, x0: float, y0: float, x1: float, y1: float) -> bool:
+    dx, dy = x1 - x0, y1 - y0
+    length2 = dx * dx + dy * dy
+    if length2 == 0:
+        return abs(x - x0) < _EPS_MIL and abs(y - y0) < _EPS_MIL
+    t = ((x - x0) * dx + (y - y0) * dy) / length2
+    if t < -1e-9 or t > 1 + 1e-9:
+        return False
+    return (x0 + t * dx - x) ** 2 + (y0 + t * dy - y) ** 2 < _EPS_MIL ** 2
+
+
+class _Wiring:
+    """A sheet's connectivity. Lines (wires, buses, harnesses) join where an end of one
+    lies on another (Altium's automatic junctions); objects (pins, ports, entries,
+    labels, power ports, junctions) join the lines their points lie on and objects at
+    the same point. Lines crossing without a junction stay apart."""
+
+    def __init__(self):
+        self._lines: list[list[tuple[float, float]]] = []
+        self._objects: list[tuple[str, object, list[tuple[float, float]]]] = []
+        self._horizontal: dict[int, list[tuple[float, float, int]]] = {}
+        self._vertical: dict[int, list[tuple[float, float, int]]] = {}
+        self._other: list[tuple[float, float, float, float, int]] = []
+        self._parent: list[int] = []
+
+    def add_line(self, vertices: list[tuple[float, float]]) -> None:
+        if len(vertices) < 2:
+            return
+        node = len(self._lines)
+        self._lines.append(vertices)
+        for (x0, y0), (x1, y1) in zip(vertices, vertices[1:]):
+            if abs(y0 - y1) < _EPS_MIL:
+                self._horizontal.setdefault(_key(y0), []).append((min(x0, x1), max(x0, x1), node))
+            elif abs(x0 - x1) < _EPS_MIL:
+                self._vertical.setdefault(_key(x0), []).append((min(y0, y1), max(y0, y1), node))
+            else:
+                self._other.append((x0, y0, x1, y1, node))
+
+    def add_object(self, kind: str, item, points: list[tuple[float, float]]) -> None:
+        self._objects.append((kind, item, points))
+
+    def _lines_at(self, x: float, y: float) -> set[int]:
+        found = set()
+        for key in (_key(y) - 1, _key(y), _key(y) + 1):
+            for x0, x1, node in self._horizontal.get(key, ()):
+                if x0 - _EPS_MIL <= x <= x1 + _EPS_MIL and abs(y - key * _EPS_MIL) < 2 * _EPS_MIL:
+                    found.add(node)
+        for key in (_key(x) - 1, _key(x), _key(x) + 1):
+            for y0, y1, node in self._vertical.get(key, ()):
+                if y0 - _EPS_MIL <= y <= y1 + _EPS_MIL and abs(x - key * _EPS_MIL) < 2 * _EPS_MIL:
+                    found.add(node)
+        for x0, y0, x1, y1, node in self._other:
+            if _on_segment(x, y, x0, y0, x1, y1):
+                found.add(node)
+        return found
+
+    def _find(self, i: int) -> int:
+        while self._parent[i] != i:
+            self._parent[i] = self._parent[self._parent[i]]
+            i = self._parent[i]
+        return i
+
+    def _union(self, a: int, b: int) -> None:
+        a, b = self._find(a), self._find(b)
+        if a != b:
+            self._parent[b] = a
+
+    def resolve(self) -> list[WireGroup]:
+        """Join everything, set each port's and entry's group and return those groups."""
+        lines = len(self._lines)
+        self._parent = list(range(lines + len(self._objects)))
+        for node, vertices in enumerate(self._lines):
+            for x, y in (vertices[0], vertices[-1]):
+                for other in self._lines_at(x, y):
+                    self._union(node, other)
+        at: dict[tuple, int] = {}
+        for i, (kind, item, points) in enumerate(self._objects):
+            node = lines + i
+            for x, y in points:
+                for line in self._lines_at(x, y):
+                    self._union(node, line)
+                key = (_key(x), _key(y))
+                if key in at:
+                    self._union(node, at[key])
+                else:
+                    at[key] = node
+            # On one sheet net labels, power ports and ports of one name are one net.
+            if kind in ("label", "power_port", "port"):
+                name = (kind, (item.name if kind == "port" else item).strip().lower())
+                if name in at:
+                    self._union(node, at[name])
+                else:
+                    at[name] = node
+
+        line_counts: dict[int, int] = {}
+        for node in range(lines):
+            root = self._find(node)
+            line_counts[root] = line_counts.get(root, 0) + 1
+        members: dict[int, list[tuple[str, object]]] = {}
+        for i, (kind, item, _) in enumerate(self._objects):
+            members.setdefault(self._find(lines + i), []).append((kind, item))
+
+        groups: list[WireGroup] = []
+        index: dict[int, int] = {}
+        for i, (kind, item, _) in enumerate(self._objects):
+            if kind not in ("port", "entry"):
+                continue
+            root = self._find(lines + i)
+            if root not in index:
+                index[root] = len(groups)
+                groups.append(_group(line_counts.get(root, 0), members[root]))
+            (item[0] if kind == "entry" else item).group = index[root]
+        return groups
+
+
+def _group(wires: int, members: list[tuple[str, object]]) -> WireGroup:
+    group = WireGroup(wires=wires)
+    for kind, item in members:
+        if kind == "pin":
+            target, value = group.pins, item
+        elif kind == "label":
+            target, value = group.labels, item
+        elif kind == "power_port":
+            target, value = group.power_ports, item
+        elif kind == "port":
+            target, value = group.ports, item.name
+        elif kind == "entry":
+            target, value = group.entries, (item[1].designator, item[0].name)
+        else:
+            continue
+        if kind in ("port", "entry") or value not in target:
+            target.append(value)
+    return group
