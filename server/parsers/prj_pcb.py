@@ -58,6 +58,68 @@ class PrjPcbData:
     net_naming: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class PrjOptions:
+    """The option sections of a .PrjPcb as written (key -> value), read for
+    get_project_options. Keys keep their case; values are stripped."""
+    design: dict[str, str] = field(default_factory=dict)              # [Design]
+    erc_levels: dict[str, str] = field(default_factory=dict)          # [Electrical Rules Check]
+    connection_matrix: dict[str, str] = field(default_factory=dict)   # [ERC Connection Matrix]
+    class_generation: dict[str, str] = field(default_factory=dict)    # [PrjClassGen]
+    # (DocumentPath as written, its ClassGen* / GenerateClassCluster keys) per schematic
+    # [DocumentN] and [DeviceSheetN].
+    sheet_class_generation: list[tuple[str, dict[str, str]]] = field(default_factory=list)
+    comparison: list[dict[str, str]] = field(default_factory=list)    # ComparisonOptionsN fields
+    difference_levels: dict[str, str] = field(default_factory=dict)   # [Difference Levels]
+    annotate: dict[str, str] = field(default_factory=dict)            # [Annotate]
+    diff_pair_suffixes: list[dict[str, str]] = field(default_factory=list)  # [DiffPairSuffixN]
+
+
+def parse_prj_options(path: str) -> PrjOptions:
+    """The project option sections of a .PrjPcb (Project Options dialog), as written."""
+    sections = _split_sections(Path(path).read_text(encoding="utf-8-sig"))
+    options = PrjOptions(
+        design=_section(sections, "Design"),
+        erc_levels=_section(sections, "Electrical Rules Check"),
+        connection_matrix=_section(sections, "ERC Connection Matrix"),
+        class_generation=_section(sections, "PrjClassGen"),
+        difference_levels=_section(sections, "Difference Levels"),
+        annotate=_section(sections, "Annotate"),
+    )
+    for header, lines in sections:
+        if re.match(r"^(?:Document|DeviceSheet)\d+$", header, re.IGNORECASE):
+            raw = _get_field(lines, "DocumentPath") or ""
+            if raw.lower().endswith(".schdoc"):
+                fields = _fields(lines)
+                options.sheet_class_generation.append((raw, {
+                    key: value for key, value in fields.items()
+                    if key.lower().startswith("classgen") or key.lower() == "generateclasscluster"
+                }))
+        elif re.match(r"^DiffPairSuffix\d+$", header, re.IGNORECASE):
+            options.diff_pair_suffixes.append(_fields(lines))
+        elif header.lower() == "comparison options":
+            for key, value in _fields(lines).items():
+                if key.lower().startswith("comparisonoptions"):
+                    options.comparison.append(_parse_inline_props(value))
+    return options
+
+
+def _fields(lines: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            result.setdefault(key.strip(), value.strip())
+    return result
+
+
+def _section(sections: list[tuple[str, list[str]]], name: str) -> dict[str, str]:
+    for header, lines in sections:
+        if header.lower() == name.lower():
+            return _fields(lines)
+    return {}
+
+
 # Project Options > Options > Netlist Options, as the [Design] keys that store them.
 NET_NAMING_KEYS = (
     "AllowPortNetNames", "AllowSheetEntryNetNames", "AppendSheetNumberToLocalNets",

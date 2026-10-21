@@ -6,6 +6,48 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_project_options`: the project settings that change how a design is read, offline
+  from the .PrjPcb (no netlist needed): the Net Identifier Scope and net naming (read as
+  `get_design_hierarchy` reads them), Allow Single Pin Nets, diff-pair suffixes (Altium's
+  _P/_N default; custom `[DiffPairSuffixN]` sections passed on raw), class generation
+  (`[PrjClassGen]` and each sheet's component class, room, net-class scope and structure
+  class), multi-channel Room Naming Style (`TChannelRoomNamingStyle`), designator format
+  and level separator, the report level of every Error Reporting violation type, the
+  Connection Matrix, the Comparator's object matching criteria and the output and ECO log
+  paths with the output options. `[Electrical Rules Check]` TypeN is mapped to Altium's
+  violation type of TErrorKind ordinal N-1 (Altium's WSM API order and the order of the
+  165 violation names in AD25's Workspace Manager, anchored by the two slots Altium
+  writes by name, MultiChannelAlternate and AlternateItemFail; Altium Develop's Workspace
+  Manager appends the 166th and 167th) and the 17 matrix rows and columns to the
+  dialog's pin, port and sheet-entry order. Each check is reported at its default
+  (counted), lowered, raised, or, where its default is unknown, listed by level. The
+  audit lists ERC checks switched off or downgraded from Altium's default (key checks
+  first, with what goes unreported), Connection Matrix cells relaxed for driver
+  conflicts and unconnected input pins, and every No ERC directive. A default is the level Altium's AD25 examples, the projects
+  shipped in its extensions and a corpus of real projects agree on; where they disagree
+  (e.g. Nets with only one pin) the check is not audited. Keys no Altium source verifies
+  (Difference Levels types, Comparison Options Confirm and InclAllRules, the Annotate
+  naming format, ERC types beyond the 167 names, TypeN values outside 0-3) are passed on
+  raw under `unmapped`.
+- No ERC directives (SchDoc RECORD=22) are read with the sheet hierarchy: location,
+  IsActive and SuppressAll (generic or specific, absent read as true as KiCad's importer
+  does, so records saved before the flags read as active generic ones), Symbol, and a
+  specific one's ErrorKindSetToSuppress and ConnectionPairsToSuppress as written. Each
+  takes the wiring of the object at its point (a pin's end, a port, a power port), else
+  of the wire through it, without joining anything itself; with a netlist its pins name
+  the compiled net and the net's pin count. A No ERC suppresses the violations reported
+  at its point, not the whole net. `get_project_options` lists them flagged first: an
+  active one on a power net (a power port on its wiring, or a rail name with no signal
+  token: VCC_EN is a signal), a high-fanout net, a net with several pins, or (offline) a
+  net that leaves the sheet through a sheet entry, a port (under the hierarchical scopes
+  only one a symbol placing the sheet has an entry for; under Flat and Global one another
+  sheet shares) or a net label another sheet shares under Global scope. On a corpus of
+  63 projects (offline): 29 have
+  ERC checks lowered from the default (26 switch off Nets with possible connection
+  problems and Nets containing multiple similar objects, 3 Nets with no driving source),
+  3 relax a driver-conflict matrix cell, and 62 hold 1,699 No ERC directives, all active
+  and generic, of which 30 in 8 projects are flagged (10 on power nets, 9 on nets with
+  several pins, 11 on nets leaving the sheet); no exceptions, at most 0.9 s per project.
 - `project_tour`: a guided tour of the loaded project for a newcomer, in the order Altium
   teaches a design: project and sheet hierarchy (`get_design_hierarchy`, `list_variants`),
   each schematic block (`get_sheet_context` per sheet in tree order, asking first above

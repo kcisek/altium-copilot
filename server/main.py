@@ -78,6 +78,7 @@ try:
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
+    from services.project_options import build_project_options, page_project_options
     from services.project_tour import build_project_tour, defined_variant_count
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
@@ -137,6 +138,7 @@ except ImportError:
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
     from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
+    from server.services.project_options import build_project_options, page_project_options
     from server.services.project_tour import build_project_tour, defined_variant_count
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
@@ -304,6 +306,16 @@ DNP reasons, fabrication requirements. Use it.
   With a netlist, ports and entries name their net (nets: one per channel). Issues are
   read from the files, not Altium's compiler: quote issue_help and say Compile in
   Altium (Messages panel) is the final word. sheet= narrows to a subtree.
+
+## Project Options
+
+- get_project_options — "what are the project settings?", "is ERC configured right?",
+  "why does compile not report X?", "where do outputs go?", "are any No ERCs hiding
+  problems?", before an ERC review: the .PrjPcb settings (net scope and naming, diff-pair
+  suffixes, class generation, multi-channel naming, ERC levels, Connection Matrix,
+  Comparator, output path) and an audit. Quote each audit entry with its default and
+  hides/risk; a flagged No ERC is a question for the designer, not a proven fault. Never
+  guess what an unmapped key means. The saved file is read: Compile in Altium is final.
 
 ## Project Tour
 
@@ -1748,6 +1760,49 @@ def get_design_hierarchy(sheet: str | None = None, offset: int = 0) -> str:
     for limit, issue_limit in ((40, 150), (15, 150), (5, 150), (5, 60), (1, 60), (1, 20)):
         rendered = json.dumps(page_design_hierarchy(model, offset, limit, issue_limit),
                               indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# ---------- get_project_options ----------
+
+@mcp.tool(
+    title="Get Project Options",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_project_options(offset: int = 0) -> str:
+    """The project settings that change how Altium reads the design, offline from the
+    .PrjPcb (Project Options): the Net Identifier Scope (and what Automatic resolves to)
+    with the net naming options, diff-pair suffixes, class generation (project-wide and
+    per sheet), multi-channel room naming and designator format, the ERC report level of
+    each violation type (Error Reporting), the Connection Matrix, the Comparator's
+    matching criteria and the output paths. The audit lists ERC checks switched off or
+    downgraded from Altium's default (hides says what goes unreported), Connection
+    Matrix cells relaxed for risky pin pairs (driver conflicts such as output to output,
+    unconnected input pins), and every No ERC directive on the sheets with its sheet,
+    location (mil), active flag, generic or specific mode, the net it sits on and its
+    kind (power, high_fanout, signal, single_pin, wire_only, nothing), flagged when an
+    active one sits on a power net or a net with several pins, where the violations it
+    suppresses at its point may hide real problems. With a
+    compiled netlist each No ERC names its net and the net's pin count; without one,
+    the names on its wiring and that sheet's pins. Keys that no Altium source verifies
+    are passed on raw under unmapped.
+
+    No ERC directives are paginated (offset from next_offset), flagged first; the
+    settings and audit come with the first page."""
+    try:
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    model = build_project_options(project, _design_notes.hierarchy, netlist)
+    if "error" in model:
+        return json.dumps(model)
+    if netlist is not None:
+        model["netlist_updated_utc"] = _netlist_last_updated
+    for limit in (200, 80, 30, 10, 1):
+        rendered = json.dumps(page_project_options(model, offset, limit), indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered

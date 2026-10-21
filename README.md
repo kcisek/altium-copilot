@@ -60,6 +60,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 | *"What are the fabrication notes?"* | Draftsman notes, tables, view titles, drill table and layer stack notes | `get_design_notes` |
 | *"Show me the picture on the PSU sheet"* | Pasted datasheet excerpts and diagrams, returned as images | `get_design_image` |
 | *"How is the design structured? Why is this net called VBAT on the child sheet?"* | An offline Report Project Hierarchy: the sheet tree from the top sheet through sheet symbols (device sheets, Repeat channels and their counts), each sheet's ports and its symbols' entries with I/O types and harnesses, the project's Net Identifier Scope (and what Automatic resolves to) with how nets cross sheets and how they are named; with a netlist, the net each port and entry joins. Flags symbols pointing at missing files, entries without a port and ports without an entry, I/O mismatches, ports on a top sheet, duplicate symbols and cycles. Works without Altium | `get_design_hierarchy` |
+| *"Is ERC set up right? Is a No ERC hiding a problem? Where do outputs go?"* | The project settings that change how the design is read, from the .PrjPcb: Net Identifier Scope and net naming, diff-pair suffixes, class generation, multi-channel naming, the report level of every ERC violation type, the Connection Matrix, the Comparator's matching criteria and the output path. Audits ERC checks switched off or downgraded from Altium's default, relaxed Connection Matrix cells for driver conflicts and unconnected inputs, and every No ERC directive with the net it sits on, flagged when an active one is on a power net or a net with several pins. Works without Altium | `get_project_options` |
 | *"Is my copy of this Altium 365 project up to date?"* | Where the local Git clone stands, read offline: when it was last updated from Altium 365, commits ahead or behind as of that update, design files changed locally, the last commit. Never fetches | `get_clone_status` |
 | *"Package this project for the firmware team"* | A SQLite snapshot your teammates open without Altium (see [Sharing with your team](#-new-sharing-with-your-team)) | `package_for_xfn` |
 
@@ -126,8 +127,8 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 
 | File | What is read |
 |---|---|
-| `.PrjPcb` | Sheet list (subfolders, `..\` paths and device sheets included), variants, project parameters, output folder, Comparator settings |
-| `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks |
+| `.PrjPcb` | Sheet list (subfolders, `..\` paths and device sheets included), variants, project parameters, output folder, Comparator settings, Project Options (ERC report levels, Connection Matrix, class generation, multi-channel naming, Net Identifier Scope) |
+| `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks, No ERC directives |
 | Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel. With Altium closed the project loads without it (see [Requirements](#requirements)) |
 | `.Annotation` | Board designators of board-annotated and multi-channel designs |
 | `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not), the copper a pour was last poured into (solid pours' regions, hatched pours' tracks and arcs), copper regions and fills, internal plane nets, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings; for the health check also region shapes, the board shape and Health Check settings; for the DFM check also pad holes (plated or not, a slot's angle, whether the hole is offset from the pad), bare holes such as mounting holes, board cutouts and the number of embedded board arrays (panels) |
@@ -136,9 +137,11 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | `Design Rule Check - <PcbDoc>.html` or `.drc` | Altium's last Batch DRC report, from the project's output folder |
 | Git clone of an Altium 365 project (`.git`) | When the origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`: the project GUID, the last fetch time (`FETCH_HEAD`), the local commit against the remote-tracking branch as of that fetch, uncommitted changes and the last commit. Read with local `git` commands that cannot open a connection (`protocol.allow=never`), do not rewrite the index (`--no-optional-locks`) and start no program the repository's configuration names (filters, fsmonitor, signature checks); nothing is fetched and no credential is used |
 
-Not read: schematic wires (connectivity comes from the netlist), ERC results, OutJob
-outputs and the DRC XML report, ActiveBOM and supply-chain data (lifecycle, stock,
-price), and Altium 365 review comments. The copilot never runs Altium's ERC or DRC.
+Not read: schematic wires for the design's connectivity (it comes from the netlist;
+wiring is read per sheet only for the sheet hierarchy and the net a No ERC sits on),
+ERC results, OutJob outputs and the DRC XML report, ActiveBOM and supply-chain data
+(lifecycle, stock, price), and Altium 365 review comments. The copilot never runs
+Altium's ERC or DRC.
 
 ---
 
