@@ -2000,8 +2000,8 @@ def get_net_pcb(net: str, units: PcbUnits | None = None) -> str:
     """Return physical PCB routing details for exact or regex-matched nets.
 
     layers are routing: a hatched pour's tracks and arcs are not counted.
-    pours lists the net's polygon pours, shelved ones (no copper) with
-    shelved true.
+    pours lists the net's polygon pours with their names (several may share
+    one), shelved ones (no copper) with shelved true.
     """
     index, error = _pcb_index_or_error()
     if error:

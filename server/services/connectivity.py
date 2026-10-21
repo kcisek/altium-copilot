@@ -28,14 +28,18 @@ try:
     from services.drc_results import rule_kind
     from services.pcb_index import PcbIndex
     from services.pcb_length import NetGraph, stack_z
-    from services.pcb_rules import ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope
+    from services.pcb_rules import (
+        ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope, scope_name,
+    )
 except ImportError:
     from server.parsers.drc_report import RULE
     from server.parsers.pcb_doc import parse_dim_mil
     from server.services.drc_results import rule_kind
     from server.services.pcb_index import PcbIndex
     from server.services.pcb_length import NetGraph, stack_z
-    from server.services.pcb_rules import ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope
+    from server.services.pcb_rules import (
+        ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope, scope_name,
+    )
 
 CHECKS = ("unrouted", "isolated", "antennae", "weak")
 # weak_connection findings only matter with the Un-Routed Net rule's 'Check for
@@ -94,10 +98,10 @@ APPROXIMATIONS = [
     "this violation is to extend the polygon over the centre (a track's centreline is "
     "tested against the poured copper). The style is the first enabled rule by priority "
     "whose first scope matches the pad or via and second the pour. Whether Altium also "
-    "matches them the other way round is not documented, a pour's name and class are "
-    "not read, and a room term on a pour is decided only when the pour lies clear of the "
-    "room, so every rule that may come first counts: the pad or via is tested only when "
-    "they all say Direct.",
+    "matches them the other way round is not documented, a pour without a saved name "
+    "leaves name terms open, and a room term on a pour is decided only when the pour "
+    "lies clear of the room, so every rule that may come first counts: the pad or via "
+    "is tested only when they all say Direct.",
     "Pour copper is the copper saved in the file (a solid pour's regions, a hatched "
     "pour's tracks and arcs): a pour changed since its last repour is checked as "
     "saved; a shelved pour, and one with no saved copper (never poured, or poured to "
@@ -714,15 +718,18 @@ class Connectivity:
         kind, else its CONNECTSTYLE. The rule is the first enabled one by
         priority whose first scope matches the pad or via and second the pour.
         Altium's help does not say whether the scopes also match the other way
-        round, and some terms cannot be decided on a pour (its name is not
-        read), so every rule that may come first counts: the style is known
-        only when they all agree, else None (as without a rule)."""
+        round, and some terms cannot be decided on a pour (how much of it lies
+        in a room, a pour without NAME), so every rule that may come first
+        counts: the style is known only when they all agree, else None (as
+        without a rule)."""
         target = self._net_target(net)
+        pour = self.pcb.pours[pour_id]
         sides = (
             replace(target, obj=self.index.object_facts(row)),
             replace(target, obj=ObjectFacts(
                 kind="polygon", layer=layer, span=frozenset({layer}),
-                points=tuple(self.pcb.pours[pour_id].vertices),
+                points=tuple(pour.vertices),
+                polygon=scope_name(pour.name),
             )),
         )
         prefix = "VIA." if row["kind"] == "via" else "THPAD." if row["hole"] else "SMDPAD."
