@@ -77,6 +77,8 @@ WORKING_TOOL_CALLS = {
     "check_project_integrity": lambda: main.check_project_integrity(),
     "get_output_jobs": lambda: main.get_output_jobs(),
     "check_fab_drawing": lambda: main.check_fab_drawing(),
+    "check_release_readiness": lambda: main.check_release_readiness(),
+    "release_review": lambda: main.release_review(),
     # The project folder against itself: no Git clone is needed in folder mode.
     "diff_design": lambda: main.diff_design(project_dir_a=main._project["root_dir"]),
     "list_variants": lambda: main.list_variants(),

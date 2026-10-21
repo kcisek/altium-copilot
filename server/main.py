@@ -88,6 +88,10 @@ try:
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
     from services.project_tour import build_project_tour, defined_variant_count
+    from services.release_gate import (
+        ReleaseInputs, build_release_readiness, build_release_review,
+        page_release_readiness,
+    )
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
     from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
@@ -160,6 +164,10 @@ except ImportError:
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
     from server.services.project_tour import build_project_tour, defined_variant_count
+    from server.services.release_gate import (
+        ReleaseInputs, build_release_readiness, build_release_review,
+        page_release_readiness,
+    )
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -374,6 +382,19 @@ DNP reasons, fabrication requirements. Use it.
   place; offer suggested_notes as lines to add, with the user filling every <...> value
   (never invent one). A missing item may be worded unusually: read get_design_notes
   before calling it absent. Tables are caches from the last Import Changes.
+
+## Release Readiness
+
+- check_release_readiness — "is this ready to release?", "is it ready for review or fab?",
+  "release check", before a release: one table of gates modelled on Altium's Project
+  Releaser (DRC report fresh and clean, ERC, netlist and sync, unrouted nets, polygons,
+  outline, fiducials, mounting holes, Not Fitted parts in the assembly outputs, OutJob
+  per variant and output age, fab notes vs stackup, title blocks, project integrity,
+  Altium 365 copy), each with status, blocking, evidence and the source_tool to call for
+  details. Quote verdict_summary first. A blocking gate that failed fails the release;
+  not_verified is never a pass: say what would verify it (ERC always needs Altium).
+- release_review — a guided go / no-go: the gates, the causes from each source_tool, then
+  the blocking items, what was not verified and the warnings.
 
 ## Project Tour
 
@@ -4708,6 +4729,63 @@ def get_drc_report(
     return rendered
 
 
+# ---------- check_release_readiness ----------
+
+@mcp.tool(
+    title="Check Release Readiness",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_release_readiness(offset: int = 0) -> str:
+    """One "is this ready for review or fab?" report, offline, modelled on Altium's
+    Project Releaser: a fixed list of gates, each with status (pass, fail, warn,
+    not_verified, not_applicable), blocking, one line of evidence from the check behind
+    it and source_tool (the tool to call for the details). Gates: Batch DRC report clean
+    and newer than the board (get_drc_report), ERC (blocking and always not_verified: no
+    ERC result is saved in the files; says whether an OutJob ERC validation output makes
+    the Releaser run it), netlist newer than every sheet, schematic and PCB in sync
+    (check_sch_pcb_sync; both need the netlist), no unrouted nets (check_connectivity),
+    polygons not shelved or modified (check_pcb_health), board outline, global fiducials
+    per assembled side (check_dfm), mounting holes, Not Fitted parts left out of the BOM
+    and pick-and-place outputs (Altium places them on the PCB by design), the OutJob
+    complete for every variant and its generated outputs newer than the design
+    (get_output_jobs), Draftsman fab notes against the stackup (check_fab_drawing),
+    title-block revision and date across sheets and drawings (get_design_notes), project
+    integrity (check_project_integrity), the Altium 365 copy committed and level
+    (get_clone_status), silkscreen DRC; and not_verified with the reason: footprints vs
+    libraries, lifecycle and compliance, testpoints, teardrops, via stitching, the
+    team's template.
+
+    verdict: fail when a blocking gate failed (one failed check fails the release, as in
+    the Releaser), not_ready_unverified when none failed but a blocking gate is
+    not_verified, pass only when every blocking gate passed, warned or is not applicable
+    (verdict_summary names the blocking warns). A missing data source is not_verified,
+    never a pass; a non-blocking gate's problem is a warn. Gate rows are paginated
+    (offset from next_offset); the verdict comes with every page."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    inputs = ReleaseInputs(
+        project=project,
+        netlist=netlist,
+        variant_state=variant_state,
+        notes=_design_notes,
+        pcb_index=lambda: _pcb_session.get(project, netlist),
+        saved_after_netlist=_saved_after_netlist,
+        sheets_saved_after=_sheets_saved_after,
+        dfm_variant=lambda: _dfm_variant(project, netlist, variant_state),
+        fab_board_reader=_fab_board_reader(project, netlist),
+        fab_bom=_fab_bom(project, netlist, variant_state),
+        clone_status=clone_status,
+    )
+    model = build_release_readiness(inputs)
+    for limit in (len(model["gates"]) or 1, 12, 6, 3, 1):
+        rendered = json.dumps(page_release_readiness(model, offset, limit), indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
 
 SCHEMATIC_REVIEW_PROMPT = """\
 Project: {name}
@@ -4860,6 +4938,24 @@ def pcb_manufacturing_review() -> str:
     return build_manufacturing_review(
         project, variant_state.active.name, index, netlist_free=netlist is None,
     )
+
+
+@mcp.tool(title="Release Review", annotations=ToolAnnotations(readOnlyHint=True))
+def release_review() -> str:
+    """Start a release go / no-go review of the loaded project, modelled on Altium's
+    Project Releaser: run check_release_readiness, drill into each failing gate with its
+    source tool, then give a go / no-go with the blocking items, what was not verified
+    (never reported as passed) and the warnings. Call when the user asks whether the
+    design is ready to release, for review or for fabrication ('is this ready to
+    release?', 'release check', 'go/no-go before release', 'can I send this to fab?').
+    Not for one fabricator's capabilities (pcb_manufacturing_review, check_dfm) or the
+    circuit (schematic_review)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady:
+        return json.dumps(REVIEW_NO_PROJECT_ERROR)
+    return build_release_review(project, variant_state.active.name,
+                                netlist_free=netlist is None)
 
 
 REVIEW_NO_PROJECT_ERROR = {
