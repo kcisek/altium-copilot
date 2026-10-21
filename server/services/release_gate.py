@@ -6,9 +6,10 @@ board-finalising steps: DRC and ERC clean and newer than the design, the netlist
 than the sheets, schematic and PCB in sync, no unrouted nets, polygons repoured, board
 outline, fiducials and mounting holes, Not Fitted parts left out of the assembly
 outputs, the OutJob complete for every variant and its outputs current, the Draftsman
-fab notes against the stackup, the title blocks, the project files and the Altium 365
-copy, then what cannot be checked offline (footprints against the libraries, lifecycle
-and compliance, testpoints, teardrops, via stitching, the team's template).
+fab notes against the stackup, the title blocks, the project files, the Altium 365
+copy and test access (check_testpoints, advisory), then what cannot be checked offline
+(footprints against the libraries, lifecycle and compliance, teardrops, via stitching,
+the team's template).
 
 Pure composition, no MCP: each gate calls the service functions its source tool uses,
 over the loaded project, its cached PCB index (the board's connectivity and DFM results
@@ -29,6 +30,7 @@ files: the best offline verdict names it.
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import cached_property
@@ -50,6 +52,7 @@ try:
     from services.project_integrity import build_project_integrity
     from services.project_tour import defined_variant_count
     from services.sch_pcb_sync import net_matching_options, run_sync_check
+    from services.testpoints import review_testpoints
     from services.via_checks import LARGE_HOLE_MIL
 except ImportError:
     from server.parsers.drc_report import RULE
@@ -68,6 +71,7 @@ except ImportError:
     from server.services.project_integrity import build_project_integrity
     from server.services.project_tour import defined_variant_count
     from server.services.sch_pcb_sync import net_matching_options, run_sync_check
+    from server.services.testpoints import review_testpoints
     from server.services.via_checks import LARGE_HOLE_MIL
 
 STATUSES = ("pass", "fail", "warn", "not_verified", "not_applicable")
@@ -838,12 +842,30 @@ def gate_lifecycle(ctx: ReleaseContext) -> tuple[str, str]:
 
 
 def gate_testpoints(ctx: ReleaseContext) -> tuple[str, str]:
-    text = ("Testpoint assignments (pad Testpoint properties, the Testpoint Manager) are not "
-            "read from the PcbDoc")
-    if "error" not in ctx.outjobs and ctx.connected_types() & {
-            "Test Points", "Test Points For Assembly"}:
-        text += "; a Test Point report output is connected"
-    return "not_verified", text + "."
+    """check_testpoints on its default (ict) profile, advisory: warn on a warning finding
+    (no probe sites, a rail or ground net without one, a site too small, too close or
+    blocked), else pass with the coverage."""
+    index = ctx.require_index()
+    full = review_testpoints(index, is_dnp=ctx.inputs.dfm_variant().is_dnp)
+    if "error" in full:
+        return "not_verified", full.get("message") or full["error"]
+    sites, coverage = full["sites"], full["coverage"]
+    if not sites["probe_sites"]:
+        return "warn", (f"No probe sites: no pad or via is marked as a Fabrication Testpoint "
+                        f"and there are no TP parts ({_plural(coverage['nets'], 'net')}; "
+                        "Assembly Testpoint marks are not read).")
+    share = f"{coverage['percent']}%" if coverage["percent"] is not None else "no net of 2+ pads"
+    text = (f"{_plural(sites['probe_sites'], 'probe site')} "
+            f"{'reaches' if sites['probe_sites'] == 1 else 'reach'} "
+            f"{coverage['with_access']} of {_plural(coverage['nets'], 'net')} "
+            f"({share}; top {coverage['top']}, bottom {coverage['bottom']})")
+    warnings = Counter(finding["check"] for finding in full["findings"]
+                       if finding["severity"] == "warning")
+    if warnings:
+        checks = ", ".join(f"{check} {count}" for check, count in warnings.most_common())
+        return "warn", (f"{text}; {_plural(sum(warnings.values()), 'warning')} on ICT "
+                        f"guidance ({checks}).")
+    return "pass", f"{text}; no warning on ICT guidance."
 
 
 def gate_teardrops(ctx: ReleaseContext) -> tuple[str, str]:
@@ -898,7 +920,8 @@ GATES: tuple[Gate, ...] = (
          gate_footprints),
     Gate("lifecycle_compliance", "Component lifecycle and environment compliance", False,
          None, gate_lifecycle),
-    Gate("testpoints", "Testpoints assigned", False, None, gate_testpoints),
+    Gate("testpoints", "Test access (testpoints)", False, "check_testpoints",
+         gate_testpoints),
     Gate("teardrops", "Teardrops added", False, None, gate_teardrops),
     Gate("via_stitching", "Via stitching done", False, "check_vias", gate_via_stitching),
     Gate("team_template", "Project matches the team's template parameters", False, None,
@@ -1042,6 +1065,7 @@ RELEASE_REVIEW_TOOLS = (
     "check_project_integrity",
     "get_clone_status",
     "check_vias",
+    "check_testpoints",
     "diff_design",
 )
 
@@ -1084,7 +1108,8 @@ check_pcb_health; board_outline → get_board_info; fiducials → check_dfm with
 ["fiducials"]; mounting_holes → get_assembly_guide; dnp_parts, outjob_coverage and
 outputs_current → get_output_jobs; fab_drawing → check_fab_drawing; title_block →
 get_design_notes; project_integrity → check_project_integrity; clone_status →
-get_clone_status; via_stitching → check_vias. Give each its cause and the fix in Altium.
+get_clone_status; testpoints → check_testpoints (guidance values: ask for the test
+house's numbers); via_stitching → check_vias. Give each its cause and the fix in Altium.
 
 ### Phase 3 — Go / No-Go
 

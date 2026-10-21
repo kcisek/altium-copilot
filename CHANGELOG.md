@@ -6,6 +6,37 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_testpoints`: test access (DFT) review of the saved PcbDoc (roadmap #33), offline
+  and netlist-free (`services/testpoints.py`). Probe sites are pads and vias marked as
+  Fabrication Testpoints (top and bottom, now decoded from the Pads6 main subrecord and the
+  Vias6 header as `Primitive.test_fab_top` / `test_fab_bottom`; KiCad's importer reads the
+  same flags1 0x80 / flags2 0x01, and in the private set of 90 boards the 8 marked pads, on
+  2 boards, are all SMD pads of TP parts) and the pads of TP parts (designator TP..., or a
+  testpoint footprint), each on the faces its copper is on. Assembly Testpoint properties
+  are not decoded (no file read sets one apart from the fabrication flags; main-subrecord
+  byte 118 is 1 on exactly the 8 marked pads and 0 on the other 37,418 read, a candidate
+  left undecoded). Reports the sites per side and source, the share of nets (2+ pads) with
+  access per side and the probe side (auto: the side reaching more nets), the Testpoint
+  Usage rules resolved per net (`get_design_rules` now decodes the Testpoint and Testpoint
+  Usage rules: sizes, holes, sides, grid, under component; usage required / prohibited /
+  don't care, VALID 0 being Altium's default Required), and findings: no probe sites,
+  nets a usage rule or the `nets` argument requires without access (Altium's default rule
+  over All is info unless the batch DRC checks it), nets reachable only from the other
+  side of a single-sided fixture, rails (power-named nets, check_decoupling's name rules,
+  so 3V3_EN or GND_SENSE is a signal, and nets of 25+ connections) with fewer than 2 or
+  more than 10 sites, ground with about 1 site per 20 connections, and on the probe
+  side's sites (both sides for flying probe): site size (1.0 mm preferred, 0.9 mm
+  acceptable), centre spacing (2.5 mm, 1.8 mm minimum), board-edge clearance (3.2 mm),
+  sites under another part's 3D body (info when the Testpoint rule allows it) and sites
+  near parts over 5 mm tall; on every marked face: tented testpoint vias and sites outside
+  the Testpoint rule; and fewer than 2 non-plated tooling holes. Profiles `ict` (default) and
+  `flying_probe` hold guidance values (said so in the result), overridable in `limits`.
+  check_release_readiness's testpoints gate now runs it (advisory: warn on a warning
+  finding). Validated on Altium's public AD25 examples (SpiritLevel's 2 GND testpoint vias
+  and 3 TP parts reach 4 of 126 nets; Bluetooth Sentinel's 11 TP parts 10 of 55; the others
+  have no site) and the private set (90 boards, no exceptions: 12 with probe sites, 2 with
+  marked pads, coverage 0.7% to 32%, median 11.8%; review median 9 ms, at most 48 ms after
+  the board is loaded).
 - `check_release_readiness`: one "is this ready for review or fab?" report (roadmap #38),
   modelled on Altium's Project Releaser and the board-finalising steps. A fixed table of
   23 gates, each with status (pass, fail, warn, not_verified, not_applicable), blocking,
@@ -30,7 +61,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   parameters, project integrity, the Altium 365 copy committed and level, and
   silkscreen from the DRC report when the board batch-checks it (not verified when the
   run stopped at its violation limit); footprints against the libraries, lifecycle and
-  compliance, testpoints, teardrops, via stitching and the team's template are not
+  compliance, teardrops, via stitching and the team's template are not
   verified, each with the reason. Only blocking gates fail (a non-blocking problem is a warn); a check
   that raises is not verified. Verdict: fail when a blocking gate failed,
   not_ready_unverified when none failed but a blocking gate is not verified, pass only

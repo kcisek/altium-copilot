@@ -215,6 +215,31 @@ class Primitive:
     plated: bool | None = None
     slot_rotation: float | None = None
     hole_offset: bool = False
+    # Pads and vias: Altium's Fabrication Testpoint top / bottom properties (the
+    # record header's flags, see _test_flags). Assembly Testpoint properties are not
+    # decoded (no file read so far sets one apart from these). False elsewhere.
+    test_fab_top: bool = False
+    test_fab_bottom: bool = False
+
+
+# Pads6 main subrecord and Vias6 record header (KiCad's APAD6 and AVIA6 read the same
+# two bytes): flags1 at 1 (0x20 tented top, 0x40 tented bottom, 0x80 fabrication test
+# point top), flags2 at 2 (0x01 fabrication test point bottom). Seen set: flags1 0x80 on
+# 8 pads of 2 private boards, all SMD pads of TP-designator parts on a net, and flags2
+# 0x01 on 2 GND vias of the SpiritLevel example; no other pad or via of the examples or
+# the private set has either. Main-subrecord byte 118 is 1 on exactly those 8 pads and 0
+# on the other 37,418 read (an Assembly Testpoint flag is a candidate; not decoded).
+_TEST_FAB_TOP = 0x80
+_TEST_FAB_BOTTOM = 0x01
+
+
+def _test_flags(header: bytes) -> dict[str, bool]:
+    """Primitive.test_fab_top / test_fab_bottom from a pad's main subrecord or a via
+    record."""
+    return {
+        "test_fab_top": bool(header[1] & _TEST_FAB_TOP),
+        "test_fab_bottom": bool(header[2] & _TEST_FAB_BOTTOM),
+    }
 
 
 def iter_binary_records(data: bytes):
@@ -305,7 +330,7 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
 
 # Vias6 record offsets beyond the common primitive header (KiCad's AVIA6 reads
 # the same ones): flags1 at 1 (0x20 tented top, 0x40 tented bottom, 0x80
-# fabrication test point top), flags2 at 2 (0x01 test point bottom), the
+# fabrication test point top), flags2 at 2 (0x01 test point bottom: _test_flags), the
 # solder mask expansion (int32 at 54; 66 bit 0x02 manual, 67 bit 0x01 measured
 # from the hole edge; 241 bit 0x01 bottom linked to top, else int32 at 242),
 # the stack mode at 74 and 32 int32 pad diameters (v6 layers 1..32) from 75.
@@ -344,8 +369,8 @@ def _via_stack(payload: bytes, diameter: int, hole: int) -> ViaStack:
     stack = ViaStack(
         tent_top=bool(flags1 & 0x20) or mask_top,
         tent_bottom=bool(flags1 & 0x40) or mask_bottom,
-        test_fab_top=bool(flags1 & 0x80),
-        test_fab_bottom=bool(flags2 & 0x01),
+        test_fab_top=bool(flags1 & _TEST_FAB_TOP),
+        test_fab_bottom=bool(flags2 & _TEST_FAB_BOTTOM),
     )
     if len(payload) >= _VIA_DIAMETERS_AT + 32 * 4:
         stack.mode = payload[_VIA_MODE_AT]
@@ -397,6 +422,7 @@ def decode_vias(data: bytes) -> tuple[list[Primitive], int]:
                 width=_units_to_mil(diameter),
                 hole=_units_to_mil(hole),
                 via=_via_stack(payload, diameter, hole),
+                **_test_flags(payload),
             )
         )
     return primitives, skipped
@@ -788,6 +814,7 @@ def decode_pads(data: bytes) -> tuple[list[Primitive], int]:
                 hole_shape=hole_shape if hole > 0 else None,
                 slot_length=slot_length if hole > 0 else None,
                 **(_hole_fields(main, size_shape, hole_shape) if hole > 0 else {}),
+                **_test_flags(main),
             )
         )
     return primitives, skipped
