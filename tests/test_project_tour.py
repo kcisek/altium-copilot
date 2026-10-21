@@ -166,7 +166,7 @@ def test_ground_rules(project):
     assert "Read-only: the tour changes no design file." in flat
     assert "pause there if the user asked to" in flat
     assert "Reuse results already in this conversation" in flat
-    assert "No tool reads OutJob settings or generated output files" in flat
+    assert "Then get_output_jobs: the OutJobs, what their connected outputs cover" in flat
     assert "quote its assessment first" in flat
 
 

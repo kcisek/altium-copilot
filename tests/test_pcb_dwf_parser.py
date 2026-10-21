@@ -235,3 +235,30 @@ def test_fabrication_view_without_cached_stack_uses_default_layer_names(tmp_path
     view = next(i for i in parse_pcb_dwf(str(path)).items if i.view == "fabrication view")
     assert view.layer == "Bottom Layer"
     assert view.title.startswith("Bottom Layer (Scale")
+
+
+def test_variants_of_the_drawing_and_its_views(tmp_path, drawing):
+    # The fixture stores none: the views follow the drawing, which names no variant.
+    assert drawing.document_variant is None
+    assert all(item.variant is None for item in drawing.items if item.kind == "view")
+    xml = drawing_xml().replace(
+        "<DocumentId>",
+        "<DocumentOptions><AssemblyVariant>[All Variants]</AssemblyVariant>"
+        "<AssemblyVariantV2>Prod</AssemblyVariantV2></DocumentOptions><DocumentId>")
+    xml = xml.replace(
+        "<ViewSide>Bottom</ViewSide></Item>",
+        "<ViewComponentDisplaySettingsData><Variant>Lite</Variant></ViewComponentDisplaySettingsData>"
+        "<ViewSide>Bottom</ViewSide></Item>")
+    xml = xml.replace(
+        "<UseCustomScale>true</UseCustomScale><ViewSide>Top</ViewSide></Item>",
+        '<UseCustomScale>true</UseCustomScale><Variant i:nil="true"/><ViewSide>Top</ViewSide></Item>')
+    path = tmp_path / "variants.PCBDwf"
+    path.write_bytes(lz4_stream(xml.encode()))
+    parsed = parse_pcb_dwf(str(path))
+    assert parsed.document_variant == "Prod"
+    views = {item.view: item.variant for item in parsed.items if item.kind == "view"}
+    assert views["assembly view"] == "Lite" and views["fabrication view"] is None
+    # Without the V2 element the older AssemblyVariant is read.
+    old = xml.replace("<AssemblyVariantV2>Prod</AssemblyVariantV2>", "")
+    path.write_bytes(lz4_stream(old.encode()))
+    assert parse_pcb_dwf(str(path)).document_variant == "[All Variants]"

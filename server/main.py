@@ -80,6 +80,7 @@ try:
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from services.project_options import build_project_options, page_project_options
     from services.project_integrity import build_project_integrity, page_project_integrity
+    from services.output_jobs import build_output_jobs, page_output_jobs
     from services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -146,6 +147,7 @@ except ImportError:
     from server.services.project_integrity import (
         build_project_integrity, page_project_integrity,
     )
+    from server.services.output_jobs import build_output_jobs, page_output_jobs
     from server.services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -338,6 +340,20 @@ DNP reasons, fabrication requirements. Use it.
   multi-channel formats that break bus names. Errors break compile, sync or save; warnings
   give silently wrong results. Quote each finding's fix and source; ERC and Compile in
   Altium are the final word.
+
+## Output Jobs
+
+- get_output_jobs — "what does my OutJob generate?", "are my release outputs complete?",
+  "is anything missing for fab or assembly?", "are my Gerbers up to date?", before a
+  release: each OutJob's containers (path, naming) and outputs by category (connected or
+  not, order, data source, variant), coverage (fabrication data, NC drill,
+  pick-and-place, assembly drawing, BOM, ERC, DRC) and findings (gaps, BOM and
+  pick-and-place on different variants, wrong data source, ERC levels that differ from
+  Project Options, paths on another drive or near 260 characters, Gerber vs ODB++ or
+  drill origins, overlays missing from the stack, cutouts without a mechanical layer,
+  Draftsman variants, outputs older than the design). Quote each finding's severity, fix
+  and source, and not_checked; only a connected output is generated. Generating in
+  Altium is the final word.
 
 ## Project Tour
 
@@ -1899,6 +1915,60 @@ def check_project_integrity(checks: list[str] | None = None, offset: int = 0) ->
             model["load_diagnostics"] = kept
     for limit, examples in ((60, 10), (30, 5), (15, 3), (5, 2), (1, 1)):
         rendered = json.dumps(page_project_integrity(model, offset, limit, examples), indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# ---------- get_output_jobs ----------
+
+@mcp.tool(
+    title="Get Output Jobs",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_output_jobs(outjob: str | None = None, offset: int = 0) -> str:
+    """The project's Output Jobs (.OutJob) offline: the OutJobs the .PrjPcb lists (and
+    .OutJob files in the project folder it does not list, flagged), each with its variant
+    and containers (PDF, folder structure, video, print job: release or manually managed
+    base path, container and output sub-folders, file naming, the path Altium last
+    resolved) and its outputs grouped by category (Fabrication, Assembly, Documentation,
+    Report, Validation, Export): type, state (connected to a container or not, with its
+    order there; only connected outputs are generated), data source document, variant,
+    and mapped settings (Gerber, NC Drill, ODB++, IPC-2581, pick-and-place units, format
+    and origin; ERC report options). coverage says per role (fabrication_data, nc_drill,
+    pick_and_place, assembly_drawing, bom, erc, drc) whether a connected output covers
+    it. Findings, each with severity, examples, an Altium fix and the knowledge-base
+    article behind it where there is one: OutJobs missing, unreadable or not in the
+    project; no fabrication data, no NC drill for Gerbers, no pick-and-place, assembly
+    drawing, BOM, ERC or DRC validation output; Gerber only where the stackup is
+    rigid-flex or has blind/buried drill pairs (no ODB++/IPC-2581); BOM and
+    pick-and-place on different variants; a variant without an assembly drawing; data
+    sources missing on disk, outside the project or a Draftsman drawing updated from
+    another board; ERC validation levels and Connection Matrix differing from Project
+    Options (the release uses the OutJob's); output, ECO log or container paths on
+    another drive and paths near the Windows 260-character limit; Gerbers on the
+    absolute origin next to ODB++ (always relative) and Gerber vs NC Drill origins;
+    overlay layers missing from the layer stack; board cutouts with Gerbers plotting no
+    mechanical layer; Draftsman views whose own variant overrides the drawing's, and
+    drawings whose variant differs from the OutJob's; generated files at a container's
+    folder older than the design documents
+    (file times; nothing is written); outputs connected to no container. not_checked
+    names what the files cannot tell (release folders, layer sets, DRC settings, long-path
+    support).
+
+    outjob (a file name or stem) narrows the details to one OutJob; coverage and
+    findings stay project-wide. Details are paginated by OutJob (offset from
+    next_offset); coverage, findings and notes come with the first page."""
+    try:
+        project, _, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    model = build_output_jobs(project, _design_notes.draftsman, outjob)
+    if "error" in model:
+        return json.dumps(model)
+    for limit, examples in ((10, 25), (4, 10), (2, 5), (1, 3), (1, 1)):
+        rendered = json.dumps(page_output_jobs(model, offset, limit, examples), indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered

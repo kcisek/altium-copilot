@@ -37,6 +37,7 @@ PROJECT_TOUR_TOOLS = (
     "get_drc_report",
     "check_pcb_health",
     "get_bom",
+    "get_output_jobs",
     "get_design_notes",
     "schematic_review",
     "constraints_review",
@@ -107,7 +108,9 @@ and is there a part of the board to focus on? Do not proceed until the user answ
 ### Phase 4 — Outputs and Manufacturing State
 
 {phase_4}
-No tool reads OutJob settings or generated output files: list them as not covered.
+Then get_output_jobs: the OutJobs, what their connected outputs cover (coverage) and
+the errors and warnings that would stop a release, with their fixes; no OutJob: say
+the outputs are made by hand.
 This is a snapshot, not a review.
 
 ### Phase 5 — Variants and Design Notes
