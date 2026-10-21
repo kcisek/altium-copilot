@@ -6,6 +6,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `project_tour`: a guided tour of the loaded project for a newcomer, in the order Altium
+  teaches a design: project and sheet hierarchy (`get_design_hierarchy`, `list_variants`),
+  each schematic block (`get_sheet_context` per sheet in tree order, asking first above
+  12 sheets) and the power rails (from the sheets' regulators and power ports, confirmed
+  with `query_net`, presented as a derived reading since no tool builds a power tree),
+  the PCB (`get_board_info` stackup and impedance profiles, `get_component_placement`,
+  key nets through `list_diff_pairs`, `get_classes`, `get_net_pcb` and `check_lengths`),
+  outputs and manufacturing state (`get_drc_report` with its assessment,
+  `check_pcb_health`, `get_bom`; OutJobs and generated outputs are named as not
+  covered), then variants and design notes (`get_design_notes`). It adapts to the load:
+  a netlist-free load tours each sheet's ports, symbols and notes and says the parts,
+  pins, rails and BOM need the netlist; a PCB-only project (no schematic sheets) skips
+  the schematic phase; a project without a PcbDoc skips the board phase and the DRC and
+  health items. It ends in a Markdown project primer with a fixed
+  11-section outline (a section the tour could not cover keeps its heading with the
+  reason), which Claude shows in the chat and writes only after the user agrees to a
+  path (suggested next to the .PrjPcb). Ground rules: state only what the tools return,
+  cite sheets and designators, mark inferences as assumptions.
 - `get_design_hierarchy`: the project's sheet hierarchy offline, like the OutJob's
   Report Project Hierarchy, from the .PrjPcb and the .SchDoc files alone (no netlist
   needed, so it also works after a netlist-free load). The sheet tree runs from the top

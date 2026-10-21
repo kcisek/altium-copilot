@@ -78,6 +78,7 @@ try:
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
+    from services.project_tour import build_project_tour, defined_variant_count
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
     from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
@@ -136,6 +137,7 @@ except ImportError:
         MAX_IMAGE_BYTES, MAX_PASSTHROUGH_SIDE_PX, bmp_to_png, image_format, image_size,
     )
     from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
+    from server.services.project_tour import build_project_tour, defined_variant_count
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -302,6 +304,14 @@ DNP reasons, fabrication requirements. Use it.
   With a netlist, ports and entries name their net (nets: one per channel). Issues are
   read from the files, not Altium's compiler: quote issue_help and say Compile in
   Altium (Messages panel) is the final word. sheet= narrows to a subtree.
+
+## Project Tour
+
+- project_tour — "walk me through this project", "I'm new to this board", "give me a
+  tour", "onboard me", "write a project primer": a phased tour (hierarchy, schematic
+  blocks and rails, PCB stackup, placement and key nets, outputs, variants and notes)
+  ending in a Markdown project primer. Show the primer; save it only where the user
+  agrees. A quick summary needs only the session-start steps.
 
 ## Bill of Materials
 
@@ -4469,6 +4479,30 @@ def schematic_review() -> str:
         first_sheet=first_sheet,
         n=n,
         root_dir=_project["root_dir"],
+    )
+
+
+@mcp.tool(title="Project Tour", annotations=ToolAnnotations(readOnlyHint=True))
+def project_tour() -> str:
+    """Start a guided tour of the loaded project for a newcomer, in the order Altium
+    teaches a design: project and sheet hierarchy (get_design_hierarchy, list_variants),
+    each schematic block and the power rails, the PCB (stackup and impedance, placement,
+    key nets), outputs and manufacturing state (DRC report, health, BOM), then variants
+    and design notes. It ends in a Markdown project primer with a fixed outline, which
+    Claude shows and saves only where the user agrees. Adapts to the load: a
+    netlist-free load tours what the files show, a project without a PcbDoc skips the
+    board, a PCB-only project the schematic. Call when the user is new to the project or
+    asks for a walk-through ('walk me through this design', 'give me a tour', 'onboard
+    me', 'write a project primer'). Not
+    for a quick summary (the session start covers it) or a review (schematic_review,
+    constraints_review, pcb_manufacturing_review)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady:
+        return json.dumps(REVIEW_NO_PROJECT_ERROR)
+    return build_project_tour(
+        project, variant_state.active.name, defined_variant_count(variant_state.variants),
+        netlist_free=netlist is None,
     )
 
 
