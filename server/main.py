@@ -375,7 +375,9 @@ component locations, distances):
     whether its saved copper (tracks, vias, pads, the pour copper as last poured,
     regions, fills, assigned internal planes) joins all its pads, with each missing
     connection's nearest pads and distance, a near-miss copper gap, isolated copper and
-    antennae; weak (edge-only) joins when checks names weak. It reads the copper saved
+    antennae; weak (edge-only) joins when checks names weak or the Un-Routed Net rule
+    checks incomplete connections (then nets_unrouted_in_altium, routed here only
+    through weak joins, read un-routed in Altium). It reads the copper saved
     now; quote altium_drc's report issues before comparing with Altium's last DRC run. Nets
     connected through assumed copper (planes, split-plane or pour outlines) are in
     assumed_copper_nets; say those connections are assumed.
@@ -2058,8 +2060,8 @@ def get_net_pcb(net: str, units: PcbUnits | None = None) -> str:
     """Return physical PCB routing details for exact or regex-matched nets.
 
     layers are routing: a hatched pour's tracks and arcs are not counted.
-    pours lists the net's polygon pours, shelved ones (no copper) with
-    shelved true.
+    pours lists the net's polygon pours with their names (several may share
+    one), shelved ones (no copper) with shelved true.
     """
     index, error = _pcb_index_or_error()
     if error:
@@ -3476,14 +3478,18 @@ def check_connectivity(
     open_track_mil; over_tolerance against an enabled Net Antennae rule, null without
     one), weak_connection (copper that only touches where a net needs it, or a pad or via
     connected directly to a pour with its centre off the pour's outline, which Altium's
-    'Check for incomplete connections' rejects). With compare_drc, altium_drc puts
-    Altium's last Batch DRC report beside it (get_drc_report reads that report).
+    'Check for incomplete connections' rejects). That option of the board's Un-Routed
+    Net rule is read (rules.UnRoutedNet, summary.incomplete_connections_checked): where
+    it is on, weak connections are warnings and the nets routed here only through them
+    read un-routed in Altium (nets_unrouted_in_altium). With
+    compare_drc, altium_drc puts Altium's last Batch DRC report beside it
+    (get_drc_report reads that report).
 
     net (nets or differential pairs) and net_class take comma-separated names; layer
     narrows the findings (not the summary) to one copper layer; checks narrows to
-    unrouted, isolated, antennae, weak (weak is listed only when named; the summary
-    always counts it). Findings are paginated (offset from next_offset). Lengths use
-    units (default: board display unit)."""
+    unrouted, isolated, antennae, weak (weak is listed by default only when the option
+    is or may be on; the summary always counts it). Findings are paginated (offset from
+    next_offset). Lengths use units (default: board display unit)."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)

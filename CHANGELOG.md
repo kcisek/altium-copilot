@@ -393,8 +393,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   - `weak_connection`: copper that only touches where a net needs it, which Altium's
     'Check for incomplete connections' rejects (centrelines that do not meet, a track
     centreline off the pad, via or pour copper, a via centre off the pad), listed when
-    `checks` names `weak` (the summary always counts them);
-    `nets_joined_only_by_weak_connections` would read un-routed with that option on
+    `checks` names `weak` or the board's Un-Routed Net rule has that option on (see
+    Changed; the summary always counts them); `nets_joined_only_by_weak_connections`
+    would read un-routed with that option on
   Nets connected only through assumed copper are listed in `assumed_copper_nets`.
   Filters by net or pair, net class, layer and check; paginated, with long connection
   lists shortened to fit. `altium_drc` sets Altium's last Batch DRC report beside it:
@@ -566,8 +567,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   included, within 0.5 mil. Relief connections are not tested, as in Altium's help,
   and neither is a pad or via whose style is not known. The style is that of the first
   enabled rule by priority whose first scope matches the pad or via and second the
-  pour. Layer, net and IsPolygon terms are decided on the pour, a room or region term
-  only when the pour lies clear of it, and its name and class are not read. Altium's
+  pour. Layer, net, IsPolygon, name and polygon class terms are decided on the pour, a
+  room or region term only when the pour lies clear of it. Altium's
   help does not say whether the scopes may also match the other way
   round, so every rule that may come first counts, and the pad or via is tested only
   when they all say Direct. On Altium's 6 examples, 12 of 28,988 pad and via contacts
@@ -578,6 +579,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   its centre 5 to 100 mil past the outline and at most half of the pad inside it. The
   test was left out when `check_connectivity` was added, because pour outlines then
   ignored their arcs
+- `check_connectivity` reads the Un-Routed Net rule's 'Check for incomplete
+  connections' option (saved as `CHECKBADCONNECTIONS=TRUE`). `rules.UnRoutedNet` gives
+  each rule's `check_incomplete_connections`: true, false, or null when the rule does
+  not save it, which means off. Altium's help gives no default, and boards save this
+  key only when it is on, while other rule options are saved as FALSE too. Per net,
+  the option is that of the Un-Routed Net rule that applies: the first enabled one by
+  priority whose scope matches the net. When a scope is not decided for a net, every
+  rule that may come first counts, and the option is null when they differ. Where it
+  is or may be on, `weak_connection` findings are listed by default. Where it is on,
+  they are warnings (`incomplete_connections_checked` on each finding), and the nets
+  routed here only through weak connections read un-routed in Altium. Those nets are
+  listed in `nets_unrouted_in_altium` and flagged `unrouted_in_altium` in `nets`. The
+  summary gives `incomplete_connections_checked`,
+  `nets_routed_here_unrouted_in_altium` and `incomplete_connections_note`.
+  `altium_drc` counts those nets as not routed here, and the connections they join
+  only through weak connections as missing
+  (`nets_not_routed_here_only_by_weak_connections`,
+  `missing_connections_here_only_by_weak_connections`). Net status and routing
+  counts still follow touching copper. `pcb_manufacturing_review` treats a net in
+  `nets_unrouted_in_altium` as a no-go, like an unrouted net. Altium's 6 examples do
+  not save the option, so nothing changes there. On 83 real boards, 4 of 93 Un-Routed
+  Net rules have it on, all enabled with scope All, one per board. 3 of those boards
+  have no weak connection. The fourth has 17 (9 track to track, 7 track to pad, 1
+  track to via; 7 miss by 0.5 to 1 mil, where Altium's undocumented tolerance
+  decides). Altium would read 15 connections on 10 nets routed here as missing because
+  of them. None of the 4 has a DRC report to compare
+- Rule scopes that name polygon pours are decided: each pour's name is read from its
+  Polygons6 `NAME`, which Altium saves as UTF-16 character codes ("71,78,68" is GND),
+  and matched without regard to case, as other names are. On a pour itself (the pour
+  side of a Polygon Connect Style rule) `IsNamedPolygon`, `InNamedPolygon`, `Name =`,
+  `<>` and `Like` (`=` and `<>` compare the whole name, so a match that needs `*` or
+  `?` as a wildcard stays unknown) and `InPolygonClass` (class members are pour names;
+  All Polygons holds every pour) were unknown. On a hatched pour's tracks and arcs
+  `InNamedPolygon` was, per object (`check_rule_compliance`) and for a net's pour
+  copper in binary rules (`get_rules_for_net`). They stay unknown for a pour without
+  `NAME` and for a name with a character beyond Latin-1, which scope text (read as
+  Latin-1) cannot hold. Pours may share a name. `get_net_pcb` lists each pour's
+  `name`. On 83 real boards and Altium's 6 examples, all 1,266 pours but one have a
+  name, all ASCII; 2 of 193 Polygon Connect Style rules use `IsNamedPolygon`, naming no
+  pour on their board, so 223 pad and via contacts there move from no known style to
+  Direct (no `weak_connection` finding changes, their centres being inside the
+  outline). The 141 contacts still without a style come from rules that match only
+  the other way round. `check_rule_compliance` and the rule resolution behind
+  `get_rules_for_net` (every net, every kind) give the same results as before on all
+  89 boards
 
 ### Fixed
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)

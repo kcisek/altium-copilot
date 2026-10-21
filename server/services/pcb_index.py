@@ -11,7 +11,7 @@ try:
         PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PadCopper, PcbData, pad_copper_on,
     )
     from services.pcb_rules import (
-        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
+        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices, scope_name,
     )
     from services.pcb_geometry import (
         arc_arc_distance,
@@ -33,7 +33,7 @@ except ImportError:
         PAD_SHAPE_ROUND, PAD_SHAPE_ROUNDRECT, PadCopper, PcbData, pad_copper_on,
     )
     from server.services.pcb_rules import (
-        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices,
+        MULTI_LAYER, ObjectFacts, RuleContext, RuleTarget, room_vertices, scope_name,
     )
     from server.services.pcb_geometry import (
         arc_arc_distance,
@@ -122,6 +122,7 @@ CREATE TABLE pours (
     hatch_style TEXT,
     shelved INTEGER,
     vertices TEXT,
+    name TEXT,
     minx REAL,
     miny REAL,
     maxx REAL,
@@ -484,7 +485,7 @@ class PcbIndex:
             x_values = [vertex[0] for vertex in pour.vertices] or [0.0]
             y_values = [vertex[1] for vertex in pour.vertices] or [0.0]
             self.db.execute(
-                "INSERT INTO pours VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO pours VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     pour.pour_id,
                     pour.net,
@@ -492,6 +493,7 @@ class PcbIndex:
                     pour.hatch_style,
                     int(pour.shelved),
                     json.dumps(pour.vertices),
+                    pour.name,
                     min(x_values),
                     min(y_values),
                     max(x_values),
@@ -648,6 +650,7 @@ class PcbIndex:
             "component": ctx.component_classes,
             "pad": ctx.pad_classes,
             "xsignal": ctx.xsignal_classes,
+            "polygon": ctx.polygon_classes,
         }
         self._net_to_classes: dict[str, list[str]] = defaultdict(list)
         self._pair_to_classes: dict[str, list[str]] = defaultdict(list)
@@ -783,15 +786,18 @@ class PcbIndex:
             else None
         )
         try:
-            in_pour = row["poured_by"] is not None
+            poured_by = row["poured_by"]
         except (IndexError, KeyError):  # a hand-built row without the column
-            in_pour = False
+            poured_by = None
+        pours = self.pcb.pours
+        pour = pours[poured_by] if poured_by is not None and 0 <= poured_by < len(pours) else None
         return ObjectFacts(
             kind=kind,
             layer=layer,
             span=span,
             points=points,
-            in_pour=in_pour,
+            in_pour=poured_by is not None,
+            polygon=scope_name(pour.name) if pour is not None else None,
             component=designator.lower() if designator else None,
             footprint=footprint,
             pad=pad,
@@ -900,11 +906,15 @@ class PcbIndex:
         if not net_ids:
             return target
         placeholders = ",".join("?" * len(net_ids))
-        target.has_pours = self.db.execute(
-            f"SELECT 1 FROM pours WHERE net_id IN ({placeholders}) "
-            "AND NOT shelved LIMIT 1",
-            net_ids,
-        ).fetchone() is not None
+        target.pour_names = {
+            scope_name(row["name"])
+            for row in self.db.execute(
+                f"SELECT DISTINCT name FROM pours WHERE net_id IN ({placeholders}) "
+                "AND NOT shelved",
+                net_ids,
+            )
+        }
+        target.has_pours = bool(target.pour_names)
         rows = self.db.execute(
             "SELECT DISTINCT component, pad_name FROM prims "
             "WHERE kind = 'pad' AND component IS NOT NULL "
@@ -1117,6 +1127,7 @@ class PcbIndex:
         # net's pour inventory, not its copper.
         pours = [
             {
+                **({"name": row["name"]} if row["name"] is not None else {}),
                 "layer": self.layer_name(row["layer"]),
                 "hatch": row["hatch_style"],
                 **({"shelved": True} if row["shelved"] else {}),
