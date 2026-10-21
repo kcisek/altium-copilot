@@ -3401,14 +3401,18 @@ def check_connectivity(
     open_track_mil; over_tolerance against an enabled Net Antennae rule, null without
     one), weak_connection (copper that only touches where a net needs it, or a pad or via
     connected directly to a pour with its centre off the pour's outline, which Altium's
-    'Check for incomplete connections' rejects). With compare_drc, altium_drc puts
-    Altium's last Batch DRC report beside it (get_drc_report reads that report).
+    'Check for incomplete connections' rejects). That option of the board's Un-Routed
+    Net rule is read (rules.UnRoutedNet, summary.incomplete_connections_checked): where
+    it is on, weak connections are warnings and the nets routed here only through them
+    read un-routed in Altium (summary.nets_routed_here_unrouted_in_altium). With
+    compare_drc, altium_drc puts Altium's last Batch DRC report beside it
+    (get_drc_report reads that report).
 
     net (nets or differential pairs) and net_class take comma-separated names; layer
     narrows the findings (not the summary) to one copper layer; checks narrows to
-    unrouted, isolated, antennae, weak (weak is listed only when named; the summary
-    always counts it). Findings are paginated (offset from next_offset). Lengths use
-    units (default: board display unit)."""
+    unrouted, isolated, antennae, weak (weak is listed by default only when the option
+    is or may be on; the summary always counts it). Findings are paginated (offset from
+    next_offset). Lengths use units (default: board display unit)."""
     index, error = _pcb_index_or_error()
     if error:
         return json.dumps(error)

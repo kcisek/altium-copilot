@@ -498,6 +498,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   its centre 5 to 100 mil past the outline and at most half of the pad inside it. The
   test was left out when `check_connectivity` was added, because pour outlines then
   ignored their arcs
+- `check_connectivity` reads the Un-Routed Net rule's 'Check for incomplete
+  connections' option (saved as `CHECKBADCONNECTIONS=TRUE`). `rules.UnRoutedNet` gives
+  each rule's `check_incomplete_connections`: true, false, or null when the rule does
+  not save it, which means off. Altium's help gives no default, and boards save this
+  key only when it is on, while other rule options are saved as FALSE too. Per net,
+  the option is that of the Un-Routed Net rule that applies: the first enabled one by
+  priority whose scope matches the net. When a scope is not decided for a net, every
+  rule that may come first counts, and the option is null when they differ. Where it
+  is on, `weak_connection` findings are listed by default and are warnings
+  (`incomplete_connections_checked` on each finding). The summary's
+  `incomplete_connections_checked`, `nets_routed_here_unrouted_in_altium` and
+  `incomplete_connections_note` say which nets are routed here only through weak
+  connections and so read un-routed in Altium. `altium_drc` counts those nets as not
+  routed here (`nets_not_routed_here_only_by_weak_connections`). Net status and
+  routing counts still follow touching copper. Altium's 6 examples do not save the
+  option, so nothing changes there. On 83 real boards, 4 of 93 Un-Routed Net rules
+  have it on, all enabled with scope All, one per board. 3 of those boards have no
+  weak connection. The fourth has 17 (9 track to track, 7 track to pad, 1 track to
+  via; 7 miss by 0.5 to 1 mil, where Altium's undocumented tolerance decides), and 10
+  nets routed here only through them. None of the 4 has a DRC report to compare
 
 ### Fixed
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)
