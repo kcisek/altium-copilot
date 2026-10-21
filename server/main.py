@@ -59,6 +59,10 @@ try:
         DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
     )
     from services.manufacturing_review import build_manufacturing_review
+    from services.assembly_guide import (
+        ROW_LIMITS as GUIDE_ROW_LIMITS, GuideVariant, build_guide,
+        page as page_guide, summary as guide_summary,
+    )
     from services.fab_profiles import load_profile
     from services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
@@ -112,6 +116,10 @@ except ImportError:
         DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
     )
     from server.services.manufacturing_review import build_manufacturing_review
+    from server.services.assembly_guide import (
+        ROW_LIMITS as GUIDE_ROW_LIMITS, GuideVariant, build_guide,
+        page as page_guide, summary as guide_summary,
+    )
     from server.services.fab_profiles import load_profile
     from server.services.connectivity import (
         check_connectivity as review_connectivity, drc_comparison,
@@ -381,6 +389,13 @@ component locations, distances):
     manufacturing", "go/no-go before fab": a guided fabrication then assembly review
     ending in a go / no-go that lists what was not checked; it asks which fabricator
     first. One check against a fab profile is check_dfm.
+21. get_assembly_guide — "how do I assemble / hand-solder this prototype?", "assembly
+    guide", "build sheet", "soldering order": the variant's parts in soldering order
+    (the SMD of both sides first, the side with shorter parts first, then through-hole;
+    short to tall on each side) in BOM-line steps with Center-X/Y, rotation and pin-1
+    or polarity hints, as a Markdown checklist (Done / Skipped) or CSV. Quote
+    first_side_reason and left_out (Not Fitted parts, fiducials, parts nobody places);
+    without a netlist the steps are approximate (grouping_approximate): say so.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3778,13 +3793,17 @@ def _bom_plan(netlist: dict, variant_state: VariantState, variant: str | None):
         if chosen is None and variant.strip().lower() in BOM_BASE_NAMES:
             return plan_variant(None, netlist, names), names, None
         if chosen is None:
-            return None, names, {
-                "error": "variant_not_found",
-                "message": f"No variant '{variant}'. Variants: "
-                + ", ".join(v.name for v in variant_state.variants)
-                + f", or '{BASE_VARIANT}'.",
-            }
+            return None, names, _variant_not_found(variant, variant_state)
     return plan_variant(chosen, netlist, names), names, None
+
+
+def _variant_not_found(variant: str, variant_state: VariantState) -> dict:
+    return {
+        "error": "variant_not_found",
+        "message": f"No variant '{variant}'. Variants: "
+        + ", ".join(v.name for v in variant_state.variants)
+        + f", or '{BASE_VARIANT}'.",
+    }
 
 
 def _bom_header(netlist: dict, plan, parts: list, excluded: dict) -> dict:
@@ -3932,6 +3951,131 @@ def check_bom(
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
+
+
+GUIDE_APPROXIMATE_NOTE = (
+    "No netlist with schematic parts is loaded: steps group parts by footprint and the "
+    "PCB's Comment (approximate BOM lines, no MPN), and Not Fitted parts come from the "
+    "designators stored in the project's variants."
+)
+GUIDE_UNAPPLIED_NOTE = (
+    "Not Fitted entries of variant '{variant}' with no designator (only a UniqueId): "
+    "{count}. Without the schematic parts they cannot be bound, so their parts may be "
+    "listed as placed: check the variant in Altium. Open the project in Altium Designer "
+    "once, then call set_project_dir again for a guide that leaves them out."
+)
+GUIDE_TEXT_OMITTED = (
+    "The page is too large even at 5 rows, so its rows are left out: call again with side "
+    "set to top or bottom."
+)
+
+
+def _guide_variant(project: dict, netlist: dict | None, variant_state: VariantState,
+                   variant: str | None):
+    """(GuideVariant, error) for get_assembly_guide: with schematic parts the variant's
+    BOM as get_bom builds it (Not Fitted parts bound by UniqueId, parameter variations
+    applied), else the designators stored in the project's variant."""
+    if netlist is not None and netlist.get("components"):
+        plan, _, error = _bom_plan(netlist, variant_state, variant)
+        if error:
+            return None, error
+        parts, excluded = build_bom_parts(netlist, plan, project.get("parameters") or {})
+        no_bom = frozenset(name for names in excluded.values() for name in names)
+        return GuideVariant(plan.name, plan.not_fitted.__contains__,
+                            {part.designator: part for part in parts}, no_bom), None
+    chosen = variant_state.active if variant is None else variant_state.get(variant.strip())
+    if chosen is None:
+        if variant.strip().lower() not in BOM_BASE_NAMES:
+            return None, _variant_not_found(variant, variant_state)
+        return GuideVariant(BASE_VARIANT), None
+    return GuideVariant(chosen.name, frozenset(chosen.dnp_refdes).__contains__,
+                        unapplied=len(chosen.dnp_uid or ())), None
+
+
+@mcp.tool(
+    title="Get Assembly Guide",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_assembly_guide(
+    variant: str | None = None,
+    side: Literal["top", "bottom", "both"] | None = None,
+    format: Literal["markdown", "csv"] = "markdown",
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Assembly sequence for a prototype build of a variant (default: the active one;
+    '[No Variations]' for the base design) from the saved PcbDoc: "how do I assemble /
+    hand-solder this board?", "assembly guide", "build sheet", "placement order",
+    "soldering checklist". Parts are grouped into steps per side and process by BOM line
+    (get_bom's grouping, MPN first; without a netlist by footprint and Comment, marked
+    approximate) and ordered: the SMD of both sides first, the side whose tallest SMD
+    part is shorter (else the one with fewer SMD parts, else the bottom) first, so the
+    taller side is soldered last; then the through-hole parts (top, then bottom); on
+    each side short to tall (3D body height, else at most a chip part's width, parts
+    with no height last). first_side_reason and sequence_rules say why: quote them. Each
+    step has its quantity, Comment, footprint, MPN and height, and per part the
+    designator, Center-X/Y (as Altium's pick-and-place file writes it) and Ref-X/Y from
+    the board origin, rotation and, for polarized parts (diodes, LEDs, polarized
+    capacitors, ICs, transistors, connectors), where pin 1, the cathode or + lies from
+    the part's centre ('pin 1 top-left', seen from the side being assembled: the bottom
+    flipped left to right) or 'no pin 1 marked'. Left out and listed: the variant's Not
+    Fitted parts, fiducials, no-BOM kinds, mounting holes, parts without pads and, with
+    a netlist, PCB parts not in the BOM and BOM parts not on the board. Quote notes
+    (without schematic parts: approximate steps, and Not Fitted entries known only by
+    UniqueId that could not be applied) and polarized_parts.note (diodes and polarized
+    capacitors with numbered pads: pin 1 is not said to be the cathode or +). No board
+    map is drawn (get_component_placement and query_pcb_region locate a part).
+
+    format markdown is a printable checklist (Done and Skipped columns; the first page
+    opens with the sequence, the last lists what was left out); csv has one part per row
+    with every column. side narrows to top or bottom. Rows are paginated (offset from
+    next_offset). Coordinates and heights use units (default: board display unit). Not:
+    the pick-and-place data check (check_dfm pick_and_place); the parts list (get_bom)."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    if side not in (None, "top", "bottom", "both"):
+        return json.dumps({"error": "invalid_side", "message": "side is top, bottom or both."})
+    if format not in ("markdown", "csv"):
+        return json.dumps({"error": "invalid_format",
+                           "message": "format is markdown or csv."})
+    project, netlist, variant_state = _require_project(netlist=False)
+    chosen, error = _guide_variant(project, netlist, variant_state, variant)
+    if error:
+        return json.dumps(error)
+    side = None if side == "both" else side
+    guide = build_guide(index, chosen, side)
+    paths = project.get("pcb_doc_paths") or []
+    header: dict = {"units": resolved}
+    if paths:
+        header["pcb_doc"] = Path(paths[0]).name
+    header["origin_mil"] = [round(value, 3) for value in guide.origin]
+    header.update(guide_summary(guide, to_mm))
+    notes = [GUIDE_APPROXIMATE_NOTE] if guide.approximate else []
+    if chosen.unapplied:
+        notes.append(GUIDE_UNAPPLIED_NOTE.format(count=chosen.unapplied, variant=chosen.name))
+    if notes:
+        header["notes"] = notes
+    header = _convert_units(header, to_mm)
+    title = f"Assembly guide: {project.get('name')}, variant '{guide.variant}'"
+    if side:
+        title += f", {side} side"
+    offset = max(0, int(offset or 0))
+    for limit in GUIDE_ROW_LIMITS:
+        result = {**header, **page_guide(guide, offset, limit, format, to_mm, title)}
+        if limit < GUIDE_ROW_LIMITS[0]:
+            result["rows_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    brief = {key: value for key, value in result.items() if key not in ("markdown", "csv")}
+    brief.pop("left_out", None)
+    brief["text_omitted"] = GUIDE_TEXT_OMITTED
+    return json.dumps(brief, indent=2)
 
 
 DRC_NOT_READ = (

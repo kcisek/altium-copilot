@@ -109,6 +109,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   boards it ran without an exception in about 0.05 s per board at most after the index:
   82 boards are advisory and none fails; 53 have an asymmetric SMD part, 39 an origin
   away from the lower-left corner (24 never set), 13 have No-BOM parts without pads
+- `get_assembly_guide`: an assembly sequence for prototype builds of a variant (the
+  active one by default), from the saved PcbDoc. The SMD of both sides comes first, the
+  side whose tallest SMD part is shorter first (else the one with fewer SMD parts, else
+  the bottom), so the side with the taller, heavier parts is soldered last; then the
+  through-hole parts (top, then bottom), whose leads would keep the board from lying
+  flat; on each side short to tall by 3D-body height (a chip passive without a body
+  counts as at most its EIA width; parts with no height go last, smallest pad extent
+  first). Mixed parts (SMD pads and plated pins) go with the SMD of their side. The
+  result says why (`first_side_reason`, `sequence_rules`). Steps are BOM lines as
+  `get_bom` groups them (MPN first) with a netlist, else footprint and Comment, marked
+  approximate; each has its quantity, Comment, footprint, MPN and height, and per part
+  the designator, Center-X/Y as Altium's pick-and-place file writes it and Ref-X/Y from
+  the board origin, rotation and, for polarized parts (diodes and LEDs, polarized
+  capacitors, batteries, connectors, ICs and any part with three or more pad names), a
+  pin-1 hint from the pad named 1, A1, K or + ('pin 1 top-left', 'cathode (K) left',
+  seen from the side being assembled, the bottom flipped left to right; a depopulated
+  A1 ball is placed at the grid's corner), else 'no pin 1 marked'. Diodes and polarized
+  capacitors whose pads are only numbered get 'pin 1 ...', which does not say where the
+  cathode or + is: they are counted and a note says to check the marking against the
+  silkscreen. Left out and listed: the variant's Not Fitted parts (a Not Fitted part is
+  never listed among the parts to fit by hand), fiducials, Graphical, Net Tie and No-BOM
+  parts, mounting holes, parts without pads and, with a netlist, PCB parts not in the
+  BOM and BOM parts not on the board. Without the schematic parts, a variant's Not
+  Fitted entries stored with no designator (only a UniqueId) cannot be applied: a note
+  gives their count. `format` markdown is a printable checklist with Done and
+  Skipped columns (the first page opens with the sequence, the last lists what was left
+  out); csv has one part per row. `side`, `units` and row paging under the result size.
+  No board map is drawn. On the private set of 83 boards it ran without an exception in
+  at most 0.03 s per board after the index (2 pages at most, the largest 32 kB): 97.6%
+  of 2778 steps have a 3D-body height, and 2557 of 2568 polarized parts (99.6%) get a
+  pin-1 hint; the first side was decided by part height on 66 boards, 12 have SMD on
+  one side only. With the sheets' parts (56 projects), 7 projects have BOM parts not on
+  the board and 1 has board parts not in the BOM. On those 56 projects without a
+  netlist, 298 of 1070 polarized parts (on 32 projects) are diodes or polarized
+  capacitors with only numbered pads, and 1 variant has Not Fitted entries known only
+  by UniqueId
 - `pcb_manufacturing_review`: a guided manufacturing-readiness review of the saved PCB.
   Claude asks which fabricator and assembler (their numbers or a `fab_profile.json`),
   confirms the profile, checks fabrication (`check_dfm`, vias, health, connectivity,
