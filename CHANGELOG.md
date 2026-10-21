@@ -313,8 +313,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   - `weak_connection`: copper that only touches where a net needs it, which Altium's
     'Check for incomplete connections' rejects (centrelines that do not meet, a track
     centreline off the pad, via or pour copper, a via centre off the pad), listed when
-    `checks` names `weak` (the summary always counts them);
-    `nets_joined_only_by_weak_connections` would read un-routed with that option on
+    `checks` names `weak` or the board's Un-Routed Net rule has that option on (see
+    Changed; the summary always counts them); `nets_joined_only_by_weak_connections`
+    would read un-routed with that option on
   Nets connected only through assumed copper are listed in `assumed_copper_nets`.
   Filters by net or pair, net class, layer and check; paginated, with long connection
   lists shortened to fit. `altium_drc` sets Altium's last Batch DRC report beside it:
@@ -506,18 +507,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   the option is that of the Un-Routed Net rule that applies: the first enabled one by
   priority whose scope matches the net. When a scope is not decided for a net, every
   rule that may come first counts, and the option is null when they differ. Where it
-  is on, `weak_connection` findings are listed by default and are warnings
-  (`incomplete_connections_checked` on each finding). The summary's
-  `incomplete_connections_checked`, `nets_routed_here_unrouted_in_altium` and
-  `incomplete_connections_note` say which nets are routed here only through weak
-  connections and so read un-routed in Altium. `altium_drc` counts those nets as not
-  routed here (`nets_not_routed_here_only_by_weak_connections`). Net status and
-  routing counts still follow touching copper. Altium's 6 examples do not save the
-  option, so nothing changes there. On 83 real boards, 4 of 93 Un-Routed Net rules
-  have it on, all enabled with scope All, one per board. 3 of those boards have no
-  weak connection. The fourth has 17 (9 track to track, 7 track to pad, 1 track to
-  via; 7 miss by 0.5 to 1 mil, where Altium's undocumented tolerance decides), and 10
-  nets routed here only through them. None of the 4 has a DRC report to compare
+  is or may be on, `weak_connection` findings are listed by default. Where it is on,
+  they are warnings (`incomplete_connections_checked` on each finding), and the nets
+  routed here only through weak connections read un-routed in Altium. Those nets are
+  listed in `nets_unrouted_in_altium` and flagged `unrouted_in_altium` in `nets`. The
+  summary gives `incomplete_connections_checked`,
+  `nets_routed_here_unrouted_in_altium` and `incomplete_connections_note`.
+  `altium_drc` counts those nets as not routed here, and the connections they join
+  only through weak connections as missing
+  (`nets_not_routed_here_only_by_weak_connections`,
+  `missing_connections_here_only_by_weak_connections`). Net status and routing
+  counts still follow touching copper. `pcb_manufacturing_review` treats a net in
+  `nets_unrouted_in_altium` as a no-go, like an unrouted net. Altium's 6 examples do
+  not save the option, so nothing changes there. On 83 real boards, 4 of 93 Un-Routed
+  Net rules have it on, all enabled with scope All, one per board. 3 of those boards
+  have no weak connection. The fourth has 17 (9 track to track, 7 track to pad, 1
+  track to via; 7 miss by 0.5 to 1 mil, where Altium's undocumented tolerance
+  decides). Altium would read 15 connections on 10 nets routed here as missing because
+  of them. None of the 4 has a DRC report to compare
 
 ### Fixed
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)

@@ -353,7 +353,9 @@ component locations, distances):
     whether its saved copper (tracks, vias, pads, the pour copper as last poured,
     regions, fills, assigned internal planes) joins all its pads, with each missing
     connection's nearest pads and distance, a near-miss copper gap, isolated copper and
-    antennae; weak (edge-only) joins when checks names weak. It reads the copper saved
+    antennae; weak (edge-only) joins when checks names weak or the Un-Routed Net rule
+    checks incomplete connections (then nets_unrouted_in_altium, routed here only
+    through weak joins, read un-routed in Altium). It reads the copper saved
     now; quote altium_drc's report issues before comparing with Altium's last DRC run. Nets
     connected through assumed copper (planes, split-plane or pour outlines) are in
     assumed_copper_nets; say those connections are assumed.
@@ -3404,7 +3406,7 @@ def check_connectivity(
     'Check for incomplete connections' rejects). That option of the board's Un-Routed
     Net rule is read (rules.UnRoutedNet, summary.incomplete_connections_checked): where
     it is on, weak connections are warnings and the nets routed here only through them
-    read un-routed in Altium (summary.nets_routed_here_unrouted_in_altium). With
+    read un-routed in Altium (nets_unrouted_in_altium). With
     compare_drc, altium_drc puts Altium's last Batch DRC report beside it
     (get_drc_report reads that report).
 
