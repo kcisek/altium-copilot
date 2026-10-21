@@ -711,26 +711,31 @@ def test_track_grazing_pour_copper_is_weak_but_a_relief_via_is_not_tested():
     assert weak["objects"] == ["Track on Top Layer", "Pour copper on Top Layer"]
 
 
-def _straddling_board(**connect_style):
+def _straddling_board(region=True, pour_layer=1, **connect_style):
     """GND with a pour round U1-1, an SMD pad (U2-1) whose centre is 4 mil past
     the pour's right edge and a via (on to U3-1) 6 mil past its left edge, each
-    joined to the pour only by touching its copper."""
+    joined to the pour only by touching its copper (a region on the top layer)."""
     board = Board(["GND"])
     board.pad("GND", "U1", "1", 0, 0)
     board.pad("GND", "U2", "1", 104, 0, size=10.0)
     board.via("GND", -106, 0)
     board.track("GND", -106, 0, -106, -100)
     board.pad("GND", "U3", "1", -106, -100)
-    pour = board.pour("GND", 1, _square(-100, -20, 100, 20))
-    board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
+    pour = board.pour("GND", pour_layer, _square(-100, -20, 100, 20))
+    if region:
+        board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
     if connect_style:
         board.rule("PolygonConnect", **connect_style)
     return board
 
 
+BOTH = ["Pad U2-1", "Via"]
+
+
 @pytest.mark.parametrize("connect_style, flagged", [
-    ({"CONNECTSTYLE": "Direct"}, ["Pad U2-1", "Via"]),
+    ({"CONNECTSTYLE": "Direct"}, BOTH),
     ({"CONNECTSTYLE": "Relief"}, []),
+    ({"CONNECTSTYLE": "NoConnect"}, []),
     ({}, []),  # no Polygon Connect Style rule: not tested
     (
         {"THPAD.CONNECTSTYLE": "Direct", "SMDPAD.CONNECTSTYLE": "Direct",
@@ -755,24 +760,75 @@ def test_direct_pad_or_via_with_its_centre_off_the_pour_outline_is_weak(
     assert result["summary"]["nets_joined_only_by_weak_connections"] == (1 if flagged else 0)
 
 
-@pytest.mark.parametrize("scope1, scope2, otherwise, flagged", [
-    # The polygon side decides: the direct rule is for bottom-layer pours only.
-    ("All", "OnLayer('Bottom Layer')", "Relief", []),
-    ("All", "OnLayer('Top Layer') And IsPolygon", "Relief", ["Pad U2-1", "Via"]),
-    # Either way round: U2-1 matches the second scope, the pour the first.
-    ("All", "InComponent('U2')", "Relief", ["Pad U2-1"]),
-    ("IsVia", "All", "Relief", ["Via"]),
-    # A pour's name is not read: the first rule cannot be decided, so the
-    # second one (direct too) is not taken and nothing is tested.
-    ("All", "IsNamedPolygon('GND_TOP')", "Direct", []),
+@pytest.mark.parametrize("scope1, scope2, first, otherwise, flagged", [
+    # The pour side decides: the first rule is for bottom-layer pours only.
+    ("All", "OnLayer('Bottom Layer')", "Direct", "Relief", []),
+    ("All", "OnLayer('Top Layer') And IsPolygon", "Direct", "Relief", BOTH),
+    ("All", "Not IsSplitPlane", "Direct", "Relief", BOTH),
+    ("IsVia", "All", "Direct", "Relief", ["Via"]),
+    # Matched only the other way round (U2-1 by the second scope, the pour by the
+    # first; the via is not a pour): Altium's help does not say whether that
+    # counts, so the pad is tested only when the next rule agrees.
+    ("All", "InComponent('U2')", "Direct", "Relief", []),
+    ("All", "InComponent('U2')", "Direct", "Direct", BOTH),
+    ("Not IsVia", "All", "Relief", "Direct", []),
+    # A pour's name is not read and a scope that does not parse is not known:
+    # the style is known only when the rules that may apply agree.
+    ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Relief", []),
+    ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Direct", BOTH),
+    ("InNet('GND'", "All", "Relief", "Direct", []),
 ])
-def test_polygon_connect_rule_matches_the_pad_and_the_pour(scope1, scope2, otherwise, flagged):
+def test_polygon_connect_rule_matches_the_pad_or_via_and_the_pour(
+    scope1, scope2, first, otherwise, flagged
+):
     board = _straddling_board()
-    board.rule("PolygonConnect", scope=scope1, scope2=scope2, CONNECTSTYLE="Direct")
+    board.rule("PolygonConnect", scope=scope1, scope2=scope2, CONNECTSTYLE=first)
     board.rule("PolygonConnect", CONNECTSTYLE=otherwise)
     result = check_connectivity(board.index(), checks=["weak"])
     weak = _finding(result, "weak_connection", "GND")
     assert sorted(item["objects"][0] for item in weak) == flagged
+
+
+@pytest.mark.parametrize("enabled, flagged", [(True, []), (False, BOTH)])
+def test_polygon_connect_rules_go_by_priority_when_enabled(enabled, flagged):
+    board = _straddling_board(CONNECTSTYLE="Direct")
+    board.rule("PolygonConnect", enabled=enabled, CONNECTSTYLE="Relief")
+    board.rules[0].priority, board.rules[1].priority = 2, 1  # the relief rule first
+    result = check_connectivity(board.index(), checks=["weak"])
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == flagged
+
+
+def test_room_rule_is_decided_on_the_pour_too():
+    # A relief rule for a room the pads, the via and the pour are all outside.
+    board = _straddling_board()
+    board.rule("RoomDefinition", name="PSU", VX0="1000mil", VY0="1000mil",
+               VX1="1200mil", VY1="1000mil", VX2="1200mil", VY2="1200mil",
+               VX3="1000mil", VY3="1200mil")
+    board.rule("PolygonConnect", scope="WithinRoom('PSU')", CONNECTSTYLE="Relief")
+    board.rule("PolygonConnect", CONNECTSTYLE="Direct")
+    result = check_connectivity(board.index(), checks=["weak"])
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == BOTH
+
+
+def test_pour_whose_layer_is_not_read_takes_the_copper_layer():
+    # The pour's own layer did not resolve; its copper is on the top layer.
+    # U2-1 (top) matches the direct rule; the via (Multi-Layer) only through the
+    # pour, and no other rule applies, so its style is not known.
+    board = _straddling_board(pour_layer=None)
+    board.rule("PolygonConnect", scope="OnTopLayer", CONNECTSTYLE="Direct")
+    result = check_connectivity(board.index(), checks=["weak"])
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == ["Pad U2-1"]
+
+
+def test_pour_outline_standing_in_for_unread_copper_tests_pads_too():
+    index = _straddling_board(region=False, CONNECTSTYLE="Direct").index(area_streams=())
+    result = check_connectivity(index, checks=["weak"])
+    assert _status(index, "GND") == "routed"
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == BOTH
 
 
 def test_through_hole_pad_takes_the_rule_thpad_style():
@@ -808,19 +864,23 @@ def test_hatched_pour_tests_a_direct_pad_centre_too(style, weak):
         assert sorted(found[0]["objects"]) == ["Pad U2-1", "Pour track on Top Layer"]
 
 
-def test_pad_centre_on_or_just_past_the_pour_outline_is_not_weak():
+@pytest.mark.parametrize("past, weak", [(0.4, 0), (0.6, 1)])
+def test_pad_centre_on_or_within_centre_mil_of_the_pour_outline_is_not_weak(past, weak):
     board = Board(["GND"])
     board.pad("GND", "U1", "1", 0, 0)
     board.pad("GND", "U2", "1", 100, 0)  # on the pour's right edge
-    board.via("GND", -100.4, 0)  # 0.4 mil past its left edge (CENTRE_MIL 0.5)
-    board.track("GND", -100.4, 0, -100.4, -100)
-    board.pad("GND", "U3", "1", -100.4, -100)
+    board.via("GND", -100 - past, 0)  # past its left edge (CENTRE_MIL 0.5)
+    board.track("GND", -100 - past, 0, -100 - past, -100)
+    board.pad("GND", "U3", "1", -100 - past, -100)
     pour = board.pour("GND", 1, _square(-100, -20, 100, 20))
     board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
     board.rule("PolygonConnect", CONNECTSTYLE="Direct")
-    result = check_connectivity(board.index(), checks=list(CHECKS))
-    assert _finding(result, "weak_connection", "GND") == []
-    assert result["summary"]["nets_joined_only_by_weak_connections"] == 0
+    index = board.index()
+    result = check_connectivity(index, checks=list(CHECKS))
+    assert _status(index, "GND") == "routed"
+    found = _finding(result, "weak_connection", "GND")
+    assert [item["objects"][0] for item in found] == ["Via"] * weak
+    assert result["summary"]["nets_joined_only_by_weak_connections"] == weak
 
 
 def test_pad_centre_is_tested_against_the_pour_outline_arcs():

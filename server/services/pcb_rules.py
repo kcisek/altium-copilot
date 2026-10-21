@@ -246,13 +246,13 @@ class ObjectFacts:
 
     layer is the object's Layer property (v6 id; 74 = Multi-Layer for vias and
     through-hole pads); span is every copper layer it occupies. A polygon is
-    the pour itself (the polygon side of a Polygon Connect Style rule).
+    a pour itself (the polygon side of a Polygon Connect Style rule).
     """
 
     kind: str  # "track" | "arc" | "via" | "pad" | "polygon"
     layer: int
     span: frozenset = frozenset()
-    points: tuple = ()  # track/arc endpoints; via/pad centre
+    points: tuple = ()  # track/arc endpoints; via/pad centre; polygon outline
     in_pour: bool = False  # a hatched pour's track or arc (InPolygon)
     component: str | None = None
     footprint: str | None = None
@@ -356,8 +356,9 @@ def point_in_polygon(x: float, y: float, vertices) -> bool:
 
 def _object_anchor(obj: ObjectFacts) -> tuple[float, float] | None:
     """Point that decides room/region membership: a via or pad centre, the
-    midpoint of a track or arc chord (Altium tests pads and vias by their
-    centre; whole-object containment for straddling tracks is approximated)."""
+    midpoint of a track or arc chord, the mean of a polygon's outline points
+    (Altium tests pads and vias by their centre; whole-object containment for
+    straddling tracks and polygons is approximated)."""
     if not obj.points:
         return None
     xs = [point[0] for point in obj.points]
@@ -397,8 +398,10 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
         # A free primitive is one that is not part of a component.
         return _TRUE if obj.component is None else _FALSE
     if name in _POLYGON_ONLY and obj.kind == "polygon":
-        # The pour itself: its name, class and type are not read.
-        return _TRUE if name in ("ispoly", "ispolygon") else _unknown(node)
+        # The pour itself, never a split plane: its name and class are not read.
+        if name in ("ispoly", "ispolygon"):
+            return _TRUE
+        return _FALSE if name == "issplitplane" else _unknown(node)
     if name in _POLYGON_ONLY and obj.in_pour:
         return _pour_copper_call(node)
     if name in _LAYER_PREDICATES:
