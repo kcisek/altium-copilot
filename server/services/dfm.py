@@ -220,6 +220,14 @@ NOT_CHECKED = {
 _SIDES = ("top", "bottom")
 
 
+def side_counts(counts: dict) -> dict[str, dict[str, int]]:
+    """Placements per side from dfm_assembly.placements' counts, as the assembly checks
+    count them: SMD (mixed parts included), THT (mixed included) and all."""
+    return {side: {"smd": counts[side]["smd"] + counts[side]["mixed"],
+                   "tht": counts[side]["tht"] + counts[side]["mixed"],
+                   "all": sum(counts[side].values())} for side in _SIDES}
+
+
 @dataclass(frozen=True)
 class AssemblyContext:
     """The active variant for the assembly checks. is_dnp: VariantState.is_dnp, applied
@@ -2163,10 +2171,7 @@ class _Review:
 
     def side_counts(self) -> dict[str, dict[str, int]]:
         """Placements per side: SMD (mixed parts included) and THT (mixed included)."""
-        counts = self.placements().counts
-        return {side: {"smd": counts[side]["smd"] + counts[side]["mixed"],
-                       "tht": counts[side]["tht"] + counts[side]["mixed"],
-                       "all": sum(counts[side].values())} for side in _SIDES}
+        return side_counts(self.placements().counts)
 
     def part_example(self, part, at=None, **fields):
         """An example naming a part: its designator, side and a point (its centre)."""

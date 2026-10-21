@@ -6,6 +6,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_release_readiness`: one "is this ready for review or fab?" report (roadmap #38),
+  modelled on Altium's Project Releaser and the board-finalising steps. A fixed table of
+  23 gates, each with status (pass, fail, warn, not_verified, not_applicable), blocking,
+  one line of evidence quoted from the check behind it and source_tool, the tool to call
+  for the details. The gates call the existing services directly over the cached PCB
+  index and design-notes cache (`services/release_gate.py`, no logic duplicated): Batch
+  DRC report clean and not older than the board (get_drc_report's assessment: a report
+  for another board, an incomplete one or one that never checked Short-Circuit is not
+  verified, a stale one fails), ERC
+  (blocking and always not verified: no ERC result is saved in the files; the evidence
+  says whether a connected OutJob ERC validation output makes the Releaser run it),
+  netlist newer than every sheet and schematic-PCB sync (both need the netlist),
+  unrouted nets (check_connectivity, nets routed only through weak joins included),
+  shelved or modified polygons, board outline, global fiducials per assembled side
+  (check_dfm), mounting holes (parts of holes only, free pads with a 1 mm hole, bare
+  holes), Not Fitted parts left out of the BOM and pick-and-place outputs (Altium keeps
+  them on the PCB by design, so the outputs' variant is checked, not the board), the
+  OutJob complete for every variant (gaps, BOM and pick-and-place on different
+  variants, ERC levels that make the release fail) and its generated outputs newer than
+  the design, Draftsman fab notes against the stackup (not verified without a Draftsman
+  drawing), title-block revision and date across the sheets and the drawings' own
+  parameters, project integrity, the Altium 365 copy committed and level, and
+  silkscreen from the DRC report when the board batch-checks it (not verified when the
+  run stopped at its violation limit); footprints against the libraries, lifecycle and
+  compliance, testpoints, teardrops, via stitching and the team's template are not
+  verified, each with the reason. Only blocking gates fail (a non-blocking problem is a warn); a check
+  that raises is not verified. Verdict: fail when a blocking gate failed,
+  not_ready_unverified when none failed but a blocking gate is not verified, pass only
+  when every blocking gate passed, warned or is not applicable (the summary names the
+  blocking warns). Gate rows are paginated, each timed (ms). Validated on
+  Altium's public AD25 examples (Bluetooth Sentinel not_ready_unverified; Mini PC fail on
+  its OutJob's ERC levels; 13.9 s cold for Mini PC's 46 sheets, 1046 parts and 2
+  drawings, 9.3 s after the session start's get_design_notes, 0.6 s warm) and a corpus
+  of 63 projects (netlist-free loads: 41 fail, 22 not_ready_unverified, no exceptions;
+  cold median 0.9 s, at most 2.5 s; DRC report missing in 45 and with violations in 18,
+  8 boards with unrouted nets, 4 with shelved or modified polygons, OutJob gaps failing
+  22, outputs older than the design in 25, the Altium 365 copy failing in 3).
+- `release_review`: a short guided release go / no-go: check_release_readiness, then each
+  failing gate's source tool for its cause and fix, ending in tables of blocking items,
+  what was not verified (never reported as passed) and warnings.
 - `check_fab_drawing`: the project's Draftsman drawings checked offline (roadmap #36). Each
   .PCBDwf (or one named) is classified from its views and notes as a fabrication,
   assembly or other drawing (with a second role when both are strong), and its notes,
