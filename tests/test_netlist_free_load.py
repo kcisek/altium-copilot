@@ -69,6 +69,7 @@ WORKING_TOOL_CALLS = {
     "get_drc_report": lambda: main.get_drc_report(),
     "constraints_review": lambda: main.constraints_review(),
     "pcb_manufacturing_review": lambda: main.pcb_manufacturing_review(),
+    "project_tour": lambda: main.project_tour(),
     "get_design_notes": lambda: main.get_design_notes(),
     "get_design_image": lambda: main.get_design_image("Fab.PCBDwf"),
     "get_design_hierarchy": lambda: main.get_design_hierarchy(),
@@ -217,6 +218,9 @@ def test_constraints_review_explains_the_missing_netlist(env):
     assert "get_component_placement" in review
     manufacturing = main.pcb_manufacturing_review()
     assert "Netlist-free load" in manufacturing and "approximate" in manufacturing
+    tour = main.project_tour()
+    assert "Load: netlist-free" in tour and "(limited: netlist-free load)" in tour
+    assert "PCB: Board.PcbDoc" in tour and "### Phase 3 — PCB\n" in tour
 
 
 def test_stale_cached_netlist_is_not_used(env):
@@ -245,6 +249,22 @@ def test_project_without_pcbdoc(env):
     assert "no .PcbDoc" in result["message"]
     assert json.loads(main.get_board_info())["error"] == "no_pcb_document"
     assert json.loads(main.list_variants())["active_variant"] == "Prod"
+    tour = main.project_tour()
+    assert "### Phase 3 — PCB (skipped: no PcbDoc)" in tour and "get_board_info" not in tour
+
+
+def test_pcb_only_project_tour_skips_the_schematic(env):
+    # No .SchDoc: the load is netlist-free, and Altium's full load would answer no_sheets,
+    # so the tour neither walks sheets nor promises a full tour after opening Altium.
+    root, _, _ = env
+    (root / "Board.PrjPcb").write_text(
+        "[Design]\nVersion=1.0\n[Document1]\nDocumentPath=Board.PcbDoc\n", encoding="utf-8")
+    assert _load(root)["loaded"]
+    tour = main.project_tour()
+    assert "Schematic sheets: 0\n" in tour and "PCB: Board.PcbDoc\n" in tour
+    assert "### Phase 2 — Schematic Blocks (skipped: no schematic sheets)" in tour
+    assert "enables the full tour" not in tour and "get_sheet_context" not in tour
+    assert "### Phase 3 — PCB\n" in tour
 
 
 def test_without_a_project_tools_still_say_no_project(env):
@@ -254,6 +274,7 @@ def test_without_a_project_tools_still_say_no_project(env):
     assert json.loads(main.schematic_review())["error"] == "no_project"
     assert json.loads(main.constraints_review())["error"] == "no_project"
     assert json.loads(main.pcb_manufacturing_review())["error"] == "no_project"
+    assert json.loads(main.project_tour())["error"] == "no_project"
 
 
 LITE_VARIANT = "[ProjectVariant2]\nDescription=Lite\nVariationCount=0\n"
