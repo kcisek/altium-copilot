@@ -245,13 +245,14 @@ class ObjectFacts:
     can be decided exactly. Names are lower-case.
 
     layer is the object's Layer property (v6 id; 74 = Multi-Layer for vias and
-    through-hole pads); span is every copper layer it occupies.
+    through-hole pads); span is every copper layer it occupies. A polygon is
+    a pour itself (the polygon side of a Polygon Connect Style rule).
     """
 
-    kind: str  # "track" | "arc" | "via" | "pad"
+    kind: str  # "track" | "arc" | "via" | "pad" | "polygon"
     layer: int
     span: frozenset = frozenset()
-    points: tuple = ()  # track/arc endpoints; via/pad centre
+    points: tuple = ()  # track/arc endpoints; via/pad centre; polygon outline
     in_pour: bool = False  # a hatched pour's track or arc (InPolygon)
     component: str | None = None
     footprint: str | None = None
@@ -364,6 +365,43 @@ def _object_anchor(obj: ObjectFacts) -> tuple[float, float] | None:
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
+def _polygon_region_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple:
+    """A room or region term on a polygon (its outline in obj.points): false
+    when the outline's bounds miss every room or region it names, else unknown
+    (how much of a pour lies in a room is not measured)."""
+    name, args = node[1], node[2]
+    if name in ("withinroom", "touchesroom", "inroom"):
+        shapes = [
+            vertices
+            for room, vertices in ctx.room_shapes.items()
+            if _any_matches(args, {room})
+        ]
+        if not shapes:
+            return _FALSE if args and not _any_matches(args, ctx.rooms) else _unknown(node)
+        boxes = [
+            (min(x for x, _ in vertices), min(y for _, y in vertices),
+             max(x for x, _ in vertices), max(y for _, y in vertices))
+            for vertices in shapes
+        ]
+    elif name in ("inregion", "inregionabsolute") and len(args) == 4:
+        try:
+            x1, y1, x2, y2 = (float(str(arg).lower().replace("mil", "")) for arg in args)
+        except ValueError:
+            return _unknown(node)
+        boxes = [(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))]
+    else:
+        return _unknown(node)
+    if not obj.points:
+        return _unknown(node)
+    minx, maxx = min(x for x, _ in obj.points), max(x for x, _ in obj.points)
+    miny, maxy = min(y for _, y in obj.points), max(y for _, y in obj.points)
+    if all(
+        box[2] < minx or maxx < box[0] or box[3] < miny or maxy < box[1] for box in boxes
+    ):
+        return _FALSE
+    return _unknown(node)
+
+
 def _pour_copper_call(node) -> tuple:
     """A polygon term on a pour's copper (its child primitives, which rules
     are applied to). InPolygon returns them; IsPolygon, IsNamedPolygon and
@@ -395,6 +433,11 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
     if name == "isfree":
         # A free primitive is one that is not part of a component.
         return _TRUE if obj.component is None else _FALSE
+    if name in _POLYGON_ONLY and obj.kind == "polygon":
+        # The pour itself, never a split plane: its name and class are not read.
+        if name in ("ispoly", "ispolygon"):
+            return _TRUE
+        return _FALSE if name == "issplitplane" else _unknown(node)
     if name in _POLYGON_ONLY and obj.in_pour:
         return _pour_copper_call(node)
     if name in _LAYER_PREDICATES:
@@ -421,6 +464,8 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
         if name in checks:
             return _TRUE if checks[name] else _FALSE
         return _unknown(node)
+    if name in _REGION_PREDICATES and obj.kind == "polygon":
+        return _polygon_region_call(node, obj, ctx)
     if name in ("withinroom", "touchesroom", "inroom"):
         anchor = _object_anchor(obj)
         shapes = [
@@ -618,6 +663,8 @@ def _eval_cmp(node, target: RuleTarget) -> tuple:
             return _TRUE if value == obj.kind else _FALSE
         if node[2] == "<>":
             return _FALSE if value == obj.kind else _TRUE
+    if obj is not None and obj.kind == "polygon" and prop == "name":
+        return _unknown(node)  # a pour's name is not read
     if obj is not None and prop == "name" and node[2] in ("=", "like", "<>"):
         # A pad's Name is "<designator>-<pad>"; other routed objects have none.
         matched = bool(obj.pad) and _wildcard_matches(str(node[3]), obj.pad)

@@ -479,6 +479,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   the nominal diameter, so the two tools could disagree. Simple-stack vias keep their
   ring; no ring changes on 83 real boards (all simple stack) or on Altium's examples
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
+- `check_connectivity`'s `weak_connection` also tests a pad or via that touches a
+  pour's copper (solid or hatched, or the outline standing in for unread copper), as
+  Altium's 'Check for incomplete connections' does: when it is connected directly
+  (Polygon Connect Style), its centre must be inside the pour's outline, arc edges
+  included, within 0.5 mil. Relief connections are not tested, as in Altium's help,
+  and neither is a pad or via whose style is not known. The style is that of the first
+  enabled rule by priority whose first scope matches the pad or via and second the
+  pour. Layer, net and IsPolygon terms are decided on the pour, a room or region term
+  only when the pour lies clear of it, and its name and class are not read. Altium's
+  help does not say whether the scopes may also match the other way
+  round, so every rule that may come first counts, and the pad or via is tested only
+  when they all say Direct. On Altium's 6 examples, 12 of 28,988 pad and via contacts
+  with solid pour copper have their centre off the outline: 7 direct vias and 5
+  relief-connected edge-connector fingers (not tested). One Mini PC via is a connection
+  its net needs, so it is reported. On 83 real boards, 81 of 35,429 contacts are off
+  the outline (78 direct). 24 SMD pads on 4 boards are needed connections, each with
+  its centre 5 to 100 mil past the outline and at most half of the pad inside it. The
+  test was left out when `check_connectivity` was added, because pour outlines then
+  ignored their arcs
 
 ### Fixed
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)
@@ -508,6 +527,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   Sentinel's round GND pours have 3 to 5 vertices and arcs of up to 315 degrees.
   Read straight, 13,468 of their 20,340 poured track and arc ends lay more than
   0.3 mil outside them; now none do. On 83 real boards, 116 pours have arc edges
+- The board outline's points follow its arc edges (Board6 `KINDn=1`) too: they were
+  its vertices only, so an arc bulging past them was cut off. `get_board_info` gave
+  Altium's Bluetooth Sentinel example `board_extents_mil` of 3149.6 x 196.9 mil, the
+  strip its vertices span; with its two 315-degree arcs the board is 3149.6 x 2165.4 mil.
+  The arcs become chords at most 0.25 mil inside them, as pour outlines do
+  (`check_dfm` and `check_pcb_health` already read the arcs themselves). `get_drc_report`
+  measures a violation's zoom box against the outline with its arcs: adding the copper's
+  extents, as it did, missed an arc reaching past the copper. On Altium's other examples
+  the extents do not change; on 83 real boards, 51 have outline arcs and one board's
+  extents change. An outline or pour arc whose angles are finite but too large to subtract
+  (a corrupt record) is a straight edge, as other bad arc values are; in a pour it raised
+  an error that dropped every pour ("Polygons6 parse failed")
 - `check_pcb_health` read a Regions6 or BoardRegions record whose vertices are not
   finite coordinates, or whose hole list runs past the record, as a region. It now
   counts it as unread, as `check_connectivity` already did: both decode Regions6 and

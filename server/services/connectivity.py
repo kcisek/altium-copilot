@@ -20,6 +20,7 @@ keys.
 import math
 import re
 from collections import Counter, defaultdict
+from dataclasses import replace
 
 try:
     from parsers.drc_report import RULE
@@ -27,14 +28,14 @@ try:
     from services.drc_results import rule_kind
     from services.pcb_index import PcbIndex
     from services.pcb_length import NetGraph, stack_z
-    from services.pcb_rules import ObjectResolver, RuleTarget
+    from services.pcb_rules import ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope
 except ImportError:
     from server.parsers.drc_report import RULE
     from server.parsers.pcb_doc import parse_dim_mil
     from server.services.drc_results import rule_kind
     from server.services.pcb_index import PcbIndex
     from server.services.pcb_length import NetGraph, stack_z
-    from server.services.pcb_rules import ObjectResolver, RuleTarget
+    from server.services.pcb_rules import ObjectFacts, ObjectResolver, RuleTarget, evaluate_scope
 
 CHECKS = ("unrouted", "isolated", "antennae", "weak")
 # weak_connection findings only matter with the Un-Routed Net rule's 'Check for
@@ -72,11 +73,21 @@ APPROXIMATIONS = [
     "Net rule. weak_connection lists the joins that Altium's 'Check for incomplete "
     "connections' option rejects (tracks whose centrelines do not meet, a track whose "
     "centreline misses the pad, via or pour copper it touches, a via whose centre is "
-    "off the pad or via; centrelines within "
+    "off the pad or via, a pad or via connected directly to a pour whose centre is "
+    "outside the pour's outline; centrelines and centres within "
     f"{CENTRE_MIL:g} mil count as meeting) where a net needs them: with that option on, "
-    "its nets_joined_only_by_weak_connections would read un-routed. Altium also wants "
-    "a directly connected pad or via's centre inside the pour outline; that is not "
-    "tested, nor whether the board's rule has the option on.",
+    "its nets_joined_only_by_weak_connections would read un-routed. Whether the board's "
+    "rule has the option on is not read.",
+    "A pad or via touching a pour's copper is tested when its Polygon Connect Style is "
+    "Direct (Altium tests the centre 'when the Pad/Via uses a direct connection'), "
+    "against the pour's outline with its arcs, not the poured copper: Altium's fix for "
+    "this violation is to extend the polygon over the centre (a track's centreline is "
+    "tested against the poured copper). The style is the first enabled rule by priority "
+    "whose first scope matches the pad or via and second the pour. Whether Altium also "
+    "matches them the other way round is not documented, a pour's name and class are "
+    "not read, and a room term on a pour is decided only when the pour lies clear of the "
+    "room, so every rule that may come first counts: the pad or via is tested only when "
+    "they all say Direct.",
     "Pour copper is the copper saved in the file (a solid pour's regions, a hatched "
     "pour's tracks and arcs): a pour changed since its last repour is checked as "
     "saved; a shelved pour, and one with no saved copper (never poured, or poured to "
@@ -477,9 +488,12 @@ class Connectivity:
                 (rule for rule in self.pcb.rules if rule.kind == kind),
                 key=lambda rule: rule.priority,
             )
-            for kind in ("UnRoutedNet", "NetAntennae", "PlaneConnect")
+            for kind in ("UnRoutedNet", "NetAntennae", "PlaneConnect", "PolygonConnect")
         }
         self._resolvers: dict[tuple[str, str], ObjectResolver] = {}
+        self._pour_outlines: dict[int, _Area | None] = {}
+        self._pour_centres: dict[tuple[int, int], bool] = {}
+        self._targets: dict[str, RuleTarget] = {}
         self.shelved: dict[int, list] = defaultdict(list)
         # Nets with a plane or split plane on a layer the stack does not list.
         self.planes_off_stack: set[int] = set()
@@ -638,12 +652,107 @@ class Connectivity:
         style = properties.get("PLANECONNECTSTYLE")
         return style.strip().lower().replace(" ", "") if style else None
 
-    def _pour_contact_strong(self, row, layer: int, area) -> bool:
-        """Does an object touching a solid pour's copper meet it as 'Check for
-        incomplete connections' wants? A routing track must reach it with its
-        centreline. Pads and vias are not tested (Altium wants a directly
-        connected one's centre inside the pour outline)."""
-        if row["kind"] not in ("track", "arc") or row["poured_by"] is not None:
+    def _polygon_connect_style(self, net: str, row, pour_id: int, layer: int) -> str | None:
+        """Lower-case style (relief, direct, noconnect) of the Polygon Connect
+        Style rule for a pad or via and a pour of its net that meet on a layer:
+        the rule's VIA., THPAD. or SMDPAD. style when it sets one per object
+        kind, else its CONNECTSTYLE. The rule is the first enabled one by
+        priority whose first scope matches the pad or via and second the pour.
+        Altium's help does not say whether the scopes also match the other way
+        round, and some terms cannot be decided on a pour (its name is not
+        read), so every rule that may come first counts: the style is known
+        only when they all agree, else None (as without a rule)."""
+        if net not in self._targets:
+            self._targets[net] = self.index.rule_target(net, kind="net") or RuleTarget(
+                kind="net", name=net.lower(), nets={net.lower()}, pairs=set()
+            )
+        target = self._targets[net]
+        sides = (
+            replace(target, obj=self.index.object_facts(row)),
+            replace(target, obj=ObjectFacts(
+                kind="polygon", layer=layer, span=frozenset({layer}),
+                points=tuple(self.pcb.pours[pour_id].vertices),
+            )),
+        )
+        prefix = "VIA." if row["kind"] == "via" else "THPAD." if row["hole"] else "SMDPAD."
+
+        def matches(scope: str, side: int) -> str:
+            verdict = evaluate_scope(scope, sides[side], self.index.rule_context)["matches"]
+            return verdict if verdict in ("yes", "no") else "unknown"
+
+        def both(first: str, second: str) -> str:
+            if "no" in (first, second):
+                return "no"
+            return "yes" if first == second == "yes" else "unknown"
+
+        def style(rule) -> str | None:
+            properties = {key.upper(): value for key, value in rule.properties.items()}
+            value = properties.get(prefix + "CONNECTSTYLE") or properties.get("CONNECTSTYLE")
+            return value.strip().lower().replace(" ", "") if value else None
+
+        styles = set()
+        for rule in self.rules["PolygonConnect"]:
+            if not rule.enabled:
+                continue
+            forward = both(matches(rule.scope1, 0), matches(rule.scope2, 1))
+            backward = both(matches(rule.scope1, 1), matches(rule.scope2, 0))
+            if forward == backward == "no":
+                continue
+            styles.add(style(rule))
+            if forward == "yes":
+                break
+        else:
+            styles.add(None)
+        return styles.pop() if len(styles) == 1 else None
+
+    def _centre_in_pour(self, row, pour_id: int) -> bool:
+        """Is a pad's or via's centre inside the pour's outline (or within
+        CENTRE_MIL of it)? True when the pour has no outline."""
+        if pour_id not in self._pour_outlines:
+            pours = self.pcb.pours
+            pour = pours[pour_id] if 0 <= pour_id < len(pours) else None
+            self._pour_outlines[pour_id] = (
+                _Area("pour_outline", pour.layer, pour.net, pour.vertices)
+                if pour is not None and len(pour.vertices) >= 3 else None
+            )
+        outline = self._pour_outlines[pour_id]
+        x, y = row["x1"], row["y1"]
+        if outline is None or outline.contains(x, y):
+            return True
+        return any(
+            math.dist((x, y), _closest_on(x, y, *outline.edges[number])) <= CENTRE_MIL
+            for number in outline.edges_near(
+                x - CENTRE_MIL, y - CENTRE_MIL, x + CENTRE_MIL, y + CENTRE_MIL
+            )
+        )
+
+    def _pad_meets_pour(self, net: str, row, pour_id: int, layer: int) -> bool:
+        """Does a pad or via touching a pour's copper on a layer meet it as
+        'Check for incomplete connections' wants? With a direct connection
+        (Polygon Connect Style) its centre must be inside the pour's outline;
+        one connected by relief or no connect, or whose style is not known, is
+        not tested. Cached per pad or via and pour."""
+        key = (row["id"], pour_id)
+        if key not in self._pour_centres:
+            self._pour_centres[key] = (
+                self._centre_in_pour(row, pour_id)
+                or self._polygon_connect_style(net, row, pour_id, layer) != "direct"
+            )
+        return self._pour_centres[key]
+
+    def _pour_contact_strong(self, row, layer: int, area, net: str) -> bool:
+        """Does an object touching a solid pour's copper (or its outline, when
+        that stands in for unread copper) meet it as 'Check for incomplete
+        connections' wants? A pad or via as _pad_meets_pour says; a routing
+        track must reach the saved copper with its centreline (not tested
+        against an outline)."""
+        if row["poured_by"] is not None:
+            return True
+        if row["kind"] in ("pad", "via"):
+            return area.pour_id is None or self._pad_meets_pour(
+                net, row, area.pour_id, layer
+            )
+        if area.kind != "pour_copper":
             return True
         segment, _, _, arc = self.index._primitive_geometry(row, layer)
         box = _box(row)
@@ -680,8 +789,9 @@ class Connectivity:
         """Do two touching objects also meet as Altium's 'Check for incomplete
         connections' wants (within CENTRE_MIL): track to track by centreline,
         a track's centreline on the pad, via or pour copper it touches, a via's
-        centre on the pad or via? Pad to pad and pour copper to pour copper,
-        pads or vias are not tested."""
+        centre on the pad or via, a pad or via on a hatched pour's copper as
+        _pad_meets_pour says? Pad to pad and pour copper to pour copper are
+        not tested."""
         index = self.index
 
         def core(row):
@@ -704,6 +814,8 @@ class Connectivity:
             return True
         if poured:
             other = second if poured[0] is first else first
+            if other["kind"] in ("pad", "via"):
+                return self._pad_meets_pour(net, other, poured[0]["poured_by"], layer)
             return not routing_track(other) or meets(core(other), copper(poured[0]))
         a_track, b_track = routing_track(first), routing_track(second)
         if a_track and b_track:
@@ -827,8 +939,8 @@ class Connectivity:
                 area_rows[number].append(position)
                 if sets.union(area_element[number], element[position]):
                     joins[number] += 1
-                if area.kind == "pour_copper" and not self._pour_contact_strong(
-                    row, area.layer, area
+                if area.kind in ("pour_copper", "pour_outline") and not self._pour_contact_strong(
+                    row, area.layer, area, name
                 ):
                     weak_areas.append((position, number))
                 else:
@@ -954,7 +1066,9 @@ class Connectivity:
             result["weak"].append({
                 "layer": area.layer,
                 "objects": [
-                    self._describe(row, area.layer), f"Pour copper on {self.layer_name(area.layer)}",
+                    self._describe(row, area.layer),
+                    ("Pour outline" if area.kind == "pour_outline" else "Pour copper")
+                    + f" on {self.layer_name(area.layer)}",
                 ],
                 "x": x, "y": y,
             })

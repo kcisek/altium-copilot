@@ -439,7 +439,8 @@ class DrcLinker:
             key=lambda item: -len(item[0]),
         )
         self.origin = (pcb.board.origin_x or 0.0, pcb.board.origin_y or 0.0)
-        # The outline's vertices (its arcs can bulge past them) and the copper together.
+        # The outline (its arcs flattened) and the copper together: pours and other
+        # copper can reach past the outline.
         xs = [v[0] for v in pcb.board.outline_vertices or []]
         ys = [v[1] for v in pcb.board.outline_vertices or []]
         row = index.db.execute(

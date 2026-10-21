@@ -3399,7 +3399,8 @@ def check_connectivity(
     pads: floating tracks and vias, dead pour islands as info), antenna (open-ended
     tracks and tracks ending on a via that connects nothing else, with stub_mil and
     open_track_mil; over_tolerance against an enabled Net Antennae rule, null without
-    one), weak_connection (copper that only touches where a net needs it, which Altium's
+    one), weak_connection (copper that only touches where a net needs it, or a pad or via
+    connected directly to a pour with its centre off the pour's outline, which Altium's
     'Check for incomplete connections' rejects). With compare_drc, altium_drc puts
     Altium's last Batch DRC report beside it (get_drc_report reads that report).
 
