@@ -6,6 +6,74 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_output_jobs`: the project's Output Jobs offline (roadmap #37), from a new .OutJob
+  parser (`parsers/out_job.py`) whose keys are mapped only where Altium's 11 public AD25
+  example and template OutJobs and a corpus agree. OutJobs come from the .PrjPcb document
+  list; .OutJob files in the project folder (or one folder down, outside nested projects)
+  it does not list are shown and flagged but not counted. Per OutJob: the variant (the
+  job's VariantName, an output's own OutputVariantName where written; VariantScope 1 read
+  as one variant for the whole job, other values passed raw), the container selected in
+  the editor, each container (OutputMediumN: print job, PDF, folder structure, video) with
+  its outputs in order and its path: release managed (the Output Path of Project Options)
+  or manually managed (OutputBasePath), the [Media Name], custom or expression container
+  folder (an expression of quoted text, ProjectName and project parameters such as
+  "=ProjectName" is evaluated, one with CurrentDate or CurrentTime is not; 121 corpus
+  containers use one, 40 of them dated), the [Output Type] / [Output Name] / custom
+  output sub-folder, file naming (a PDF is named by its OutputFileNameSpecial expression
+  when one is written, as all 13 corpus PDFs found next to one are), timestamp and
+  add-to-project flags and the path Altium last resolved; and the outputs grouped by
+  category with state (OutputEnabledN_OutputMediumM: connected with its order, 0 not
+  connected; OutputEnabledN only mirrors the selected container, which every sample
+  confirms), data source, variant and mapped settings (Gerber and Gerber X2 units,
+  decimals, origin, board profile and the mechanical layers plotted, ODB++ units, NC
+  Drill units, format and origin, IPC-2581 version and units, pick-and-place units and
+  formats, ERC report options); other keys are counted or passed raw. coverage gives
+  per role (fabrication data, NC drill, pick-and-place, assembly drawing, BOM, ERC, DRC)
+  connected, present but not connected, or missing. Findings with severity, examples, an
+  Altium fix and the knowledge-base article where one documents it: missing, unreadable
+  or unlisted OutJobs; each missing role (no NC drill for Gerbers without ODB++, IPC-2581
+  or Gerber X2 drill files is an error; an assembly-drawing gap is info when PCB Prints
+  are connected); Gerber only on a rigid-flex stack or with blind/buried drill pairs; BOM
+  and pick-and-place on different variants and a variant with no assembly drawing; data
+  sources missing on disk, outside the project, a Draftsman drawing last updated from
+  another board, the default source with several PcbDocs; an ERC output whose own
+  ERCTypeN levels or Connection Matrix differ from Project Options (KB "Release Fails
+  When ERC Validation Settings Differ from Project Options"); Output Path, ECO Log Path or
+  manual container paths on another drive or a share (KB "Empty Project Release Caused by
+  Output Path Configuration"); file paths estimated near or past 260 characters (KB "File
+  Buffer is not Initialized Error"); Gerbers on the absolute origin next to ODB++ (KB
+  "Resolve component position offset in ODB++ files") and Gerber vs NC Drill origins in
+  one OutJob, both skipped when the board's relative origin is the absolute one; Top or
+  Bottom Overlay missing from the V9 layer stack (KB "ODB++ Export Missing Overlay
+  Layers"); board cutouts with Gerbers plotting no mechanical layer (KB "Board Cutout not
+  in Gerber output"); Draftsman views whose own variant overrides the drawing's and
+  drawings whose variant differs from the OutJob's (KB "How to control the Draftsman
+  output variant for Project Release"; the Draftsman reader now reads the drawing's
+  AssemblyVariantV2 and each view's Variant); generated files at a container's folder (or
+  an output's sub-folder, or the PDF) older than the documents they come from by more
+  than 2 minutes (file times only; nothing is written); outputs connected to no
+  container. not_checked names what the files cannot tell (release folders, plotted layer
+  sets, DRC output settings, which no sample stores, long-path support). The board facts
+  come from a light read of the PcbDoc (Board6 stack and origin, component sides, region
+  heads), so the tool needs no netlist. `project_tour` now uses it in its outputs phase.
+  On Altium's examples: Bluetooth Sentinel's Assembly.OutJob plots Gerbers on the
+  absolute origin while its Fabrication.OutJob has ODB++, and no OutJob validates ERC or
+  DRC; Mini PC's two OutJobs carry ERC levels that differ from the project in 8 types, its
+  Job1.OutJob is not in the project and its Draftsman drawing was updated from a board of
+  the same name in another folder. On a corpus of 63 projects (113 OutJobs, 100 listed by
+  60 projects, 13 unlisted; 854 outputs of 17 types; 253 folder, 170 PDF, 89 print-job
+  and 20 video containers): no exceptions, median 0.07 s and at most 0.84 s per project,
+  every answer under 37k characters; no ERC and no DRC validation output in 60 projects
+  (one has them, not connected), outputs connected to no container in 26 (49 outputs),
+  outputs older than the design in 25 (47 containers), a Gerber on the absolute origin
+  next to a relative NC Drill in one OutJob in 3 and next to ODB++ in 4, board cutouts
+  with no mechanical layer or profile plotted in 4 (13 more plot one: info), no assembly
+  drawing in 9, no pick-and-place in 4, Draftsman views overriding the drawing's variant
+  in 3 and drawings on another variant than their OutJob in 2, a variant without an
+  assembly drawing in 2, both overlays missing from the stack in 1 (the bottom-side
+  layers removed on boards without bottom parts in 4: info), 6 outputs whose data source
+  is missing in 1, and Draftsman drawings last updated from a board of the same name in
+  another folder in 16 (info) and from another board in 2.
 - `check_project_integrity`: problems in the project folder, the .PrjPcb and the strings
   on the sheets that silently break compile, sync or saving, offline (roadmap #12). File
   checks: schematics with legacy extensions (.Sch, .S01, .S02 ...; Altium KB: Update PCB

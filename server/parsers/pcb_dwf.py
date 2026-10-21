@@ -50,6 +50,9 @@ class DraftsmanItem:
     picture_index: int | None = None  # pictures: index for get_design_image
     width_mm: float | None = None
     height_mm: float | None = None
+    # views: the view's own Variant as written ("Document" follows the drawing's variant;
+    # None when the view stores none or nil)
+    variant: str | None = None
 
 
 @dataclass
@@ -61,6 +64,8 @@ class DraftsmanDoc:
     parameters: dict[str, str] = field(default_factory=dict)
     source_pcb: str | None = None   # board the drawing was last updated from
     last_update: str | None = None  # UTC, as Draftsman writes it (ends in "Z")
+    # DocumentOptions AssemblyVariantV2 (else AssemblyVariant): the drawing's variant
+    document_variant: str | None = None
     pictures: list[bytes] = field(default_factory=list, repr=False)  # by picture_index
 
 
@@ -280,9 +285,24 @@ def _parse_item(item: ET.Element, page: int, layers: dict[str, str],
                 _text(scale, "Numenator") and _text(scale, "Denominator"):
             title = title.replace("=ViewScale", f"{_text(scale, 'Numenator')}:{_text(scale, 'Denominator')}")
         parsed.title = resolve(title) or None
+        parsed.variant = _view_variant(item)
     else:
         return None
     return parsed
+
+
+# Where a view keeps its own variant: directly, or in its component display settings
+# (assembly views), its current variation (BOM views) or its settings (realistic views).
+_VARIANT_HOLDERS = ("ViewComponentDisplaySettingsData", "CurrentVariation", "Settings")
+
+
+def _view_variant(item: ET.Element) -> str | None:
+    holders = [item] + [_child(item, name) for name in _VARIANT_HOLDERS]
+    for holder in holders:
+        element = _child(holder, "Variant")
+        if element is not None and element.attrib.get(_XSI_NIL) != "true" and len(element) == 0:
+            return (element.text or "").strip() or None
+    return None
 
 
 def _drill_table(root: ET.Element) -> list[dict]:
@@ -399,6 +419,8 @@ def parse_pcb_dwf(path: str) -> DraftsmanDoc:
         last_update=_text(root, "LastUpdate") or None,
         drill_table=_drill_table(root),
         layer_notes=_layer_notes(stacks),
+        document_variant=(_text(_child(root, "DocumentOptions"), "AssemblyVariantV2")
+                          or _text(_child(root, "DocumentOptions"), "AssemblyVariant") or None),
     )
     for param in _children(_child(root, "Parameters"), "DrawingDocumentParameterData"):
         name, value = _text(param, "Name"), _text(param, "Value")
