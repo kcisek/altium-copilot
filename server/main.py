@@ -374,7 +374,8 @@ component locations, distances):
     on the checks run", never just "manufacturable". Assembly (DFA: "can it be
     assembled?", fiducials, tombstoning, part spacing, too many unique parts) is the
     same tool for the active variant: part_counts, assembly_sides, part_spacing,
-    part_to_edge, fiducials, tombstoning, fine_pitch. A limit the profile does not set
+    part_to_edge, fiducials, tombstoning, fine_pitch, pick_and_place (centroids, board
+    origin). A limit the profile does not set
     (part spacing, part to edge, pitch) is measured, not judged: ask the assembler.
 20. pcb_manufacturing_review — "is this board ready to order?", "review it for
     manufacturing", "go/no-go before fab": a guided fabrication then assembly review
@@ -3615,8 +3616,9 @@ def check_dfm(
     "DFM check", "can my fab / Altimade / JLCPCB / PCBWay make this?", "check against my
     fab's capabilities", before ordering boards; "can it be assembled?", "DFA check",
     fiducials, tombstoning, part spacing, parts near the edge, "too many unique parts
-    for Altimade?". The answer is "meets <profile>'s limits on the checks run", never
-    "manufacturable" in general: name the profile (scope says which), and never present
+    for Altimade?", "is the pick-and-place file right?". The answer is "meets
+    <profile>'s limits on the checks run", never "manufacturable" in general: name
+    the profile (scope says which), and never present
     Altimade's result as another fabricator's. When the user names another fab or
     assembler, ask for its numbers (or a fab_profile.json) and pass profile="none" with
     limits. Not: the board's own rules against its copper (check_rule_compliance);
@@ -3647,7 +3649,12 @@ def check_dfm(
     both sides, THT on the bottom: extra steps, info), part_spacing (same-side parts by
     3D body outline and pad copper; overlapping parts), part_to_edge, fiducials
     (global per assembled side, local near fine-pitch parts), tombstoning (small
-    passives whose pads meet their copper unequally) and fine_pitch. An assembly limit
+    passives whose pads meet their copper unequally), fine_pitch and pick_and_place
+    (Center-X/Y as Altium's pick-and-place file writes it, the midpoint of the outermost
+    pad centres: fitted parts without pads, written at the absolute origin, are a
+    warning when in the BOM or fiducials; parts whose Center-X/Y is off their 3D body,
+    a board origin away from the outline's lower-left corner and Ref-X/Y far from
+    Center-X/Y are info; no limit needed). An assembly limit
     the profile does not set (min_part_spacing, min_part_to_edge, min_global_fiducials,
     local_fiducial_pitch, min_pitch) is measured, not judged: ask the assembler.
     results gives each check's status with its severity, limit and worst value: answer
@@ -3660,7 +3667,8 @@ def check_dfm(
     profile; drills is the drill table. Findings are classes (a width, a family of
     gaps, a drill row or via type) with counts (spacing counts places: spots where two
     nets' copper comes too close) and the worst examples, errors first. Quote
-    not_checked (solder mask, silkscreen, plane pullback, panels, courtyards, paste).
+    not_checked (solder mask, silkscreen, plane pullback, panels, courtyards, paste,
+    pick-and-place rotations).
 
     checks narrows to some of these; findings are paginated (offset from next_offset).
     Example locations (at_mil) are relative to the board origin: add origin_mil for

@@ -32,7 +32,7 @@ FAB_CHECKS = (
 )
 ASSEMBLY_CHECKS = (
     "part_counts", "assembly_sides", "part_spacing", "part_to_edge", "fiducials",
-    "tombstoning", "fine_pitch",
+    "tombstoning", "fine_pitch", "pick_and_place",
 )
 
 SNAPSHOT_MAX_FILES = 5
@@ -375,7 +375,9 @@ Do not proceed to Phase 3 until then.
    the fab's): placements and unique parts against max_placements and max_unique_parts
    (Altimade's ordering limits), parts on both sides and THT on the bottom (extra process
    steps), part spacing, parts near the edge, fiducials, tombstoning risk on small
-   passives, fine pitch. A limit the profile does not set is measured, not judged: ask
+   passives, fine pitch, and the pick-and-place data (parts without pads, asymmetric
+   parts, the board origin: tell the assembler which columns and origin the file
+   uses). A limit the profile does not set is measured, not judged: ask
    the assembler for min_part_spacing, min_part_to_edge, min_global_fiducials,
    local_fiducial_pitch and min_pitch. Without its numbers, compare board_minimums with
    the guidance at the end in the report, marked "typical — confirm"; never pass a
@@ -409,7 +411,7 @@ Present the findings as four Markdown tables:
   | Item | Why | How to confirm |
 
 Table 4 lists every not_checked entry the tools returned (solder mask, silkscreen, paste
-and stencil, panels, courtyards, component heights, pick-and-place data and the like),
+and stencil, panels, courtyards, component heights, pick-and-place rotations and the like),
 the phases or checks left out of scope, and anything a tool could not answer.
 
 Verdict, naming the profile: GO (no fail, nothing blocking), GO WITH CONDITIONS (marginal

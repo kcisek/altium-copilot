@@ -81,7 +81,7 @@ def _area(net, outline, holes=(), layer=1):
 
 
 def _index(components=(), primitives=(), bodies=(), areas=(), outline=None, regions=b"",
-           pours=()):
+           pours=(), bare_holes=()):
     board = _board()
     if outline is not None:
         board.outline_shape = list(outline)
@@ -89,7 +89,7 @@ def _index(components=(), primitives=(), bodies=(), areas=(), outline=None, regi
         board=board, nets=list(NETS), components=list(components),
         primitives=list(primitives), pours=list(pours), layer_name_to_v6=dict(LAYERS),
         raw={"ShapeBasedRegions6/Data": regions} if regions else {}, areas=list(areas),
-        bodies=list(bodies),
+        bodies=list(bodies), bare_holes=list(bare_holes),
     )
     return PcbIndex(pcb, None)
 
@@ -673,6 +673,123 @@ def test_tombstoning_tracks_only_where_no_area_copper_and_terminals():
     plain = _index(components, primitives, areas=areas)
     plain._has_rtree = False
     assert assembly.tombstoning(plain) == assembly.tombstoning(index)
+
+
+# ---------- pick and place ----------
+
+# Altium's files write 4 decimals in mm: the map's oracle agrees within 0.0001 mm.
+PNP_TOLERANCE = 0.001 * MM
+
+
+def _approx(point):
+    return pytest.approx(point, abs=PNP_TOLERANCE)
+
+
+def test_pick_and_place_centre_is_the_box_of_pad_centres():
+    components = [
+        _part(0, "Q1", 100, 100),  # two pads of different size
+        _part(1, "J1", 400, 100),  # mixed: SMD pads and through-hole pegs
+        _part(2, "U1", 700, 700, side="bottom", rotation=270.0),
+        _part(3, "LOGO1", 300, 300, kind=0),  # no pads
+        _part(4, "P1", 900, 100),  # a through-hole header with a pin-1 origin
+    ]
+    primitives = [
+        _smd(0, 100, 100, 10.0), _smd(0, 200, 100, 60.0),
+        _smd(1, 380, 100), _smd(1, 420, 100), _tht(1, 300, 160), _tht(1, 520, 160),
+        _smd(2, 680, 700, layer=32), _smd(2, 720, 700, layer=32), _smd(2, 700, 760, layer=32),
+        _tht(4, 900, 100), _tht(4, 1000, 100), _tht(4, 1100, 100),
+    ]
+    index = _index(components, primitives)
+    q1, j1, u1, logo, p1 = assembly.centroids(index)
+    # The midpoint of the pad centres, not of the copper extent (Part.centre).
+    assert q1.centre == _approx((150.0, 100.0))
+    assert assembly.parts(index)[0].centre == _approx((162.5, 100.0))
+    assert (q1.extent_basis, q1.extent_centre) == ("pads", _approx((162.5, 100.0)))
+    assert q1.extent_offset_mil == pytest.approx(12.5)
+    assert q1.reference_offset_mil == pytest.approx(50.0)
+    # Every pad of a mixed part counts, through-hole pegs too.
+    assert j1.centre == _approx((410.0, 130.0))
+    # A bottom part: the same box, no mirroring.
+    assert u1.centre == _approx((700.0, 730.0)) and u1.unverified == ()
+    # No pads: Altium writes the absolute origin.
+    assert (logo.centre, logo.reference, logo.extent_offset_mil) == (None, (300, 300), None)
+    # Pin-1 origin: Ref-X/Y is off Center-X/Y; the extent agrees with the centre.
+    assert p1.centre == _approx((1000.0, 100.0))
+    assert p1.reference_offset_mil == pytest.approx(100.0)
+    assert p1.extent_offset_mil == pytest.approx(0.0, abs=1e-9)
+    assert assembly.centroids(index) is assembly.centroids(index)  # cached
+
+
+def test_pick_and_place_asymmetric_parts_and_unverified_cases():
+    from server.parsers.pcb_doc import BareHole
+
+    components = [
+        _part(0, "J1", 200, 200),  # an edge connector: pads in a row, the body beyond
+        _part(1, "U2", 500, 500, rotation=30.0),  # off the 90-degree grid
+        _part(2, "U3", 800, 200),  # pads on both sides
+        _part(3, "M1", 800, 800, kind=1),  # copper pads and a bare-hole pad
+        _part(4, "R9", 900, 500, rotation=30.0),  # off the grid, symmetric: no case
+        _part(5, "U4", 1200, 200),  # a bottom pad inside its top pads' box: no case
+    ]
+    primitives = [_smd(0, x, 200) for x in (100, 150, 200, 250, 300)]
+    cosine, sine = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
+    for dx, dy in ((-40, -20), (40, -20), (-40, 60)):  # an L of pads
+        primitives.append(_smd(1, 500 + dx * cosine - dy * sine, 500 + dx * sine + dy * cosine))
+    primitives += [_smd(2, 780, 200), _smd(2, 820, 200), _smd(2, 800, 300, layer=32)]
+    primitives += [_tht(3, 780, 800), _tht(3, 820, 800)]
+    primitives += [_smd(4, 900 + dx * cosine, 500 + dx * sine) for dx in (-20, 20)]
+    primitives += [_smd(5, 1180, 200), _smd(5, 1220, 200), _smd(5, 1200, 300),
+                   _smd(5, 1200, 220, layer=32)]
+    bodies = [_body(0, _rect(80, 180, 320, 400))]
+    holes = [BareHole(x=900, y=800, hole=60.0, layer=74, net=None, component=3, pad_name="M")]
+    index = _index(components, primitives, bodies, bare_holes=holes)
+    j1, u2, u3, m1, r9, u4 = assembly.centroids(index)
+    assert (j1.centre, j1.extent_basis) == (_approx((200.0, 200.0)), "body")
+    assert j1.extent_centre == _approx((200.0, 290.0))
+    assert j1.extent_offset_mil == pytest.approx(90.0)
+    assert j1.reference_offset_mil == pytest.approx(0.0, abs=1e-9)
+    # The box is taken in the board's frame; the part's frame gives another centre here.
+    assert "rotation" in u2.unverified and r9.unverified == ()
+    # Pads on both sides are all counted (the top pads alone give y = 200).
+    assert u3.centre == _approx((800.0, 250.0)) and u3.unverified == ("both_sides",)
+    # The part's own side decides: its top pads alone give the same centre.
+    assert u4.centre == _approx((1200.0, 250.0)) and u4.unverified == ()
+    # A bare-hole pad counts as a pad.
+    assert m1.centre == _approx((840.0, 800.0)) and m1.unverified == ("bare_holes",)
+
+
+def _shifted_outline(dx, dy):
+    return [type(vertex)(vertex.x + dx, vertex.y + dy,
+                         None if vertex.arc is None else
+                         (vertex.arc[0] + dx, vertex.arc[1] + dy, *vertex.arc[2:]))
+            for vertex in OUTLINE]
+
+
+def test_board_origin_against_the_outline():
+    index = _index(outline=_shifted_outline(500, 500))
+    board = index.pcb.board
+    # Within 0.1 mm (3.94 mil) of a corner is at it: 2.2 mil (0.057 mm) off the lower-left
+    # is at it, 6 mil (0.15 mm) off is not.
+    cases = [((0.0, 0.0), "not_set"), ((500.0, 500.0), "lower_left"),
+             ((500.2, 500.1), "lower_left"), ((502.0, 501.0), "lower_left"),
+             ((506.0, 500.0), "inside"), ((1500.0, 500.0), "other_corner"),
+             ((1498.0, 1502.0), "other_corner"), ((494.0, 500.0), "outside"),
+             ((800.0, 900.0), "inside"), ((2000.0, 0.0), "outside"), ((None, None), "not_set")]
+    for (x, y), position in cases:
+        board.origin_x, board.origin_y = x, y
+        facts = assembly.origin(index)
+        assert facts.position == position, (x, y)
+        assert facts.box == (500, 500, 1500, 1500) and not facts.rigid_flex
+    board.origin_x, board.origin_y = 0.0, 0.0
+    assert assembly.origin(index).to_lower_left_mil == pytest.approx(math.hypot(500, 500))
+    board.substacks = [{"id": "1", "name": "Rigid", "is_flex": False},
+                       {"id": "2", "name": "Flex", "is_flex": True}]
+    assert assembly.origin(index).rigid_flex
+    # The outline's corner at the absolute origin: an origin left there is at the corner,
+    # also when the corner is 0.03 mm off it (a corpus case: not a finding).
+    assert assembly.origin(_index(outline=OUTLINE)).position == "lower_left"
+    assert assembly.origin(_index(outline=_shifted_outline(1.0, 0.5))).position == "lower_left"
+    assert assembly.origin(_index()).position == "no_outline"
 
 
 # ---------- the cache ----------

@@ -2,8 +2,11 @@
 the exclusions, results, board minimums and the drill table, paging and the cache, and
 Altium's examples (skipped when absent)."""
 
+import csv
 import gc
 import json
+import math
+import re
 import time
 import weakref
 from pathlib import Path
@@ -127,10 +130,10 @@ def test_invalid_checks():
     result = review_dfm(_index(), _default(), ["spacing", "Bogus"])
     assert result["error"] == "invalid_checks" and "bogus" in result["message"]
     assert result["valid_checks"] == list(VALID_CHECKS)
-    assert len(VALID_CHECKS) == 19 and "copper_weight" in VALID_CHECKS
+    assert len(VALID_CHECKS) == 20 and "copper_weight" in VALID_CHECKS
     assert VALID_CHECKS[12:] == dfm._ASSEMBLY == (
         "part_counts", "assembly_sides", "part_spacing", "part_to_edge", "fiducials",
-        "tombstoning", "fine_pitch")
+        "tombstoning", "fine_pitch", "pick_and_place")
     # Names are case- and space-insensitive and keep the checks' own order.
     full = review_dfm(_index(), _default(), [" Board_Size ", "trace_width"])
     assert full["checks_run"] == ["trace_width", "board_size"]
@@ -1065,10 +1068,11 @@ def test_result_shape_board_facts_and_units():
     assert ranks == sorted(ranks)
     for key in ("solder_mask", "silkscreen", "acute_angles", "copper_text", "plane_pullback",
                 "same_net_gaps", "panels", "courtyards", "component_heights",
-                "pick_and_place", "paste_stencil", "board_thickness", "no_net_gaps",
+                "pick_and_place_rotation", "paste_stencil", "board_thickness", "no_net_gaps",
                 "inside_valid_pours", "other_side_pins"):
         assert key in result["not_checked"]
     assert "assembly" not in result["not_checked"]
+    assert "pick_and_place" not in result["not_checked"]  # checked now
     assert any("Altimade's published limits were used" in note for note in result["notes"])
     # Issue texts follow the units: mm with enough decimals to tell value from limit.
     mm = review_dfm(index, _default(), ["spacing"], to_mm=True)
@@ -1633,6 +1637,170 @@ def test_assembly_minimums_notes_and_the_cache_follow_the_variant():
     assert list(whole["results"]) == list(VALID_CHECKS)
 
 
+def _pnp_board(origin=ORIGIN):
+    """J1 an edge connector (pads in a row, its body beyond them), P1 a through-hole
+    header with a pin-1 origin, R1 a symmetric chip; without pads: FID1 (a No-BOM
+    fiducial), X1 and X2 (in the BOM) and LOGO1 (graphical)."""
+    components = [
+        facts._part(0, "J1", 200, 200, footprint="CONN"),
+        facts._part(1, "P1", 600, 200, footprint="HDR"),
+        facts._part(2, "FID1", 50, 950, kind=5),
+        facts._part(3, "X1", 300, 600),
+        facts._part(4, "LOGO1", 800, 800, kind=2),
+        facts._part(5, "X2", 400, 600),
+        facts._part(6, "R1", 500, 500, footprint="R0402"),
+    ]
+    primitives = [facts._smd(0, x, 200, net=A) for x in (100, 150, 200, 250, 300)]
+    primitives += [facts._tht(1, x, 200, net=B) for x in (600, 700)]
+    primitives += [facts._smd(6, 490, 500, 10.0, net=A), facts._smd(6, 510, 500, 10.0, net=B)]
+    bodies = [facts._body(0, facts._rect(80, 180, 320, 400)),
+              facts._body(1, facts._rect(570, 170, 730, 230))]
+    index = facts._index(components, primitives, bodies, outline=facts.OUTLINE)
+    index.pcb.board.origin_x, index.pcb.board.origin_y = origin
+    return index
+
+
+def _pnp(result, **fields):
+    return next(finding for finding in _found(result, "pick_and_place")
+                if all(finding.get(key) == value for key, value in fields.items()))
+
+
+def test_pick_and_place_classes():
+    full = review_dfm(_pnp_board(), _profile(), ["pick_and_place"])
+    assert full["results"]["pick_and_place"] == {
+        "status": "fail", "parts": 3, "pad_less": 4, "origin": "inside",
+        "worst_offset_mil": 90.0, "origin_to_lower_left_mil": pytest.approx(111.8034),
+        "objects": 6, "groups": 6, "severity": "warning",
+    }
+    # Without pads: Altium writes the absolute origin, (-100, -50) mil in the file.
+    bom = _pnp(full, pad_less="bom")
+    assert (bom["severity"], bom["count"], bom["centre_in_file_mil"]) == (
+        "warning", 2, [-100.0, -50.0])
+    assert bom["issue"].startswith(
+        "2 fitted parts in the BOM without pads: Altium's pick-and-place file has no centre "
+        "for a part without pads and writes Center-X/Y at the absolute origin, (-100 mil, "
+        "-50 mil) from the board origin in the file.")
+    assert [(e["object"], e["at_mil"], e["kind"]) for e in bom["examples"]] == [
+        ("X1", [200.0, 550.0], "standard"), ("X2", [300.0, 550.0], "standard")]
+    fiducial = _pnp(full, pad_less="fiducial")
+    assert fiducial["severity"] == "warning" and "wrong fiducial position" in fiducial["issue"]
+    graphical = _pnp(full, pad_less="not_placed")
+    assert (graphical["severity"], graphical["count"]) == ("info", 1)
+    # The origin is inside the board, not at the outline's lower-left corner.
+    origin = _pnp(full, origin="inside")
+    assert (origin["severity"], origin["count"], origin["lower_left_mil"]) == (
+        "info", 1, [-100.0, -50.0])
+    assert "'Reference to relative origin'" in origin["issue"]
+    # J1: Center-X/Y on its pads, 90 mil from its body's centre (and so is its origin).
+    asymmetric = _pnp(full, mount="smd")
+    assert asymmetric == {
+        "check": "pick_and_place", "severity": "info", "issue": asymmetric["issue"],
+        "count": 1, "mount": "smd", "basis": "body", "threshold_mil": pytest.approx(19.685),
+        "offset_mil": 90.0, "reference_at_centre": 0,
+        "examples": [{"at_mil": [100.0, 150.0], "object": "J1", "side": "top",
+                      "offset_mil": 90.0, "extent_at_mil": [100.0, 240.0],
+                      "reference_offset_mil": 90.0}],
+    }
+    assert "Give the assembler Ref-X/Y for this part" in asymmetric["issue"]
+    # P1's pin-1 origin: Ref-X/Y 50 mil from Center-X/Y, listed but not a miss.
+    reference = _pnp(full, kind="reference_offset")
+    assert (reference["severity"], reference["count"], reference["through_hole"]) == (
+        "info", 1, 1)
+    assert reference["examples"][0]["reference_at_mil"] == [500.0, 150.0]
+    # The variant: X2 Not Fitted is left out.
+    lite = review_dfm(_pnp_board(), _profile(), ["pick_and_place"], variant=_variant("X2"))
+    assert lite["results"]["pick_and_place"]["pad_less"] == 3
+    assert _pnp(lite, pad_less="bom")["count"] == 1
+    # In mm, the file's units.
+    converted = main_mod._convert_units(full, True)
+    assert _pnp(converted, pad_less="bom")["centre_in_file_mm"] == [-2.54, -1.27]
+
+
+def test_pick_and_place_status_follows_the_classes():
+    # The origin at the outline's lower-left: no origin finding.
+    full = review_dfm(_pnp_board((0.0, 0.0)), _profile(), ["pick_and_place"])
+    assert not [f for f in _found(full, "pick_and_place") if "origin" in f]
+    assert full["results"]["pick_and_place"]["origin"] == "lower_left"
+    # Info only (the pad-less parts in the BOM Not Fitted, the fiducial too): advisory.
+    lite = review_dfm(_pnp_board((0.0, 0.0)), _profile(), ["pick_and_place"],
+                      variant=_variant("X1", "X2", "FID1"))
+    entry = lite["results"]["pick_and_place"]
+    assert (entry["status"], entry["severity"]) == ("advisory", "info")
+    # Only Ref-X/Y off Center-X/Y (not a miss): pass.
+    alone = review_dfm(_pnp_board((0.0, 0.0)), _profile(), ["pick_and_place"],
+                       variant=_variant("X1", "X2", "FID1", "LOGO1", "J1"))
+    entry = alone["results"]["pick_and_place"]
+    assert (entry["status"], entry["objects"], entry["groups"]) == ("pass", 0, 1)
+    assert entry["severity"] == "info"
+    # No outline: the origin is not classed.
+    bare = facts._index([facts._part(0, "R1", 100, 100)],
+                        [facts._smd(0, 90, 100, 10.0), facts._smd(0, 110, 100, 10.0)])
+    entry = review_dfm(bare, _profile(), ["pick_and_place"])["results"]["pick_and_place"]
+    assert entry == {"status": "pass", "parts": 1, "pad_less": 0, "origin": "no_outline",
+                     "worst_offset_mil": 0.0, "objects": 0, "groups": 0}
+
+
+def test_pick_and_place_origin_texts():
+    """Each origin class says where the origin is; the rigid-flex caveat only on a
+    rigid-flex stack."""
+    cases = [
+        ((0.0, 0.0), (500, 500), "not_set",
+         "The board's relative origin is not set (it is the absolute origin), 707.107 mil "
+         "from the outline's lower-left corner: "),
+        ((1000.0, 1000.0), (0, 0), "other_corner",
+         "The board's relative origin is at a corner of the outline other than the "
+         "lower-left one, 1414.214 mil from it: "),
+        ((-200.0, 0.0), (0, 0), "outside",
+         "The board's relative origin is outside the outline, 200 mil from its lower-left "
+         "corner: "),
+    ]
+    for origin, shift, position, text in cases:
+        index = _pnp_board(origin)
+        index.pcb.board.outline_shape = facts._shifted_outline(*shift)
+        full = review_dfm(index, _profile(), ["pick_and_place"])
+        finding = _pnp(full, origin=position)
+        assert (finding["severity"], finding["count"]) == ("info", 1)
+        assert finding["issue"].startswith(text), position
+        assert "rigid-flex" not in finding["issue"]
+    flex = _pnp_board()
+    flex.pcb.board.substacks = [{"id": "1", "name": "Rigid", "is_flex": False},
+                                {"id": "2", "name": "Flex", "is_flex": True}]
+    finding = _pnp(review_dfm(flex, _profile(), ["pick_and_place"]), origin="inside")
+    assert finding["issue"].endswith(
+        "The stack is rigid-flex: the outline read may be one region of the board, so check "
+        "the origin against the whole board.")
+
+
+def test_pick_and_place_reference_points_and_named_fiducials():
+    """J2's reference point is at its body centre (counted in the asymmetric class), R2's
+    is 0.635 mm off its Center-X/Y (listed), R3's 0.48 mm (not); MARK1 is a fiducial by
+    its footprint and JP1 a pad-less jumper (in the BOM)."""
+    components = [
+        facts._part(0, "J1", 200, 200), facts._part(1, "J2", 600, 290),
+        facts._part(2, "R2", 1000, 525), facts._part(3, "R3", 1200, 519),
+        facts._part(4, "MARK1", 50, 950, footprint="Fiducial_1mm", kind=5),
+        facts._part(5, "JP1", 300, 600, kind=6),
+    ]
+    primitives = [facts._smd(0, x, 200, net=A) for x in (100, 150, 200, 250, 300)]
+    primitives += [facts._smd(1, x, 200, net=A) for x in (500, 550, 600, 650, 700)]
+    for number, x in ((2, 1000), (3, 1200)):
+        primitives += [facts._smd(number, x - 10, 500, 10.0, net=A),
+                       facts._smd(number, x + 10, 500, 10.0, net=B)]
+    bodies = [facts._body(0, facts._rect(80, 180, 320, 400)),
+              facts._body(1, facts._rect(480, 180, 720, 400))]
+    index = facts._index(components, primitives, bodies, outline=facts.OUTLINE)
+    full = review_dfm(index, _profile(), ["pick_and_place"])
+    asymmetric = _pnp(full, mount="smd")
+    assert (asymmetric["count"], asymmetric["reference_at_centre"]) == (2, 1)
+    assert "(1 of them already has it there, within 19.685 mil)" in asymmetric["issue"]
+    reference = _pnp(full, kind="reference_offset")
+    assert [(e["object"], e["offset_mil"]) for e in reference["examples"]] == [
+        ("J2", 90.0), ("R2", 25.0)]
+    assert _pnp(full, pad_less="fiducial")["examples"][0]["object"] == "MARK1"
+    jumper = _pnp(full, pad_less="bom")
+    assert (jumper["severity"], jumper["examples"][0]["kind"]) == ("warning", "jumper")
+
+
 # ---------- Altium's examples ----------
 
 
@@ -1654,6 +1822,7 @@ SNAPSHOT = {
         "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
         "part_to_edge": "pass", "fiducials": "advisory",
         "tombstoning": "advisory", "fine_pitch": "advisory",
+        "pick_and_place": "advisory",
     },
     "MiniPC.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass", "annular_ring": "fail",
@@ -1663,6 +1832,7 @@ SNAPSHOT = {
         "part_counts": "advisory", "assembly_sides": "advisory", "part_spacing": "advisory",
         "part_to_edge": "pass", "fiducials": "advisory",
         "tombstoning": "fail", "fine_pitch": "advisory",
+        "pick_and_place": "advisory",
     },
     "PC4-SODIMM_V200_RC_A1_20141015.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass",
@@ -1672,6 +1842,7 @@ SNAPSHOT = {
         "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
         "part_to_edge": "not_checked", "fiducials": "advisory",
         "tombstoning": "pass", "fine_pitch": "advisory",
+        "pick_and_place": "advisory",
     },
     "WiFi.PcbDoc": {
         "trace_width": "pass", "spacing": "fail", "hole_size": "pass", "annular_ring": "pass",
@@ -1681,6 +1852,7 @@ SNAPSHOT = {
         "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "not_checked",
         "part_to_edge": "not_checked", "fiducials": "advisory",
         "tombstoning": "pass", "fine_pitch": "advisory",
+        "pick_and_place": "advisory",
     },
     "WiFi_panel.PcbDoc": {
         "trace_width": "pass", "spacing": "pass", "hole_size": "pass", "annular_ring": "fail",
@@ -1690,6 +1862,7 @@ SNAPSHOT = {
         "part_counts": "pass", "assembly_sides": "pass", "part_spacing": "not_checked",
         "part_to_edge": "not_checked", "fiducials": "pass",
         "tombstoning": "pass", "fine_pitch": "not_checked",
+        "pick_and_place": "pass",
     },
     "SL1 Xilinx Spartan-IIE PQ208 Rev1.02.PcbDoc": {
         "trace_width": "pass", "spacing": "pass", "hole_size": "pass",
@@ -1699,6 +1872,7 @@ SNAPSHOT = {
         "part_counts": "pass", "assembly_sides": "advisory", "part_spacing": "advisory",
         "part_to_edge": "not_checked", "fiducials": "advisory",
         "tombstoning": "pass", "fine_pitch": "advisory",
+        "pick_and_place": "advisory",
     },
 }
 
@@ -1722,6 +1896,111 @@ def test_examples_status_snapshot(name):
         sizes = [len(_rendered(page_dfm(mm, 0, limit, examples), to_mm))
                  for limit, examples in SHRINK_STEPS]
         assert sizes[1] < 60000
+
+
+# Default profile, every part fitted: (origin, pad-less parts, asymmetric SMD or mixed
+# parts, asymmetric through-hole parts) per board.
+PNP_SNAPSHOT = {
+    "Bluetooth_Sentinel.PcbDoc": ("inside", 1, 0, 0),
+    "MiniPC.PcbDoc": ("lower_left", 1, 3, 6),
+    "PC4-SODIMM_V200_RC_A1_20141015.PcbDoc": ("inside", 0, 0, 0),
+    "WiFi.PcbDoc": ("lower_left", 0, 1, 0),
+    "WiFi_panel.PcbDoc": ("lower_left", 0, 0, 0),
+    "SL1 Xilinx Spartan-IIE PQ208 Rev1.02.PcbDoc": ("lower_left", 1, 3, 1),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PNP_SNAPSHOT))
+def test_examples_pick_and_place(name):
+    index, _ = _example(name)
+    full = review_dfm(index, _default(), ["pick_and_place"])
+    entry = full["results"]["pick_and_place"]
+    found = _found(full, "pick_and_place")
+    counts = {mount: sum(f["count"] for f in found if f.get("mount") == mount)
+              for mount in ("smd", "tht")}
+    assert (entry["origin"], entry["pad_less"], counts["smd"], counts["tht"]) == \
+        PNP_SNAPSHOT[name]
+    # No placed part's Center-X/Y lands at the absolute origin, and none is a warning:
+    # the examples' pad-less parts are a logo, a graphic and a mechanical part.
+    assert not _found(full, "pick_and_place", "warning")
+
+
+def test_minipc_pick_and_place(minipc):
+    index, _ = minipc
+    full = review_dfm(index, _default(), ["pick_and_place"], to_mm=True)
+    entry = full["results"]["pick_and_place"]
+    assert (entry["parts"], entry["origin"], entry["unverified"]) == (
+        1041, "lower_left", {"bare_holes": 3})
+    # The edge connectors J20 and J6: Center-X/Y on their pads, mm off their bodies.
+    smd = _pnp(full, mount="smd")
+    assert [e["object"] for e in smd["examples"][:2]] == ["J20", "J6"]
+    assert smd["examples"][0]["offset_mil"] == pytest.approx(4.1507 * MM, abs=0.01)
+    (mechanical,) = [f for f in _found(full, "pick_and_place") if "pad_less" in f]
+    assert mechanical["examples"][0]["kind"] == "mechanical"
+
+
+def _altium_pick_place(path):
+    """{designator: (x, y) mil} of an Altium pick-and-place file (txt or csv, mm or
+    mil), or None when the file is not one."""
+    # Altium may write a byte-order mark before the column header, mid-file.
+    lines = path.read_text("utf-8", "replace").replace("\ufeff", "").splitlines()
+    head = next((n for n, line in enumerate(lines[:80])
+                 if "Designator" in line and "Center-X" in line), None)
+    if head is None:
+        return None
+    metric = "(mm)" in lines[head] or any(
+        "mm" in line.lower().split(":")[-1] or "metric" in line.lower()
+        for line in lines[:head] if "Units used" in line)
+    if path.suffix.lower() == ".csv" or '","' in lines[head]:
+        rows = list(csv.reader(lines[head:]))
+    else:
+        starts = [match.start() for match in re.finditer(r"\S+", lines[head])]
+        rows = [[line[a:b].strip() for a, b in zip(starts, starts[1:] + [None])]
+                for line in lines[head:] if line.strip()]
+    columns = [re.sub(r"\(.*\)", "", name).strip().strip('"') for name in rows[0]]
+    at = {name: columns.index(name) for name in ("Designator", "Center-X", "Center-Y")}
+    scale = MM if metric else 1.0
+    found = {}
+    for row in rows[1:]:
+        try:
+            x, y = (float(re.sub(r"[a-z]+$", "", row[at[key]].strip(), flags=re.I))
+                    for key in ("Center-X", "Center-Y"))
+        except (ValueError, IndexError):
+            continue
+        found[row[at["Designator"]].strip()] = (x * scale, y * scale)
+    return found
+
+
+def test_centres_match_altium_pick_place_files():
+    """Altium's own pick-and-place output beside an example board, when one exists
+    (Altium's examples ship none: generate one to run this). The map's private oracle:
+    2571 of 2571 rows of unchanged parts within 0.0001 mm."""
+    files = [] if not EXAMPLES.is_dir() else [
+        path for path in EXAMPLES.rglob("Pick Place for *") if path.suffix.lower() in
+        (".txt", ".csv")]
+    pairs = []
+    for path in files:
+        stem = re.sub(r"\s*\(.*\)$", "", path.stem[len("Pick Place for "):])
+        board = next(path.parent.parent.rglob(f"{stem}.PcbDoc"), None)
+        rows = _altium_pick_place(path)
+        if board is not None and rows:
+            pairs.append((board, rows))
+    if not pairs:
+        pytest.skip("no Altium pick-and-place file beside the example boards")
+    for board, rows in pairs:
+        index = PcbIndex(parse_pcb_doc(str(board)), None)
+        ox, oy = index.pcb.board.origin_x or 0.0, index.pcb.board.origin_y or 0.0
+        by_name = {part.designator: part.component for part in dfm.assembly.parts(index)}
+        centroids = dfm.assembly.centroids(index)
+        checked = hits = 0
+        for name, (x, y) in rows.items():
+            if name not in by_name:
+                continue
+            centre = centroids[by_name[name]].centre or (0.0, 0.0)
+            checked += 1
+            hits += math.hypot(centre[0] - ox - x, centre[1] - oy - y) <= 0.001 * MM
+        # Parts moved after the file was written miss; Altium's own rows agree.
+        assert checked and hits >= 0.95 * checked, (board.name, hits, checked)
 
 
 def test_sodimm_assembly():
@@ -1849,10 +2128,12 @@ def test_minipc_worst_case_page_fits(minipc):
     start = time.perf_counter()
     full = review_dfm(index, _profile(strict), to_mm=True)
     assert time.perf_counter() - start < 9.0  # about 3.5 s, part spacing at its 5 mm bound
-    # Every check fails but the two that are advice whatever the limits.
+    # Every check fails but the three that are advice whatever the limits (MiniPC has no
+    # pad-less part in the BOM: pick and place has no limit to miss).
     assert {check: entry["status"] for check, entry in full["results"].items()
             if entry["status"] != "fail"} == {"drill_count": "advisory",
-                                              "assembly_sides": "advisory"}
+                                              "assembly_sides": "advisory",
+                                              "pick_and_place": "advisory"}
     assert len(_rendered(page_dfm(full, 0, *SHRINK_STEPS[1]), True)) < 60000
 
 

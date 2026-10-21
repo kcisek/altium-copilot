@@ -4,7 +4,8 @@ included), hole sizes, annular rings, aspect ratios, hole to hole, copper and ho
 the board edge, layer count, copper weight, board size, drill sizes, and the board's own
 rules against the profile; and assembly (DFA) for the active variant over
 dfm_assembly's facts: placements and unique parts, the sides assembled, part spacing,
-parts near the edge, fiducials, tombstoning of small passives and fine pitch.
+parts near the edge, fiducials, tombstoning of small passives, fine pitch and the
+pick-and-place data (centres as Altium writes them, and the board origin).
 
 Pure logic, no MCP. Lengths are mils under *_mil keys, so callers can convert units;
 ratios and counts carry no unit. Issue texts are written in the units asked for, with
@@ -60,7 +61,11 @@ pitch is advisory for parts at FINE_PITCH_MIL or finer, and fiducials are compar
 typical counts (GLOBAL_FIDUCIALS per assembled side, LOCAL_FIDUCIALS near parts at
 LOCAL_FIDUCIAL_PITCH_MIL or finer) as info. Max placements and unique parts are
 Altimade's ordering limits: info while Altimade is only the default. Fiducials report
-their misses as missing_global and local_parts, not one objects count.
+their misses as missing_global and local_parts, not one objects count. Pick and place
+needs no limit: fitted parts without pads (Altium writes their centre at the absolute
+origin) are a warning when they are in the BOM or named fiducials; asymmetric parts
+(Center-X/Y off the body), an origin away from the outline's lower-left corner and
+Ref-X/Y far from Center-X/Y (not a miss) are info.
 """
 
 import heapq
@@ -75,7 +80,7 @@ try:
     from parsers.pcb_doc import MULTI_LAYER, pad_copper_on
     from services import dfm_assembly as assembly
     from services import dfm_geometry as geometry
-    from services.bom import natural_key
+    from services.bom import KIND_NAMES, natural_key
     from services.fab_profiles import MM
     from services.pcb_compliance import (
         CLEARANCE_TOLERANCE_MIL,
@@ -89,7 +94,7 @@ except ImportError:
     from server.parsers.pcb_doc import MULTI_LAYER, pad_copper_on
     from server.services import dfm_assembly as assembly
     from server.services import dfm_geometry as geometry
-    from server.services.bom import natural_key
+    from server.services.bom import KIND_NAMES, natural_key
     from server.services.fab_profiles import MM
     from server.services.pcb_compliance import (
         CLEARANCE_TOLERANCE_MIL,
@@ -121,6 +126,7 @@ CHECKS = (
     "fiducials",
     "tombstoning",
     "fine_pitch",
+    "pick_and_place",
 )
 VALID_CHECKS = CHECKS
 _ASSEMBLY = CHECKS[CHECKS.index("part_counts"):]
@@ -155,6 +161,21 @@ FINE_PITCH_MIL = 0.5 * MM
 # Altium's DFA article: top-side SMD parts 125 mil from the edge without breakaway rails
 # (guidance in a reason text, not a default).
 PART_EDGE_GUIDANCE_MIL = 125.0
+# Pick and place (map_pnp: a survey of 7867 placed parts on 83 boards of a private set;
+# no assembler publishes a number). Asymmetric parts, info: Center-X/Y at least
+# ASYMMETRIC_SMD_MIL from the body's box centre (the pad copper extent's without a body)
+# for an SMD or mixed part, ASYMMETRIC_THT_MIL for a through-hole one, whose bodies
+# often overhang their pins (map: 79 SMD-only parts past 0.5 mm, 31 past 1 mm; 72
+# through-hole or mixed parts past 2 mm; through the check, 83 SMD or mixed parts on 53
+# boards and 69 through-hole parts on 27). Ref-X/Y more than REFERENCE_OFFSET_MIL from
+# Center-X/Y is listed for assemblers who place from Ref-X/Y, never a miss (corpus: 1616
+# parts on 78 of 83 boards, 1154 of them through-hole with a pin-1 origin).
+ASYMMETRIC_SMD_MIL = 0.5 * MM
+ASYMMETRIC_THT_MIL = 2.0 * MM
+REFERENCE_OFFSET_MIL = 0.5 * MM
+# Pad-less parts of these kinds (Standard, Net Tie in the BOM, Jumper) are in the BOM and
+# the pick-and-place file: a warning; Mechanical, Graphical and No-BOM ones are info.
+PNP_BOM_KINDS = (0, 3, 6)
 
 _SEVERITY_RANK = {"error": 0, "warning": 1, "info": 2}
 _SEQUENCE = itertools.count()
@@ -188,7 +209,11 @@ NOT_CHECKED = {
                        "that side's parts (a bottom SMD part on a top connector's pins).",
     "component_heights": "Component heights against an enclosure or a height limit are "
                          "not checked.",
-    "pick_and_place": "Pick-and-place centroids and rotations are not checked.",
+    "pick_and_place_rotation": "Pick-and-place rotations against the assembler's zero "
+                               "orientation (IPC-7351 or the tape's) are not checked: "
+                               "Altium writes each part's own rotation. Ref-X/Y, Pad-X/Y "
+                               "and the Y-flip option were not compared with Altium's "
+                               "files.",
     "paste_stencil": "Paste mask and stencil apertures (paste reduction, step stencils) "
                      "are not checked.",
 }
@@ -1859,23 +1884,7 @@ class _Review:
 
     def outline_box(self) -> tuple | None:
         """(min x, min y, max x, max y) of the outline, arcs bulging included."""
-        shape = self.pcb.board.outline_shape
-        if len(shape) < 3:
-            return None
-        xs = [vertex.x for vertex in shape]
-        ys = [vertex.y for vertex in shape]
-        for vertex in shape:
-            if vertex.arc is None:
-                continue
-            cx, cy, radius, start, end = vertex.arc
-            sweep = (end - start) % 360.0 or 360.0
-            if sweep < 0.2:
-                continue
-            for angle in (start, end, 0.0, 90.0, 180.0, 270.0):
-                if (angle - start) % 360.0 <= sweep + 1e-9:
-                    xs.append(cx + radius * math.cos(math.radians(angle)))
-                    ys.append(cy + radius * math.sin(math.radians(angle)))
-        return min(xs), min(ys), max(xs), max(ys)
+        return assembly.outline_box(self.pcb)
 
     def check_board_size(self) -> None:
         box = self.outline_box()
@@ -2709,6 +2718,213 @@ class _Review:
             return text
         return describe
 
+    def check_pick_and_place(self) -> None:
+        """Altium's pick-and-place data (Center-X/Y: the midpoint of the box of a part's
+        pad centres, over every pad; the file counts from the board's relative origin),
+        whatever the profile. Fitted parts without pads, which Altium writes at the
+        absolute origin: a warning for a part in the BOM (Standard, Net Tie in the BOM,
+        Jumper) or one named a fiducial, else info. Placed parts whose Center-X/Y is off
+        their footprint's extent (the 3D bodies' box, else the pad copper's) by
+        ASYMMETRIC_SMD_MIL (SMD or mixed) or ASYMMETRIC_THT_MIL (through-hole): info.
+        The relative origin anywhere but the outline's lower-left corner: info (Altium's
+        own files were made from such boards). Ref-X/Y more than REFERENCE_OFFSET_MIL
+        from Center-X/Y: an info class that is not a miss."""
+        centroids = assembly.centroids(self.index)
+        parts = assembly.parts(self.index)
+        out = self.not_fitted()
+        placed = self.placed_parts()
+        origin = assembly.origin(self.index)
+        pad_less = sorted(
+            (part for part in parts if part.component not in out and part.x is not None
+             and centroids[part.component].centre is None),
+            key=lambda part: natural_key(self.designator(part.component) or ""))
+        offsets = [centroids[part.component].extent_offset_mil for part in placed]
+        offsets = [offset for offset in offsets if offset is not None]
+        entry = self.results["pick_and_place"] = {
+            "status": "pass", "parts": len(placed), "pad_less": len(pad_less),
+            "origin": origin.position,
+            "worst_offset_mil": _round(max(offsets)) if offsets else None,
+        }
+        if origin.to_lower_left_mil is not None:
+            entry["origin_to_lower_left_mil"] = _round(origin.to_lower_left_mil)
+        unverified = Counter(reason for part in placed
+                             for reason in centroids[part.component].unverified)
+        if unverified:
+            entry["unverified"] = dict(sorted(unverified.items()))
+            entry["note"] = (
+                "Center-X/Y of these parts depends on a case Altium's own files did not "
+                "settle (bare-hole pads counted, pads on both sides counted, the box taken "
+                "in the board's frame for a rotation off 90 degrees): compare with the "
+                "file Altium writes.")
+        self._pnp_pad_less(pad_less)
+        self._pnp_origin(origin)
+        self._pnp_asymmetric(placed, centroids)
+        self._pnp_reference(placed, centroids)
+
+    def _pnp_pad_less(self, pad_less) -> None:
+        """Fitted parts without pads: Center-X/Y falls back to the absolute origin."""
+        classes: dict[str, _Group] = {}
+        written = self.at(0.0, 0.0)
+        for part in pad_less:
+            reason = ("fiducial" if assembly.named_fiducial(part) else
+                      "bom" if part.kind in PNP_BOM_KINDS else "not_placed")
+            if reason not in classes:
+                group = classes[reason] = self.group(
+                    "pick_and_place", "info" if reason == "not_placed" else "warning",
+                    pad_less=reason, centre_in_file_mil=written)
+                group.describe = self._describe_pad_less(reason, written)
+            classes[reason].add(0.0, self.part_example(
+                part, (part.x, part.y), kind=KIND_NAMES.get(part.kind, str(part.kind))))
+
+    def _describe_pad_less(self, reason, written):
+        where = f"({self.len(written[0])}, {self.len(written[1])})"
+
+        def describe(group: _Group) -> str:
+            one = group.count == 1
+            what = {
+                "bom": "fitted part in the BOM" if one else "fitted parts in the BOM",
+                "fiducial": "fiducial" if one else "fiducials",
+                "not_placed": ("fitted part not placed by machine (Mechanical, Graphical or "
+                               "Standard (No BOM))" if one else "fitted parts not placed by "
+                               "machine (Mechanical, Graphical or Standard (No BOM))"),
+            }[reason]
+            text = (f"{group.count} {what} without pads: Altium's pick-and-place file has "
+                    "no centre for a part without pads and writes Center-X/Y at the absolute "
+                    f"origin, {where} from the board origin in the file. ")
+            if reason == "fiducial":
+                return text + ("The assembler would take a wrong fiducial position: make "
+                               "each fiducial a single SMD pad, or give the assembler "
+                               "Ref-X/Y (its reference point) for it.")
+            if reason == "bom":
+                return text + ("Give the assembler Ref-X/Y for it with the reference point "
+                               "at the body centre, add the pads, or make it Standard (No "
+                               "BOM) or Mechanical if no machine places it.")
+            return text + ("If the file lists them (No BOM parts only with 'Include "
+                           "Standard (No BOM) Items'), leave them out or tell the "
+                           "assembler.")
+        return describe
+
+    def _pnp_origin(self, origin) -> None:
+        """The relative origin anywhere but the outline's lower-left corner: info."""
+        if origin.position in ("lower_left", "no_outline"):
+            return
+        box = origin.box
+        group = self.group("pick_and_place", "info", origin=origin.position,
+                           origin_to_lower_left_mil=_round(origin.to_lower_left_mil),
+                           lower_left_mil=self.at(box[0], box[1]))
+        group.count = 1
+        reach = self.len(origin.to_lower_left_mil)
+
+        def describe(group: _Group) -> str:
+            text = {
+                "not_set": "The board's relative origin is not set (it is the absolute "
+                           f"origin), {reach} from the outline's lower-left corner",
+                "other_corner": "The board's relative origin is at a corner of the outline "
+                                f"other than the lower-left one, {reach} from it",
+                "inside": "The board's relative origin is inside the board, "
+                          f"{reach} from the outline's lower-left corner",
+                "outside": "The board's relative origin is outside the outline, "
+                           f"{reach} from its lower-left corner",
+            }[origin.position]
+            text += (": the pick-and-place file (and ODB++) count from it, so the board's "
+                     "corner is not 0,0 there. Assemblers usually expect the lower-left "
+                     "corner: set it there (Edit > Origin > Set) before making the outputs, "
+                     "or confirm the assembler aligns the file with the board data. Gerbers "
+                     "line up with the pick-and-place file and ODB++ only with Gerber Setup "
+                     "> Advanced > 'Reference to relative origin'.")
+            if origin.rigid_flex:
+                text += (" The stack is rigid-flex: the outline read may be one region of the "
+                         "board, so check the origin against the whole board.")
+            return text
+        group.describe = describe
+
+    def _pnp_asymmetric(self, placed, centroids) -> None:
+        """Placed parts whose Center-X/Y is off their footprint's extent: info."""
+        classes: dict[tuple, _Group] = {}
+        found = []
+        for part in placed:
+            facts = centroids[part.component]
+            if facts.extent_offset_mil is None:
+                continue
+            mount = "tht" if part.mount == "tht" else "smd"
+            limit = ASYMMETRIC_THT_MIL if mount == "tht" else ASYMMETRIC_SMD_MIL
+            if facts.extent_offset_mil >= limit - EPS_MIL:
+                found.append((facts.extent_offset_mil, mount, facts.extent_basis, limit,
+                              part, facts))
+        # Largest offset first: the class's offset_mil is its largest, examples the worst.
+        found.sort(key=lambda item: (-item[0], item[4].component))
+        for offset, mount, basis, limit, part, facts in found:
+            reference = math.hypot(facts.reference[0] - facts.extent_centre[0],
+                                   facts.reference[1] - facts.extent_centre[1])
+            key = (mount, basis)
+            group = classes.get(key)
+            if group is None:
+                group = classes[key] = self.group(
+                    "pick_and_place", "info", mount=mount, basis=basis,
+                    threshold_mil=_round(limit), offset_mil=_round(offset),
+                    reference_at_centre=0)
+                group.describe = self._describe_asymmetric(mount, basis, limit, offset)
+            group.fields["reference_at_centre"] += reference < limit - EPS_MIL
+            group.add(-offset, self.part_example(
+                part, facts.centre, offset_mil=_round(offset),
+                extent_at_mil=self.at(*facts.extent_centre),
+                reference_offset_mil=_round(reference)))
+
+    def _describe_asymmetric(self, mount, basis, limit, largest):
+        extent = "3D body's centre" if basis == "body" else "pad copper extent's centre"
+        kind = "through-hole" if mount == "tht" else "SMD or mixed"
+
+        def describe(group: _Group) -> str:
+            one = group.count == 1
+            parts, these = ("part", "this part") if one else ("parts", "these parts")
+            there = group.fields["reference_at_centre"]
+            text = (f"{group.count} placed {kind} {parts} whose Center-X/Y (the midpoint of "
+                    f"the outermost pad centres, as Altium writes it) is {self.len(limit)} or "
+                    f"more from the footprint's {extent} (up to {self.len(largest)}): an "
+                    "asymmetric footprint, such as an edge connector or a part with a tab. A "
+                    "machine placing at Center-X/Y puts the body off by that much unless the "
+                    "assembler's package data corrects it. Give the assembler Ref-X/Y for "
+                    f"{these} with the footprint's reference point at the body centre")
+            if there:
+                has = "it already has" if one else (
+                    f"{there} of them already {'has' if there == 1 else 'have'}")
+                text += f" ({has} it there, within {self.len(limit)})"
+            return text + ", or confirm the assembler corrects the offset."
+        return describe
+
+    def _pnp_reference(self, placed, centroids) -> None:
+        """Ref-X/Y far from Center-X/Y: info, not a miss."""
+        found = []
+        for part in placed:
+            facts = centroids[part.component]
+            offset = facts.reference_offset_mil
+            if offset is not None and offset > REFERENCE_OFFSET_MIL + EPS_MIL:
+                found.append((offset, part, facts))
+        if not found:
+            return
+        through = sum(1 for _, part, _ in found if part.mount == "tht")
+        group = self.group("pick_and_place", "info", miss=False, kind="reference_offset",
+                           threshold_mil=_round(REFERENCE_OFFSET_MIL), through_hole=through)
+        found.sort(key=lambda item: (-item[0], item[1].component))
+        for offset, part, facts in found:
+            group.add(-offset, self.part_example(
+                part, facts.centre, offset_mil=_round(offset),
+                reference_at_mil=self.at(*facts.reference)))
+        largest = found[0][0]
+        group.fields["offset_mil"] = _round(largest)
+
+        def describe(group: _Group) -> str:
+            parts, their = ("placed part", "its") if group.count == 1 else ("placed parts",
+                                                                            "their")
+            text = (f"{group.count} {parts} whose reference point (Ref-X/Y) is more than "
+                    f"{self.len(REFERENCE_OFFSET_MIL)} from {their} Center-X/Y (up to "
+                    f"{self.len(largest)}")
+            if through:
+                text += f"; {through} through-hole, where a pin-1 origin is common"
+            return text + ("). No problem when the assembler places from Center-X/Y, the "
+                           "default columns; an assembler who places from Ref-X/Y must know.")
+        group.describe = describe
+
     def assembly_minimums(self, out: dict, not_measured: list) -> None:
         """What the board asks of any assembler for the active variant: placements per
         side (mixed parts counted as THT), unique parts, fiducials per side, the finest
@@ -2747,7 +2963,8 @@ class _Review:
         name = self.variant.variant
         text = (f"Assembly checks are for the active variant '{name}': its Not Fitted parts "
                 "are left out (placements, unique parts, spacing, part to edge, the parts "
-                "wanting local fiducials, tombstoning, pitch and their board minimums). "
+                "wanting local fiducials, tombstoning, pitch, pick and place and their board "
+                "minimums). "
                 "Fiducials are counted whatever the variant: their copper is on the bare "
                 "board." if name else
                 "Assembly checks count every part as fitted (no variant given).")
