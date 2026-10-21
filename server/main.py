@@ -79,6 +79,7 @@ try:
     )
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from services.project_options import build_project_options, page_project_options
+    from services.project_integrity import build_project_integrity, page_project_integrity
     from services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -142,6 +143,9 @@ except ImportError:
     )
     from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from server.services.project_options import build_project_options, page_project_options
+    from server.services.project_integrity import (
+        build_project_integrity, page_project_integrity,
+    )
     from server.services.design_diff import (
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
@@ -322,6 +326,18 @@ DNP reasons, fabrication requirements. Use it.
   Comparator, output path) and an audit. Quote each audit entry with its default and
   hides/risk; a flagged No ERC is a question for the designer, not a proven fault. Never
   guess what an unmapped key means. The saved file is read: Compile in Altium is final.
+
+## Project Integrity
+
+- check_project_integrity — "Update PCB wants to delete all my parts", "Constraint Manager
+  won't save", "why do compiled designators differ from the sheet?", "is anything broken
+  in the project files?", after importing or reannotating a design, before a release:
+  legacy file extensions, documents missing on disk, a leftover .Annotation file, parts
+  outside the sheet, compile masks, stale variant entries, hidden, non-ASCII or edge-space
+  characters in names, bad bus ranges, ActiveBOM-reserved 'Manufacturer N' parameters and
+  multi-channel formats that break bus names. Errors break compile, sync or save; warnings
+  give silently wrong results. Quote each finding's fix and source; ERC and Compile in
+  Altium are the final word.
 
 ## Project Tour
 
@@ -1820,6 +1836,69 @@ def get_project_options(offset: int = 0) -> str:
         model["netlist_updated_utc"] = _netlist_last_updated
     for limit in (200, 80, 30, 10, 1):
         rendered = json.dumps(page_project_options(model, offset, limit), indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# ---------- check_project_integrity ----------
+
+# Load diagnostics that point at the same problems: sheets that did not parse, unreadable
+# .Annotation files, designator clashes and netlist parts on no listed sheet.
+_INTEGRITY_DIAGNOSTICS = (
+    "sheet_errors", "annotation_errors", "designator_clash_count", "designator_clashes",
+    "designator_clashes_hint", "refdes_without_metadata", "refdes_without_metadata_sample",
+    "refdes_without_metadata_hint", "warning", "message",
+)
+
+
+@mcp.tool(
+    title="Check Project Integrity",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_project_integrity(checks: list[str] | None = None, offset: int = 0) -> str:
+    """Problems in the project folder, the .PrjPcb and the strings on the sheets that
+    silently break compile, sync or saving, offline (no netlist needed). File checks:
+    legacy_extension (schematics saved as .Sch/.S01/.S02: Update PCB can then remove every
+    part; a .Pcb is renamed with them), missing_document (listed in the project, not on disk),
+    annotation_file (a leftover .Annotation file from Board Level Annotation that makes
+    the compiled designators differ from the editor's, entries for parts that are gone),
+    outside_sheet_border (parts placed beyond the sheet size: compiled, not printed),
+    compile_mask (parts a compile mask leaves out of the PCB and BOM) and variant_entry
+    (variant entries whose designator or UniqueId no longer exists, e.g. after a PCB
+    reannotation). Name checks on net labels, power ports, ports, sheet entries,
+    designators and component parameters: hidden_characters (control, format and
+    non-ASCII space characters: these make Constraint Manager saves fail), non_ascii,
+    whitespace (leading or trailing spaces), net_name_syntax (brackets that are no
+    Name[first..last] bus range), reserved_bom_parameter (local 'Manufacturer N' /
+    'Manufacturer Part Number N' parameters, which the exported BOM overwrites from Part
+    Choices, and the parts whose copilot MPN comes from one) and
+    channel_designator_format (a multi-channel Designator Format that adds channel text
+    after bus names on channel sheets).
+
+    Each finding has a severity (error: breaks compile, sync or save; warning: a silently
+    wrong result; info), its count, examples (sheet, designator, net, port or parameter,
+    location in mil), how to fix it in Altium and the Altium knowledge-base article
+    behind it (source). checks narrows to some of these. Findings are paginated (offset
+    from next_offset), errors first; with a netlist, variant entries bind to the
+    compiled designators and the load diagnostics come with the first page."""
+    try:
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as e:
+        return json.dumps(e.payload)
+    model = build_project_integrity(project, _design_notes.hierarchy, _design_notes.integrity,
+                                    netlist, checks)
+    if "error" in model:
+        return json.dumps(model)
+    if netlist is not None:
+        model["netlist_updated_utc"] = _netlist_last_updated
+        diagnostics = _load_diagnostics(netlist)
+        kept = {key: diagnostics[key] for key in _INTEGRITY_DIAGNOSTICS if key in diagnostics}
+        if kept:
+            model["load_diagnostics"] = kept
+    for limit, examples in ((60, 10), (30, 5), (15, 3), (5, 2), (1, 1)):
+        rendered = json.dumps(page_project_integrity(model, offset, limit, examples), indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
