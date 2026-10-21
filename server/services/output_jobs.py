@@ -324,6 +324,27 @@ def page_output_jobs(model: dict, offset: int, limit: int, example_limit: int) -
     return result
 
 
+def draftsman_outputs(project: dict) -> list[dict]:
+    """The Draftsman (PCBDrawing) outputs of the OutJobs the project lists, for the tools
+    that check the drawings themselves: [{outjob, output, drawing (its path; None when
+    the default source is ambiguous or the file is not found), variant, connected}].
+    [] when the .PrjPcb cannot be read."""
+    prj_path = project["prj_pcb_path"]
+    try:
+        documents = parse_prj_documents(prj_path)
+        prj = parse_prj_pcb(prj_path)
+        options = parse_prj_options(prj_path)
+    except (OSError, UnicodeDecodeError):
+        return []
+    context = _Context(project, prj, options, documents, lambda path: None)
+    return [
+        {"outjob": out.job.file, "output": out.output.name or out.output.type,
+         "drawing": _drawing_path(context, out), "variant": out.variant,
+         "connected": out.connected}
+        for out in context.outputs if out.output.type in DRAWING_TYPES
+    ]
+
+
 # ---------- shared state ----------
 
 @dataclass
@@ -827,7 +848,7 @@ def _detail(context: _Context, job: _Job) -> dict:
             path = _drawing_path(context, out)
             drawing = context.drawing(path) if path else None
             if drawing is not None:
-                row["drawing"] = Path(path).name
+                row["drawing"] = PureWindowsPath(path).name
                 row["drawing_variant"] = drawing.document_variant or NO_VARIATIONS
                 row["assembly_views"] = sum(1 for item in drawing.items
                                             if item.kind == "view" and item.view == "assembly view")
@@ -1137,7 +1158,7 @@ def _draftsman_variant(context):
                 continue
             if not _same_variant(item.variant, drawing_variant):
                 views.append(out.label() | {
-                    "drawing": Path(path).name, "page": item.page, "view": item.view,
+                    "drawing": PureWindowsPath(path).name, "page": item.page, "view": item.view,
                     "title": item.title, "view_variant": item.variant,
                     "drawing_variant": drawing_variant, "outjob_variant": out.variant})
         if not _same_variant(drawing_variant, out.variant):

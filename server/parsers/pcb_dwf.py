@@ -8,11 +8,13 @@ Altium.Designer.PcbDrawing.DataSerialization.V1. Lengths in it are WPF device
 independent units of 1/96 inch.
 
 Only text a designer reads off the drawing is extracted: notes, free text, tables,
-view titles, pictures, and the drill table and layer stack data the drawing caches from
-the board at its last update.
+view titles, pictures, and the drill table, layer stack, impedance (transmission line)
+data and BOM table rows the drawing caches from the board and project at its last
+update.
 """
 import base64
 import binascii
+import html
 import re
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -53,6 +55,10 @@ class DraftsmanItem:
     # views: the view's own Variant as written ("Document" follows the drawing's variant;
     # None when the view stores none or nil)
     variant: str | None = None
+    # views: settings the checks read. Bill of materials: data_source (Project: the
+    # compiled schematic parts, Plate: the board's), view_mode, show_not_fitted;
+    # impedance table: visible_lines (TransmissionLineData ids; empty: all shown).
+    options: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -67,6 +73,19 @@ class DraftsmanDoc:
     # DocumentOptions AssemblyVariantV2 (else AssemblyVariant): the drawing's variant
     document_variant: str | None = None
     pictures: list[bytes] = field(default_factory=list, repr=False)  # by picture_index
+    # The board's layer stack as cached (what a Layer Stack Legend prints): per layer
+    # {layer, type (GoalType), material, thickness_mm, weight, dk, tg}, empty keys left
+    # out ("stack" when the board has several stacks); flex: a stack marked IsFlex.
+    layer_stack: list[dict] = field(default_factory=list)
+    flex: bool = False
+    # The Layer Stack Manager's transmission lines as cached (an impedance table's
+    # rows): {id, layer, type, target_ohm, tolerance, calculated_ohm, width_mm,
+    # lower_width_mm, gap_mm, substack, reference_layers}.
+    impedance_lines: list[dict] = field(default_factory=list)
+    # BOM table rows as cached at the last Import Changes, one data set per option set
+    # (BomData2/BomDataSet): {data_source, view_mode, variant, show_not_fitted,
+    # lines: [{comment, designators}]}.
+    bom_data: list[dict] = field(default_factory=list)
 
 
 # Root elements holding the drawing's copy of the board (geometry, BOM, assembly data).
@@ -286,6 +305,17 @@ def _parse_item(item: ET.Element, page: int, layers: dict[str, str],
             title = title.replace("=ViewScale", f"{_text(scale, 'Numenator')}:{_text(scale, 'Denominator')}")
         parsed.title = resolve(title) or None
         parsed.variant = _view_variant(item)
+        if kind == "BillOfMaterialsView":
+            parsed.options = {
+                "data_source": _text(item, "DataSourceKind") or None,
+                "view_mode": _text(item, "ViewMode") or None,
+                "show_not_fitted": _text(item, "ShowNotFitted") == "true",
+            }
+        elif kind == "TransmissionLineTableData":
+            parsed.options = {"visible_lines": [
+                int(e.text) for e in _children(_child(item, "VisibleLines"), "int")
+                if (e.text or "").strip().lstrip("-").isdigit()
+            ]}
     else:
         return None
     return parsed
@@ -363,6 +393,141 @@ def _layer_notes(stacks: list[ET.Element]) -> list[dict]:
     return notes
 
 
+def _float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+# Cached stack fields per layer (StackLayerBoardLayerData) -> key; Thickness is in 1/96 in.
+_STACK_FIELDS = (("GoalType", "type"), ("Material", "material"), ("Weight", "weight"),
+                 ("GlassTransTemp", "tg"), ("Manufacturer", "manufacturer"))
+
+
+def _layer_stack(stacks: list[ET.Element]) -> list[dict]:
+    rows = []
+    for stack in stacks:
+        for layer in _children(_child(stack, "Stack"), "StackLayerBoardLayerData"):
+            row: dict = {"layer": _text(layer, "Name")}
+            if len(stacks) > 1:
+                row["stack"] = _text(stack, "Name")
+            for name, key in _STACK_FIELDS:
+                if _text(layer, name):
+                    row[key] = _text(layer, name)
+            thickness = _mm(_text(layer, "Thickness"))
+            if thickness:
+                row["thickness_mm"] = thickness
+            dk = _float(_text(layer, "Dk"))
+            if dk:
+                row["dk"] = dk
+            rows.append(row)
+    return rows
+
+
+def _impedance_lines(root: ET.Element) -> list[dict]:
+    """The transmission lines the drawing cached from the Layer Stack Manager (lengths
+    in 1/96 in, as everywhere in the drawing)."""
+    structure = _child(_child(root, "LayerStackInformation"), "TransmissionLineStructure")
+    lines = []
+    for line in _children(_child(structure, "Lines"), "TransmissionLineData"):
+        row: dict = {
+            "id": _text(line, "Id"),
+            "layer": _text(line, "TraceLayer"),
+            "type": _text(line, "LineType"),
+            "target_ohm": _float(_text(line, "TargetImpedance")),
+            "tolerance": _text(line, "TargetTolerance") or None,
+            "calculated_ohm": _float(_text(line, "CalculatedImpedance")),
+            "width_mm": _mm(_text(line, "UpperTraceWidth")),
+            "lower_width_mm": _mm(_text(line, "LowerTraceWidth")),
+        }
+        gap = _mm(_text(line, "Gap"))
+        if gap:
+            row["gap_mm"] = gap
+        if _text(line, "SubStack"):
+            row["substack"] = _text(line, "SubStack")
+        references = [(e.text or "").strip() for e in _children(_child(line, "ReferenceLayers"), "string")]
+        if any(references):
+            row["reference_layers"] = [r for r in references if r]
+        lines.append(row)
+    return lines
+
+
+_BOM_OPTION = re.compile(rb"<(DataSource|ViewMode|ShowNotFitted|Variant)>([^<]*)</\1>")
+_BOM_FIELD = re.compile(rb"<(Comment|Designator)>([^<]*)</\1>")
+
+
+def _xml_text(raw: bytes) -> str:
+    return html.unescape(raw.decode("utf-8", "replace")).strip()
+
+
+def _bom_data(xml: bytearray) -> list[dict]:
+    """The BOM table rows cached in BillOfMaterialsInformation/BomData2, read from the
+    bytes: the subtree is cut out before parsing, and its components' parameters make it
+    most of a large drawing. Each BomGroup is a table line, its BoardComponents the parts
+    on it (Comment and Designator precede the bulky NamedParameters)."""
+    start = xml.find(b"<BomData2>")
+    end = xml.find(b"</BomData2>", start) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return []
+    sets = []
+    pos = start
+    while True:
+        set_start = xml.find(b"<BomDataSet>", pos, end)
+        if set_start < 0:
+            break
+        set_end = xml.find(b"</BomDataSet>", set_start, end)
+        set_end = end if set_end < 0 else set_end
+        sets.append(_bom_set(xml, set_start, set_end))
+        pos = set_end
+    return sets
+
+
+def _bom_set(xml: bytearray, start: int, end: int) -> dict:
+    options_start = xml.find(b"<Options>", start, end)
+    options_end = xml.find(b"</Options>", options_start, end) if options_start >= 0 else -1
+    options = {}
+    if options_start >= 0 and options_end >= 0:
+        options = {m.group(1).decode(): _xml_text(m.group(2))
+                   for m in _BOM_OPTION.finditer(bytes(xml[options_start:options_end]))}
+    groups = []
+    pos = start
+    while True:
+        group = xml.find(b"<BomGroup>", pos, end)
+        if group < 0:
+            break
+        groups.append(group)
+        pos = group + 1
+    lines = []
+    for n, group in enumerate(groups):
+        group_end = groups[n + 1] if n + 1 < len(groups) else end
+        comments, designators = [], []
+        pos = group
+        while True:
+            part = xml.find(b"<BoardComponent>", pos, group_end)
+            if part < 0:
+                break
+            stop = xml.find(b"<NamedParameters", part, group_end)
+            following = xml.find(b"</BoardComponent>", part, group_end)
+            stop = min(s for s in (stop, following, group_end) if s >= 0)
+            fields = {m.group(1): _xml_text(m.group(2))
+                      for m in _BOM_FIELD.finditer(bytes(xml[part:stop]))}
+            designators.append(fields.get(b"Designator", ""))
+            comments.append(fields.get(b"Comment", ""))
+            pos = stop
+        if designators:
+            # The most common comment; on a tie the first (a set's order changes per run).
+            lines.append({"comment": max(comments, key=comments.count),
+                          "designators": designators})
+    return {
+        "data_source": options.get("DataSource") or None,
+        "view_mode": options.get("ViewMode") or None,
+        "variant": options.get("Variant") or None,
+        "show_not_fitted": options.get("ShowNotFitted") == "true",
+        "lines": lines,
+    }
+
+
 def _cached_values(root: ET.Element) -> dict[str, str]:
     """Lower-cased parameter name -> value the drawing shows for "=Name" special strings.
 
@@ -411,7 +576,10 @@ def _parse_root(xml: bytearray) -> ET.Element:
 def parse_pcb_dwf(path: str) -> DraftsmanDoc:
     """Read the notes, text, tables, view titles, pictures and cached board data of a .PCBDwf."""
     with open(path, "rb") as f:
-        root = _parse_root(_decode(f.read()))
+        xml = _decode(f.read())
+    bom_data = _bom_data(xml)
+    root = _parse_root(xml)
+    del xml
     stacks = _layer_stacks(root)
     layers, values = _layer_names(stacks), _cached_values(root)
     doc = DraftsmanDoc(
@@ -421,6 +589,10 @@ def parse_pcb_dwf(path: str) -> DraftsmanDoc:
         layer_notes=_layer_notes(stacks),
         document_variant=(_text(_child(root, "DocumentOptions"), "AssemblyVariantV2")
                           or _text(_child(root, "DocumentOptions"), "AssemblyVariant") or None),
+        layer_stack=_layer_stack(stacks),
+        flex=any(_text(stack, "IsFlex") == "true" for stack in stacks),
+        impedance_lines=_impedance_lines(root),
+        bom_data=bom_data,
     )
     for param in _children(_child(root, "Parameters"), "DrawingDocumentParameterData"):
         name, value = _text(param, "Name"), _text(param, "Value")
