@@ -1,15 +1,16 @@
 """Assembly (DFA) facts for check_dfm over a PcbIndex: per part its pads and terminals,
 mount class, side, pad pitch, chip size, 3D bodies and heights and fiducial flag;
 free-pad fiducials; placements per side; the nearest same-side neighbour of each part;
-each part's distance to the board edge; fiducials near fine-pitch parts; and how the
-terminals of two-terminal passives meet their copper (tombstoning). The engine holds no
-limits: dfm.py compares the facts with a profile.
+each part's distance to the board edge; fiducials near fine-pitch parts; how the
+terminals of two-terminal passives meet their copper (tombstoning); and each part's
+pick-and-place centre as Altium writes it, with the board origin against the outline.
+The engine holds no limits: dfm.py compares the facts with a profile.
 
 Pure logic, no MCP. Lengths are mils and coordinates absolute (the caller makes them
 origin-relative). The facts are built once per index, each pass when it is first asked
 for, and cached on it (PcbIndex._dfm_assembly): the parts and fiducials, the spacing
 search per set of left-out parts and the close pairs and edge search per reach (a few
-kept each), and the tombstoning facts. The model holds the index weakly, so a replaced
+kept each), the tombstoning facts and the centroids. The model holds the index weakly, so a replaced
 index is freed as soon as nothing else holds it. DNP depends on the variant, so it is
 applied per call (Part.fitted, placements, part_spacing's exclude).
 
@@ -55,6 +56,20 @@ direct connection, any is a relief, none is none (Altium's saved relief copper r
 spokes into the pad, so the centre cannot tell). The widest track or arc of the pad's net
 touching its copper is its widest attached track. A terminal of several pads takes its
 heaviest pad's connection and its widest track.
+
+Pick and place: a part's Center-X/Y as Altium's pick-and-place file writes it, the
+midpoint of the box of its pad centres over every pad (SMD and through-hole, any layer;
+pad size plays no part), and the absolute origin (0, 0) for a part without pads; the file
+counts from the board's relative origin (Board6 ORIGINX/Y). Map: 40 of Altium's own files,
+for 25 boards of a private set, agree on 2571 of 2571 rows of unchanged parts within
+0.0001 mm (the copper extent's centre misses 304 of them, by up to 1.4 mm), bottom-side
+parts unmirrored, and all 12 pad-less rows sit at the absolute origin (2 of them on boards
+whose relative origin is set, so not at the file's 0,0). Bare-hole pads count (they are
+Pads6 pads). Cases the files
+did not settle are marked per part where they change the centre (Centroid.unverified):
+bare-hole pads, pads on both sides (all are counted), a rotation off the 90-degree grid
+(the box is taken in the board's frame). The origin is classed against the outline's
+extent (arcs included).
 """
 
 import math
@@ -136,6 +151,14 @@ BODY_SLACK = 0.25
 # (3.7-4.4), so larger codes are not told by their span.
 SPAN_SIZES_MM = (("0201", 1.2), ("0402", 2.05), ("0603", 2.55), ("0805", 3.1))
 SMALL_SPAN_MIL = 2.55 * MM
+# Pick and place: the file's resolution (4 decimals in mm), below which two centres are
+# one; the relative origin within ORIGIN_TOLERANCE_MIL of a corner of the outline's extent
+# is at that corner (0.1 mm, well inside any placement tolerance: 4 boards of the private
+# set have it 0.01 to 0.05 mm from the lower-left corner and none 0.05 to 0.5 mm);
+# rotations within ORTHOGONAL_DEG of the 90-degree grid are on it.
+PNP_RESOLUTION_MIL = 0.0001 * MM
+ORIGIN_TOLERANCE_MIL = 0.1 * MM
+ORTHOGONAL_DEG = 0.001
 # Graphical parts and net ties (not in the BOM) have no assembly geometry.
 _NO_ASSEMBLY_KINDS = (2, 4)
 _MECHANICAL_KIND = 1
@@ -348,6 +371,40 @@ class Tombstone:
     causes: tuple[str, ...]
 
 
+@dataclass
+class Centroid:
+    """A part's pick-and-place facts (absolute; the file subtracts the board origin)."""
+
+    component: int
+    # Center-X/Y: the midpoint of the box of its pad centres; None: no pads, and Altium
+    # writes the absolute origin (0, 0).
+    centre: tuple[float, float] | None
+    reference: tuple[float, float]  # Ref-X/Y: the footprint's reference point
+    reference_offset_mil: float | None  # centre to reference point
+    # The footprint's extent: its 3D bodies' box centre (body), else its pad copper
+    # extent's (pads); and the centre's distance from it.
+    extent_centre: tuple[float, float] | None
+    extent_basis: str | None  # body | pads
+    extent_offset_mil: float | None
+    # Cases Altium's files did not settle that move the centre here (by more than
+    # PNP_RESOLUTION_MIL): bare_holes, both_sides, rotation.
+    unverified: tuple[str, ...] = ()
+
+
+@dataclass
+class OriginFacts:
+    """The board's relative origin (Edit > Origin > Set: Board6 ORIGINX/Y, (0, 0) when
+    never set) against the outline's extent."""
+
+    origin: tuple[float, float]  # absolute
+    box: tuple[float, float, float, float] | None  # the outline's extent; None: no outline
+    # lower_left | not_set (the absolute origin, the outline elsewhere) | other_corner |
+    # inside (the extent) | outside | no_outline
+    position: str
+    to_lower_left_mil: float | None  # origin to the extent's lower-left corner
+    rigid_flex: bool  # the stack has a flex region: the outline read may be one region
+
+
 # ---------- helpers ----------
 
 
@@ -384,6 +441,82 @@ def _box(points) -> tuple[float, float, float, float]:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _middle(points) -> tuple[float, float]:
+    """The centre of the points' box."""
+    box = _box(points)
+    return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+
+
+def _moved(first, second) -> bool:
+    return math.hypot(first[0] - second[0], first[1] - second[1]) > PNP_RESOLUTION_MIL
+
+
+def outline_box(pcb) -> tuple[float, float, float, float] | None:
+    """(min x, min y, max x, max y) of the board outline, arcs bulging included; None
+    without an outline."""
+    shape = pcb.board.outline_shape
+    if len(shape) < 3:
+        return None
+    xs = [vertex.x for vertex in shape]
+    ys = [vertex.y for vertex in shape]
+    for vertex in shape:
+        if vertex.arc is None:
+            continue
+        cx, cy, radius, start, end = vertex.arc
+        sweep = (end - start) % 360.0 or 360.0
+        if sweep < 0.2:
+            continue
+        for angle in (start, end, 0.0, 90.0, 180.0, 270.0):
+            if (angle - start) % 360.0 <= sweep + 1e-9:
+                xs.append(cx + radius * math.cos(math.radians(angle)))
+                ys.append(cy + radius * math.sin(math.radians(angle)))
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def named_fiducial(part) -> bool:
+    """The part's designator or footprint names a fiducial (pads or not)."""
+    return bool(_FIDUCIAL_DESIGNATOR.match(part.designator or "")
+                or _FIDUCIAL_FOOTPRINT.search(part.footprint or ""))
+
+
+def _centroid(pcb, part, holes) -> Centroid:
+    """Altium's pick-and-place facts of one part; holes: its bare-hole pads (x, y)."""
+    pads = [pcb.primitives[row - 1] for row in part.pads]
+    reference = (part.x if part.x is not None else 0.0, part.y if part.y is not None else 0.0)
+    copper = [(pad.x1, pad.y1) for pad in pads]
+    points = copper + list(holes)
+    if not points:
+        return Centroid(part.component, None, reference, None, None, None, None)
+    centre = _middle(points)
+    unverified = []
+    if holes and (not copper or _moved(_middle(copper), centre)):
+        unverified.append("bare_holes")
+    layers = {pad.layer for pad in pads if not (pad.hole or 0.0) > 0}
+    if _TOP in layers and _BOTTOM in layers:
+        other = _BOTTOM if part.side == "top" else _TOP
+        own = [(pad.x1, pad.y1) for pad in pads
+               if (pad.hole or 0.0) > 0 or pad.layer != other] + list(holes)
+        if own and _moved(_middle(own), centre):
+            unverified.append("both_sides")
+    turn = part.rotation % 90.0
+    if min(turn, 90.0 - turn) > ORTHOGONAL_DEG:
+        ox, oy = reference
+        local = _middle(_rotate(points, -part.rotation, ox, oy))
+        if _moved(_rotate([local], part.rotation, ox, oy)[0], centre):
+            unverified.append("rotation")
+    box = part.body_box or part.pad_box
+    extent = basis = offset = None
+    if box is not None:
+        extent = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+        basis = "body" if part.body_box is not None else "pads"
+        offset = math.hypot(centre[0] - extent[0], centre[1] - extent[1])
+    return Centroid(
+        part.component, centre, reference,
+        math.hypot(centre[0] - reference[0], centre[1] - reference[1]),
+        extent, basis, offset, tuple(unverified),
+    )
 
 
 def _union(first, second):
@@ -694,6 +827,7 @@ class _Model:
         self._close: dict[float, list[PartGap]] = {}
         self._edges: dict[float, EdgeFacts] = {}
         self._tombstones: list[Tombstone] | None = None
+        self._centroids: list[Centroid] | None = None
         self.distance_calls = 0
 
     @property
@@ -1183,6 +1317,19 @@ class _Model:
         self._tombstones = found
         return found
 
+    # ---------- pick and place ----------
+
+    def centroids(self) -> list[Centroid]:
+        if self._centroids is None:
+            pcb = self.index.pcb
+            holes: dict[int, list[tuple[float, float]]] = defaultdict(list)
+            for hole in getattr(pcb, "bare_holes", None) or ():
+                if hole.component is not None:
+                    holes[hole.component].append((hole.x, hole.y))
+            self._centroids = [_centroid(pcb, part, holes.get(part.component, ()))
+                               for part in self.parts]
+        return self._centroids
+
     def connections(self, rows) -> list[PadConnection]:
         """The connection of each pad (prims row ids) to its copper, in order."""
         index = self.index
@@ -1349,3 +1496,33 @@ def pad_connections(index, rows) -> list[PadConnection]:
     """How each pad (prims row ids, in order) meets its copper: ring style and coverage,
     widest touching track (not cached)."""
     return _model(index).connections(list(rows))
+
+
+def centroids(index) -> list[Centroid]:
+    """Every part's pick-and-place facts, in pcb.components order (cached)."""
+    return _model(index).centroids()
+
+
+def origin(index) -> OriginFacts:
+    """The board's relative origin against the outline's extent."""
+    board = index.pcb.board
+    point = (board.origin_x or 0.0, board.origin_y or 0.0)
+    box = outline_box(index.pcb)
+    rigid_flex = any(substack.get("is_flex") for substack in board.substacks or ())
+    if box is None:
+        return OriginFacts(point, None, "no_outline", None, rigid_flex)
+    reach = math.hypot(point[0] - box[0], point[1] - box[1])
+    tolerance = ORIGIN_TOLERANCE_MIL
+    corners = [(x, y) for x in (box[0], box[2]) for y in (box[1], box[3])]
+    if reach <= tolerance:
+        position = "lower_left"
+    elif math.hypot(*point) <= tolerance:
+        position = "not_set"
+    elif any(math.hypot(point[0] - x, point[1] - y) <= tolerance for x, y in corners):
+        position = "other_corner"
+    elif (box[0] - tolerance <= point[0] <= box[2] + tolerance
+          and box[1] - tolerance <= point[1] <= box[3] + tolerance):
+        position = "inside"
+    else:
+        position = "outside"
+    return OriginFacts(point, box, position, reach, rigid_flex)

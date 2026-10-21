@@ -40,6 +40,9 @@ UNITLESS = {
     "bottom", "bottom_smd", "bottom_tht", "fiducials", "fiducials_nearby", "local_parts",
     "max_placements", "max_unique_parts", "min_global_fiducials", "placements",
     "small_passives", "top", "top_smd", "top_tht", "typical_global_fiducials", "unique_parts",
+    # pick and place: part counts, and unverified cases per kind
+    "parts", "pad_less", "through_hole", "reference_at_centre", "bare_holes", "both_sides",
+    "rotation",
 }
 # Assembly limits every assembly check of MiniPC misses (part spacing at its bound).
 ASSEMBLY_STRICT = {
@@ -691,7 +694,8 @@ def test_minipc_worst_case_fits_through_the_tool(board, minipc_index):
         assert result["has_more"] and result["findings_limited_to"] in (40, 15, 5)
         assert {check: entry["status"] for check, entry in result["results"].items()
                 if entry["status"] != "fail"} == {"drill_count": "advisory",
-                                                  "assembly_sides": "advisory"}
+                                                  "assembly_sides": "advisory",
+                                                  "pick_and_place": "advisory"}
     default = json.loads(main_mod.check_dfm())
     assert len(json.dumps(default, indent=2)) <= LIMIT
     assert default["results"]["spacing"]["objects"] == 14001  # places, not object pairs

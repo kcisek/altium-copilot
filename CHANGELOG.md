@@ -85,6 +85,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   exception, at most 0.3 s per board after the index, every page under the limit; 7
   boards have a small passive with one pad directly connected, 16 have overlapping
   bodies and 3 have fiducials
+- `check_dfm` checks the pick-and-place data (`pick_and_place`, no limit needed). It
+  computes each part's Center-X/Y the way Altium's pick-and-place file does: the
+  midpoint of the box of its pad centres over every pad (SMD and through-hole, any
+  layer; pad size plays no part), counted from the board's relative origin. On a private
+  set, 40 of Altium's own files (for 25 boards) agree on 2571 of 2571 rows of unchanged
+  parts within 0.0001 mm (the copper extent's centre would miss 304 of them by up to
+  1.4 mm), and their 12 rows for parts without pads sit at the absolute origin (2 of
+  them on boards whose relative origin is set). Findings: fitted parts without pads,
+  whose Center-X/Y Altium writes at the absolute origin (a warning for a part in the BOM
+  or a fiducial, info for Mechanical, Graphical and No-BOM parts); asymmetric parts
+  whose Center-X/Y is 0.5 mm (SMD or mixed) or 2 mm (through-hole) from their 3D body's
+  centre (the pad copper's without a body), such as edge connectors, with the fix
+  (Ref-X/Y with the reference point at the body centre, or the assembler's correction);
+  a relative origin that is not set, outside the outline or more than 0.1 mm from its
+  lower-left corner (info, with Gerber Setup's 'Reference to relative origin' for
+  Gerbers to line up with the pick-and-place file and ODB++); and, not a miss, parts
+  whose Ref-X/Y is more than
+  0.5 mm from Center-X/Y (mostly through-hole parts with a pin-1 origin). Cases Altium's
+  files did not settle (bare-hole pads, pads on both sides, rotations off the 90-degree
+  grid) are counted per board where they move a centre. Rotations against the
+  assembler's zero orientation stay listed as not checked. On the private set of 83
+  boards it ran without an exception in about 0.05 s per board at most after the index:
+  82 boards are advisory and none fails; 53 have an asymmetric SMD part, 39 an origin
+  away from the lower-left corner (24 never set), 13 have No-BOM parts without pads
 - `pcb_manufacturing_review`: a guided manufacturing-readiness review of the saved PCB.
   Claude asks which fabricator and assembler (their numbers or a `fab_profile.json`),
   confirms the profile, checks fabrication (`check_dfm`, vias, health, connectivity,
