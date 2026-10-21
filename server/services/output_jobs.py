@@ -848,7 +848,7 @@ def _detail(context: _Context, job: _Job) -> dict:
             path = _drawing_path(context, out)
             drawing = context.drawing(path) if path else None
             if drawing is not None:
-                row["drawing"] = Path(path).name
+                row["drawing"] = PureWindowsPath(path).name
                 row["drawing_variant"] = drawing.document_variant or NO_VARIATIONS
                 row["assembly_views"] = sum(1 for item in drawing.items
                                             if item.kind == "view" and item.view == "assembly view")
@@ -1158,7 +1158,7 @@ def _draftsman_variant(context):
                 continue
             if not _same_variant(item.variant, drawing_variant):
                 views.append(out.label() | {
-                    "drawing": Path(path).name, "page": item.page, "view": item.view,
+                    "drawing": PureWindowsPath(path).name, "page": item.page, "view": item.view,
                     "title": item.title, "view_variant": item.variant,
                     "drawing_variant": drawing_variant, "outjob_variant": out.variant})
         if not _same_variant(drawing_variant, out.variant):

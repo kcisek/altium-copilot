@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -118,7 +118,7 @@ def _run(docs, facts="default", outputs=(), active=None, bom=None, document=None
                "pcb_dwf_paths": [rf"C:\Projects\Board\{name}" for name in docs]}
 
     def read(path):
-        value = docs[Path(path).name]
+        value = docs[PureWindowsPath(path).name]
         if isinstance(value, Exception):
             raise value
         return value
@@ -713,7 +713,7 @@ def test_stale_from_git_history():
     """In a clone, file times are the checkout's: the board's last commit counts, and a
     board committed with the drawing cannot be told apart."""
     def history(commits):
-        return lambda path: commits.get(Path(path).name)
+        return lambda path: commits.get(PureWindowsPath(path).name)
     later = {"Board.PcbDoc": {"time": UPDATED_TS + 86400, "basis": "last commit", "commit": "b"},
              "Fab.PCBDwf": {"time": UPDATED_TS + 60, "basis": "last commit", "commit": "a"}}
     model = build_fab_drawing(
@@ -785,8 +785,8 @@ def test_a_drawing_is_checked_against_its_own_board():
     read = []
 
     def read_board(path):
-        read.append(Path(path).name)
-        return _facts(pcb_doc=Path(path).name, path=path), None
+        read.append(PureWindowsPath(path).name)
+        return _facts(pcb_doc=PureWindowsPath(path).name, path=path), None
     # Made from a same-named board in another folder: the project's board of that name.
     doc = _fab_doc(source_pcb=r"D:\Old\Panel.PcbDoc")
     model = build_fab_drawing(project, lambda path: doc, read_board, [], None)
@@ -917,7 +917,7 @@ def test_draftsman_outputs_name_the_drawing_and_variant(tmp_path):
                        documents=("a.SchDoc", "Board.PcbDoc", "Fab.PCBDwf"))
     (row,) = draftsman_outputs(project)
     assert row["outjob"] == "Fab.OutJob" and row["output"] == "Fab Drawing"
-    assert Path(row["drawing"]).name == "Fab.PCBDwf"
+    assert PureWindowsPath(row["drawing"]).name == "Fab.PCBDwf"
     assert row["variant"] == "Prod" and row["connected"] is True
 
 

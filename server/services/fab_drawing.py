@@ -273,12 +273,12 @@ def build_fab_drawing(project: dict, read_drawing, read_board, outputs: list[dic
     paths = list(project.get("pcb_dwf_paths") or [])
     if document:
         wanted = document.strip().lower()
-        chosen = [p for p in paths if Path(p).name.lower() == wanted
-                  or Path(p).stem.lower() == wanted]
+        chosen = [p for p in paths if PureWindowsPath(p).name.lower() == wanted
+                  or PureWindowsPath(p).stem.lower() == wanted]
         if not chosen:
             return {"error": "document_not_found",
                     "message": f"'{document}' is not a Draftsman document of this project.",
-                    "drawings": [Path(p).name for p in paths]}
+                    "drawings": [PureWindowsPath(p).name for p in paths]}
         paths = chosen
     not_checked: list[dict] = []
     pcbs = list(project.get("pcb_doc_paths") or [])
@@ -306,7 +306,7 @@ def build_fab_drawing(project: dict, read_drawing, read_board, outputs: list[dic
     findings: list[dict] = []
     details = []
     for path in paths:
-        name = Path(path).name
+        name = PureWindowsPath(path).name  # a project's paths are Windows paths
         try:
             doc = read_drawing(path)
         except Exception as error:
