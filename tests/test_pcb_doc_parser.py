@@ -852,6 +852,31 @@ def test_decode_polygons():
     )
 
 
+@pytest.mark.parametrize("raw, name", [
+    ("71,78,68", "GND"),  # Altium saves NAME as character codes
+    ("49,95,84,111,112,45,71,78,68", "1_Top-GND"),
+    ("80,111,117,114,32,8364", "Pour €"),
+    ("49,50", "12"),
+    # UTF-16 code units: a surrogate pair is one character, a lone one U+FFFD.
+    ("71,55357,56832", "G\U0001F600"),
+    ("71,55296", "G�"),
+    ("Top Layer-GND", "Top Layer-GND"),  # any other form is kept as written
+    ("71,,78", "71,,78"),
+    ("12", "12"),  # a plain numeric name, not a control character
+    ("99999999999", "99999999999"),  # not a UTF-16 code unit
+    ("9" * 5000, "9" * 5000),
+    ("", None),
+    (None, None),
+])
+def test_decode_polygons_reads_the_pour_name(raw, name):
+    record = {"LAYER": "TOP", "NET": "5", "VX0": "0mil", "VY0": "0mil",
+              "VX1": "100mil", "VY1": "0mil", "VX2": "100mil", "VY2": "50mil"}
+    if raw is not None:
+        record["NAME"] = raw
+    (pour,), _ = decode_polygons([record], {"top": 1})
+    assert pour.name == name
+
+
 def test_decode_polygons_shelved_pour_keeps_its_outline_but_no_rows():
     outline = {
         "LAYER": "TOP", "NET": "5", "HATCHSTYLE": "Solid",
@@ -1700,6 +1725,19 @@ def test_examples_bare_holes_and_panels():
                     (False, 2.35): 2}
     assert pcb.embedded_boards == 0
     assert parse_pcb_doc(str(panel)).embedded_boards == 1
+
+
+def test_examples_pour_names():
+    bluetooth = EXAMPLES / "Bluetooth Sentinel" / "Bluetooth_Sentinel.PcbDoc"
+    spirit = EXAMPLES / "SpiritLevel-SL1" / "SL1 Xilinx Spartan-IIE PQ208 Rev1.02.PcbDoc"
+    if not (bluetooth.is_file() and spirit.is_file()):
+        pytest.skip("Altium example boards not installed")
+    from server.parsers.pcb_doc import parse_pcb_doc
+
+    # Pours may share a name: all ten Bluetooth Sentinel pours are GND.
+    assert {pour.name for pour in parse_pcb_doc(str(bluetooth)).pours} == {"GND"}
+    assert [pour.name for pour in parse_pcb_doc(str(spirit)).pours] == [
+        "Top Layer-GND", "Bottom Layer-GND"]
 
 
 # ---------- ComponentBodies6 ----------

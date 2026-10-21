@@ -223,6 +223,7 @@ class RuleContext:
     pair_classes: dict[str, set[str]] = field(default_factory=dict)
     component_classes: dict[str, set[str]] = field(default_factory=dict)
     pad_classes: dict[str, set[str]] = field(default_factory=dict)
+    polygon_classes: dict[str, set[str]] = field(default_factory=dict)  # pour names
     superclasses: dict[str, set[str]] = field(default_factory=dict)
     pairs: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     net_names: dict[str, str] = field(default_factory=dict)
@@ -254,6 +255,9 @@ class ObjectFacts:
     span: frozenset = frozenset()
     points: tuple = ()  # track/arc endpoints; via/pad centre; polygon outline
     in_pour: bool = False  # a hatched pour's track or arc (InPolygon)
+    # The pour's name for a polygon, or its pour's for in_pour copper; None
+    # when the pour has no NAME.
+    polygon: str | None = None
     component: str | None = None
     footprint: str | None = None
     pad: str | None = None  # "u1-5"
@@ -278,6 +282,9 @@ class RuleTarget:
     footprints: set[str] = field(default_factory=set)
     pads: set[str] = field(default_factory=set)
     has_pours: bool = False
+    # Names of the nets' unshelved pours (None for a pour without NAME), so
+    # InNamedPolygon can be decided on their copper (pour_view).
+    pour_names: set[str | None] = field(default_factory=set)
     # Evaluation views (set by evaluate_scope / resolve_kind / callers that
     # check one object): member — evaluate a pair as one of its nets;
     # pour_view — the net's polygon pour copper instead of its routing;
@@ -402,15 +409,39 @@ def _polygon_region_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple:
     return _unknown(node)
 
 
-def _pour_copper_call(node) -> tuple:
+def scope_name(name: str | None) -> str | None:
+    """A name as scopes can match it: lower-case, or None when it is not read
+    or holds a character above U+00FF, which scope and class text (read as
+    Latin-1) cannot hold."""
+    if name is None or any(ord(char) > 0xFF for char in name):
+        return None
+    return name.lower()
+
+
+def _named_pour(node, names) -> tuple:
+    """Does IsNamedPolygon / InNamedPolygon name the pour, or every one of
+    the pours, whose names (lower; None when not read) are given? Unknown
+    when only some match or a name is not read."""
+    hits = {None if name is None else _any_matches(node[2], {name}) for name in names}
+    if hits == {True}:
+        return _TRUE
+    if hits == {False}:
+        return _FALSE
+    return _unknown(node)
+
+
+def _pour_copper_call(node, names) -> tuple:
     """A polygon term on a pour's copper (its child primitives, which rules
-    are applied to). InPolygon returns them; IsPolygon, IsNamedPolygon and
-    InPolygonClass return the polygon object only. InNamedPolygon needs the
-    pour's name and IsSplitPlane its type, which are not read."""
+    are applied to), names being those of the pours it may belong to.
+    InPolygon returns them, InNamedPolygon those of the pours it names;
+    IsPolygon, IsNamedPolygon and InPolygonClass return the polygon object
+    only. IsSplitPlane needs the pour's type, which is not used here."""
     name = node[1]
     if name in ("inpoly", "inpolygon"):
         return _TRUE
-    if name in ("innamedpolygon", "issplitplane"):
+    if name == "innamedpolygon":
+        return _named_pour(node, names)
+    if name == "issplitplane":
         return _unknown(node)
     return _FALSE
 
@@ -434,12 +465,26 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
         # A free primitive is one that is not part of a component.
         return _TRUE if obj.component is None else _FALSE
     if name in _POLYGON_ONLY and obj.kind == "polygon":
-        # The pour itself, never a split plane: its name and class are not read.
+        # The pour itself, never a split plane. IsNamedPolygon and
+        # InNamedPolygon (which returns the parent pour too) test its name,
+        # InPolygonClass its classes, whose members are pour names.
         if name in ("ispoly", "ispolygon"):
             return _TRUE
-        return _FALSE if name == "issplitplane" else _unknown(node)
+        if name == "issplitplane":
+            return _FALSE
+        if name in ("isnamedpolygon", "innamedpolygon"):
+            return _named_pour(node, {obj.polygon})
+        if name == "inpolygonclass":
+            # All Polygons holds a pour whose name is not read, too.
+            member = _class_member(
+                ctx, ctx.polygon_classes, "polygon", args, {obj.polygon or ""}
+            )
+            if member:
+                return _TRUE
+            return _unknown(node) if obj.polygon is None else _FALSE
+        return _unknown(node)
     if name in _POLYGON_ONLY and obj.in_pour:
-        return _pour_copper_call(node)
+        return _pour_copper_call(node, {obj.polygon})
     if name in _LAYER_PREDICATES:
         layer = obj.layer
         if name in ("onlayer", "existsonlayer"):
@@ -611,7 +656,7 @@ def _eval_call(node, target: RuleTarget, ctx: RuleContext) -> tuple:
         # Tracks of a pair's nets are checked through the pair (member view).
         return _TRUE if target.kind == "diff_pair" else _FALSE
     if name in _POLYGON_ONLY and target.pour_view:
-        return _pour_copper_call(node)
+        return _pour_copper_call(node, target.pour_names)
     if name in _COMPONENT_ONLY or name in _POLYGON_ONLY:
         # These select components, text or pour children, never a net's
         # routing or the pair object itself.
@@ -664,7 +709,22 @@ def _eval_cmp(node, target: RuleTarget) -> tuple:
         if node[2] == "<>":
             return _FALSE if value == obj.kind else _TRUE
     if obj is not None and obj.kind == "polygon" and prop == "name":
-        return _unknown(node)  # a pour's name is not read
+        # A pour's own name. Like takes wildcards; = and <> compare the whole
+        # name, so where only a wildcard reading of * or ? matches, unknown.
+        operator, pattern = node[2], str(node[3])
+        if obj.polygon is None or operator not in ("=", "like", "<>"):
+            return _unknown(node)
+        if operator == "like":
+            matched = _wildcard_matches(pattern, obj.polygon)
+        elif pattern.lower() == obj.polygon:
+            matched = True
+        elif _wildcard_matches(pattern, obj.polygon):
+            return _unknown(node)
+        else:
+            matched = False
+        if operator == "<>":
+            return _FALSE if matched else _TRUE
+        return _TRUE if matched else _FALSE
     if obj is not None and prop == "name" and node[2] in ("=", "like", "<>"):
         # A pad's Name is "<designator>-<pad>"; other routed objects have none.
         matched = bool(obj.pad) and _wildcard_matches(str(node[3]), obj.pad)

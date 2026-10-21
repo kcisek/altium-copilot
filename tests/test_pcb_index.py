@@ -689,6 +689,44 @@ def test_shelved_pour_has_no_copper_but_is_listed(pcb_data):
     assert (counts["pours"], counts["shelved_pours"]) == (2, 1)
 
 
+def test_pour_names_reach_rules_and_the_net_summary(pcb_data):
+    square = [(50, 50), (250, 50), (250, 150), (50, 150)]
+    _add_pour(pcb_data, 2, "TOP", square, NAME="67,76,75,95,84,79,80")  # CLK_TOP
+    _add_pour(pcb_data, 2, "BOTTOM", square, NAME="67,76,75,95,66,79,84", SHELVED="TRUE")
+    _add_pour(pcb_data, 2, "BOTTOM", square)  # no NAME
+    pcb_data.primitives.append(replace(_track(2, 1, 60, 60, 240, 60), poured_by=1))
+    index = PcbIndex(pcb_data, NETLIST)
+    # The shelved pour has no copper for rules to see.
+    assert index.rule_target("CLK_B").pour_names == {"clk_top", None}
+    assert index.rule_target("CLK_A").pour_names == set()
+    row = index.db.execute("SELECT * FROM prims WHERE poured_by = 1").fetchone()
+    facts = index.object_facts(row)
+    assert (facts.in_pour, facts.polygon) == (True, "clk_top")
+    routing = index.db.execute(
+        "SELECT * FROM prims WHERE kind = 'track' AND poured_by IS NULL"
+    ).fetchone()
+    assert index.object_facts(routing).polygon is None
+    pours = index.net_summary("CLK_B")["pours"]
+    assert [pour.get("name") for pour in pours] == ["CLK_TOP", "CLK_BOT", None]
+    assert list(pours[0])[:2] == ["name", "layer"]
+    assert "name" not in pours[2]
+
+
+def test_pour_name_beyond_latin1_is_listed_but_not_matched(pcb_data):
+    square = [(50, 50), (250, 50), (250, 150), (50, 150)]
+    # A surrogate pair (a character beyond the BMP) and the euro sign: no scope
+    # read as Latin-1 can name these pours.
+    _add_pour(pcb_data, 2, "TOP", square, NAME="71,55357,56832")
+    _add_pour(pcb_data, 2, "BOTTOM", square, NAME="80,111,117,114,32,8364")
+    pcb_data.primitives.append(replace(_track(2, 1, 60, 60, 240, 60), poured_by=2))
+    index = PcbIndex(pcb_data, NETLIST)
+    assert [pour["name"] for pour in index.net_summary("CLK_B")["pours"]] == [
+        "G\U0001F600", "Pour €"]
+    assert index.rule_target("CLK_B").pour_names == {None}
+    row = index.db.execute("SELECT * FROM prims WHERE poured_by = 2").fetchone()
+    assert index.object_facts(row).polygon is None
+
+
 def test_region_query_lists_pour_outline_only_under_pours(outline_data):
     index = PcbIndex(outline_data, NETLIST)
     # The outline (x = 650) is 5 mil away: within the radius, but not copper.

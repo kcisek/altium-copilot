@@ -1126,6 +1126,9 @@ class PolygonPour:
     polygon_type: str | None = None
     # The outline as stored: its vertices with their arcs.
     shape: list[ShapeVertex] = field(default_factory=list)
+    # NAME, which IsNamedPolygon / InNamedPolygon and polygon class members
+    # give; None when the record has none. Pours may share a name.
+    name: str | None = None
 
 
 @dataclass
@@ -1464,6 +1467,30 @@ def _positional_layer(token: str) -> int | None:
     return 38 + number if 1 <= number <= 16 else None
 
 
+_CHAR_CODES_RE = re.compile(r"\d+(?:,\d+)*")
+
+
+def _polygon_name(raw: str | None) -> str | None:
+    """A Polygons6 NAME, None when missing or empty. Altium saves it as
+    comma-separated UTF-16 code units ("71,78,68" is GND), as on every named
+    pour of 89 boards (the public examples among them). A value in any other
+    form, or whose codes would be control characters (a plain numeric name),
+    is kept as written."""
+    if not raw:
+        return None
+    if not _CHAR_CODES_RE.fullmatch(raw):
+        return raw
+    try:
+        codes = [int(code) for code in raw.split(",")]
+    except ValueError:  # more digits than int() reads
+        return raw
+    if any(code < 32 or code > 0xFFFF for code in codes):
+        return raw
+    # A surrogate pair is one character beyond the BMP; a lone one is U+FFFD.
+    text = "".join(map(chr, codes))
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
 def decode_polygons(
     records: list[dict[str, str]],
     layer_name_to_v6: dict[str, int],
@@ -1494,6 +1521,7 @@ def decode_polygons(
             copper_invalid=record.get("COPPERINVALIDATE", "").strip().upper() == "TRUE",
             polygon_type=(record.get("POLYGONTYPE") or "").strip() or None,
             shape=shape,
+            name=_polygon_name(record.get("NAME")),
         )
         pours.append(pour)
         if layer is None or len(vertices) < 3 or pour.shelved:

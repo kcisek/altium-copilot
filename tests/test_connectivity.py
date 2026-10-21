@@ -110,11 +110,12 @@ class Board:
             x1=x, y1=y, x2=x, y2=y, width=diameter, hole=10.0,
         ))
 
-    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon"):
+    def pour(self, net, layer, vertices, hatch="Solid", shelved=False, polygon_type="Polygon",
+             name=None):
         self.pours.append(PolygonPour(
             pour_id=len(self.pours), net=None if net is None else self.net(net),
             layer=layer, hatch_style=hatch, vertices=list(vertices), shelved=shelved,
-            polygon_type=polygon_type,
+            polygon_type=polygon_type, name=name,
         ))
         return len(self.pours) - 1
 
@@ -711,7 +712,7 @@ def test_track_grazing_pour_copper_is_weak_but_a_relief_via_is_not_tested():
     assert weak["objects"] == ["Track on Top Layer", "Pour copper on Top Layer"]
 
 
-def _straddling_board(region=True, pour_layer=1, **connect_style):
+def _straddling_board(region=True, pour_layer=1, pour_name=None, **connect_style):
     """GND with a pour round U1-1, an SMD pad (U2-1) whose centre is 4 mil past
     the pour's right edge and a via (on to U3-1) 6 mil past its left edge, each
     joined to the pour only by touching its copper (a region on the top layer)."""
@@ -721,7 +722,7 @@ def _straddling_board(region=True, pour_layer=1, **connect_style):
     board.via("GND", -106, 0)
     board.track("GND", -106, 0, -106, -100)
     board.pad("GND", "U3", "1", -106, -100)
-    pour = board.pour("GND", pour_layer, _square(-100, -20, 100, 20))
+    pour = board.pour("GND", pour_layer, _square(-100, -20, 100, 20), name=pour_name)
     if region:
         board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
     if connect_style:
@@ -772,8 +773,8 @@ def test_direct_pad_or_via_with_its_centre_off_the_pour_outline_is_weak(
     ("All", "InComponent('U2')", "Direct", "Relief", []),
     ("All", "InComponent('U2')", "Direct", "Direct", BOTH),
     ("Not IsVia", "All", "Relief", "Direct", []),
-    # A pour's name is not read and a scope that does not parse is not known:
-    # the style is known only when the rules that may apply agree.
+    # A pour without NAME and a scope that does not parse are not known: the
+    # style is known only when the rules that may apply agree.
     ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Relief", []),
     ("All", "IsNamedPolygon('GND_TOP')", "Direct", "Direct", BOTH),
     ("InNet('GND'", "All", "Relief", "Direct", []),
@@ -784,6 +785,41 @@ def test_polygon_connect_rule_matches_the_pad_or_via_and_the_pour(
     scope1, scope2, first, otherwise, flagged
 ):
     board = _straddling_board()
+    board.rule("PolygonConnect", scope=scope1, scope2=scope2, CONNECTSTYLE=first)
+    board.rule("PolygonConnect", CONNECTSTYLE=otherwise)
+    result = check_connectivity(board.index(), checks=["weak"])
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == flagged
+
+
+@pytest.mark.parametrize("scope1, scope2, first, otherwise, flagged", [
+    # A direct rule for the pour by name or class, a relief rule after it.
+    ("All", "IsNamedPolygon('gnd_top')", "Direct", "Relief", BOTH),
+    ("All", "IsNamedPolygon('GND_BOTTOM')", "Direct", "Relief", []),
+    ("All", "InNamedPolygon('GND_TOP')", "Direct", "Relief", BOTH),
+    ("All", "IsPolygon And (Name Like 'GND_T*')", "Direct", "Relief", BOTH),
+    ("All", "Name = 'VCC'", "Direct", "Relief", []),
+    ("All", "InPolygonClass('TopPours')", "Direct", "Relief", BOTH),
+    ("All", "InPolygonClass('All Polygons')", "Direct", "Relief", BOTH),
+    ("All", "InPolygonClass('BottomPours')", "Direct", "Relief", []),
+    # A relief rule for another pour is ruled out: the direct one applies.
+    ("All", "IsNamedPolygon('GND_BOTTOM')", "Relief", "Direct", BOTH),
+    # Named in the first scope, the pour matches only the other way round,
+    # which may count: nothing is tested while the styles differ.
+    ("IsNamedPolygon('GND_TOP')", "All", "Relief", "Direct", []),
+    ("IsNamedPolygon('GND_BOTTOM')", "All", "Relief", "Direct", BOTH),
+])
+def test_polygon_connect_rule_naming_the_pour(scope1, scope2, first, otherwise, flagged):
+    board = _straddling_board(pour_name="GND_TOP")
+    board.classes.extend(
+        PcbClass(name=name, kind="polygon", members=members, superclass=superclass,
+                 auto_generated=False, unique_id=None)
+        for name, members, superclass in (
+            ("TopPours", ["GND_TOP"], False),
+            ("BottomPours", ["GND_BOTTOM"], False),
+            ("All Polygons", [], True),
+        )
+    )
     board.rule("PolygonConnect", scope=scope1, scope2=scope2, CONNECTSTYLE=first)
     board.rule("PolygonConnect", CONNECTSTYLE=otherwise)
     result = check_connectivity(board.index(), checks=["weak"])

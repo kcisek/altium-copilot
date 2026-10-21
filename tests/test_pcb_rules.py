@@ -17,6 +17,7 @@ from server.services.pcb_rules import (
     resolve_kind,
     rule_header,
     rule_values,
+    scope_name,
     stale_references,
 )
 
@@ -579,10 +580,104 @@ PAD_U3 = dict(kind="pad", layer=1, span=frozenset({1}), points=((300, 300),),
     ("IsPolygon", dict(TRACK_TOP_IN_ROOM, in_pour=True), "no"),
     ("IsNamedPolygon('GND')", dict(TRACK_TOP_IN_ROOM, in_pour=True), "no"),
     ("IsPolygon", TRACK_TOP_IN_ROOM, "no"),
+    # InNamedPolygon returns the copper of the pours it names.
+    ("InNamedPolygon('GND')", dict(TRACK_TOP_IN_ROOM, in_pour=True, polygon="gnd"), "yes"),
+    ("InNamedPolygon('VCC', 'G*')", dict(TRACK_TOP_IN_ROOM, in_pour=True, polygon="gnd"),
+     "yes"),
+    ("InNamedPolygon('VCC')", dict(TRACK_TOP_IN_ROOM, in_pour=True, polygon="gnd"), "no"),
     ("InNamedPolygon('GND')", dict(TRACK_TOP_IN_ROOM, in_pour=True), "conditional"),
+    ("InNamedPolygon('GND')", TRACK_TOP_IN_ROOM, "no"),
 ])
 def test_object_scopes_are_decided(obj_ctx, scope, facts, expected):
     assert _matches(scope, _on(CLK_A, **facts), obj_ctx) == expected
+
+
+POUR_GND_TOP = dict(kind="polygon", layer=1, span=frozenset({1}),
+                    points=((0, 0), (100, 0), (100, 100)), polygon="gnd_top")
+
+
+@pytest.mark.parametrize("scope, facts, expected", [
+    ("IsNamedPolygon('GND_TOP')", POUR_GND_TOP, "yes"),
+    ("IsNamedPolygon('gnd_top')", POUR_GND_TOP, "yes"),
+    ("IsNamedPolygon('GND_BOTTOM', 'GND_T*')", POUR_GND_TOP, "yes"),
+    ("IsNamedPolygon('GND_BOTTOM')", POUR_GND_TOP, "no"),
+    ("Not IsNamedPolygon('GND_BOTTOM')", POUR_GND_TOP, "yes"),
+    # InNamedPolygon returns the parent pour too.
+    ("InNamedPolygon('GND_TOP')", POUR_GND_TOP, "yes"),
+    ("InNamedPolygon('VCC')", POUR_GND_TOP, "no"),
+    ("Name = 'GND_TOP'", POUR_GND_TOP, "yes"),
+    ("IsPolygon And (Name Like 'GND*')", POUR_GND_TOP, "yes"),
+    ("Name Like 'VCC*'", POUR_GND_TOP, "no"),
+    ("Name <> 'GND_TOP'", POUR_GND_TOP, "no"),
+    ("Name <> 'VCC'", POUR_GND_TOP, "yes"),
+    ("Name = 'gnd_top'", POUR_GND_TOP, "yes"),
+    # = and <> compare the whole name: a * may be literal.
+    ("Name = 'GND*'", POUR_GND_TOP, "conditional"),
+    ("Name <> 'GND*'", POUR_GND_TOP, "conditional"),
+    ("Name = 'VCC*'", POUR_GND_TOP, "no"),
+    ("Name = 'GND*'", dict(POUR_GND_TOP, polygon="gnd*"), "yes"),
+    ("Name > 'A'", POUR_GND_TOP, "conditional"),
+    ("InPolygonClass('All Polygons')", POUR_GND_TOP, "yes"),
+    ("InPolygonClass('TopPours')", POUR_GND_TOP, "yes"),
+    ("InPolygonClass('Top*')", POUR_GND_TOP, "yes"),
+    ("InPolygonClass('BottomPours')", POUR_GND_TOP, "no"),
+    ("InPolygonClass('Missing')", POUR_GND_TOP, "no"),
+    # A pour without NAME: only the superclass is known.
+    ("IsNamedPolygon('GND_TOP')", dict(POUR_GND_TOP, polygon=None), "conditional"),
+    ("InNamedPolygon('GND_TOP')", dict(POUR_GND_TOP, polygon=None), "conditional"),
+    ("Name = 'GND_TOP'", dict(POUR_GND_TOP, polygon=None), "conditional"),
+    ("InPolygonClass('TopPours')", dict(POUR_GND_TOP, polygon=None), "conditional"),
+    ("InPolygonClass('All Polygons')", dict(POUR_GND_TOP, polygon=None), "yes"),
+    # The pour terms select nothing else.
+    ("IsNamedPolygon('GND_TOP')", VIA, "no"),
+    ("InPolygonClass('All Polygons')", VIA, "no"),
+])
+def test_pour_name_and_class_scopes_on_a_pour(obj_ctx, scope, facts, expected):
+    obj_ctx.polygon_classes = {"toppours": {"gnd_top", "vcc_top"}, "bottompours": {"gnd_bot"}}
+    obj_ctx.superclasses["polygon"] = {"all polygons"}
+    assert _matches(scope, _on(CLK_A, **facts), obj_ctx) == expected
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("GND_Top", "gnd_top"),
+    ("Masse øst", "masse øst"),  # Latin-1, as scope text is read
+    ("Pour €", None),  # no scope can hold it
+    ("G\U0001F600", None),
+    (None, None),
+])
+def test_scope_name(name, expected):
+    assert scope_name(name) == expected
+
+
+@pytest.mark.parametrize("pour_names, expected", [
+    ({"gnd_top"}, "yes"),
+    ({"gnd_bottom"}, "no"),
+    ({"gnd_top", "gnd_bottom"}, "conditional"),  # only GND_TOP's copper
+    ({"gnd_top", None}, "conditional"),  # a pour without NAME
+    (set(), "conditional"),  # names not given
+])
+def test_named_pour_on_the_nets_pour_copper(obj_ctx, pour_names, expected):
+    target = replace(CLK_A, has_pours=True, pour_names=pour_names, pour_view=True)
+    assert _matches("InNamedPolygon('GND_TOP')", target, obj_ctx) == expected
+
+
+def test_binary_rule_naming_another_pour_is_ruled_out(ctx):
+    target = _net("CLK_A", components={"u3"})
+    target.has_pours, target.pour_names = True, {"clk_pour"}
+    rules = [
+        _rule("Clearance", 1, "InNamedPolygon('GND_TOP')", "All", name="GndPour"),
+        _rule("Clearance", 2, "InNamedPolygon('CLK*')", "All", name="ClkPour"),
+    ]
+    result = resolve_kind(rules, target, ctx, _describe)
+    by_name = {candidate["name"]: candidate for candidate in result["candidates"]}
+    # GndPour reaches CLK_A only as the other side (scope2 All).
+    assert by_name["GndPour"]["orientations"] == [
+        {"target_side": "scope2", "other_side": "InNamedPolygon('GND_TOP')"}
+    ]
+    assert by_name["ClkPour"]["orientations"][0] == {
+        "target_side": "scope1", "other_side": "All",
+        "conditions": ["only the net's polygon pour copper"],
+    }
 
 
 FREE_TH_PAD = dict(kind="pad", layer=MULTI_LAYER, span=frozenset({1, 3, 32}),
