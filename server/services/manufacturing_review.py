@@ -360,7 +360,8 @@ Do not proceed to Phase 2 until then.
 3. check_pcb_health: shelved or modified pours (Altium stops output generation), duplicate
    designators, parts outside the board, invalid rules.
 4. check_connectivity: unrouted connections and dead copper. An unrouted net is a no-go
-   unless the user says it is intended.
+   unless the user says it is intended, and so is a net in nets_unrouted_in_altium
+   (routed only through weak joins that the board's Un-Routed Net rule rejects).
 5. get_drc_report: Altium's last batch DRC with its assessment. No report, or a stale one:
    say so and recommend running Tools > Design Rule Check before generating outputs.
 

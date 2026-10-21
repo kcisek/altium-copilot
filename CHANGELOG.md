@@ -109,6 +109,42 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   boards it ran without an exception in about 0.05 s per board at most after the index:
   82 boards are advisory and none fails; 53 have an asymmetric SMD part, 39 an origin
   away from the lower-left corner (24 never set), 13 have No-BOM parts without pads
+- `get_assembly_guide`: an assembly sequence for prototype builds of a variant (the
+  active one by default), from the saved PcbDoc. The SMD of both sides comes first, the
+  side whose tallest SMD part is shorter first (else the one with fewer SMD parts, else
+  the bottom), so the side with the taller, heavier parts is soldered last; then the
+  through-hole parts (top, then bottom), whose leads would keep the board from lying
+  flat; on each side short to tall by 3D-body height (a chip passive without a body
+  counts as at most its EIA width; parts with no height go last, smallest pad extent
+  first). Mixed parts (SMD pads and plated pins) go with the SMD of their side. The
+  result says why (`first_side_reason`, `sequence_rules`). Steps are BOM lines as
+  `get_bom` groups them (MPN first) with a netlist, else footprint and Comment, marked
+  approximate; each has its quantity, Comment, footprint, MPN and height, and per part
+  the designator, Center-X/Y as Altium's pick-and-place file writes it and Ref-X/Y from
+  the board origin, rotation and, for polarized parts (diodes and LEDs, polarized
+  capacitors, batteries, connectors, ICs and any part with three or more pad names), a
+  pin-1 hint from the pad named 1, A1, K or + ('pin 1 top-left', 'cathode (K) left',
+  seen from the side being assembled, the bottom flipped left to right; a depopulated
+  A1 ball is placed at the grid's corner), else 'no pin 1 marked'. Diodes and polarized
+  capacitors whose pads are only numbered get 'pin 1 ...', which does not say where the
+  cathode or + is: they are counted and a note says to check the marking against the
+  silkscreen. Left out and listed: the variant's Not Fitted parts (a Not Fitted part is
+  never listed among the parts to fit by hand), fiducials, Graphical, Net Tie and No-BOM
+  parts, mounting holes, parts without pads and, with a netlist, PCB parts not in the
+  BOM and BOM parts not on the board. Without the schematic parts, a variant's Not
+  Fitted entries stored with no designator (only a UniqueId) cannot be applied: a note
+  gives their count. `format` markdown is a printable checklist with Done and
+  Skipped columns (the first page opens with the sequence, the last lists what was left
+  out); csv has one part per row. `side`, `units` and row paging under the result size.
+  No board map is drawn. On the private set of 83 boards it ran without an exception in
+  at most 0.03 s per board after the index (2 pages at most, the largest 32 kB): 97.6%
+  of 2778 steps have a 3D-body height, and 2557 of 2568 polarized parts (99.6%) get a
+  pin-1 hint; the first side was decided by part height on 66 boards, 12 have SMD on
+  one side only. With the sheets' parts (56 projects), 7 projects have BOM parts not on
+  the board and 1 has board parts not in the BOM. On those 56 projects without a
+  netlist, 298 of 1070 polarized parts (on 32 projects) are diodes or polarized
+  capacitors with only numbered pads, and 1 variant has Not Fitted entries known only
+  by UniqueId
 - `pcb_manufacturing_review`: a guided manufacturing-readiness review of the saved PCB.
   Claude asks which fabricator and assembler (their numbers or a `fab_profile.json`),
   confirms the profile, checks fabrication (`check_dfm`, vias, health, connectivity,
@@ -313,8 +349,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   - `weak_connection`: copper that only touches where a net needs it, which Altium's
     'Check for incomplete connections' rejects (centrelines that do not meet, a track
     centreline off the pad, via or pour copper, a via centre off the pad), listed when
-    `checks` names `weak` (the summary always counts them);
-    `nets_joined_only_by_weak_connections` would read un-routed with that option on
+    `checks` names `weak` or the board's Un-Routed Net rule has that option on (see
+    Changed; the summary always counts them); `nets_joined_only_by_weak_connections`
+    would read un-routed with that option on
   Nets connected only through assumed copper are listed in `assumed_copper_nets`.
   Filters by net or pair, net class, layer and check; paginated, with long connection
   lists shortened to fit. `altium_drc` sets Altium's last Batch DRC report beside it:
@@ -498,6 +535,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   its centre 5 to 100 mil past the outline and at most half of the pad inside it. The
   test was left out when `check_connectivity` was added, because pour outlines then
   ignored their arcs
+- `check_connectivity` reads the Un-Routed Net rule's 'Check for incomplete
+  connections' option (saved as `CHECKBADCONNECTIONS=TRUE`). `rules.UnRoutedNet` gives
+  each rule's `check_incomplete_connections`: true, false, or null when the rule does
+  not save it, which means off. Altium's help gives no default, and boards save this
+  key only when it is on, while other rule options are saved as FALSE too. Per net,
+  the option is that of the Un-Routed Net rule that applies: the first enabled one by
+  priority whose scope matches the net. When a scope is not decided for a net, every
+  rule that may come first counts, and the option is null when they differ. Where it
+  is or may be on, `weak_connection` findings are listed by default. Where it is on,
+  they are warnings (`incomplete_connections_checked` on each finding), and the nets
+  routed here only through weak connections read un-routed in Altium. Those nets are
+  listed in `nets_unrouted_in_altium` and flagged `unrouted_in_altium` in `nets`. The
+  summary gives `incomplete_connections_checked`,
+  `nets_routed_here_unrouted_in_altium` and `incomplete_connections_note`.
+  `altium_drc` counts those nets as not routed here, and the connections they join
+  only through weak connections as missing
+  (`nets_not_routed_here_only_by_weak_connections`,
+  `missing_connections_here_only_by_weak_connections`). Net status and routing
+  counts still follow touching copper. `pcb_manufacturing_review` treats a net in
+  `nets_unrouted_in_altium` as a no-go, like an unrouted net. Altium's 6 examples do
+  not save the option, so nothing changes there. On 83 real boards, 4 of 93 Un-Routed
+  Net rules have it on, all enabled with scope All, one per board. 3 of those boards
+  have no weak connection. The fourth has 17 (9 track to track, 7 track to pad, 1
+  track to via; 7 miss by 0.5 to 1 mil, where Altium's undocumented tolerance
+  decides). Altium would read 15 connections on 10 nets routed here as missing because
+  of them. None of the 4 has a DRC report to compare
 - Rule scopes that name polygon pours are decided: each pour's name is read from its
   Polygons6 `NAME`, which Altium saves as UTF-16 character codes ("71,78,68" is GND),
   and matched without regard to case, as other names are. On a pour itself (the pour

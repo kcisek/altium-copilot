@@ -43,8 +43,8 @@ except ImportError:
 
 CHECKS = ("unrouted", "isolated", "antennae", "weak")
 # weak_connection findings only matter with the Un-Routed Net rule's 'Check for
-# incomplete connections' option on (not read): listed when asked for; the
-# summary counts them always.
+# incomplete connections' option on: listed when asked for, or when the rule of
+# a checked net has (or may have) it on; the summary counts them always.
 DEFAULT_CHECKS = ("unrouted", "isolated", "antennae")
 # The findings' own names select their check too.
 _CHECK_ALIASES = {
@@ -80,8 +80,18 @@ APPROXIMATIONS = [
     "off the pad or via, a pad or via connected directly to a pour whose centre is "
     "outside the pour's outline; centrelines and centres within "
     f"{CENTRE_MIL:g} mil count as meeting) where a net needs them: with that option on, "
-    "its nets_joined_only_by_weak_connections would read un-routed. Whether the board's "
-    "rule has the option on is not read.",
+    "its nets_joined_only_by_weak_connections would read un-routed.",
+    "The option is that of the Un-Routed Net rule that applies to each net: the first "
+    "enabled rule by priority whose scope matches the net, every rule that may come "
+    "first counting when a scope is not decided for the net "
+    "(incomplete_connections_checked null when they differ). A rule that does not save "
+    "it has it off: Altium's help gives no default, and boards save it only when on "
+    "(CHECKBADCONNECTIONS=TRUE) while other options are saved as FALSE too. Where it is "
+    "or may be on, weak_connection findings are listed by default. Where it is on, they "
+    "are warnings, and a net routed here only through weak connections reads un-routed "
+    "in Altium (nets_unrouted_in_altium). Its status here and the routing counts still "
+    "follow touching copper; altium_drc counts it as not routed here, and its "
+    "connections joined only through weak connections as missing.",
     "A pad or via touching a pour's copper is tested when its Polygon Connect Style is "
     "Direct (Altium tests the centre 'when the Pad/Via uses a direct connection'), "
     "against the pour's outline with its arcs, not the poured copper: Altium's fix for "
@@ -131,6 +141,14 @@ def _r(value: float | None, digits: int = 2) -> float | None:
 
 def _pct(part: int, whole: int) -> float | None:
     return round(100.0 * part / whole, 1) if whole else None
+
+
+def _incomplete_option(rule) -> bool | None:
+    """An Un-Routed Net rule's 'Check for incomplete connections' as saved
+    (CHECKBADCONNECTIONS); None when the rule does not save it (off)."""
+    properties = {key.upper(): value for key, value in rule.properties.items()}
+    value = properties.get("CHECKBADCONNECTIONS")
+    return None if value is None else value.strip().upper() == "TRUE"
 
 
 class _UnionFind:
@@ -498,6 +516,7 @@ class Connectivity:
         self._pour_outlines: dict[int, _Area | None] = {}
         self._pour_centres: dict[tuple[int, int], bool] = {}
         self._targets: dict[str, RuleTarget] = {}
+        self._incomplete: dict[str, bool | None] = {}
         self.shelved: dict[int, list] = defaultdict(list)
         # Nets with a plane or split plane on a layer the stack does not list.
         self.planes_off_stack: set[int] = set()
@@ -615,12 +634,48 @@ class Connectivity:
                     entry["tolerance_mil"] = parse_dim_mil(
                         rule.properties.get("NETANTENNAETOLERANCE")
                     )
+                else:
+                    entry["check_incomplete_connections"] = _incomplete_option(rule)
                 rules.append(entry)
             out[kind] = {
                 "rules": rules,
                 "checked_by_batch_drc": None if kinds is None else kind_id in kinds,
             }
         return out
+
+    def incomplete_connections(self, net: str) -> bool | None:
+        """Does the Un-Routed Net rule that applies to a net have 'Check for
+        incomplete connections' on? The rule is the first enabled one by
+        priority whose scope matches the net; a rule whose scope is not decided
+        for the net may come first, so every rule that may counts: True or
+        False when they all agree (False when none applies, as Altium then
+        does not check the net), else None. Cached per net."""
+        if net in self._incomplete:
+            return self._incomplete[net]
+        rules = [rule for rule in self.rules["UnRoutedNet"] if rule.enabled]
+        flags = set()
+        if not any(_incomplete_option(rule) for rule in rules):
+            rules = []
+        for rule in rules:
+            verdict = "yes" if rule.scope1.strip().lower() == "all" else evaluate_scope(
+                rule.scope1, self._net_target(net), self.index.rule_context
+            )["matches"]
+            if verdict == "no":
+                continue
+            flags.add(bool(_incomplete_option(rule)))
+            if verdict == "yes":
+                break
+        else:
+            flags.add(False)
+        self._incomplete[net] = flags.pop() if len(flags) == 1 else None
+        return self._incomplete[net]
+
+    def _net_target(self, net: str) -> RuleTarget:
+        if net not in self._targets:
+            self._targets[net] = self.index.rule_target(net, kind="net") or RuleTarget(
+                kind="net", name=net.lower(), nets={net.lower()}, pairs=set()
+            )
+        return self._targets[net]
 
     def _object_rule(self, kind: str, net: str, row):
         """The enabled rule of a kind that applies to an object of a net, by
@@ -667,11 +722,7 @@ class Connectivity:
         in a room, a pour without NAME), so every rule that may come first
         counts: the style is known only when they all agree, else None (as
         without a rule)."""
-        if net not in self._targets:
-            self._targets[net] = self.index.rule_target(net, kind="net") or RuleTarget(
-                kind="net", name=net.lower(), nets={net.lower()}, pairs=set()
-            )
-        target = self._targets[net]
+        target = self._net_target(net)
         pour = self.pcb.pours[pour_id]
         sides = (
             replace(target, obj=self.index.object_facts(row)),
@@ -1637,16 +1688,18 @@ def _findings(board: Connectivity, result: dict, checks: set, layer: int | None)
                 finding["in_isolated_copper"] = True
             out.append(finding)
     if "weak" in checks:
+        checked = board.incomplete_connections(net)
         for weak in result["weak"]:
             if not on_layer([weak["layer"]]):
                 continue
             out.append({
                 "check": "weak_connection",
-                "severity": "info",
+                "severity": "warning" if checked else "info",
                 "net": net,
                 "layer": board.layer_name(weak["layer"]),
                 "objects": weak["objects"],
                 "location_mil": _location(weak["x"], weak["y"]),
+                "incomplete_connections_checked": checked,
             })
     return out
 
@@ -1699,11 +1752,21 @@ def check_connectivity(
                 ],
             }
     board = connectivity(index)
+    # 'Check for incomplete connections' per net; where it is (or may be) on,
+    # weak joins are listed unless checks says otherwise.
+    options = {net_id: board.incomplete_connections(index.pcb.nets[net_id]) for net_id in net_ids}
+    if not checks and any(option is not False for option in options.values()):
+        selected.append("weak")
     statuses = Counter()
     connections_total = connections_routed = 0
     antennae = over = no_rule = in_isolated = isolated = weak = strict_nets = 0
     assumed: list[dict] = []
     not_routed: list[str] = []
+    # Nets routed here that Altium reads un-routed: joined only by weak
+    # connections, with the option on (or, maybe_unrouted, possibly on); and
+    # the connections Altium then misses on top of ours.
+    weak_not_routed: list[str] = []
+    maybe_unrouted = weak_missing = 0
     findings: list[dict] = []
     per_net: list[dict] = []
     for net_id in net_ids:
@@ -1723,8 +1786,17 @@ def check_connectivity(
         if result["assumed"]:
             assumed.append({"net": result["net"], "through": result["assumed"]})
         findings.extend(_findings(board, result, set(selected), layer_id))
+        weak_only = False
         if result["pads"] >= 2 and result["strict_pad_islands"] > result["pad_islands"]:
             strict_nets += 1
+            if options[net_id]:
+                weak_missing += result["strict_pad_islands"] - result["pad_islands"]
+            if result["status"] == "routed":
+                if options[net_id]:
+                    weak_not_routed.append(result["net"])
+                    weak_only = True
+                elif options[net_id] is None:
+                    maybe_unrouted += 1
         if nets or net_classes:
             entry = {
                 "net": result["net"],
@@ -1732,10 +1804,14 @@ def check_connectivity(
                 "pads": result["pads"],
                 "pad_islands": result["pad_islands"],
             }
+            if weak_only:
+                entry["unrouted_in_altium"] = True
             if result["assumed"]:
                 entry["connected_through_assumed_copper"] = result["assumed"]
             per_net.append(entry)
     routable = statuses["routed"] + statuses["partly_routed"] + statuses["unrouted"]
+    states = set(options.values())
+    checked = states.pop() if len(states) == 1 else None if states else False
     summary = {
         "nets_checked": len(net_ids),
         "nets_with_2_or_more_pads": routable,
@@ -1760,8 +1836,33 @@ def check_connectivity(
         "antennae_in_isolated_copper": in_isolated,
         "weak_connections": weak,
         "nets_joined_only_by_weak_connections": strict_nets,
+        "incomplete_connections_checked": checked,
         "nets_connected_through_assumed_copper": len(assumed),
     }
+    if checked is not False:
+        count = len(weak_not_routed)
+        summary["nets_routed_here_unrouted_in_altium"] = count
+        summary["incomplete_connections_note"] = (
+            (
+                "The Un-Routed Net rule has 'Check for incomplete connections' on"
+                if checked else
+                "'Check for incomplete connections' is on in an Un-Routed Net rule that "
+                "applies to some of the nets checked, or may apply "
+                "(incomplete_connections_checked on each weak_connection, null where a "
+                "rule's scope is not decided for the net). Where it is on"
+            )
+            + ": Altium does not count weak connections as connected, so "
+            + f"{count} net{'' if count == 1 else 's'} routed here only through them "
+            + f"read{'s' if count == 1 else ''} un-routed in Altium (nets_unrouted_in_altium)"
+            + (
+                f", and {maybe_unrouted} more may, where the rule is not decided"
+                if maybe_unrouted else ""
+            )
+            + (
+                ". The weak_connection findings show where (warnings where it is on)."
+                if "weak" in selected else ". Name weak in checks to list the weak connections."
+            )
+        )
     findings.sort(key=lambda finding: (
         _SEVERITY_ORDER[finding["severity"]],
         _CHECK_ORDER[finding["check"]],
@@ -1782,6 +1883,8 @@ def check_connectivity(
         )
     if per_net:
         result["nets"] = per_net
+    if checked is not False:
+        result["nets_unrouted_in_altium"] = sorted(weak_not_routed, key=str.lower)
     if assumed:
         result["assumed_copper_nets"] = assumed
     result["severity_counts"] = dict(Counter(finding["severity"] for finding in findings))
@@ -1794,6 +1897,8 @@ def check_connectivity(
         if nets or net_classes else None
     )
     result["_not_routed_nets"] = not_routed
+    result["_weak_not_routed_nets"] = weak_not_routed
+    result["_weak_missing_connections"] = weak_missing
     result["approximations"] = list(APPROXIMATIONS)
     if not board.regions_read and board.model["pour_outline"]:
         result["approximations"].insert(0, (
@@ -1817,7 +1922,7 @@ def page_result(
     offset = max(0, offset)
     findings = full["findings"]
     approximations = result.pop("approximations")
-    for key in ("nets", "assumed_copper_nets"):
+    for key in ("nets", "nets_unrouted_in_altium", "assumed_copper_nets"):
         if key in full and len(full[key]) > net_limit:
             result[key] = full[key][:net_limit]
             result[f"{key}_not_listed"] = len(full[key]) - net_limit
@@ -1857,7 +1962,10 @@ def _listed(names: list[str], key: str) -> dict:
 def drc_comparison(report, full: dict) -> dict:
     """Altium's Un-Routed Net and Net Antennae violations in a Batch DRC report
     against this check. The net lists cover the nets checked, whatever the
-    checks and layer filters; the report's counts are always the whole board's."""
+    checks and layer filters; the report's counts are always the whole board's.
+    Where a net's rule checks incomplete connections, the connections joined
+    here only through weak connections count as missing, and a net routed here
+    only through them as not routed."""
     unrouted_nets: Counter = Counter()
     unrouted = antennae = connection_rows = other_rows = 0
     antenna_tables = 0
@@ -1880,20 +1988,32 @@ def drc_comparison(report, full: dict) -> dict:
                 else:
                     other_rows += 1
     checked = full.get("_checked_nets")
-    here = list(full.get("_not_routed_nets", []))
+    # A net routed here only through weak connections is not routed in Altium
+    # when its rule checks incomplete connections.
+    weak_only = list(full.get("_weak_not_routed_nets", []))
+    here = list(full.get("_not_routed_nets", [])) + weak_only
     there = [net for net in unrouted_nets if checked is None or net.lower() in checked]
     here_lower = {net.lower() for net in here}
     there_lower = {net.lower() for net in there}
     summary = full["summary"]
     rules = full.get("rules", {}).get("NetAntennae", {})
+    weak_missing = full.get("_weak_missing_connections", 0)
+    weak_block = (
+        {
+            "missing_connections_here_only_by_weak_connections": weak_missing,
+            "nets_not_routed_here_only_by_weak_connections": len(weak_only),
+        }
+        if "nets_routed_here_unrouted_in_altium" in summary else {}
+    )
     return {
         "unrouted": {
             "report_violations": unrouted,
             "report_missing_connections": connection_rows,
             "report_other_rows": other_rows,
             "report_nets": len(there),
-            "missing_connections_here": summary["connections"]["missing"],
+            "missing_connections_here": summary["connections"]["missing"] + weak_missing,
             "nets_not_routed_here": len(here),
+            **weak_block,
             **_listed(
                 sorted(net for net in there if net.lower() not in here_lower),
                 "report_nets_routed_here",
