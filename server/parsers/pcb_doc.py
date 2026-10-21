@@ -967,6 +967,7 @@ class BoardInfo:
     display_unit: str
     layers: list[PcbLayer]
     stackup_source: str
+    # The outline as points, arc edges approximated by chords (shape_points).
     outline_vertices: list[tuple[float, float]] = field(
         default_factory=list
     )
@@ -974,7 +975,7 @@ class BoardInfo:
     # Layer-stack regions (rigid/flex); each {"id", "name", "is_flex"}.
     substacks: list[dict] = field(default_factory=list)
     drill_pairs: list[DrillPair] = field(default_factory=list)
-    # The outline with its arcs (outline_vertices keeps only the vertices).
+    # The outline with its arcs (outline_vertices flattens them).
     outline_shape: list["ShapeVertex"] = field(default_factory=list)
     # Health Check Monitor settings saved with the board (HEALTHCHECKSTORAGE):
     # check id -> enabled; None when the board stores none (all on but id 20).
@@ -1011,7 +1012,12 @@ def shape_from_properties(properties: dict[str, str]) -> list[ShapeVertex]:
             start = _optional_float(properties.get(f"SA{index}"))
             end = _optional_float(properties.get(f"EA{index}"))
             values = (cx, cy, radius, start, end)
-            if None not in values and all(map(math.isfinite, values)) and radius > 0:
+            if (
+                None not in values
+                and all(map(math.isfinite, values))
+                and math.isfinite(end - start)  # huge angles of opposite sign
+                and radius > 0
+            ):
                 arc = values
         if x is not None and y is not None:
             vertices.append(ShapeVertex(x, y, arc))
@@ -1322,17 +1328,7 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
             )
         ]
 
-    outline_vertices: list[tuple[float, float]] = []
-    vertex_index = 0
-    while (
-        f"VX{vertex_index}" in properties
-        and f"VY{vertex_index}" in properties
-    ):
-        x = parse_dim_mil(properties[f"VX{vertex_index}"])
-        y = parse_dim_mil(properties[f"VY{vertex_index}"])
-        if x is not None and y is not None:
-            outline_vertices.append((x, y))
-        vertex_index += 1
+    outline_shape = shape_from_properties(properties)
 
     substacks: list[dict] = []
     substack_index = 0
@@ -1368,11 +1364,11 @@ def decode_board(records: list[dict[str, str]]) -> BoardInfo:
         ),
         layers=layers,
         stackup_source=stackup_source,
-        outline_vertices=outline_vertices,
+        outline_vertices=shape_points(outline_shape),
         substacks=substacks,
         impedance_profiles=decode_impedance_profiles(properties),
         drill_pairs=decode_drill_pairs(properties),
-        outline_shape=shape_from_properties(properties),
+        outline_shape=outline_shape,
         health_checks=_health_check_storage(properties.get("HEALTHCHECKSTORAGE")),
         plane_nets=plane_nets,
     )

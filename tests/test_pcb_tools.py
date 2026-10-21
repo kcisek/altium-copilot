@@ -6,9 +6,10 @@ import pytest
 
 import server.main as main_mod
 from server.main import PcbSession
-from server.parsers.pcb_doc import Primitive
+from server.parsers.pcb_doc import ARC_MAX_SAGITTA_MIL, Primitive, decode_board
 from server.parsers.prj_pcb import VariantDefinition, VariantState
 from server.services.pcb_index import PcbIndex
+from tests.test_pcb_doc_parser import STRIP_WITH_CIRCLE, _shape_props
 from tests.test_pcb_index import (  # noqa: F401
     ANNOTATED_NETLIST,
     NETLIST,
@@ -409,6 +410,17 @@ def test_board_info_prefers_board_outline_extents(loaded_pcb):
         "repour" in note.lower()
         for note in result["analysis_notes"]
     )
+
+
+def test_board_info_extents_follow_outline_arcs(loaded_pcb):
+    # The outline's vertices span 300 x 20 mil; its arc dips to y = -80.
+    outline = decode_board([_shape_props(*STRIP_WITH_CIRCLE)])
+    loaded_pcb.pcb.board.outline_vertices = outline.outline_vertices
+    result = json.loads(main_mod.get_board_info(units="mil"))
+    extents = result["board_extents_mil"]
+    assert result["extents_source"] == "board_outline"
+    assert (extents["minx_mil"], extents["maxx_mil"], extents["maxy_mil"]) == (0.0, 300.0, 20.0)
+    assert extents["miny_mil"] == pytest.approx(-80.0, abs=ARC_MAX_SAGITTA_MIL)
 
 
 def test_server_instructions_include_pcb_workflow():
