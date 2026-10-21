@@ -1157,7 +1157,7 @@ def test_errors():
     assert bad["error"] == "invalid_checks" and bad["valid_checks"] == list(CHECKS)
 
 
-def test_weak_findings_are_listed_only_when_asked_for():
+def test_weak_findings_are_listed_only_when_asked_for_without_the_option():
     board = Board(["W"])
     board.pad("W", "U1", "1", 0, 0)
     board.pad("W", "U2", "1", 50, 100)
@@ -1166,6 +1166,122 @@ def test_weak_findings_are_listed_only_when_asked_for():
     result = check_connectivity(board.index())
     assert not _finding(result, "weak_connection", "W")
     assert result["summary"]["weak_connections"] == 1
+    assert result["summary"]["incomplete_connections_checked"] is False
+    assert "nets_routed_here_unrouted_in_altium" not in result["summary"]
+    assert "nets_unrouted_in_altium" not in result
+
+
+def _weak_board(nets=("W",)) -> Board:
+    """Each net: two pads joined by tracks whose copper only overlaps (a weak join)."""
+    board = Board(list(nets))
+    for number, net in enumerate(nets):
+        y = number * 500.0
+        board.pad(net, "U1", str(number + 1), 0, y)
+        board.pad(net, "U2", str(number + 1), 50, y + 100)
+        board.track(net, 0, y, 100, y)
+        board.track(net, 50, y + 100, 50, y + 3)
+    return board
+
+
+def test_rule_summary_reads_check_for_incomplete_connections():
+    board = _weak_board()
+    board.rule("UnRoutedNet", name="On", CHECKBADCONNECTIONS="TRUE")
+    board.rule("UnRoutedNet", name="Off", CHECKBADCONNECTIONS="FALSE")
+    board.rule("UnRoutedNet", name="Unsaved")
+    board.rule("UnRoutedNet", name="Lower", checkbadconnections=" true ")
+    rules = check_connectivity(board.index())["rules"]["UnRoutedNet"]["rules"]
+    assert [(rule["name"], rule["check_incomplete_connections"]) for rule in rules] == [
+        ("On", True), ("Off", False), ("Unsaved", None), ("Lower", True),
+    ]
+
+
+def test_weak_joins_are_warnings_when_the_rule_checks_incomplete_connections():
+    board = _weak_board()
+    board.rule("UnRoutedNet", CHECKBADCONNECTIONS="TRUE")
+    index = board.index()
+    result = check_connectivity(index)
+    assert result["checks_run"] == [*DEFAULT_CHECKS, "weak"]
+    (weak,) = _finding(result, "weak_connection", "W")
+    assert weak["severity"] == "warning"
+    assert weak["incomplete_connections_checked"] is True
+    summary = result["summary"]
+    # Touching copper still routes the net here; Altium reads it un-routed.
+    assert summary["routed"] == 1 and summary["connections"]["missing"] == 0
+    assert summary["incomplete_connections_checked"] is True
+    assert summary["nets_joined_only_by_weak_connections"] == 1
+    assert summary["nets_routed_here_unrouted_in_altium"] == 1
+    assert result["nets_unrouted_in_altium"] == ["W"]
+    note = summary["incomplete_connections_note"]
+    assert "1 net routed here only through them reads un-routed" in note
+    assert "findings show where" in note
+    # Warnings come first (the info is the open track end past the join).
+    assert [item["check"] for item in result["findings"]] == ["weak_connection", "antenna"]
+    # checks still narrows; the summary and the list still name the net.
+    narrowed = check_connectivity(index, checks=["unrouted"], nets=["W"])
+    assert not _finding(narrowed, "weak_connection", "W")
+    assert "Name weak in checks" in narrowed["summary"]["incomplete_connections_note"]
+    assert narrowed["nets_unrouted_in_altium"] == ["W"]
+    assert narrowed["nets"][0]["unrouted_in_altium"] is True
+    page = page_result(narrowed, net_limit=0)
+    assert page["nets_unrouted_in_altium"] == []
+    assert page["nets_unrouted_in_altium_not_listed"] == 1
+
+
+@pytest.mark.parametrize("rules", [
+    [{"CHECKBADCONNECTIONS": "FALSE"}],
+    [{"CHECKBADCONNECTIONS": "TRUE", "enabled": False}, {}],
+    # The rule with the option does not apply to the net; the next one does.
+    [{"CHECKBADCONNECTIONS": "TRUE", "scope": "InNetClass('Other')"}, {}],
+    # A rule that applies to the net comes first.
+    [{}, {"CHECKBADCONNECTIONS": "TRUE"}],
+    # No rule applies to the net: Altium does not check it.
+    [{"CHECKBADCONNECTIONS": "TRUE", "scope": "InNet('V')"}],
+])
+def test_weak_joins_stay_info_when_the_rule_that_applies_has_the_option_off(rules):
+    board = _weak_board()
+    for properties in rules:
+        board.rule("UnRoutedNet", **properties)
+    result = check_connectivity(board.index(), checks=["weak"])
+    (weak,) = _finding(result, "weak_connection", "W")
+    assert (weak["severity"], weak["incomplete_connections_checked"]) == ("info", False)
+    assert result["summary"]["incomplete_connections_checked"] is False
+    assert "incomplete_connections_note" not in result["summary"]
+    assert check_connectivity(board.index())["checks_run"] == list(DEFAULT_CHECKS)
+
+
+def test_option_on_for_some_nets_is_per_net():
+    board = _weak_board(("W", "V"))
+    board.rule("UnRoutedNet", scope="InNet('W')", CHECKBADCONNECTIONS="TRUE")
+    board.rule("UnRoutedNet")
+    result = check_connectivity(board.index())
+    assert "weak" in result["checks_run"]
+    (on,) = _finding(result, "weak_connection", "W")
+    (off,) = _finding(result, "weak_connection", "V")
+    assert (on["severity"], on["incomplete_connections_checked"]) == ("warning", True)
+    assert (off["severity"], off["incomplete_connections_checked"]) == ("info", False)
+    summary = result["summary"]
+    assert summary["incomplete_connections_checked"] is None
+    assert summary["nets_joined_only_by_weak_connections"] == 2
+    assert summary["nets_routed_here_unrouted_in_altium"] == 1
+    assert "applies to some of the nets checked" in summary["incomplete_connections_note"]
+    narrowed = check_connectivity(board.index(), nets=["W"])
+    assert narrowed["summary"]["incomplete_connections_checked"] is True
+
+
+def test_option_in_a_rule_whose_scope_is_undecided_for_the_net_is_unknown():
+    # OnLayer is not decided for a whole net: that rule may come first.
+    board = _weak_board()
+    board.rule("UnRoutedNet", scope="OnLayer('Top Layer')", CHECKBADCONNECTIONS="TRUE")
+    board.rule("UnRoutedNet")
+    result = check_connectivity(board.index())
+    assert "weak" in result["checks_run"]
+    (weak,) = _finding(result, "weak_connection", "W")
+    assert (weak["severity"], weak["incomplete_connections_checked"]) == ("info", None)
+    assert result["summary"]["incomplete_connections_checked"] is None
+    # Only a net whose rule has the option on for certain reads un-routed in Altium.
+    assert result["summary"]["nets_routed_here_unrouted_in_altium"] == 0
+    assert result["nets_unrouted_in_altium"] == []
+    assert "1 more may" in result["summary"]["incomplete_connections_note"]
 
 
 def test_finding_names_select_their_checks():
@@ -1261,6 +1377,43 @@ def test_drc_comparison_counts_dead_copper_rows_apart():
     block = drc_comparison(report, check_connectivity(_filter_board()))["unrouted"]
     assert (block["report_missing_connections"], block["report_other_rows"]) == (1, 1)
     assert block["report_nets"] == 1
+
+
+@pytest.mark.parametrize("option", ["on", "unsaved", "undecided"])
+def test_drc_comparison_counts_weak_only_nets_as_not_routed_when_checked(option):
+    board = _weak_board(("W", "V"))
+    board.pad("V", "U3", "9", 900, 900)  # V has a missing connection too
+    if option == "undecided":
+        board.rule("UnRoutedNet", scope="OnLayer('Top Layer')", CHECKBADCONNECTIONS="TRUE")
+    board.rule("UnRoutedNet", **({"CHECKBADCONNECTIONS": "TRUE"} if option == "on" else {}))
+    report = DrcReport(format="html", tables=[
+        DrcTable(type=RULE, title="Un-Routed Net Constraint: ( (All) )", count=1, violations=[
+            DrcViolation("Un-Routed Net Constraint: Net W Between Track (0mil,0mil)"
+                         "(100mil,0mil) on Top Layer And Track (50mil,100mil)(50mil,3mil) "
+                         "on Top Layer"),
+        ]),
+    ])
+    full = check_connectivity(board.index())
+    assert full["summary"]["connections"]["missing"] == 1  # V's far pad
+    block = drc_comparison(report, full)["unrouted"]
+    if option == "on":
+        # W's join and V's join both count as missing; W reads un-routed.
+        assert block["missing_connections_here"] == 3
+        assert block["missing_connections_here_only_by_weak_connections"] == 2
+        assert block["nets_not_routed_here"] == 2
+        assert block["nets_not_routed_here_only_by_weak_connections"] == 1
+        assert block["report_nets_routed_here"] == []
+    else:
+        assert block["missing_connections_here"] == 1
+        assert block["nets_not_routed_here"] == 1
+        assert block["report_nets_routed_here"] == ["W"]
+        weak_keys = {key for key in block if "only_by_weak" in key}
+        if option == "unsaved":
+            assert not weak_keys
+        else:  # the option may be on: said, but nothing counted
+            assert block["nets_not_routed_here_only_by_weak_connections"] == 0
+            assert block["missing_connections_here_only_by_weak_connections"] == 0
+    assert block["not_routed_here_not_in_report"] == ["V"]
 
 
 # ---------- parser: Regions6, Fills6, planes ----------
