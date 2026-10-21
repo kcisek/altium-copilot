@@ -6,6 +6,46 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `diff_design`: what changed between two states of a project, as an ECO-style changelog
+  for reviews and release notes (roadmap #45). Sources: two revisions of the Git clone
+  holding the loaded project (commit hashes, branches, tags, HEAD~n, or `working` for the
+  files on disk; by default the last commit that changed a design file against the files
+  on disk, or a commit against its parent; with no revisions the recent commits that
+  changed design files are listed to pick from) or two project folders. A revision's
+  .PrjPcb and the .SchDoc, .PcbDoc and .Annotation files it lists are read with
+  `git ls-tree` and one `git cat-file --batch` (no filters run, Git LFS pointers reported
+  as not read) into a temporary folder outside the clone, parsed with the existing
+  parsers and deleted; git runs with the `get_clone_status` hardening and only
+  rev-parse, ls-tree, log and cat-file, so nothing is written to the clone. Files whose
+  blob ids match are not parsed. Sections: project (sheets, project parameters),
+  components (added, removed, re-designated, revalued Comment/Value with special strings
+  resolved, footprint, parameters, description and library reference), variants (Not
+  Fitted and alternate parts per variant, varied parameters), BOM line changes per
+  variant (a variant whose changes equal the base BOM's is only named), nets from the
+  PcbDoc's pads (added, removed, renamed, merged, split, pins moved between nets), parts
+  added, removed, moved, rotated or flipped (0.1 mil / 0.01 deg tolerance) and footprint
+  or designator changes on the board, rules (added, removed, changed scope, enable and
+  values through `rule_values`; a priority change only when the order of the rules both
+  states have changes), classes, differential pairs, stackup (layers, thickness, copper
+  count, impedance profiles) and per-net routed length and via count. Components match
+  by UniqueId (channel path, sheet, UniqueId alone) then designator, nets by shared pads
+  (the project's Comparator Min Match % and Min Matched Members) then name, as Altium's
+  comparator does. ICT-fixture hazards are listed first: nets that kept their name while
+  their pins changed (flagged when only added or removed parts explain it) and
+  designators now on a different part. Purely graphical edits are not reported, and
+  schematic wiring not yet pushed to the board is not seen (no offline schematic
+  netlister: see `check_sch_pcb_sync`); Local History folders and package_for_xfn
+  snapshots are not read yet. Paged under the result limit, one section at a time if
+  asked, lengths in the board's units or `units`. On a corpus of 63 projects, 62 in Git
+  clones with design history (1 to 15 design commits listed), the last three design
+  commits of each were diffed against their parents: 158 pairs (16 first commits have no
+  parent), 73 with changes, median 0.7 s and at most 2.0 s per diff, no exceptions, and
+  every clone left unchanged (file list, mtimes and sizes of 15,233 files compared
+  before and after). Over those pairs: 137 component, 57 BOM, 27 variant, 38 net (14
+  renamed, 11 added, 10 removed, one merge, one split, one pin moved), 168 placement, 38
+  rule, 41 class, 12 diff-pair, 11 stackup and 176 routing entries, and 52 ICT hazards
+  (35 designators on a new part, 30 of them with another comment or footprint; 17 nets
+  whose pins changed under the same name).
 - `get_project_options`: the project settings that change how a design is read, offline
   from the .PrjPcb (no netlist needed): the Net Identifier Scope and net naming (read as
   `get_design_hierarchy` reads them), Allow Single Pin Nets, diff-pair suffixes (Altium's

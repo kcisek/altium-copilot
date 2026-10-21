@@ -74,6 +74,8 @@ WORKING_TOOL_CALLS = {
     "get_design_image": lambda: main.get_design_image("Fab.PCBDwf"),
     "get_design_hierarchy": lambda: main.get_design_hierarchy(),
     "get_project_options": lambda: main.get_project_options(),
+    # The project folder against itself: no Git clone is needed in folder mode.
+    "diff_design": lambda: main.diff_design(project_dir_a=main._project["root_dir"]),
     "list_variants": lambda: main.list_variants(),
     "set_active_variant": lambda: main.set_active_variant("Prod"),
     "get_clone_status": lambda: main.get_clone_status(),

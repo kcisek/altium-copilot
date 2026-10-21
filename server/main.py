@@ -79,6 +79,9 @@ try:
     )
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from services.project_options import build_project_options, page_project_options
+    from services.design_diff import (
+        DiffError, diff_folders, diff_revisions, page_design_diff,
+    )
     from services.project_tour import build_project_tour, defined_variant_count
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
@@ -139,6 +142,9 @@ except ImportError:
     )
     from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from server.services.project_options import build_project_options, page_project_options
+    from server.services.design_diff import (
+        DiffError, diff_folders, diff_revisions, page_design_diff,
+    )
     from server.services.project_tour import build_project_tour, defined_variant_count
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
@@ -324,6 +330,17 @@ DNP reasons, fabrication requirements. Use it.
   blocks and rails, PCB stackup, placement and key nets, outputs, variants and notes)
   ending in a Markdown project primer. Show the primer; save it only where the user
   agrees. A quick summary needs only the session-start steps.
+
+## Design Diff
+
+- diff_design — "what changed since the last release / commit?", "what did commit X
+  change?", "write the release notes", "review this revision against the old one": an
+  ECO-style changelog between two revisions of the project's Git clone (default: the
+  last commit that changed a design file vs the files on disk; with no revisions it
+  lists recent_commits, so offer them) or two folders (an archived release). Quote
+  ict_hazards first (nets that kept their name but changed pins, designators now on
+  another part): they break test fixtures and programs. Nets come from the PcbDoc: a
+  schematic change not yet pushed to the board is not seen (check_sch_pcb_sync).
 
 ## Bill of Materials
 
@@ -3326,6 +3343,89 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# ---------- diff_design ----------
+
+DiffSection = Literal[
+    "ict_hazards", "project", "components", "variants", "bom", "nets", "placement",
+    "rules", "classes", "diff_pairs", "stackup", "routing",
+]
+
+
+@mcp.tool(
+    title="Diff Design",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def diff_design(
+    rev_a: str | None = None,
+    rev_b: str | None = None,
+    project_dir_a: str | None = None,
+    project_dir_b: str | None = None,
+    section: DiffSection | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """What changed between two states of the project, as an ECO-style changelog for a
+    review or release notes. Sources: two revisions of the Git clone holding the loaded
+    project (rev_a older, rev_b newer: a commit hash, branch, tag, HEAD~n, or 'working'
+    for the files on disk; rev_b defaults to working, rev_a to the last commit that
+    changed a design file, or to rev_b's parent when rev_b is a commit), or two project
+    folders (project_dir_a, project_dir_b; b defaults to the loaded project's folder),
+    e.g. an archived release. With no revisions the recent commits that changed design
+    files are listed (recent_commits) so the user can pick. Revisions are read offline
+    with read-only git commands into a temporary folder that is deleted; the clone is
+    never written.
+
+    Sections: project (sheets, project parameters), components (added, removed,
+    re-designated, revalued: Comment/Value, footprint, parameters), variants (Not Fitted
+    and alternate parts per variant, varied parameters), bom (line changes per variant;
+    variants whose changes equal the base BOM's are named in
+    bom_variants_same_as_base), nets (from the PcbDoc: added, removed, renamed, merged,
+    split, pins moved between nets), placement (parts added, removed, moved, rotated,
+    flipped, footprint or designator changed on the board), rules, classes, diff_pairs,
+    stackup (layers, thickness, impedance profiles) and routing (per-net routed length
+    and via count). ict_hazards come first: nets that kept their name while their pins
+    changed, and designators now on a different part. Components match by UniqueId,
+    nets by shared pins then name, as Altium's comparator does. Purely graphical edits
+    are not reported. Nets come from the PcbDoc: schematic wiring not pushed to the
+    board is not seen (check_sch_pcb_sync). Lengths in units (default: the board's).
+    Paginated: section= narrows to one section, offset from next_offset; summary and
+    notes come with the first page."""
+    try:
+        if project_dir_a or project_dir_b:
+            loaded = _project or {}
+            folder_b = project_dir_b or loaded.get("root_dir")
+            if not project_dir_a or not folder_b:
+                return json.dumps({
+                    "error": "folders_required",
+                    "message": "Pass project_dir_a (and project_dir_b, or load the project "
+                               "to compare with) to compare two folders.",
+                })
+            prj_name = Path(loaded["prj_pcb_path"]).name if loaded.get("prj_pcb_path") else None
+            model = diff_folders(project_dir_a, folder_b, prj_name, prj_name, units)
+        else:
+            if _project is None:
+                return json.dumps({
+                    "error": "no_project",
+                    "message": "No project loaded. Call set_project_dir first, or pass "
+                               "project_dir_a and project_dir_b.",
+                })
+            model = diff_revisions(_project["prj_pcb_path"], rev_a, rev_b, units)
+    except DiffError as error:
+        return json.dumps(error.payload)
+    except Exception as error:
+        logging.warning("Design diff failed: %s", error)
+        return json.dumps({"error": "diff_failed",
+                           "message": f"{type(error).__name__}: {error}"})
+    to_mm = model.get("units") == "mm"
+    for limit in (200, 80, 30, 10, 1):
+        page = _convert_units(page_design_diff(model, offset, limit, section), to_mm)
+        rendered = json.dumps(page, indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
     return rendered
