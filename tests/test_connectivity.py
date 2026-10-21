@@ -125,10 +125,10 @@ class Board:
             pour_id=pour_id,
         ))
 
-    def rule(self, kind, scope="All", name=None, enabled=True, **properties):
+    def rule(self, kind, scope="All", name=None, enabled=True, scope2="All", **properties):
         self.rules.append(PcbRule(
             name=name or kind, kind=kind, kind_id=0, enabled=enabled,
-            priority=len(self.rules) + 1, scope1=scope, scope2="All", net_scope="AnyNet",
+            priority=len(self.rules) + 1, scope1=scope, scope2=scope2, net_scope="AnyNet",
             comment="", unique_id=None, from_schematic=False, properties=properties,
         ))
 
@@ -688,7 +688,7 @@ def test_isolated_track_reports_the_nearest_copper():
     assert NEAR_MIL == 25.0
 
 
-def test_track_grazing_pour_copper_is_weak_but_a_via_is_not_tested():
+def test_track_grazing_pour_copper_is_weak_but_a_relief_via_is_not_tested():
     board = Board(["GND"])
     board.pad("GND", "U1", "1", 0, 0)
     board.pad("GND", "U2", "1", 300, 50)
@@ -699,15 +699,155 @@ def test_track_grazing_pour_copper_is_weak_but_a_via_is_not_tested():
     # the pour, its centreline does not reach it.
     board.track("GND", 100, 23, 300, 23, width=8.0)
     board.track("GND", 300, 23, 300, 50, width=8.0)
-    # A via just outside the pour touching its copper: pads and vias are not
-    # tested against the pour outline.
+    # A via just outside the pour touching its copper: connected by relief,
+    # its centre is not tested against the pour outline.
     board.via("GND", 209, -10)
     board.track("GND", 209, -10, 300, -100)
+    board.rule("PolygonConnect", CONNECTSTYLE="Relief")
     index = board.index()
     result = check_connectivity(index, checks=list(CHECKS))
     assert _status(index, "GND") == "routed"
     (weak,) = _finding(result, "weak_connection", "GND")
     assert weak["objects"] == ["Track on Top Layer", "Pour copper on Top Layer"]
+
+
+def _straddling_board(**connect_style):
+    """GND with a pour round U1-1, an SMD pad (U2-1) whose centre is 4 mil past
+    the pour's right edge and a via (on to U3-1) 6 mil past its left edge, each
+    joined to the pour only by touching its copper."""
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    board.pad("GND", "U2", "1", 104, 0, size=10.0)
+    board.via("GND", -106, 0)
+    board.track("GND", -106, 0, -106, -100)
+    board.pad("GND", "U3", "1", -106, -100)
+    pour = board.pour("GND", 1, _square(-100, -20, 100, 20))
+    board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
+    if connect_style:
+        board.rule("PolygonConnect", **connect_style)
+    return board
+
+
+@pytest.mark.parametrize("connect_style, flagged", [
+    ({"CONNECTSTYLE": "Direct"}, ["Pad U2-1", "Via"]),
+    ({"CONNECTSTYLE": "Relief"}, []),
+    ({}, []),  # no Polygon Connect Style rule: not tested
+    (
+        {"THPAD.CONNECTSTYLE": "Direct", "SMDPAD.CONNECTSTYLE": "Direct",
+         "VIA.CONNECTSTYLE": "Relief"},
+        ["Pad U2-1"],
+    ),
+    (
+        {"THPAD.CONNECTSTYLE": "Direct", "SMDPAD.CONNECTSTYLE": "Relief",
+         "VIA.CONNECTSTYLE": "Direct"},
+        ["Via"],
+    ),
+])
+def test_direct_pad_or_via_with_its_centre_off_the_pour_outline_is_weak(
+    connect_style, flagged
+):
+    index = _straddling_board(**connect_style).index()
+    result = check_connectivity(index, checks=list(CHECKS))
+    assert _status(index, "GND") == "routed"
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == flagged
+    assert {item["objects"][1] for item in weak} <= {"Pour copper on Top Layer"}
+    assert result["summary"]["nets_joined_only_by_weak_connections"] == (1 if flagged else 0)
+
+
+@pytest.mark.parametrize("scope1, scope2, otherwise, flagged", [
+    # The polygon side decides: the direct rule is for bottom-layer pours only.
+    ("All", "OnLayer('Bottom Layer')", "Relief", []),
+    ("All", "OnLayer('Top Layer') And IsPolygon", "Relief", ["Pad U2-1", "Via"]),
+    # Either way round: U2-1 matches the second scope, the pour the first.
+    ("All", "InComponent('U2')", "Relief", ["Pad U2-1"]),
+    ("IsVia", "All", "Relief", ["Via"]),
+    # A pour's name is not read: the first rule cannot be decided, so the
+    # second one (direct too) is not taken and nothing is tested.
+    ("All", "IsNamedPolygon('GND_TOP')", "Direct", []),
+])
+def test_polygon_connect_rule_matches_the_pad_and_the_pour(scope1, scope2, otherwise, flagged):
+    board = _straddling_board()
+    board.rule("PolygonConnect", scope=scope1, scope2=scope2, CONNECTSTYLE="Direct")
+    board.rule("PolygonConnect", CONNECTSTYLE=otherwise)
+    result = check_connectivity(board.index(), checks=["weak"])
+    weak = _finding(result, "weak_connection", "GND")
+    assert sorted(item["objects"][0] for item in weak) == flagged
+
+
+def test_through_hole_pad_takes_the_rule_thpad_style():
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    # A through-hole pad 15 mil past the pour's edge, its 40 mil copper over it.
+    board.pad("GND", "U2", "1", 115, 0, size=40.0, hole=20.0)
+    pour = board.pour("GND", 1, _square(-100, -20, 100, 20))
+    board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
+    board.rule("PolygonConnect", **{
+        "THPAD.CONNECTSTYLE": "Direct", "SMDPAD.CONNECTSTYLE": "Relief",
+        "VIA.CONNECTSTYLE": "Relief",
+    })
+    result = check_connectivity(board.index(), checks=["weak"])
+    (weak,) = _finding(result, "weak_connection", "GND")
+    assert weak["objects"] == ["Pad U2-1", "Pour copper on Top Layer"]
+
+
+@pytest.mark.parametrize("style, weak", [("Direct", 1), ("Relief", 0)])
+def test_hatched_pour_tests_a_direct_pad_centre_too(style, weak):
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    board.pad("GND", "U2", "1", 104, 0, size=10.0)  # 4 mil past the pour's edge
+    pour = board.pour("GND", 1, _square(-100, -20, 100, 20), hatch="Hatched")
+    board.track("GND", -98, 0, 98, 0, poured_by=pour)  # its copper reaches x = 100
+    board.rule("PolygonConnect", CONNECTSTYLE=style)
+    index = board.index()
+    result = check_connectivity(index, checks=["weak"])
+    assert _status(index, "GND") == "routed"
+    found = _finding(result, "weak_connection", "GND")
+    assert len(found) == weak
+    if weak:
+        assert sorted(found[0]["objects"]) == ["Pad U2-1", "Pour track on Top Layer"]
+
+
+def test_pad_centre_on_or_just_past_the_pour_outline_is_not_weak():
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    board.pad("GND", "U2", "1", 100, 0)  # on the pour's right edge
+    board.via("GND", -100.4, 0)  # 0.4 mil past its left edge (CENTRE_MIL 0.5)
+    board.track("GND", -100.4, 0, -100.4, -100)
+    board.pad("GND", "U3", "1", -100.4, -100)
+    pour = board.pour("GND", 1, _square(-100, -20, 100, 20))
+    board.region("GND", 1, _square(-100, -20, 100, 20), pour_id=pour)
+    board.rule("PolygonConnect", CONNECTSTYLE="Direct")
+    result = check_connectivity(board.index(), checks=list(CHECKS))
+    assert _finding(result, "weak_connection", "GND") == []
+    assert result["summary"]["nets_joined_only_by_weak_connections"] == 0
+
+
+def test_pad_centre_is_tested_against_the_pour_outline_arcs():
+    # The pour's right edge is a Polygons6 arc bulging out to x = 500; U2-1 sits
+    # in the bulge, 30 mil past the chord, so its centre is inside the outline.
+    # U3-1 lies 4 mil past the arc.
+    board = Board(["GND"])
+    board.pad("GND", "U1", "1", 0, 0)
+    board.pad("GND", "U2", "1", 480, 0)
+    board.pad("GND", "U3", "1", 504, 0, size=10.0)
+    board.track("GND", 504, 0, 504, -200)
+    board.pad("GND", "C1", "1", 504, -200)
+    record = {
+        "LAYER": "TOP", "NET": str(board.net("GND")), "HATCHSTYLE": "Solid",
+        "VX0": "-50mil", "VY0": "-50mil", "VX1": "450mil", "VY1": "-50mil", "KIND1": "1",
+        "CX1": "450mil", "CY1": "0mil", "R1": "50mil", "SA1": "270", "EA1": "90",
+        "VX2": "450mil", "VY2": "50mil", "VX3": "-50mil", "VY3": "50mil",
+    }
+    (pour,), _ = decode_polygons([record], {"top": 1})
+    board.pours.append(pour)
+    board.region("GND", 1, pour.vertices, pour_id=pour.pour_id)
+    board.rule("PolygonConnect", CONNECTSTYLE="Direct")
+    index = board.index()
+    result = check_connectivity(index, checks=["weak"])
+    assert _status(index, "GND") == "routed"
+    (weak,) = _finding(result, "weak_connection", "GND")
+    assert weak["objects"] == ["Pad U3-1", "Pour copper on Top Layer"]
 
 
 def test_track_edge_touching_a_pad_is_weak():

@@ -455,6 +455,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   the nominal diameter, so the two tools could disagree. Simple-stack vias keep their
   ring; no ring changes on 83 real boards (all simple stack) or on Altium's examples
   (MiniPC's 34 full-stack vias have nominal-size pads where they keep one)
+- `check_connectivity`'s `weak_connection` also tests a pad or via that touches a
+  pour's copper (solid or hatched), as Altium's 'Check for incomplete connections'
+  does: when it is connected directly (Polygon Connect Style), its centre must be
+  inside the pour's outline, arc edges included, within 0.5 mil. Pads and vias
+  connected by relief, or with no rule, are not tested, as in Altium's help. The rule
+  is matched like Altium's binary rules: the pad or via and the pour against its two
+  scopes, either way round. A pour's name and class are not read, so a rule naming
+  them that may come first leaves the pad or via untested. On Altium's 6 examples,
+  12 of 28,988 pad and via contacts with solid pour copper have their centre off the
+  outline: 7 direct vias and 5 relief-connected edge-connector fingers (not tested).
+  One Mini PC via is a connection its net needs, so it is reported. On 83 real boards,
+  81 of 35,429 contacts are off the outline (74 direct). 20 SMD pads on 3 boards are
+  needed connections, each with its centre 5 to 100 mil past the outline and at most
+  half of the pad inside it. The test was left out when `check_connectivity` was
+  added, because pour outlines then ignored their arcs
 
 ### Fixed
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)

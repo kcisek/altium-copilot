@@ -245,10 +245,11 @@ class ObjectFacts:
     can be decided exactly. Names are lower-case.
 
     layer is the object's Layer property (v6 id; 74 = Multi-Layer for vias and
-    through-hole pads); span is every copper layer it occupies.
+    through-hole pads); span is every copper layer it occupies. A polygon is
+    the pour itself (the polygon side of a Polygon Connect Style rule).
     """
 
-    kind: str  # "track" | "arc" | "via" | "pad"
+    kind: str  # "track" | "arc" | "via" | "pad" | "polygon"
     layer: int
     span: frozenset = frozenset()
     points: tuple = ()  # track/arc endpoints; via/pad centre
@@ -395,6 +396,9 @@ def _eval_object_call(node, obj: ObjectFacts, ctx: RuleContext) -> tuple | None:
     if name == "isfree":
         # A free primitive is one that is not part of a component.
         return _TRUE if obj.component is None else _FALSE
+    if name in _POLYGON_ONLY and obj.kind == "polygon":
+        # The pour itself: its name, class and type are not read.
+        return _TRUE if name in ("ispoly", "ispolygon") else _unknown(node)
     if name in _POLYGON_ONLY and obj.in_pour:
         return _pour_copper_call(node)
     if name in _LAYER_PREDICATES:
@@ -618,6 +622,8 @@ def _eval_cmp(node, target: RuleTarget) -> tuple:
             return _TRUE if value == obj.kind else _FALSE
         if node[2] == "<>":
             return _FALSE if value == obj.kind else _TRUE
+    if obj is not None and obj.kind == "polygon" and prop == "name":
+        return _unknown(node)  # a pour's name is not read
     if obj is not None and prop == "name" and node[2] in ("=", "like", "<>"):
         # A pad's Name is "<designator>-<pad>"; other routed objects have none.
         matched = bool(obj.pad) and _wildcard_matches(str(node[3]), obj.pad)
