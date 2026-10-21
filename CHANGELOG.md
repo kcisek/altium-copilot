@@ -6,6 +6,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_design_hierarchy`: the project's sheet hierarchy offline, like the OutJob's
+  Report Project Hierarchy, from the .PrjPcb and the .SchDoc files alone (no netlist
+  needed, so it also works after a netlist-free load). The sheet tree runs from the top
+  sheet(s), those no sheet symbol places, down through the sheet symbols (RECORD=15 with
+  their designator 32 and file name 33), with device sheets (the project's
+  `[DeviceSheetN]` documents), `Repeat(name, first, last)` channels with their count, and
+  the compiled copies a sheet gets down the tree. Per sheet: its ports (RECORD=18: name,
+  I/O type, harness type) and its symbols' sheet entries (16: name, I/O type, harness;
+  the child port's I/O type when it differs or is missing; `Repeat(X)` entries match
+  port X). Each port and entry lists the net labels and power ports on its wiring
+  (wires, buses, signal harnesses from the Additional stream, junctions, and pins at
+  their electrical end; labels, power ports and ports of one name join on a sheet), and,
+  with a compiled netlist, the net it joins (one per channel copy; through the other
+  sheets' wiring when its own has no pins, where an entry takes only the copy of the
+  child its own symbol places, told apart by the `.Annotation` UniqueId paths, and
+  never a sibling symbol's net; a note when the copies cannot be told apart or its pins
+  are in no compiled net).
+  The Net Identifier Scope is read from `[Design] HierarchyMode` (0 Automatic, 1 Flat,
+  2 Hierarchical, 3 Global, Altium's TFlattenMode order; 4 read as Strict Hierarchical,
+  which that list predates), with what Automatic resolves to by Altium's rule (sheet
+  entries on the top sheet: Hierarchical, else ports: Flat, else Global), a paragraph
+  on how nets cross sheets under it, and the Netlist Options that decide net names
+  (ports, sheet entries, higher-level names, power-port priority, sheet numbers) as a
+  name precedence. Issues: symbols pointing at a file that is not a project sheet
+  (`on_disk` when it is next to the parent), symbols without a file, cycles, bad channel
+  ranges, entries without a port in the child (an entry matching only a child power
+  port is info where power ports are global, an error under Strict Hierarchical) and
+  ports without an entry (not under Flat or Global for a symbol with no entries at
+  all, whose ports are global), I/O and harness mismatches, duplicate symbol designators and
+  entry names, ports on a top sheet and several top sheets under a hierarchical scope,
+  ports no other sheet shares under Flat or Global, sheets placed several times, and
+  unwired ports and entries; findings of one kind on one symbol or sheet are grouped
+  (`entries`, `ports`), `issue_help` explains each kind. `sheet=` narrows to a subtree;
+  sheet details are paginated, the tree and issues come with the first page. Checked
+  against the `.PrjPcbStructure` Altium wrote for its AD25 examples (every sheet
+  symbol's sheet, designator and file matched). On the private set of 56 projects (180
+  sheets) it ran without an exception in under 0.8 s per project: 3 projects have a
+  hierarchy (22 sheet symbols, 171 entries; no device sheet or Repeat channel), 707
+  ports; scopes seen were Automatic 40 (resolving to Hierarchical 3, Flat 5, Global 32)
+  and Global 16; all 55 projects with a `.PrjPcbStructure` matched it (22 of 22 sheet
+  symbols). Issues found: 124 ports no other sheet shares (10 flat or global
+  projects), 3 unwired entries and 2 ports without an entry. In the 4 projects with a
+  cached netlist, 202 of 234 ports and entries named their net (64 through other
+  sheets), and each of the 63 with a net label on its wiring got that label's name.
 - `check_dfm`: a design-for-manufacture check of the saved PcbDoc against a
   fabricator's capability limits. The limits come from a profile: Altimade's published
   limits (Altium's ordering service, page updated 2026-10-13) built in and used when

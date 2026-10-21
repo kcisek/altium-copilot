@@ -71,6 +71,7 @@ WORKING_TOOL_CALLS = {
     "pcb_manufacturing_review": lambda: main.pcb_manufacturing_review(),
     "get_design_notes": lambda: main.get_design_notes(),
     "get_design_image": lambda: main.get_design_image("Fab.PCBDwf"),
+    "get_design_hierarchy": lambda: main.get_design_hierarchy(),
     "list_variants": lambda: main.list_variants(),
     "set_active_variant": lambda: main.set_active_variant("Prod"),
     "get_clone_status": lambda: main.get_clone_status(),

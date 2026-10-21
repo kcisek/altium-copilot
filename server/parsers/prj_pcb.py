@@ -49,6 +49,20 @@ class PrjPcbData:
     log_folder_path: str = ""
     # [Design] CurrentVariant: the variant last active in Altium.
     current_variant: str = ""
+    # The device sheets among sheet_paths ([DeviceSheetN] sections).
+    device_sheet_paths: list[str] = field(default_factory=list)
+    # [Design] HierarchyMode, the Net Identifier Scope as written ('' when absent):
+    # 0 Automatic, 1 Flat, 2 Hierarchical, 3 Global (Altium's TFlattenMode order).
+    hierarchy_mode: str = ""
+    # [Design] net naming options as written (key -> '0'/'1'), see NET_NAMING_KEYS.
+    net_naming: dict[str, str] = field(default_factory=dict)
+
+
+# Project Options > Options > Netlist Options, as the [Design] keys that store them.
+NET_NAMING_KEYS = (
+    "AllowPortNetNames", "AllowSheetEntryNetNames", "AppendSheetNumberToLocalNets",
+    "NameNetsHierarchically", "PowerPortNamesTakePriority",
+)
 
 
 def parse_prj_pcb(path: str) -> PrjPcbData:
@@ -58,6 +72,7 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
     sheet_paths = _extract_sheets(sections, project_dir)
     variants = _extract_variants(sections)
     pcb_doc_paths = _extract_documents(sections, project_dir, ".pcbdoc")
+    net_naming = {key: _design_field(sections, key) for key in NET_NAMING_KEYS}
     return PrjPcbData(
         sheet_paths=sheet_paths,
         variants=variants,
@@ -68,6 +83,9 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
         output_path=_design_field(sections, "OutputPath"),
         log_folder_path=_design_field(sections, "LogFolderPath"),
         current_variant=_design_field(sections, "CurrentVariant"),
+        device_sheet_paths=_extract_documents(sections, project_dir, ".schdoc", "DeviceSheet"),
+        hierarchy_mode=_design_field(sections, "HierarchyMode"),
+        net_naming={key: value for key, value in net_naming.items() if value},
     )
 
 

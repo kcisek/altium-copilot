@@ -14,10 +14,14 @@ from pathlib import Path, PureWindowsPath
 
 try:
     from parsers.pcb_dwf import DraftsmanDoc, parse_pcb_dwf
-    from parsers.sch_doc import SheetAnnotations, parse_sch_doc_annotations
+    from parsers.sch_doc import (
+        SheetAnnotations, SheetHierarchy, parse_sch_doc_annotations, parse_sch_hierarchy,
+    )
 except ImportError:
     from server.parsers.pcb_dwf import DraftsmanDoc, parse_pcb_dwf
-    from server.parsers.sch_doc import SheetAnnotations, parse_sch_doc_annotations
+    from server.parsers.sch_doc import (
+        SheetAnnotations, SheetHierarchy, parse_sch_doc_annotations, parse_sch_hierarchy,
+    )
 
 NOTES_PAGE_CHAR_BUDGET = 60_000
 NOTES_MAX_RESULT_SIZE_CHARS = 80_000
@@ -46,6 +50,9 @@ class DesignNotesCache:
 
     def draftsman(self, path: str) -> DraftsmanDoc:
         return self._get("draftsman", path, parse_pcb_dwf)
+
+    def hierarchy(self, path: str) -> SheetHierarchy:
+        return self._get("hierarchy", path, parse_sch_hierarchy)
 
 
 def draftsman_documents(project: dict) -> list[dict]:
