@@ -54,6 +54,10 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.via_checks import page_result as page_via_result, review_vias
+    from services.testpoints import (
+        build_profile as build_testpoint_profile, page_result as page_testpoint_result,
+        review_testpoints,
+    )
     from services.pcb_health import run_health_check
     from services.dfm import (
         DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
@@ -126,6 +130,10 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.via_checks import page_result as page_via_result, review_vias
+    from server.services.testpoints import (
+        build_profile as build_testpoint_profile, page_result as page_testpoint_result,
+        review_testpoints,
+    )
     from server.services.pcb_health import run_health_check
     from server.services.dfm import (
         DRILL_ROWS_LISTED, SHRINK_STEPS, AssemblyContext, page_dfm, review_dfm,
@@ -390,7 +398,7 @@ DNP reasons, fabrication requirements. Use it.
   Releaser (DRC report fresh and clean, ERC, netlist and sync, unrouted nets, polygons,
   outline, fiducials, mounting holes, Not Fitted parts in the assembly outputs, OutJob
   per variant and output age, fab notes vs stackup, title blocks, project integrity,
-  Altium 365 copy), each with status, blocking, evidence and the source_tool to call for
+  Altium 365 copy, test access), each with status, blocking, evidence and the source_tool to call for
   details. Quote verdict_summary first. A blocking gate that failed fails the release;
   not_verified is never a pass: say what would verify it (ERC always needs Altium).
 - release_review — a guided go / no-go: the gates, the causes from each source_tool, then
@@ -524,6 +532,15 @@ component locations, distances):
     or polarity hints, as a Markdown checklist (Done / Skipped) or CSV. Quote
     first_side_reason and left_out (Not Fitted parts, fiducials, parts nobody places);
     without a netlist the steps are approximate (grouping_approximate): say so.
+22. check_testpoints — "can this board be tested?", ICT, bed-of-nails or flying-probe
+    readiness, test coverage, "which nets have testpoints?", before a test engineer gets
+    the board: probe sites (pads and vias marked as Fabrication Testpoints, TP parts) per
+    side, the share of nets with access, nets a Testpoint Usage rule or the user's
+    critical list (nets) needs without one, rails and ground probe counts, site size,
+    spacing, edge clearance, sites under bodies or near tall parts, tooling holes. Its
+    numbers are guidance (profile ict or flying_probe): say so, and ask for the test
+    house's numbers (limits) before calling the board untestable. Assembly Testpoint
+    marks are not read: a net with only those reads as uncovered.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -3906,6 +3923,93 @@ def check_vias(
     return rendered
 
 
+TESTPOINT_LIMITS_SCHEMA = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": {"anyOf": [
+            {"type": "number"}, {"type": "null"},
+        ]}},
+        {"type": "null"},
+    ],
+}
+
+
+@mcp.tool(
+    title="Check Testpoints (Test Access)",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_testpoints(
+    nets: str | None = None,
+    profile: str | None = None,
+    probe_side: Literal["auto", "top", "bottom", "both"] | None = None,
+    limits: Annotated[Any, WithJsonSchema(TESTPOINT_LIMITS_SCHEMA)] = None,
+    checks: list[str] | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Test access (DFT) review of the saved PcbDoc: "can this board be tested?", "ICT /
+    bed-of-nails / flying-probe readiness", "which nets have testpoints?", "test
+    coverage", before handing the board to a test engineer. Probe sites are pads and vias
+    with Altium's Fabrication Testpoint property (top / bottom) and the pads of TP parts
+    (designator TP..., or a testpoint footprint); Assembly Testpoint properties are not
+    read. sites counts them; coverage gives the share of nets (2+ pads) with a site, per
+    side, and the probe side; usage resolves the Testpoint Usage rules per net.
+
+    Findings, warnings first: coverage (no sites at all), required_nets (nets a Testpoint
+    Usage rule requires, or that nets names, without a site: Altium's default rule over
+    All is info unless the batch DRC checks it), probe_side (nets reachable only from the
+    other side of a single-sided fixture), rails (power-named or high-fanout nets with
+    fewer than 2 or more than 10 sites), ground (about 1 site per 20 connections), pad_size
+    (1.0 mm preferred, 0.9 mm acceptable), spacing (centres 2.5 mm, 1.8 mm minimum),
+    edge_clearance (3.2 mm), under_component (under another part's 3D body on the probed
+    side; info when the Testpoint rule allows it), tall_parts (within 5 mm of a part over
+    5 mm), solder_mask (tented testpoint vias), style_rule (outside the Testpoint rule's
+    sizes, holes or sides) and tooling_holes (2 non-plated holes for the fixture).
+
+    profile: "ict" (default: bed of nails, one probe side, auto = the side reaching more
+    nets) or "flying_probe" (both sides, looser numbers); pad_size, spacing,
+    edge_clearance, under_component and tall_parts judge the probe side's sites only. The numbers are guidance, not a
+    standard (profile.guidance): when the user has the test house's numbers pass them in
+    limits ({"spacing_min_mm": 1.27, "rail_max_sites": null}: lengths end in _mm or _mil,
+    counts take no suffix, null stops judging one). probe_side overrides the profile's.
+    nets names critical nets, pairs or classes (comma-separated) that must have access.
+    checks narrows the findings, paginated (offset from next_offset). Lengths use units
+    (default: board display unit); at_mil locations are relative to origin_mil."""
+    index, error = _pcb_index_or_error()
+    if error:
+        return json.dumps(error)
+    to_mm, resolved, units_error = _pcb_units_or_error(index, units)
+    if units_error:
+        return json.dumps(units_error)
+    test_profile, error = build_testpoint_profile(profile, limits, probe_side)
+    if error:
+        return json.dumps(error)
+    project, _, variant_state = _require_project(netlist=False)
+    full = review_testpoints(
+        index, test_profile, checks, _split_names(nets), resolved,
+        variant_state.is_dnp if variant_state is not None else None,
+    )
+    if "error" in full:
+        return json.dumps(full)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"units": resolved}
+    if paths:
+        context["pcb_doc"] = Path(paths[0]).name
+        if len(paths) > 1:
+            context["note"] = (
+                f"Project lists {len(paths)} PcbDocs; reviewed '{Path(paths[0]).name}'."
+            )
+    for limit in (100, 40, 15, 5):
+        result = _convert_units({**context, **page_testpoint_result(full, offset, limit)},
+                                to_mm)
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 @mcp.tool(
     title="Check Connectivity",
     annotations=ToolAnnotations(readOnlyHint=True),
@@ -4752,9 +4856,9 @@ def check_release_readiness(offset: int = 0) -> str:
     (get_output_jobs), Draftsman fab notes against the stackup (check_fab_drawing),
     title-block revision and date across sheets and drawings (get_design_notes), project
     integrity (check_project_integrity), the Altium 365 copy committed and level
-    (get_clone_status), silkscreen DRC; and not_verified with the reason: footprints vs
-    libraries, lifecycle and compliance, testpoints, teardrops, via stitching, the
-    team's template.
+    (get_clone_status), silkscreen DRC, test access on ICT guidance (check_testpoints,
+    advisory); and not_verified with the reason: footprints vs libraries, lifecycle and
+    compliance, teardrops, via stitching, the team's template.
 
     verdict: fail when a blocking gate failed (one failed check fails the release, as in
     the Releaser), not_ready_unverified when none failed but a blocking gate is

@@ -470,6 +470,7 @@ def test_mounting_hole_gate_counts_free_pads_with_a_large_hole(project, pcb_data
     ("unrouted_nets", "review_connectivity"),
     ("polygons", "run_health_check"),
     ("fiducials", "review_dfm"),
+    ("testpoints", "review_testpoints"),
 ])
 def test_board_gates_quote_their_source_errors(project, pcb_data, gate_id, target):
     # A source tool's error answer is not_verified with its message, never a pass.
@@ -480,6 +481,36 @@ def test_board_gates_quote_their_source_errors(project, pcb_data, gate_id, targe
          patch.object(rg, "placements", return_value=SimpleNamespace(counts=counts)):
         row = _run(gate_id, _ctx(project, PcbIndex(pcb_data, NETLIST)))
     assert row["status"] == "not_verified" and "source says no" in row["evidence"]
+
+
+def test_testpoints_gate(project, pcb_data):
+    # check_testpoints on its ICT profile, advisory: no probe site is a warn, never a pass.
+    row = _run("testpoints", _ctx(project, PcbIndex(pcb_data, NETLIST)))
+    assert row["status"] == "warn" and not row["blocking"]
+    assert row["source_tool"] == "check_testpoints"
+    assert "No probe sites" in row["evidence"] and "Assembly Testpoint" in row["evidence"]
+    pcb_data.primitives[8].test_fab_top = True  # the CLK_A via
+    row = _run("testpoints", _ctx(project, PcbIndex(pcb_data, NETLIST)))
+    # GND (3 connections, the only net of 2+ pads) has no site, the via is 20 mil and
+    # there is no tooling hole.
+    assert row["status"] == "warn"
+    assert row["evidence"] == (
+        "1 probe site reaches 0 of 1 net (0.0%; top 0, bottom 0); 3 warnings on ICT "
+        "guidance (ground 1, pad_size 1, tooling_holes 1).")
+    clean = {"sites": {"probe_sites": 4}, "findings": [
+        {"check": "spacing", "severity": "info"}],
+        "coverage": {"nets": 3, "with_access": 3, "percent": 100.0, "top": 3, "bottom": 1}}
+    with patch.object(rg, "review_testpoints", return_value=clean):
+        row = _run("testpoints", _ctx(project, PcbIndex(pcb_data, NETLIST)))
+    assert row["status"] == "pass"
+    assert row["evidence"] == ("4 probe sites reach 3 of 3 nets (100.0%; top 3, bottom 1); "
+                               "no warning on ICT guidance.")
+    # No net of 2+ pads: no share to quote (coverage percent is None).
+    clean["coverage"] = {"nets": 0, "with_access": 0, "percent": None, "top": 0, "bottom": 0}
+    with patch.object(rg, "review_testpoints", return_value=clean):
+        row = _run("testpoints", _ctx(project, PcbIndex(pcb_data, NETLIST)))
+    assert row["evidence"] == ("4 probe sites reach 0 of 0 nets (no net of 2+ pads; top 0, "
+                               "bottom 0); no warning on ICT guidance.")
 
 
 def test_fiducial_gate_not_checked_by_check_dfm(project, pcb_data):
@@ -659,8 +690,8 @@ def test_outputs_current_gate(project):
 def test_not_verifiable_gates(project):
     ctx = _ctx(project)
     ctx.outjobs = _outjobs(outputs=[("Footprints", "Footprint Comparison Report", "")])
-    for gate_id in ("footprints_vs_libraries", "lifecycle_compliance", "testpoints",
-                    "teardrops", "via_stitching", "team_template"):
+    for gate_id in ("footprints_vs_libraries", "lifecycle_compliance", "teardrops",
+                    "via_stitching", "team_template"):
         row = _run(gate_id, ctx)
         assert row["status"] == "not_verified" and not row["blocking"], gate_id
     assert "Footprint Comparison Report output is connected" in \

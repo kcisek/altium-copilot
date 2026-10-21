@@ -815,3 +815,28 @@ def test_matched_length_values_are_named():
         "group_xsignals": False,
         "group_other_nets": False,
     }
+
+
+def test_rule_values_decode_the_testpoint_rules():
+    # The style rule as Altium saves its default (SIDE stays under other); the usage rule's
+    # VALID: 0 required (the default rule's), 1 prohibited, 2 don't care; none: required.
+    style = _rule(
+        "FabricationTestpoint", SIDE="3", TESTPOINTUNDERCOMPONENT="TRUE", MINSIZE="40mil",
+        MAXSIZE="100mil", PREFEREDSIZE="60mil", MINHOLESIZE="0mil", MAXHOLESIZE="40mil",
+        PREFEREDHOLESIZE="32mil", TESTPOINTGRID="1mil", ALLOWSIDETOP="TRUE",
+        ALLOWSIDEBOTTOM="FALSE", USEGRID="TRUE", GRIDTOLERANCE="0.01mil",
+    )
+    assert rule_values(style, SIGNAL_LAYERS) == {
+        "allow_under_component": True, "min_size_mil": 40.0, "max_size_mil": 100.0,
+        "preferred_size_mil": 60.0, "min_hole_mil": 0.0, "max_hole_mil": 40.0,
+        "preferred_hole_mil": 32.0, "grid_mil": 1.0, "allow_top": True,
+        "allow_bottom": False, "use_grid": True, "grid_tolerance_mil": 0.01,
+        "other": {"side": 3},
+    }
+    assert rule_values(_rule("AssemblyTestpoint", MINSIZE="1mm"), {}) == {}  # not mil
+    for valid, usage in (("0", "required"), ("1", "prohibited"), ("2", "dont_care"),
+                         ("7", "unknown (7)")):
+        rule = _rule("FabricationTestPointUsage", VALID=valid, ALLOWMULTIPLE="FALSE")
+        assert rule_values(rule, {}) == {"usage": usage, "allow_multiple": False}
+    assert rule_values(_rule("AssemblyTestPointUsage"), {}) == {"usage": "required"}
+    assert rule_values(_rule("TestPointUsage", VALID="2"), {})["usage"] == "dont_care"

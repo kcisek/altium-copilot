@@ -908,6 +908,40 @@ ALL_MATCHING_KINDS = frozenset({"MatchedLengths"})
 
 ROOM_KIND = "RoomDefinition"
 
+# Testpoint rules: the style rules (Fabrication / Assembly Testpoint) set the testpoint's
+# pad or via size and hole, the sides allowed, its grid and whether it may sit under a
+# component; the usage rules (Fabrication / Assembly Testpoint Usage) say per net whether
+# a testpoint is required, prohibited or don't care. Testpoint and TestPointUsage are the
+# kinds' names before Altium split fabrication from assembly. SIDE (3 on every style rule
+# read, where both ALLOWSIDE keys are TRUE) stays under other.
+TESTPOINT_STYLE_KINDS = ("FabricationTestpoint", "AssemblyTestpoint", "Testpoint")
+TESTPOINT_USAGE_KINDS = (
+    "FabricationTestPointUsage", "AssemblyTestPointUsage", "TestPointUsage",
+)
+_TESTPOINT_STYLE = {
+    "MINSIZE": ("min_size_mil", "mil"),
+    "PREFEREDSIZE": ("preferred_size_mil", "mil"),
+    "MAXSIZE": ("max_size_mil", "mil"),
+    "MINHOLESIZE": ("min_hole_mil", "mil"),
+    "PREFEREDHOLESIZE": ("preferred_hole_mil", "mil"),
+    "MAXHOLESIZE": ("max_hole_mil", "mil"),
+    "ALLOWSIDETOP": ("allow_top", "bool"),
+    "ALLOWSIDEBOTTOM": ("allow_bottom", "bool"),
+    "USEGRID": ("use_grid", "bool"),
+    "TESTPOINTGRID": ("grid_mil", "mil"),
+    "GRIDTOLERANCE": ("grid_tolerance_mil", "mil"),
+    "TESTPOINTUNDERCOMPONENT": ("allow_under_component", "bool"),
+}
+_TESTPOINT_USAGE = {
+    "VALID": ("usage", "usage"),
+    "ALLOWMULTIPLE": ("allow_multiple", "bool"),
+}
+# Usage rule VALID: 0 on Altium's default rule (scope All, which Altium creates as
+# Required: 100 of 104 fabrication usage rules of the private set and all 6 of the
+# examples), 2 on the 4 others read; 1 and 2 follow the dialog's order (Required,
+# Prohibited, Don't Care). Assembly usage rules at the default carry no VALID: required.
+TESTPOINT_USAGE = {"0": "required", "1": "prohibited", "2": "dont_care"}
+
 # Explicitly named values per kind: raw key -> (output name, type).
 # Types: mil (length string), ohm, float, int, bool, str. Unlisted keys
 # still appear, under other / other_mil.
@@ -1005,6 +1039,8 @@ _KIND_VALUES: dict[str, dict[str, tuple[str, str]]] = {
     "ViasUnderSMD": {"ALLOWED": ("allowed", "bool")},
     "LayerPairs": {"ENFORCE": ("enforce", "bool")},
     "ComponentClearance": {"GAP": ("clearance_mil", "mil")},
+    **{kind: _TESTPOINT_STYLE for kind in TESTPOINT_STYLE_KINDS},
+    **{kind: _TESTPOINT_USAGE for kind in TESTPOINT_USAGE_KINDS},
 }
 
 _LAYER_KEY_RE = re.compile(
@@ -1057,6 +1093,8 @@ def _typed(raw: str, kind: str):
             return int(raw)
         except ValueError:
             return None
+    if kind == "usage":
+        return TESTPOINT_USAGE.get(raw.strip(), f"unknown ({raw.strip()})")
     return raw
 
 
@@ -1197,6 +1235,8 @@ def rule_values(
         values["routing_layers"] = routing_layers
     if rule.kind == ROOM_KIND:
         values.update(room_geometry(rule))
+    if rule.kind in TESTPOINT_USAGE_KINDS:
+        values.setdefault("usage", "required")
     if other_mil:
         values["other_mil"] = other_mil
     if other:

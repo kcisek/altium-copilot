@@ -104,8 +104,9 @@ def _track_payload(
     return bytes(payload)
 
 
-def _via_payload(layer_from=1, layer_to=32) -> bytes:
+def _via_payload(layer_from=1, layer_to=32, flags1=0, flags2=0) -> bytes:
     payload = bytearray(80)
+    payload[1], payload[2] = flags1, flags2
     struct.pack_into("<H", payload, 3, 5)
     struct.pack_into("<H", payload, 7, 0xFFFF)
     struct.pack_into(
@@ -295,11 +296,14 @@ def _pad_record(
     mid_size=None,
     mid_shape=None,
     plated=None,
+    flags1=0,
+    flags2=0,
 ) -> bytes:
     name_bytes = name.encode("latin-1")
     name_blob = bytes([len(name_bytes)]) + name_bytes
     main = bytearray(185)
     main[0] = layer
+    main[1], main[2] = flags1, flags2
     struct.pack_into("<H", main, 3, net)
     struct.pack_into("<H", main, 7, component)
     struct.pack_into("<ii", main, 13, x, y)
@@ -1848,3 +1852,30 @@ def test_examples_component_bodies():
         pytest.skip("MiniPC example not installed")
     assert counts["MiniPC.PcbDoc"] == 1055
     assert counts["PC4-SODIMM_V200_RC_A1_20141015.PcbDoc"] == 198
+
+
+def test_decode_pads_and_vias_read_the_fabrication_testpoint_flags():
+    # The header's flags1 0x80 is Fabrication Testpoint top and flags2 0x01 bottom, on a
+    # pad's main subrecord as on a via (KiCad's APAD6 / AVIA6); the lock (0x04), tenting
+    # (0x20, 0x40) and keepout (flags2 0x02) bits around them are no testpoint.
+    flags = [(0x0C, 0x00), (0x8C, 0x00), (0x0C, 0x01), (0x8C, 0x01), (0x6C, 0x02)]
+    data = b"".join(
+        _pad_record(name=str(number), flags1=first, flags2=second)
+        for number, (first, second) in enumerate(flags)
+    )
+    pads, skipped = decode_pads(data)
+    assert skipped == 0
+    assert [(pad.test_fab_top, pad.test_fab_bottom) for pad in pads] == [
+        (False, False), (True, False), (False, True), (True, True), (False, False),
+    ]
+    data = b"".join(
+        _bin_record(3, _via_payload(flags1=first, flags2=second))
+        for first, second in ((0x6C, 0x00), (0x68, 0x01), (0xEC, 0x00))
+    )
+    vias, _ = decode_vias(data)
+    expected = [(False, False), (False, True), (True, False)]
+    assert [(via.test_fab_top, via.test_fab_bottom) for via in vias] == expected
+    assert [(via.via.test_fab_top, via.via.test_fab_bottom) for via in vias] == expected
+    assert vias[2].via.tent_top and vias[2].via.tent_bottom
+    tracks, _ = decode_tracks(_bin_record(4, _track_payload()))
+    assert not tracks[0].test_fab_top and not tracks[0].test_fab_bottom
