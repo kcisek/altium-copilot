@@ -65,6 +65,7 @@ WORKING_TOOL_CALLS = {
     "check_connectivity": lambda: main.check_connectivity(),
     "check_pcb_health": lambda: main.check_pcb_health(),
     "check_dfm": lambda: main.check_dfm(),
+    "get_assembly_guide": lambda: main.get_assembly_guide(),
     "get_drc_report": lambda: main.get_drc_report(),
     "constraints_review": lambda: main.constraints_review(),
     "pcb_manufacturing_review": lambda: main.pcb_manufacturing_review(),
