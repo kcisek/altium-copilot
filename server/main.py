@@ -196,7 +196,7 @@ def _read_version() -> str:
 
 STATE_PATH = Path(
     os.environ.get("USERPROFILE") or str(Path.home())
-) / ".ee-in-a-box" / "altium-copilot-state.json"
+) / ".ee-in-a-box" / "altium-copilot-kc-state.json"
 
 
 def _is_newer(latest: str, current: str) -> bool:
@@ -218,7 +218,7 @@ def _write_state(state: dict) -> None:
 
 
 
-_GITHUB_RELEASES_URL = "https://api.github.com/repos/ee-in-a-box/altium-copilot/releases/latest"
+_GITHUB_RELEASES_URL = "https://api.github.com/repos/kcisek/altium-copilot-kc/releases/latest"
 _UPDATE_CHECK_INTERVAL_HOURS = 24
 
 
@@ -635,7 +635,7 @@ fetch, a copy behind Altium 365, local changes not committed. get_clone_status r
   ask them to switch or call set_project_dir with the correct path
 """
 
-mcp = FastMCP("altium-copilot", instructions=SERVER_INSTRUCTIONS)
+mcp = FastMCP("altium-copilot-kc", instructions=SERVER_INSTRUCTIONS)
 # FastMCP 1.27 reports its framework version unless the low-level server
 # version is explicitly set.
 mcp._mcp_server.version = _read_version()
@@ -924,7 +924,7 @@ def detect_altium_project() -> str:
     update_available = state.get("update_available")
     if update_available and _is_newer(update_available, current):
         result["update_available"] = update_available
-        result["update_command"] = "irm https://raw.githubusercontent.com/ee-in-a-box/altium-copilot/main/install.ps1 | iex"
+        result["update_command"] = "irm https://raw.githubusercontent.com/kcisek/altium-copilot-kc/main/install.ps1 | iex"
     return json.dumps(result, indent=2)
 
 
@@ -5292,7 +5292,7 @@ def package_for_xfn() -> str:
 
 if __name__ == "__main__":
     if "--version" in sys.argv:
-        print(f"altium-copilot v{_read_version()}")  # noqa: T201
+        print(f"altium-copilot-kc v{_read_version()}")  # noqa: T201
         sys.exit(0)
     threading.Thread(target=_check_for_update, args=(_read_version(),), daemon=True).start()
     try:
