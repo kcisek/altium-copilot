@@ -1,7 +1,9 @@
-# Altium Copilot
+# Altium Copilot (KC)
 
-[![CI](https://github.com/ee-in-a-box/altium-copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/ee-in-a-box/altium-copilot/actions/workflows/ci.yml)
-[![Downloads](https://img.shields.io/github/downloads/ee-in-a-box/altium-copilot/total?color=brightgreen)](https://github.com/ee-in-a-box/altium-copilot/releases)
+> **This is the KC fork** of [ee-in-a-box/altium-copilot](https://github.com/ee-in-a-box/altium-copilot), with many more tools (see the CHANGELOG). It installs as its own MCP server, `altium-copilot-kc` (in `%LOCALAPPDATA%ltium-copilot-kc`, with its own state file and update check), so it can sit beside the upstream `altium-copilot` and Claude always shows which one a tool comes from.
+
+[![CI](https://github.com/kcisek/altium-copilot-kc/actions/workflows/ci.yml/badge.svg)](https://github.com/kcisek/altium-copilot-kc/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/github/downloads/kcisek/altium-copilot-kc/total?color=brightgreen)](https://github.com/kcisek/altium-copilot-kc/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)]()
 
@@ -171,7 +173,7 @@ Altium's ERC or DRC.
 1. Install [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code)
 2. Open **PowerShell** (search `powershell` in the Start menu) and run:
    ```powershell
-   irm https://raw.githubusercontent.com/ee-in-a-box/altium-copilot/main/install.ps1 | iex
+   irm https://raw.githubusercontent.com/kcisek/altium-copilot-kc/main/install.ps1 | iex
    ```
 3. Open Altium Designer with your project loaded
 4. Start asking
