@@ -91,14 +91,14 @@ _NOT_RESISTOR_PREFIXES = frozenset({"RV", "RT", "RTH", "RLY", "RY", "REL"})
 _NOT_RESISTOR_TEXT = re.compile(r"thermistor|varistor|\bntc\b|\bptc\b|potentiometer|trimmer|"
                                 r"relay|rheostat", re.I)
 _RESISTOR_TEXT = re.compile(r"resist|\bres\b|\bohms?\b|Ω|\d\s*[kKmM]?\s*(?:ohm|Ω)", re.I)
-_TRANSISTOR_PREFIXES = frozenset({"Q", "T", "TR", "FET"})
-_CONNECTOR_PREFIXES = frozenset({"J", "P", "CN", "X", "CON", "CONN"})
+TRANSISTOR_PREFIXES = frozenset({"Q", "T", "TR", "FET"})
+CONNECTOR_PREFIXES = frozenset({"J", "P", "CN", "X", "CON", "CONN"})
 # Parts whose pin names say nothing about the net (resistor pins 1 and 2, a diode's A/K).
 _PASSIVE_PREFIXES = frozenset({
     "R", "RN", "RA", "RES", "C", "L", "FB", "FL", "D", "LED", "TP", "F", "Y", "TVS", "ESD",
     "Z", "RV", "RT", "VR",
 })
-_NOT_CONNECTOR_TEXT = re.compile(r"crystal|xtal|oscillat|resonator|transformer", re.I)
+NOT_CONNECTOR_TEXT = re.compile(r"crystal|xtal|oscillat|resonator|transformer", re.I)
 _COMPARATOR_TEXT = re.compile(r"comparator", re.I)
 _DRIVER_TEXT = re.compile(r"gate driver|mosfet driver|fet driver|half[- ]bridge driver|"
                           r"igbt driver|low[- ]side driver|high[- ]side driver", re.I)
@@ -131,7 +131,7 @@ _SOURCE_PIN = re.compile(r"S|SOURCE|S\d|E|EMITTER|E\d")
 _DRIVER_PIN = re.compile(r"HO|LO|HG|LG|GH|GL|DH|DL|UG|TG|BG|GATE\w*|GDRV\w*|DRV\w*|GD\w*")
 _REGULATOR_SWITCH = re.compile(r"SW\d*|LX\d*|PH\d*|VSW\d*")
 _BOOTSTRAP = re.compile(r"BOOT|BST|CBOOT|BS|CB")
-_DIFF_HALF = re.compile(r"(_|-)(P|N|\+|-)$|^(D[PM]|D[+-])$|[+-]$")
+DIFF_HALF = re.compile(r"(_|-)(P|N|\+|-)$|^(D[PM]|D[+-])$|[+-]$")
 _VOLTAGE = (
     re.compile(r"(?<![\d.])(\d{1,2})V(\d{1,3})?(?!\d)"),  # 3V3, 1V8, 5V, 12V, 3V3A
     re.compile(r"(?<![\d.])(\d{1,2})[.,P](\d{1,3})V?(?!\d)"),  # 3.3V, 3P3, 1,8V
@@ -218,7 +218,7 @@ def rail_voltage(net: str) -> float | None:
     return None
 
 
-def _ohms_text(ohms: float | None) -> str | None:
+def ohms_text(ohms: float | None) -> str | None:
     if ohms is None:
         return None
     for unit, scale in (("M", 1e6), ("k", 1e3)):
@@ -275,7 +275,7 @@ class Pull:
 
     def describe(self) -> dict:
         out: dict = {"designator": self.resistor, "direction": self.direction,
-                     "to": self.other, "value": _ohms_text(self.ohms)}
+                     "to": self.other, "value": ohms_text(self.ohms)}
         if self.net:
             out["on"] = self.net
         if self.pins:
@@ -330,14 +330,14 @@ class _Design:
         return net in self.grounds or net in self.rails
 
 
-def _is_resistor(prefix: str, text: str) -> bool:
+def is_resistor(prefix: str, text: str) -> bool:
     if prefix in _RESISTOR_PREFIXES:
         return True
     return (prefix.startswith("R") and prefix not in _NOT_RESISTOR_PREFIXES
             and bool(_RESISTOR_TEXT.search(text)) and not _NOT_RESISTOR_TEXT.search(text))
 
 
-def _resistor_sections(meta: dict, connected: dict[str, str]) -> list[tuple]:
+def resistor_sections(meta: dict, connected: dict[str, str]) -> list[tuple]:
     """(pin a, net a, pin b, net b, section label) for each resistor of a part: a two-pin
     resistor, an array of an even count of numbered pins paired 1 with N, 2 with N-1 (the
     usual isolated array) or a bussed array of an odd count with one common pin (pin a
@@ -365,7 +365,7 @@ def _resistor_sections(meta: dict, connected: dict[str, str]) -> list[tuple]:
     return [("common", None, pin, net, pin) for pin, net in connected.items()]
 
 
-def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
+def build_design(netlist: dict, plan, project_params: dict | None) -> _Design:
     components = netlist.get("components") or {}
     compiled = netlist.get("parts") or {}
     classes = classify_nets(netlist)
@@ -397,7 +397,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
             continue
         for ref, pin in members:
             prefix = designator_prefix(ref)
-            if prefix in _PASSIVE_PREFIXES or _is_resistor(prefix, text.get(ref, "")):
+            if prefix in _PASSIVE_PREFIXES or is_resistor(prefix, text.get(ref, "")):
                 continue
             role = pin_role(pin_name(ref, pin))
             if role == "supply" or (pin_type(ref, pin) == "Power" and role not in (
@@ -422,7 +422,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
                 if other in design.grounds:
                     design.caps[net].append((ref, farads))
             continue
-        if not _is_resistor(prefix, text[ref]):
+        if not is_resistor(prefix, text[ref]):
             continue
         design.resistors.add(ref)
         design.stats["resistors"] += 1
@@ -430,7 +430,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
                           part.comment if part else (compiled.get(ref) or {}).get("comment"),
                           (meta.get("params") or {}).get("resistance"),
                           part.description if part else meta.get("description"))
-        sections = _resistor_sections(meta, connected)
+        sections = resistor_sections(meta, connected)
         if sections and sections[0][0] == "common":
             # A bussed array: the common pin is the one on a rail or a ground.
             ends = [(pin, net) for *_, pin, net, _ in sections]
@@ -464,9 +464,9 @@ def _is_active(design: "_Design", ref: str) -> bool:
 
 
 def _is_connector(design: _Design, ref: str) -> bool:
-    if designator_prefix(ref) not in _CONNECTOR_PREFIXES:
+    if designator_prefix(ref) not in CONNECTOR_PREFIXES:
         return False
-    return not _NOT_CONNECTOR_TEXT.search(design.text.get(ref, ""))
+    return not NOT_CONNECTOR_TEXT.search(design.text.get(ref, ""))
 
 
 def _bootstrap(design: _Design, net: str, ref: str) -> bool:
@@ -542,7 +542,7 @@ def _classify_net(design: _Design, net: str) -> _Net | None:
         if electrical in ("OpenCollector", "OpenEmitter"):
             entry.add("open_drain", f"{label} ({name or 'pin'}) is {electrical}")
         prefix = designator_prefix(ref)
-        if prefix in _TRANSISTOR_PREFIXES:
+        if prefix in TRANSISTOR_PREFIXES:
             if _GATE_PIN.fullmatch(name):
                 entry.add("gate", f"{ref} gate")
             elif _BASE_PIN.fullmatch(name):
@@ -650,7 +650,7 @@ def _connector_signals(design: _Design, taken: set[str]) -> list[_Net]:
     the net: it floats when nothing is plugged in."""
     out = []
     for net, members in design.nets.items():
-        if design.fixed(net) or net in taken or _DIFF_HALF.search(net.upper()):
+        if design.fixed(net) or net in taken or DIFF_HALF.search(net.upper()):
             continue
         connectors = [ref for ref, _ in members if _is_connector(design, ref)]
         if not connectors:
@@ -683,7 +683,7 @@ def _pulls_of(design: _Design, signal: _Net, open_drain_names: set[str]) -> list
         sources = set()
         for ref, pin in design.nets[signal.name]:
             name = first_function(design.pin_name(ref, pin))
-            if designator_prefix(ref) in _TRANSISTOR_PREFIXES and (
+            if designator_prefix(ref) in TRANSISTOR_PREFIXES and (
                 _GATE_PIN.fullmatch(name) or _BASE_PIN.fullmatch(name)
             ):
                 for other_pin, other_net in (design.part_pins.get(ref) or {}).items():
@@ -824,11 +824,11 @@ def _signal_findings(design: _Design, signals: list[_Net], pulls: dict[str, list
         if len(ups) > 1:
             values = [pull.ohms for pull in ups]
             effective = _parallel(values) if None not in values else None
-            listed = ", ".join(f"{p.resistor} {_ohms_text(p.ohms) or '?'}" for p in ups[:6])
+            listed = ", ".join(f"{p.resistor} {ohms_text(p.ohms) or '?'}" for p in ups[:6])
             findings.append(_finding(
                 "parallel_pull_ups", "info", net,
                 f"{net} has {len(ups)} pull-ups in parallel ({listed})"
-                + (f", {_ohms_text(effective)} ohm together" if effective is not None
+                + (f", {ohms_text(effective)} ohm together" if effective is not None
                    else ", a value unread")
                 + "; check that this is the intended strength.",
                 [pull.resistor for pull in ups], signal_class=signal.main_class(),
@@ -977,7 +977,7 @@ def _size_buses(design: _Design, buses: list[dict], by_name: dict[str, _Net],
                 findings.append(_finding(
                     "i2c_pull_value", "warning", detail["net"],
                     f"{detail['net']} ({line}, {mode} mode): the pull-up of "
-                    f"{_ohms_text(detail['effective_ohm'])} ohm is under Rmin "
+                    f"{ohms_text(detail['effective_ohm'])} ohm is under Rmin "
                     f"{detail['rmin_ohm']:.0f} ohm = ({detail['vdd_v']:g} V - {I2C_VOL} V) / "
                     f"{iol_ma:g} mA: a driver sinking {iol_ma:g} mA cannot pull it below "
                     f"{I2C_VOL} V.",
@@ -992,7 +992,7 @@ def _size_buses(design: _Design, buses: list[dict], by_name: dict[str, _Net],
                 findings.append(_finding(
                     "i2c_pull_value", "info" if assumed else "warning", detail["net"],
                     f"{detail['net']} ({line}, {mode} mode): the pull-up of "
-                    f"{_ohms_text(detail['effective_ohm'])} ohm is over Rmax "
+                    f"{ohms_text(detail['effective_ohm'])} ohm is over Rmax "
                     f"{detail['rmax_ohm']:.0f} ohm = {tr_ns:g} ns / (0.8473 x "
                     f"{detail['cb_pf']:g} pF), so the rise is too slow (Cb "
                     f"{detail['cb_basis']})"
@@ -1014,7 +1014,7 @@ def _size_buses(design: _Design, buses: list[dict], by_name: dict[str, _Net],
 
 # ---------- entry point ----------
 
-def _resolve(requested: list[str] | None, available) -> tuple[set[str] | None, list[str]]:
+def resolve_names(requested: list[str] | None, available) -> tuple[set[str] | None, list[str]]:
     if not requested:
         return None, []
     folded = {name.casefold(): name for name in available}
@@ -1060,8 +1060,8 @@ def run_pull_resistor_check(
         return {"error": "invalid_bus_capacitance",
                 "message": "bus_capacitance_pf must be a number of picofarads above 0 and "
                            "below 100000."}
-    design = _design(netlist, plan, project_params)
-    wanted_nets, unknown = _resolve(nets, design.nets)
+    design = build_design(netlist, plan, project_params)
+    wanted_nets, unknown = resolve_names(nets, design.nets)
     if nets and not wanted_nets:
         return {"error": "net_not_found",
                 "message": f"No net {unknown} in the compiled netlist; use query_net to "

@@ -6,6 +6,78 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_interfaces`: connector and interface protection audit (roadmap #16,
+  `services/interfaces.py`), read-only and offline from the compiled netlist and, when it
+  loads, the PcbDoc. Connectors are J, P, CN, X, CON, CONN, USB, RJ, HDR (and a few more)
+  parts fitted in the active variant, not crystals, battery or fuse holders, jumpers or
+  test points. Each pin is classed signal, ground, power (a rail by name or a supply pin,
+  a power-jack's pins, or a net that feeds a rail through a fuse, series diode, ferrite
+  or MOSFET channel, listed with the part), shield (shell or mounting pins by name or
+  lettered designator, shield/chassis/earth nets, legs past the position count in the
+  description) or unconnected; a ground pin whose net is not a ground and reaches one only
+  through a capacitor, resistor or ferrite says so in its class basis. Signal pins that
+  drive a LED (by name, or reaching a PHY's LED pin) or are a magnetics centre tap are
+  tagged and not counted as lines. A signal pin's net is walked through up to 3 fitted
+  series elements (resistors and 0 ohm links, resistor-array sections, ferrites and
+  inductors, common-mode chokes paired by polarity, capacitors up to 10 uF) to the first
+  IC, transistor, transformer or other connector, recording the ESD/TVS devices on the
+  way (connector side or behind a series element), Not Fitted ESD and series footprints,
+  plain or zener clamp diodes (not counted as ESD), capacitors to ground, pulls (the
+  `check_pull_resistors` reading) and the first pin's name and electrical type. ESD parts
+  are TVS/ESD/SPD prefixes, a protection family's part number (PESD, TPD, USBLC, PRTR,
+  SMAJ/SMBJ, SMF, ESDA, IP4220, RCLAMP, SP05, ...; SP3xxx/SP7xxx only beside protection
+  words, as transceivers share them) or text that names the part as one (TVS, transient
+  voltage suppressor, ESD protection array, varistor, GDT); a part whose text first names
+  something else (MCU, transceiver, PHY, regulator, eFuse, MOSFET) stays that, and a
+  part's own rating ('ESD sensitive', '+/-15 kV ESD protection') is not a device; a bare
+  'ESD' counts for a diode or an IC with no Input or Output pins. Exposure is external
+  (USB, RJ45/Ethernet, D-Sub, circular, terminal block, power jack or power supply
+  connector, audio, coax, video, SFP/QSFP module port by text or nets, or the pins reach
+  a CAN, RS-485, RS-232 transceiver, or a PHY or USB part on high-speed lines, or carry
+  field-bus names; a processor listing its buses is not a transceiver), internal
+  (board-to-board, FPC/FFC, debug or programming header, test header, card edge or module
+  socket, debug nets, a configuration jumper whose lines only reach feedback, select or
+  strap pins, more than 60 pins) or unknown (pin headers, card slots), each with its
+  basis; `external=` and `internal=` override it, and 'without magnetics' is not
+  integrated magnetics. Findings: no_esd (warning on external connectors; info when
+  unknown, behind integrated magnetics, on RF coax or an SFP/QSFP port, or when the parts
+  the lines reach claim ESD-protected pins in their text, quoted for the datasheet),
+  shield_floating (named shield pins connected to nothing: warning on external),
+  ground_indirect (a ground pin reaching board ground only through a part: warning on
+  external with no DC path, else info), esd_behind_series, shield_rc (quoting the TVS
+  layout guidance, not calling it wrong), sparse_ground (fewer than 1 ground per 8
+  single-ended signal pins on a connector with 8 or more; differential pairs carry their
+  own return) and no_series_element (low-speed external lines, not high-speed,
+  differential or field-bus, with no series resistor, 0 ohm or ferrite footprint), all
+  info; with the PcbDoc, tvs_far_from_connector, straight line in plan view, pad edge to
+  pad edge, when a TVS more than 2 mm from the connector pin is nearer the IC pin (warning
+  beyond 5 mm on an external connector) or is farther than `max_distance` (default 10 mm,
+  info), with a TVS on the other side of the board from the connector pad marked
+  opposite_side and the text in the requested units. Internal connectors get findings
+  (PCB ones included) only when named in `connector=`. Output: an overview by exposure, a
+  summary per connector (exposure and basis, pin counts by class, protected and
+  unprotected lines, shield state), per-pin tables (for named connectors always, cut to
+  their signal pins with `pin_tables_truncated` when they do not fit; otherwise all, then
+  external connectors only, as they fit), paged findings, warnings first, shrunk to the
+  result size like `check_decoupling`. `services/pull_resistors.py` and
+  `services/decoupling.py` helpers it reuses are public now (`build_design`,
+  `is_resistor`, `resistor_sections`, `resolve_names`, `ohms_text`, `CONNECTOR_PREFIXES`,
+  `TRANSISTOR_PREFIXES`, `NOT_CONNECTOR_TEXT`, `DIFF_HALF`, `is_capacitor`,
+  `FERRITE_TEXT`, `farads_text`, `pcb_components`, `component_pads`, `THT_LAYER`).
+  Calibrated on Altium's 11 public AD25 example projects (33 connectors: 12 external, 12
+  internal, 9 unknown; 8 of 49 external lines reaching a part have ESD, the DisplayPort
+  lanes with TVS arrays at the connector, all within 2 mm of its pads in plan view and on
+  the other side of the board; 2 warnings, both on the MiniPC's USB 3.0 receptacle: no
+  ESD, and its GND pins reaching ground only through a capacitor; 14 info) and on 53
+  private boards read in aggregate (410 connectors: 50 external, 5 internal, 355 unknown,
+  279 of them pin headers; 2 of 78 external lines reaching a part have ESD; 17 warnings:
+  11 no_esd, 4 tvs_far_from_connector, 2 shield_floating; 105 info). Calibration removed
+  false positives from mounting pins left unconnected (119 connectors), card slots, RJ45
+  pairs in sparse_ground and field-bus lines in no_series_element. Not checked: the TVS
+  part's ratings (standoff, clamping voltage, capacitance, direction: its datasheet), a
+  transceiver's own ESD rating, whether a reverse-polarity or input protection part on a
+  power pin is adequate (listed in the pin table only), copper between the TVS and
+  ground, and connectors on other boards.
 - `check_pull_resistors`: floating-net and pull-up / pull-down audit with I2C pull-up
   sizing (roadmap #14, `services/pull_resistors.py`), read-only and offline from the
   compiled netlist. Signals that need a defined state come from net names, the pin names
