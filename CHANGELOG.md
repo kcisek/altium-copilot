@@ -6,6 +6,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- The fork has its own identity: the repository is `kcisek/altium-copilot-kc`, the MCP server
+  and the manifest are `altium-copilot-kc` ("Altium Copilot (KC)"), and `install.ps1` installs
+  `altium-copilot-kc.exe` into `%LOCALAPPDATA%ltium-copilot-kc`, registers it under that name in
+  Claude Desktop and Claude Code, and keeps its own state file. The update check and the release
+  build follow the fork, so it installs beside upstream `altium-copilot` instead of replacing it
 - Offline schematic netlister (`services/sch_netlister.py`): without Altium Designer and
   without an up-to-date `.NET`, the project's netlist is compiled from the saved sheets,
   so `query_net`, `get_component`, `search_components`, `get_sheet_context`, `get_bom`,

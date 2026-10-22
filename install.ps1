@@ -1,10 +1,11 @@
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$repo      = "ee-in-a-box/altium-copilot"
+$name      = "altium-copilot-kc"  # this fork: installs beside upstream altium-copilot
+$repo      = "kcisek/altium-copilot-kc"
 $apiUrl    = "https://api.github.com/repos/$repo/releases/latest"
-$installDir = "$env:LOCALAPPDATA\altium-copilot"
-$exeDest   = "$installDir\altium-copilot.exe"
-$statePath = "$env:USERPROFILE\.ee-in-a-box\altium-copilot-state.json"
+$installDir = "$env:LOCALAPPDATA\$name"
+$exeDest   = "$installDir\$name.exe"
+$statePath = "$env:USERPROFILE\.ee-in-a-box\$name-state.json"
 
 # Logging helpers
 function Write-Ok   { param($m) Write-Host "[OK] "    -ForegroundColor Green  -NoNewline; Write-Host $m }
@@ -26,8 +27,8 @@ if ($claudeProcs) {
     Start-Sleep -Milliseconds 1000
 }
 
-# --- Kill any running altium-copilot processes so the exe is not locked ---
-Get-Process -Name "altium-copilot" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# --- Kill any running copies of this server so the exe is not locked ---
+Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
 New-Item -ItemType Directory -Force -Path $installDir | Out-Null
@@ -35,9 +36,9 @@ New-Item -ItemType Directory -Force -Path $installDir | Out-Null
 # --- Fetch latest release info ---
 Write-Ok "Checking latest release..."
 try {
-    $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "altium-copilot-installer" }
+    $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "$name-installer" }
     $version = $release.tag_name -replace '^v', ''
-    $exeUrl  = "https://github.com/$repo/releases/latest/download/altium-copilot.exe"
+    $exeUrl  = "https://github.com/$repo/releases/latest/download/$name.exe"
 } catch {
     Write-Err "Failed to fetch release info: $_"
     exit 1
@@ -47,7 +48,7 @@ Write-Ok "Latest version: $version"
 
 # --- Download exe (overwrites existing) ---
 $action = if (Test-Path $exeDest) { "Updating" } else { "Downloading" }
-Write-Ok "${action} altium-copilot.exe..."
+Write-Ok "${action} $name.exe..."
 try {
     $client.DownloadFile($exeUrl, $exeDest)
 } catch {
@@ -56,7 +57,7 @@ try {
 }
 if (!(Test-Path $exeDest)) {
     Write-Host ""
-    Write-Warn "WARNING: Download succeeded but altium-copilot.exe is missing."
+    Write-Warn "WARNING: Download succeeded but $name.exe is missing."
     Write-Host "Your antivirus likely quarantined it. To fix:"
     Write-Host "  1. Open Windows Security > Virus & threat protection > Protection history"
     Write-Host "  2. Restore the file, or add $installDir to Defender exclusions."
@@ -68,7 +69,7 @@ Write-Ok "Installed to: $exeDest"
 
 # --- Add to PATH ---
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($userPath -notlike "*altium-copilot*") {
+if ($userPath -notlike "*$installDir*") {
     [Environment]::SetEnvironmentVariable("PATH", "$userPath;$installDir", "User")
     $env:PATH = "$env:PATH;$installDir"
     Write-Ok "Added $installDir to PATH."
@@ -93,7 +94,7 @@ if ($configPath) {
         $config | Add-Member -MemberType NoteProperty -Name mcpServers -Value ([PSCustomObject]@{})
     }
     $entry = [PSCustomObject]@{ command = $exeDest; args = @() }
-    $config.mcpServers | Add-Member -MemberType NoteProperty -Name "altium-copilot" -Value $entry -Force
+    $config.mcpServers | Add-Member -MemberType NoteProperty -Name $name -Value $entry -Force
     New-Item -ItemType Directory -Force -Path (Split-Path $configPath) | Out-Null
     $json = $config | ConvertTo-Json -Depth 10 -Compress
     [System.IO.File]::WriteAllText($configPath, $json, (New-Object System.Text.UTF8Encoding $false))
@@ -106,7 +107,7 @@ if ($configPath) {
 }
 
 # --- Warn about conflicting .mcpb extension installation ---
-$mcpbExtension = Get-ChildItem "$env:APPDATA\Claude\extensions\altium-copilot*" -ErrorAction SilentlyContinue | Select-Object -First 1
+$mcpbExtension = Get-ChildItem "$env:APPDATA\Claude\extensions\$name*" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($mcpbExtension) {
     Write-Host ""
     Write-Warn "WARNING: A previous installation via the Claude Extensions UI was detected."
@@ -142,14 +143,14 @@ if (-not $claudeExe) {
 }
 if ($claudeExe) {
     Write-Ok "Registering with Claude Code..."
-    & $claudeExe mcp remove --scope user altium-copilot 2>$null
-    & $claudeExe mcp add    --scope user altium-copilot -- $exeDest
+    & $claudeExe mcp remove --scope user $name 2>$null
+    & $claudeExe mcp add    --scope user $name -- $exeDest
 
     # Verify the entry actually landed. Running Claude Code sessions rewrite
     # ~/.claude.json wholesale and can clobber the add (last writer wins).
     $verified = $false
     try {
-        $registration = (& $claudeExe mcp get altium-copilot 2>$null | Out-String)
+        $registration = (& $claudeExe mcp get $name 2>$null | Out-String)
         $verified = (
             $LASTEXITCODE -eq 0 -and
             $registration -match [regex]::Escape($exeDest)
@@ -161,7 +162,7 @@ if ($claudeExe) {
         Write-Warn "Claude Code registration did not persist."
         Write-Host "This usually happens when a Claude Code session is running during install."
         Write-Host "Fix: close all Claude Code sessions (VS Code windows / terminals), then run:"
-        Write-Host ('  claude mcp add --scope user altium-copilot -- "{0}"' -f $exeDest)
+        Write-Host ('  claude mcp add --scope user {0} -- "{1}"' -f $name, $exeDest)
     }
 } else {
     Write-Warn "Claude Code not found — skipping MCP registration."
