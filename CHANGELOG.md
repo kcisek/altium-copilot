@@ -6,6 +6,56 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_pull_resistors`: floating-net and pull-up / pull-down audit with I2C pull-up
+  sizing (roadmap #14, `services/pull_resistors.py`), read-only and offline from the
+  compiled netlist. Signals that need a defined state come from net names, the pin names
+  of the parts on them and the pins' electrical types: reset, enable, shutdown, boot,
+  strap, mode and program nets (NRST, RESET_N, PWR_EN, ~SHDN, BOOT0, PROG_B; an Ethernet
+  TX_EN is data, a regulator's BOOT/BST pin a bootstrap), open-drain nets (OpenCollector
+  or OpenEmitter pins, I2C, INT, IRQ, ALERT, PGOOD, FAULT, and STAT/CHG/FLAG pins), MOSFET
+  gates and transistor bases driven from an IC pin (straight, or through one series
+  resistor), comparator outputs, and on request (`connector_no_pull`) connector pins wired
+  straight to IC Input or IO pins. Nets joined by a series resistor under 1 kohm are one
+  signal. A pull is a resistor fitted in the active variant from the signal to a rail or a
+  ground as `check_decoupling` reads them, or to a part's supply pin (a power module's
+  power-good pulled to its own output); R-prefixed parts count as resistors when their
+  text says so (RP, RS, RB), arrays are read as isolated (1 to N) or bussed, and an
+  open-drain line may be pulled up to a net that pulls up two or more such lines (a
+  GPIO-switched supply). Findings: no pull on an OpenCollector/OpenEmitter pin, an I2C
+  line or a MOSFET gate driven from an IC (warning), on named open-drain, reset, enable or
+  boot nets, bases and comparator outputs (info), none when a push-pull output (an Output
+  pin, an IC's OUT, GATE, DRV, HO/LO) drives it (an I2C line or an OpenCollector pin is
+  still reported), and info whenever the signal reaches a connector (the pull may be on
+  the other board); pulls that are all Not Fitted (warning, info when the signal reaches a
+  connector); both up and down, and pull-ups in parallel with their effective resistance
+  (info). I2C SDA and SCL pair into buses by name stem (I2C1_SDA/I2C1_SCL, SDA0/SCL0,
+  SMBCLK/SMBDAT), else by the parts they share, and each line is sized per NXP UM10204:
+  the parallel pull-up against Rmin = (VDD - 0.4 V) / IOL (3 mA, 20 mA in fast-plus) with
+  VDD from the rail's name (3V3, +3.3V, 1V8, P3V3, VDD33) and Rmax = tr / (0.8473 x Cb)
+  (1000, 300 or 120 ns), Cb from `bus_capacitance_pf` or an estimate labelled with its
+  basis (10 pF per pin, capacitors to ground, and 0.12 pF/mm of routed length when the
+  PcbDoc loads), with a verdict ok, too_low, too_high (also when the rail's voltage is
+  unknown: Rmax needs none) or unknown (and why). `i2c_mode` defaults to fast; a pull-up
+  too weak only for the assumed fast mode is info. Paged and shrunk like
+  `check_decoupling`, with `net` and `checks` filters (a gate's driving net finds the
+  gate). Calibrated on Altium's 11 public AD25 example projects (72 signals classified, 48
+  with a fitted pull, 26 findings of which 2 warnings: an on-board I2C bus with no
+  pull-up) and on 53 private boards, read in aggregate (180 signals, 82 with a fitted
+  pull, 112 findings of which 6 warnings; all 44 I2C lines without a pull, and both lines
+  whose pull-ups are all Not Fitted, leave the board through a connector). Not checked:
+  pins left unconnected (not in the netlist), unused op-amp or comparator sections (no
+  multi-section op-amp or comparator in either set to validate on), pull-ups inside ICs,
+  and bus speed, which the design does not record
+- Pin electrical types: the sheets' pin records are read into `ComponentMeta.pin_types`
+  (pin designator -> Input, IO, Output, OpenCollector, Passive, HiZ, OpenEmitter or
+  Power; a pin without the property is an Input), each pin of a multi-part component
+  keeping its own record's type and the normal display mode winning, and every netlist
+  component carries `pin_types`, unconnected pins included, from both Altium's netlist
+  and the offline compile. Checked on the AD25 examples' 47,099 pin records: supply pins
+  are Power, resistor and capacitor pins Passive, transceiver TX pins Output, alert,
+  interrupt and power-good pins of supervisors and regulators OpenCollector. The
+  decoupling check's net helpers are public for reuse (`classify_nets`, `net_kind`,
+  `net_tokens`, `first_function`, `designator_prefix`, `IC_PREFIXES`)
 - The fork has its own identity: the repository is `kcisek/altium-copilot-kc`, the MCP server
   and the manifest are `altium-copilot-kc` ("Altium Copilot (KC)"), and `install.ps1` installs
   `altium-copilot-kc.exe` into `%LOCALAPPDATA%\altium-copilot-kc`, registers it under that name in

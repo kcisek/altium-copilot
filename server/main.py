@@ -53,6 +53,7 @@ try:
     )
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
+    from services.pull_resistors import run_pull_resistor_check
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, page_result as page_testpoint_result,
@@ -129,6 +130,7 @@ except ImportError:
     )
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
+    from server.services.pull_resistors import run_pull_resistor_check
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, page_result as page_testpoint_result,
@@ -436,6 +438,18 @@ DNP reasons, fabrication requirements. Use it.
   A line's varies lists values its parts disagree on (varies_count when there are
   more): mention them, the line is not one part.
 
+## Pull-ups and Floating Nets
+
+- check_pull_resistors — "are my pull-ups right?", "is anything floating?", "are the
+  I2C pull-ups the right value?", reset, enable, boot or strap pins, or a schematic
+  review: signals that need a defined state (reset, enable, boot and strap nets,
+  open-drain and I2C lines, MOSFET gates driven from an IC, comparator outputs) with
+  their pulls, and findings when none is fitted, only Not Fitted ones, or both up and
+  down. I2C buses get the effective pull-up, Rmin, Rmax and a verdict (i2c_mode
+  default fast: ask the bus speed; pass bus_capacitance_pf when known, else Cb is an
+  estimate). A heuristic from names and pin types: pull-ups inside ICs are invisible,
+  so present a missing pull as a question for the datasheet, not a fault.
+
 ## PCB / Layout Questions
 
 For questions about the physical board (where nets route, layers, stackup, crosstalk,
@@ -658,8 +672,8 @@ _design_notes = DesignNotesCache()
 # netlist_required. Every other tool works from the project files alone.
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
-    "check_bom", "check_decoupling", "check_sch_pcb_sync", "schematic_review",
-    "package_for_xfn",
+    "check_bom", "check_decoupling", "check_pull_resistors", "check_sch_pcb_sync",
+    "schematic_review", "package_for_xfn",
 )
 
 
@@ -3961,6 +3975,84 @@ def check_decoupling(
                     f"'{Path(project['pcb_doc_paths'][0]).name}'."
                 )
         result = _convert_units({**context, **result}, to_mm)
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Check Pull Resistors",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_pull_resistors(
+    net: str | None = None,
+    checks: list[str] | None = None,
+    i2c_mode: Literal["standard", "fast", "fast_plus"] | None = None,
+    bus_capacitance_pf: float | None = None,
+    offset: int = 0,
+) -> str:
+    """Audit pull-ups, pull-downs and floating nets offline, and size I2C pull-ups. Call it
+    when the user asks about pull-ups or pull-downs, floating pins or nets, reset, enable,
+    boot or strap pins, open-drain or I2C lines, whether I2C pull-ups are the right value,
+    or for a schematic review. It finds signals that need a defined state (reset, enable,
+    shutdown, boot, strap and mode nets; open-drain nets: OpenCollector pins, I2C, INT,
+    ALERT, PGOOD, FAULT; MOSFET gates and transistor bases driven from an IC; comparator
+    outputs) and the resistors from each to a rail or ground fitted in the active variant;
+    nets joined by a series resistor under 1 kohm count as one signal. Findings: no pull
+    on an OpenCollector pin, an I2C line or a MOSFET gate driven from an IC (warnings, info
+    when the signal leaves the board through a connector), on reset, enable or other named
+    nets (info), pulls that are all Not Fitted (warning, info when the signal leaves the
+    board), both up and down or several pull-ups in parallel (info); connector_no_pull
+    (connector pins straight to IC inputs) only when named in checks. I2C buses pair SDA
+    and SCL by name: effective pull-up, Rmin = (VDD - 0.4 V) / IOL (3 mA, 20 mA
+    fast-plus) with VDD from the rail's name, Rmax = tr / (0.8473 x Cb) (tr 1000/300/120
+    ns) and a verdict ok, too_low, too_high (also when the rail's voltage is unknown) or
+    unknown. i2c_mode is standard, fast (default) or fast_plus; bus_capacitance_pf
+    replaces the estimate (10 pF per pin and capacitors to ground, plus about 0.12 pF/mm
+    of routing when the PcbDoc loads).
+
+    It is a heuristic, not ERC: signals come from net and pin names and the library's pin
+    electrical types, so nets named otherwise are missed; pull-ups inside ICs are
+    invisible (a missing pull is a question for the datasheet); pins left unconnected and
+    unused op-amp sections are not checked. net takes comma-separated names; checks
+    narrows to the names in summary. Findings are paginated (offset from next_offset),
+    warnings first."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if bus_capacitance_pf is not None and not (
+        _finite_nonnegative(bus_capacitance_pf) and bus_capacitance_pf > 0
+    ):
+        return json.dumps({"error": "invalid_bus_capacitance",
+                           "message": "bus_capacitance_pf must be a positive number."})
+
+    def index_loader():
+        if not project.get("pcb_doc_paths"):
+            return None, "the project lists no PcbDoc"
+        index, error = _pcb_session.get(project, netlist)
+        if error:
+            return None, f"{error['error']}: {error.get('message', '')}".strip(": ")
+        return index, None
+
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    for limit, net_limit, bus_limit in ((100, 60, 20), (40, 20, 8), (15, 5, 3)):
+        result = run_pull_resistor_check(
+            netlist, plan, project.get("parameters") or {}, checks=checks,
+            nets=_split_names(net), i2c_mode=i2c_mode, bus_capacitance_pf=bus_capacitance_pf,
+            index_loader=index_loader, offset=offset, limit=limit, net_limit=net_limit,
+            bus_limit=bus_limit,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        result = {"netlist_updated_utc": _netlist_last_updated, **result}
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)

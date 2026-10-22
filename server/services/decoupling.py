@@ -109,7 +109,7 @@ _PIN_INPUT_PAIR = re.compile(r"^((V|A)?IN\d*[+-]|[+-]A?IN\d*|(V|A)?IN_?[PN]\d*)$
 _PIN_BOOTSTRAP = re.compile(r"^(BST|BOOT|BS|CB|CBOOT|SW|LX|PH|VSW)\w*$")
 _PAIR_ROLES = frozenset({"supply", "ref", "cap"})
 
-_IC_PREFIXES = frozenset({"U", "IC"})
+IC_PREFIXES = frozenset({"U", "IC"})
 _FILTER_PREFIXES = frozenset({"L", "FB", "FL", "R"})
 _NOT_CAP_PREFIXES = frozenset({
     "D", "U", "IC", "Q", "J", "P", "TVS", "ESD", "Z", "LED", "CN", "CON", "CONN", "CR", "F",
@@ -129,13 +129,13 @@ _CAP_VALUE = re.compile(
 _FARADS = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "µ": 1e-6, "μ": 1e-6}
 
 
-def _tokens(net: str) -> list[str]:
+def net_tokens(net: str) -> list[str]:
     return [token for token in _SPLIT.split(net.upper().replace("\\", "")) if token]
 
 
-def _net_kind(net: str) -> dict:
+def net_kind(net: str) -> dict:
     """Whether a net name says ground, power, or carries a signal token."""
-    tokens = _tokens(net)
+    tokens = net_tokens(net)
     stripped = [token.strip("+-") for token in tokens]
     signal = any(token in _SIGNAL_TOKENS or token.rstrip("+-") in _SIGNAL_TOKENS
                  for token in tokens) or any(_SIGNAL_INSIDE.search(token) for token in tokens)
@@ -151,7 +151,7 @@ def _net_kind(net: str) -> dict:
             "status": status}
 
 
-def _first_function(name: str) -> str:
+def first_function(name: str) -> str:
     """'I/O, VREF 1' -> 'I'; 'VDD(3V3)' -> 'VDD'; '3.3 V' -> '3P3V'; '+VS' -> 'VS'."""
     text = re.sub(r"\([^)]*\)", "", name.upper().replace("\\", ""))
     first = next((part for part in re.split(r"[/,]", text.replace(" ", "")) if part), "")
@@ -162,7 +162,7 @@ def _first_function(name: str) -> str:
 def pin_role(name: str | None) -> str:
     """ground, supply, ref, cap, out, in, other, or none (no name, or a number), from the
     pin name's first function ('I/O, VREF 1' is an I/O pin, not a reference)."""
-    first = _first_function(name or "")
+    first = first_function(name or "")
     if not first or first.isdigit():
         return "none"
     if _SIGNAL_INSIDE.search(first) or _PIN_INPUT_PAIR.match(first):
@@ -180,7 +180,7 @@ def pin_role(name: str | None) -> str:
     return "other"
 
 
-def _prefix(designator: str) -> str:
+def designator_prefix(designator: str) -> str:
     match = re.match(r"[A-Za-z_]+", designator or "")
     return match.group(0).upper().strip("_") if match else ""
 
@@ -255,7 +255,24 @@ class _Design:
     fitted: dict[str, bool]
 
 
-def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
+@dataclass
+class NetClasses:
+    """The compiled design's nets, read the way the decoupling check reads them."""
+    refs: list[str]  # compiled parts with a connected pin
+    nets: dict[str, list[tuple[str, str]]]  # net -> (part, pin)
+    kinds: dict[str, dict]  # net -> net_kind
+    roles: dict[str, list[str]]  # net -> pin_role of each IC pin on it
+    ics: set[str]  # U and IC parts, fitted or not
+    grounds: set[str]
+    # Nets named like power or reaching an IC supply or capacitor pin, with that
+    # evidence ('name', 'ic_pin'); never a ground or a net with a status token (EN, PG).
+    rails: dict[str, list[str]]
+
+
+def classify_nets(netlist: dict) -> NetClasses:
+    """Grounds and rails of the compiled netlist: a net is a ground by its name, or by a
+    strict majority of IC ground pins with no output pin on it; a rail by its name or an
+    IC supply or capacitor pin, unless it carries EN, PG, SENSE and the like."""
     components = netlist.get("components") or {}
     compiled = netlist.get("parts") or {}
     pin_to_net = netlist.get("pin_to_net") or {}
@@ -271,15 +288,13 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
     def pin_name(ref: str, pin: str) -> str:
         return (((components.get(ref) or {}).get("pins") or {}).get(pin) or {}).get("name") or ""
 
-    parts = {part.designator: part for part in build_parts(netlist, plan, project_params)[0]}
-    not_fitted = getattr(plan, "not_fitted", set()) or set()
-    fitted = {ref: parts[ref].fitted if ref in parts else ref not in not_fitted for ref in refs}
-    all_ics = {ref for ref in refs if _prefix(ref) in _IC_PREFIXES}
-    kinds = {net: _net_kind(net) for net in nets}
+    all_ics = {ref for ref in refs if designator_prefix(ref) in IC_PREFIXES}
+    kinds = {net: net_kind(net) for net in nets}
+    roles = {net: [pin_role(pin_name(ref, pin)) for ref, pin in members if ref in all_ics]
+             for net, members in nets.items()}
     grounds = set()
-    for net, members in nets.items():
-        roles = [pin_role(pin_name(ref, pin)) for ref, pin in members if ref in all_ics]
-        named = [role for role in roles if role not in ("none", "other")]
+    for net in nets:
+        named = [role for role in roles[net] if role not in ("none", "other")]
         # A strict majority of ground pins, and no output on it (a charge pump's VOUT
         # meeting a VSS pin is a negative rail).
         by_pins = named.count("ground") * 2 > len(named) and "out" not in named
@@ -287,6 +302,32 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
             by_pins and not kinds[net]["power"]
         ):
             grounds.add(net)
+    rails: dict[str, list[str]] = {}
+    for net in nets:
+        if net in grounds or kinds[net]["status"]:
+            continue
+        evidence = ["name"] if kinds[net]["power"] and not kinds[net]["signal"] else []
+        if set(roles[net]) & {"supply", "cap"}:
+            evidence.append("ic_pin")
+        if evidence:
+            rails[net] = evidence
+    return NetClasses(refs, dict(nets), kinds, roles, all_ics, grounds, rails)
+
+
+def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
+    components = netlist.get("components") or {}
+    compiled = netlist.get("parts") or {}
+    pin_to_net = netlist.get("pin_to_net") or {}
+    classes = classify_nets(netlist)
+    refs, nets, kinds, grounds = classes.refs, classes.nets, classes.kinds, classes.grounds
+    all_ics = classes.ics
+
+    def pin_name(ref: str, pin: str) -> str:
+        return (((components.get(ref) or {}).get("pins") or {}).get(pin) or {}).get("name") or ""
+
+    parts = {part.designator: part for part in build_parts(netlist, plan, project_params)[0]}
+    not_fitted = getattr(plan, "not_fitted", set()) or set()
+    fitted = {ref: parts[ref].fitted if ref in parts else ref not in not_fitted for ref in refs}
 
     caps: dict[str, list[_Cap]] = defaultdict(list)
     between: dict[str, list[_Cap]] = defaultdict(list)
@@ -306,10 +347,10 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
             (compiled.get(ref) or {}).get("comment"), meta.get("value"),
             params.get("capacitance"),
         )))
-        prefix = _prefix(ref)
+        prefix = designator_prefix(ref)
         part_nets = list(dict.fromkeys(connected.values()))
         is_filter = prefix in _FILTER_PREFIXES or (
-            _FERRITE_TEXT.search(text) and prefix not in _IC_PREFIXES
+            _FERRITE_TEXT.search(text) and prefix not in IC_PREFIXES
         )
         if is_filter:
             if len(connected) == 2 and len(part_nets) == 2 and fitted[ref]:
@@ -352,14 +393,11 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
             between[net_b].append(_Cap(ref, net_b, net_a, False, farads, fitted[ref]))
 
     rails: dict[str, list[str]] = {}
-    for net, members in nets.items():
+    for net in nets:
         if net in grounds or kinds[net]["status"]:
             continue
-        evidence = ["name"] if kinds[net]["power"] and not kinds[net]["signal"] else []
-        roles = {pin_role(pin_name(ref, pin)) for ref, pin in members if ref in all_ics}
-        if roles & {"supply", "cap"}:
-            evidence.append("ic_pin")
-        elif "ref" in roles and caps.get(net):
+        evidence = list(classes.rails.get(net, []))
+        if "ic_pin" not in evidence and "ref" in classes.roles[net] and caps.get(net):
             # A reference pin alone (a TL431 divider node) makes a rail only with a
             # capacitor to ground.
             evidence.append("ref_pin")
@@ -377,7 +415,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
         for pin, net in sorted(pins.items(), key=lambda item: natural_key(item[0])):
             ic_nets[ic].add(net)
             role = roles[pin]
-            if role == "out" or _PIN_BOOTSTRAP.match(_first_function(pin_name(ic, pin))):
+            if role == "out" or _PIN_BOOTSTRAP.match(first_function(pin_name(ic, pin))):
                 bootstrap[ic].add(net)
             if ic not in ics or net not in rails:
                 continue

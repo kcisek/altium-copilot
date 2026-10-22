@@ -152,8 +152,8 @@ _PART_LISTS = ("unique_ids", "unique_paths", "footprints", "pin_designators")
 def _file_entry(result: dict, name: str, entry: dict) -> None:
     """File entry under name. The parts of one component placed on several sheets
     reach here once per sheet: the latest entry is kept as before, with every part's
-    unique IDs, footprints and pin designators united, since the PCB carries only one
-    part's unique ID. Two different parts drawn with one designator (one usually
+    unique IDs, footprints, pin designators and pin types united, since the PCB carries
+    only one part's unique ID. Two different parts drawn with one designator (one usually
     compile-masked) also meet here: a compile-masked copy never replaces a live part's
     fields (parameters, description, kind, unique IDs, models, pins), its unique IDs go
     to masked_unique_ids, and footprint_by_uid keeps each one's footprint."""
@@ -169,6 +169,7 @@ def _file_entry(result: dict, name: str, entry: dict) -> None:
             for key in _PART_LISTS:
                 merged[key] = list(dict.fromkeys([*held.get(key, []), *entry.get(key, [])]))
             merged["footprint"] = winner.get("footprint") or other.get("footprint")
+            merged["pin_types"] = {**held.get("pin_types", {}), **entry.get("pin_types", {})}
         merged["masked_unique_ids"] = list(dict.fromkeys(masked_ids))
         merged["footprint_by_uid"] = {
             **held.get("footprint_by_uid", {}), **entry.get("footprint_by_uid", {})
@@ -331,6 +332,9 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "design_item_id": meta.design_item_id,
         "compile_masked": meta.compile_masked,
         "masked_unique_ids": list(meta.masked_unique_ids),
+        # Every pin's electrical type (Input, IO, Output, OpenCollector, Passive, HiZ,
+        # OpenEmitter, Power), connected or not; tool outputs pick their fields.
+        "pin_types": dict(meta.pin_types),
     }
 
 
