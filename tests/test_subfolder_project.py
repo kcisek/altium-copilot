@@ -359,12 +359,14 @@ def test_set_project_dir_skips_cache_when_subfolder_sheet_is_newer(main_env):
         result = json.loads(main.set_project_dir(str(root)))
         load.assert_not_called()
 
-    # Without Altium the stale netlist is not used: the project loads netlist-free.
-    assert result["partial"] is True
-    assert result["netlist_stale"] is True
-    assert "saved after it was generated" in result["message"]
-    assert main._altium._netlist is None
-    assert json.loads(main.query_net("VCC"))["error"] == "netlist_required"
+    # Without Altium the stale netlist is not used: the sheets are compiled offline.
+    assert "partial" not in result and result["load_mode"] == "offline_netlist"
+    assert result["cached_netlist_stale"] is True
+    assert "saved after it was generated" in result["netlist_note"]
+    assert main._altium._netlist["source"] == "offline"
+    assert main._altium._netlist["net_file"] is None
+    assert json.loads(main.query_net("^JT_VCC$"))["netlist_source"] == "offline_compiler"
+    assert json.loads(main.get_component("C1"))["sheet"] == "sheet1"
 
 
 def test_set_project_dir_reports_sheet_errors(main_env):

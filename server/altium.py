@@ -27,6 +27,15 @@ try:
 except ImportError:
     from server.parsers.annotation import AnnotationEntry, parse_annotation
 
+try:
+    from services.sch_netlister import compile_netlist, file_signature
+except ImportError:
+    from server.services.sch_netlister import compile_netlist, file_signature
+
+# netlist["source"]: Altium's .NET file, or the copilot's offline compile of the sheets.
+SOURCE_ALTIUM = "altium"
+SOURCE_OFFLINE = "offline"
+
 # When bundled with PyInstaller (--onefile), data files are extracted to sys._MEIPASS.
 # In normal Python execution, scripts live next to this file.
 if getattr(sys, "frozen", False):
@@ -259,6 +268,46 @@ def _read_annotation(paths: list[str]) -> tuple[list["AnnotationEntry"], list[di
     return entries, errors
 
 
+def _parse_sheets(sheet_paths: list[str]) -> tuple[list[tuple[str, dict]], list[dict], list[dict]]:
+    """(sheet name, components) of each readable sheet, an error per unreadable one, and
+    the designator clashes found."""
+    sheets: list[tuple[str, dict]] = []
+    sheet_errors: list[dict] = []
+    designator_clashes: list[dict] = []
+    for sch_path in sheet_paths:
+        sheet_name = Path(sch_path).stem
+        if not Path(sch_path).is_file():
+            error = "file not found"
+        else:
+            try:
+                clashes: list[DesignatorClash] = []
+                sheets.append((sheet_name, parse_sch_doc(str(sch_path), clashes)))
+                designator_clashes += [
+                    {"sheet": sheet_name, "refdes": c.refdes,
+                     "lib_references": c.lib_references}
+                    for c in clashes
+                ]
+                continue
+            except Exception as e:
+                error = f"{type(e).__name__}: {e}"
+        sheet_errors.append({"sheet": sheet_name, "path": str(sch_path), "error": error})
+    return sheets, sheet_errors, designator_clashes
+
+
+def _apply_enrichment(netlist: dict, sheets: list[tuple[str, dict]], sheet_errors: list[dict],
+                      designator_clashes: list[dict], annotation: list["AnnotationEntry"],
+                      annotation_errors: list[dict]) -> None:
+    """Merge the sheets' components into the netlist and record what went wrong."""
+    for error in sheet_errors:
+        logging.warning("SchDoc enrichment failed for %s: %s", error["path"], error["error"])
+    enrich_netlist_sheets(netlist, sheets, annotation)
+    netlist["sheet_errors"] = sheet_errors
+    if designator_clashes:
+        netlist["designator_clashes"] = designator_clashes
+    if annotation_errors:
+        netlist["annotation_errors"] = annotation_errors
+
+
 def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
     enriched_pins = {
         pin_num: {"name": meta.pins.get(pin_num, ""), "net": net}
@@ -421,6 +470,8 @@ def validate_active_document(
 class AltiumClient:
     def __init__(self):
         self._netlist: dict | None = None
+        # The last offline compile: (source files' signature, CompiledNetlist).
+        self._compiled: tuple[tuple, object] | None = None
 
     def _enrich_from_schdocs(self, sheet_paths: list[str], netlist: dict,
                              annotation_paths: list[str] | None = None) -> None:
@@ -433,39 +484,63 @@ class AltiumClient:
         designators to the netlist's physical ones; one that cannot be read is recorded in
         netlist["annotation_errors"].
         """
-        sheets: list[tuple[str, dict]] = []
-        sheet_errors: list[dict] = []
-        designator_clashes: list[dict] = []
-        for sch_path in sheet_paths:
-            sheet_name = Path(sch_path).stem
-            if not Path(sch_path).is_file():
-                error = "file not found"
-            else:
-                try:
-                    clashes: list[DesignatorClash] = []
-                    sheets.append((sheet_name, parse_sch_doc(str(sch_path), clashes)))
-                    designator_clashes += [
-                        {"sheet": sheet_name, "refdes": c.refdes,
-                         "lib_references": c.lib_references}
-                        for c in clashes
-                    ]
-                    continue
-                except Exception as e:
-                    error = f"{type(e).__name__}: {e}"
-            logging.warning("SchDoc enrichment failed for %s: %s", sch_path, error)
-            sheet_errors.append({"sheet": sheet_name, "path": str(sch_path), "error": error})
+        sheets, sheet_errors, designator_clashes = _parse_sheets(sheet_paths)
         annotation, annotation_errors = _read_annotation(annotation_paths or [])
-        enrich_netlist_sheets(netlist, sheets, annotation)
-        netlist["sheet_errors"] = sheet_errors
-        if designator_clashes:
-            netlist["designator_clashes"] = designator_clashes
-        if annotation_errors:
-            netlist["annotation_errors"] = annotation_errors
+        _apply_enrichment(netlist, sheets, sheet_errors, designator_clashes, annotation,
+                          annotation_errors)
+
+    def compile_offline(self, project_path: str, sheet_paths: list[str] | None = None,
+                        annotation_paths: list[str] | None = None) -> dict:
+        """Compile the netlist from the saved sheets without Altium (sch_netlister), enrich
+        it like a .NET load and make it the loaded netlist. sheet_paths and
+        annotation_paths default to those the .PrjPcb lists.
+
+        The result has source "offline", no net_file, net_file_mtime set to when the
+        compile started (sheets saved later are stale, as with Altium's file) and
+        compile_warnings. A compile of unchanged files is reused. Raises when the project
+        cannot be compiled at all; a sheet that cannot be read is a sheet error."""
+        started = time.time()
+        if sheet_paths is None:
+            sheet_paths = _sheet_paths_for(project_path)
+        if annotation_paths is None:
+            annotation_paths = _annotation_paths_for(project_path)
+        signature = file_signature([project_path, *sheet_paths, *annotation_paths])
+        annotation, annotation_errors = _read_annotation(annotation_paths)
+        if self._compiled is not None and self._compiled[0] == signature:
+            compiled = self._compiled[1]
+        else:
+            compiled = compile_netlist(project_path, annotation, sheet_paths)
+            self._compiled = (signature, compiled)
+        if not compiled.sheets:
+            # Nothing to compile: an empty netlist would pass for a design without nets.
+            errors = "; ".join(f"{e['sheet']}: {e['error']}" for e in compiled.sheet_errors[:3])
+            raise RuntimeError(f"no sheet of the project could be read ({errors or 'none listed'})")
+        netlist: dict = {
+            "nets": {name: list(pins) for name, pins in compiled.nets.items()},
+            "pin_to_net": {refdes: dict(pins) for refdes, pins in compiled.pin_to_net.items()},
+            "parts": {refdes: dict(part) for refdes, part in compiled.parts.items()},
+            "source": SOURCE_OFFLINE,
+            "net_file": None,
+            "net_file_mtime": started,
+            "net_scope": compiled.scope,
+            "compile_warnings": [dict(warning) for warning in compiled.warnings],
+        }
+        try:
+            _apply_enrichment(netlist, compiled.sheets, list(compiled.sheet_errors),
+                              list(compiled.designator_clashes),
+                              [*annotation, *compiled.channel_entries], annotation_errors)
+        except Exception as e:
+            logging.warning("SchDoc enrichment failed: %s", e)
+            netlist["components"] = {}
+            netlist["sheet_errors"] = [{"sheet": "*", "path": "", "error": f"{type(e).__name__}: {e}"}]
+        self._netlist = netlist
+        return netlist
 
     def _load_enriched(self, net_path: str | Path, sheet_paths: list[str],
                        annotation_paths: list[str] | None = None) -> dict:
         """Parse a .NET file and enrich it from the given sheets. Always returns a new dict."""
         netlist = parse_protel_netlist(str(net_path))
+        netlist["source"] = SOURCE_ALTIUM
         # When it was compiled: sheets saved later are not in it.
         netlist["net_file"] = str(net_path)
         netlist["net_file_mtime"] = Path(net_path).stat().st_mtime

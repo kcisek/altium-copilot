@@ -604,16 +604,22 @@ The netlist reflects the last-saved state of the schematic files. If the user ha
 changes in Altium Designer, ask them to save first (Ctrl+S in Altium) before you answer —
 otherwise your data may be stale.
 
+Without Altium the netlist is compiled offline from the saved sheets (netlist_source
+offline_compiler; no active tab, so pass sheet_name to get_sheet_context). Answer from it
+as from Altium's, pass on compile_warnings, and say no ERC ran; refresh_netlist compiles
+again, or takes Altium's netlist once Altium has the project open.
+
 For an Altium 365 project, set_project_dir's altium365 block says where the local copy
 stands (read offline, nothing fetched). Pass its warnings on before answering: an old last
 fetch, a copy behind Altium 365, local changes not committed. get_clone_status re-reads it.
 
 ## Error Recovery
 
-- netlist_required → the project was loaded without a netlist (partial load). Tell the user
-  this answer needs the project opened in Altium Designer once, then set_project_dir again.
-  Do not retry, and do not answer schematic questions (parts, values, pins, nets) from PCB
-  data without saying it is PCB data only
+- netlist_required → the project was loaded without a netlist (partial load: the sheets
+  could not be compiled offline, see compile_error, or there are none). Tell the user to fix
+  the sheets and call refresh_netlist, or open the project in Altium Designer once, then
+  set_project_dir again. Do not retry, and do not answer schematic questions (parts, values,
+  pins, nets) from PCB data without saying it is PCB data only
 - no_components_loaded (from set_project_dir, refresh_netlist or any component tool) → nets
   loaded but no schematic component metadata did. Tell the user, name any sheet_errors, and do
   not answer component questions from the nets alone or retry search_components in a loop
@@ -671,14 +677,38 @@ def _netlist_required_error() -> dict:
         "error": "netlist_required",
         "message": (
             f"Project '{name}' was loaded without a netlist: Altium Designer was not "
-            "running and no up-to-date cached netlist was found. This tool needs the "
-            "schematic connectivity of the netlist, which only Altium Designer can "
-            "generate. Open the project in Altium Designer once, then call set_project_dir "
-            "again; later loads reuse the cached netlist without Altium. Board, design-rule, "
-            "length, differential-pair, via, DRC report, design-notes, picture, sheet-hierarchy "
-            "and variant tools work now."
+            "running, no up-to-date cached netlist was found and the sheets could not be "
+            "compiled offline (see compile_error in the load response, or the project lists "
+            "no sheet). This tool needs the schematic connectivity. Fix the sheets and call "
+            "refresh_netlist, or open the project in Altium Designer once, then call "
+            "set_project_dir again; later loads reuse the cached netlist without Altium. "
+            "Board, design-rule, length, differential-pair, via, DRC report, design-notes, "
+            "picture, sheet-hierarchy and variant tools work now."
         ),
     }
+
+
+NETLIST_SOURCE_ALTIUM = "altium"
+NETLIST_SOURCE_OFFLINE = "offline_compiler"
+OFFLINE_NETLIST_NOTE = (
+    "Compiled by the copilot from the saved sheets, following the project's net identifier "
+    "scope and netlist options; Altium Designer was not involved, so no ERC ran. It matched "
+    "Altium's own netlists and PCB pad nets on the projects it was validated on; "
+    "compile_warnings lists what it could not settle. Open the project in Altium for the "
+    "authoritative netlist."
+)
+_MAX_COMPILE_WARNINGS = 12  # compile_warnings listed in a load response
+
+
+def _netlist_source(netlist: dict | None) -> str | None:
+    """Where the loaded netlist came from: Altium's .NET or the offline compile."""
+    if netlist is None:
+        return None
+    return NETLIST_SOURCE_OFFLINE if netlist.get("source") == "offline" else NETLIST_SOURCE_ALTIUM
+
+
+def _offline(netlist: dict | None) -> bool:
+    return _netlist_source(netlist) == NETLIST_SOURCE_OFFLINE
 
 
 def _require_project(netlist: bool = True):
@@ -719,6 +749,12 @@ def _load_diagnostics(netlist: dict) -> dict:
     """Component count, per-sheet parse errors and coverage warnings for load responses."""
     components = netlist.get("components") or {}
     diagnostics: dict = {"component_count": len(components)}
+    if netlist.get("nets") is not None or netlist.get("source"):
+        diagnostics["netlist_source"] = _netlist_source(netlist)
+    if _offline(netlist):
+        diagnostics["net_identifier_scope"] = netlist.get("net_scope")
+        warnings = netlist.get("compile_warnings") or []
+        diagnostics["compile_warnings"] = warnings[:_MAX_COMPILE_WARNINGS]
     if netlist.get("sheet_errors"):
         diagnostics["sheet_errors"] = netlist["sheet_errors"]
     if netlist.get("annotation_errors"):
@@ -1051,10 +1087,76 @@ def _load_unregistered_netlist(project_dir: str, prj_pcb_path: str) -> str | Non
         return None
 
 
-def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool) -> dict:
-    """Load the project from its files alone: Altium Designer is not running and no
-    up-to-date cached netlist exists. Board, rule, notes, picture and variant tools work;
-    the NETLIST_TOOLS answer netlist_required."""
+def _load_offline_netlist(project_dir: str, prj_pcb_path: str, netlist_stale: bool) -> dict:
+    """Full load with the netlist compiled offline from the saved sheets (sch_netlister):
+    Altium Designer is not running and no up-to-date cached netlist exists. Every tool
+    works. Falls back to the netlist-free load when the project lists no sheet or the
+    compile fails. netlist_stale: a cached .NET exists but sheets were saved after it."""
+    global _project, _variant_state, _netlist_last_updated
+    _project = None
+    _variant_state = None
+    _altium._netlist = None
+    _netlist_last_updated = None
+    _pcb_session.__init__()
+
+    prj_data = parse_prj_pcb(prj_pcb_path)
+    if not prj_data.sheet_paths:
+        return _load_netlist_free(project_dir, prj_pcb_path, netlist_stale)
+    try:
+        _altium.compile_offline(prj_pcb_path, prj_data.sheet_paths, prj_data.annotation_paths)
+    except Exception as e:
+        logging.warning("Offline netlist compile failed: %s", e)
+        return _load_netlist_free(project_dir, prj_pcb_path, netlist_stale,
+                                  compile_error=f"{type(e).__name__}: {e}")
+    sheets = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
+    _project = {
+        "name": Path(prj_pcb_path).stem,
+        "root_dir": project_dir,
+        "prj_pcb_path": prj_pcb_path,
+        "sheets": sheets,
+        **_project_documents(prj_data),
+    }
+    _variant_state = VariantState(prj_data.variants)
+    _resolve_dnp_uids(_variant_state, _altium._netlist)
+    _netlist_last_updated = datetime.now(timezone.utc).isoformat()
+    # No netlist_mtime: only Altium's .NET may serve a later cache shortcut.
+    upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
+    response = {
+        "loaded": True,
+        "load_mode": "offline_netlist",
+        "project": _project["name"],
+        "sheets": [s["name"] for s in sheets],
+        "sheet_count": len(sheets),
+        "variants": [v.name for v in prj_data.variants],
+        "variant_count": len(prj_data.variants),
+        "pcb_doc": Path(prj_data.pcb_doc_paths[0]).name if prj_data.pcb_doc_paths else None,
+        "netlist_updated_utc": _netlist_last_updated,
+        "netlist_note": OFFLINE_NETLIST_NOTE + (
+            " A cached Altium netlist exists, but the project or its sheets were saved after "
+            "it was generated, so the sheets were compiled instead." if netlist_stale else ""),
+        "session_start": (
+            "Altium Designer is not running, so there is no active tab: call "
+            "get_sheet_context with sheet_name (e.g. the first sheet). Tell the user the "
+            "netlist was compiled offline and pass on any compile_warnings."
+        ),
+        **_load_diagnostics(_altium._netlist or {}),
+        **_design_info(prj_data),
+        **_altium365_info(project_dir),
+    }
+    if netlist_stale:
+        response["cached_netlist_stale"] = True
+    context = _project_context(project_dir)
+    if context is not None:
+        response["project_context"] = context
+    return response
+
+
+def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool,
+                       compile_error: str | None = None) -> dict:
+    """Load the project from its files alone, without a netlist: Altium Designer is not
+    running, no up-to-date cached netlist exists and the sheets could not be compiled
+    offline (compile_error) or there are none. Board, rule, notes, picture and variant
+    tools work; the NETLIST_TOOLS answer netlist_required."""
     global _project, _variant_state, _netlist_last_updated
     _project = None
     _variant_state = None
@@ -1083,15 +1185,18 @@ def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool)
     _resolve_dnp_uids(_variant_state, None)
     upsert_registry_entry(Path(prj_pcb_path).name, project_dir)
 
+    reason = ("the sheets could not be compiled offline" if compile_error
+              else "the project lists no schematic sheet to compile")
     message = (
-        "Partial load: Altium Designer is not running and no up-to-date cached netlist was "
-        "found, so the project was loaded from its files without a netlist. The tools in "
-        "netlist_required_tools need it and answer netlist_required; board, design-rule, "
-        "length, differential-pair, via, DRC report, design-notes, picture, sheet-hierarchy "
-        "and variant tools work. PCB parts are not linked to schematic parts (sch_refdes is empty) and "
-        "DNP comes from the designators stored in the variants. To load fully, open the "
-        "project in Altium Designer once and call set_project_dir again; later loads "
-        "reuse the cached netlist without Altium."
+        "Partial load: Altium Designer is not running, no up-to-date cached netlist was "
+        f"found and {reason}, so the project was loaded from its files without a netlist. "
+        "The tools in netlist_required_tools need it and answer netlist_required; board, "
+        "design-rule, length, differential-pair, via, DRC report, design-notes, picture, "
+        "sheet-hierarchy and variant tools work. PCB parts are not linked to schematic parts "
+        "(sch_refdes is empty) and DNP comes from the designators stored in the variants. "
+        "To load fully, fix the sheets and call refresh_netlist, or open the project in "
+        "Altium Designer once and call set_project_dir again; later loads reuse the cached "
+        "netlist without Altium."
     )
     if not prj_data.pcb_doc_paths:
         message += " The project lists no .PcbDoc, so the board tools answer no_pcb_document."
@@ -1122,6 +1227,8 @@ def _load_netlist_free(project_dir: str, prj_pcb_path: str, netlist_stale: bool)
     }
     if netlist_stale:
         response["netlist_stale"] = True
+    if compile_error:
+        response["compile_error"] = compile_error
     context = _project_context(project_dir)
     if context is not None:
         response["project_context"] = context
@@ -1133,9 +1240,11 @@ def set_project_dir(project_dir: str) -> str:
     """Load an Altium project from disk. Must be called before any other tool.
     If the netlist cache is valid, loads from disk without requiring Altium to be open.
     Otherwise generates the netlist in Altium Designer, which must have the project open.
-    When Altium is not running, loads the project without a netlist (partial: true):
-    board, rule, notes, picture and variant tools work, the tools listed in
-    netlist_required_tools answer netlist_required."""
+    When Altium is not running, compiles the netlist offline from the saved sheets
+    (load_mode offline_netlist, netlist_source offline_compiler, with compile_warnings):
+    every tool works. Only when that compile fails or there are no sheets does it load
+    without a netlist (partial: true): the tools listed in netlist_required_tools then
+    answer netlist_required."""
     global _project, _variant_state, _netlist_last_updated
 
     # Find .PrjPcb upfront — needed by both the cache shortcut and the Altium flow.
@@ -1182,13 +1291,14 @@ def set_project_dir(project_dir: str) -> str:
             break
 
     # Full Altium flow — required when cache is absent or stale. Without Altium the
-    # project still loads from its files, without a netlist.
+    # netlist is compiled offline from the saved sheets.
     status = _altium.get_status()
     if not status.get("running"):
         loaded = None if _stale_cache else _load_unregistered_netlist(project_dir, prj_pcb_path)
         if loaded is not None:
             return loaded
-        return json.dumps(_load_netlist_free(project_dir, prj_pcb_path, _stale_cache), indent=2)
+        return json.dumps(_load_offline_netlist(project_dir, prj_pcb_path, _stale_cache),
+                          indent=2)
     if status.get("warning") == "no_sheet_open":
         return json.dumps({
             "error": "no_sheet_open",
@@ -1294,7 +1404,9 @@ def refresh_netlist() -> str:
     Call this when the user says they changed, added, or saved anything in the schematic.
     Do not call speculatively — only when the user confirms they have saved.
     After a netlist-free load (partial: true) it loads the project again, fully
-    when Altium Designer now has it open."""
+    when Altium Designer now has it open or the sheets now compile. An offline netlist
+    (netlist_source offline_compiler) is compiled again from the saved sheets, or
+    generated by Altium Designer when it has the project open."""
     global _netlist_last_updated, _variant_state
     try:
         project, netlist, variant_state = _require_project(netlist=False)
@@ -1302,6 +1414,16 @@ def refresh_netlist() -> str:
         return json.dumps(e.payload)
     if netlist is None:
         return _reload_partial(project, variant_state)
+    offline = _offline(netlist)
+    if offline:
+        try:
+            status = _altium.get_status()
+        except Exception as e:  # status unknown: compile offline again
+            logging.warning("Altium status failed: %s", e)
+            status = {}
+        # Altium's netlist only when Altium has this very project open.
+        offline = not (status.get("running") and (status.get("project_file") or "").lower()
+                       == Path(project["prj_pcb_path"]).name.lower())
     # Re-read the sheet list so sheets added, moved or removed since load are picked up
     # and the sheet names stay in step with the components' sheet attribution.
     prj_data = None
@@ -1315,11 +1437,19 @@ def refresh_netlist() -> str:
     except Exception as e:
         logging.warning("Could not re-read .PrjPcb, using the sheet list from load: %s", e)
     try:
-        regenerated = _altium.generate_netlist(
-            project["prj_pcb_path"], sheet_paths=sheet_paths, annotation_paths=annotation_paths
-        )
+        if offline:
+            _altium.compile_offline(project["prj_pcb_path"], sheet_paths, annotation_paths)
+            regenerated = True
+        else:
+            # An offline netlist is replaced by Altium's even when its .NET was fresh.
+            regenerated = _altium.generate_netlist(
+                project["prj_pcb_path"], sheet_paths=sheet_paths,
+                annotation_paths=annotation_paths,
+            ) or _offline(netlist)
     except Exception as e:
-        return json.dumps({"error": "generate_failed", "message": str(e)})
+        error = "compile_failed" if offline else "generate_failed"
+        return json.dumps({"error": error, "message": f"{type(e).__name__}: {e}" if offline
+                           else str(e)})
     if prj_data is not None:
         project["sheets"] = [{"name": Path(p).stem, "path": p} for p in prj_data.sheet_paths]
         project.update(_project_documents(prj_data))
@@ -1363,20 +1493,26 @@ def refresh_netlist() -> str:
     _netlist_last_updated = datetime.now(timezone.utc).isoformat()
     _rn_name = Path(project["prj_pcb_path"]).stem
     _rn_dir = project["root_dir"]
-    _rn_net = (
-        list(Path(_rn_dir).rglob(f"{_rn_name}.NET")) or
-        list(Path(_rn_dir).rglob(f"{_rn_name}.net"))
-    )
-    upsert_registry_entry(
-        Path(project["prj_pcb_path"]).name,
-        _rn_dir,
-        netlist_mtime=_rn_net[0].stat().st_mtime if _rn_net else None,
-    )
+    if offline:
+        # An offline compile never vouches for a .NET on disk.
+        upsert_registry_entry(Path(project["prj_pcb_path"]).name, _rn_dir)
+    else:
+        _rn_net = (
+            list(Path(_rn_dir).rglob(f"{_rn_name}.NET")) or
+            list(Path(_rn_dir).rglob(f"{_rn_name}.net"))
+        )
+        upsert_registry_entry(
+            Path(project["prj_pcb_path"]).name,
+            _rn_dir,
+            netlist_mtime=_rn_net[0].stat().st_mtime if _rn_net else None,
+        )
     result = {
         "refreshed": True,
         "netlist_updated_utc": _netlist_last_updated,
         **diagnostics,
     }
+    if offline:
+        result["netlist_note"] = OFFLINE_NETLIST_NOTE
     if variant_note:
         result["variant_note"] = variant_note
     return json.dumps(result)
@@ -1458,9 +1594,10 @@ def _query_net_impl(netlist: dict, pattern: str) -> str:
                 "pins": [{"refdes": r, "pin": p} for r, p in all_connections],
             })
 
+    source = {"netlist_source": NETLIST_SOURCE_OFFLINE} if _offline(netlist) else {}
     if len(results) == 1:
-        return json.dumps(results[0], indent=2)
-    return json.dumps({"match_count": len(results), "nets": results}, indent=2)
+        return json.dumps({**results[0], **source}, indent=2)
+    return json.dumps({"match_count": len(results), "nets": results, **source}, indent=2)
 
 
 @mcp.tool(title="Query Net", annotations=ToolAnnotations(readOnlyHint=True),
@@ -1661,6 +1798,9 @@ def _get_sheet_context_impl(project: dict, netlist: dict, variant_state: Variant
     if no_components:
         return json.dumps(no_components)
     context = build_sheet_context(netlist, sheet_name, variant_state, offset)
+    if _offline(netlist):
+        header, _, rest = context.partition("\n")
+        context = f"{header}\nnetlist_source:{NETLIST_SOURCE_OFFLINE}\n{rest}"
     sheet_error = next((e for e in netlist.get("sheet_errors") or []
                         if e.get("sheet", "").lower() == sheet_name.lower()), None)
     if sheet_error:
@@ -3630,6 +3770,8 @@ def check_sch_pcb_sync(checks: list[str] | None = None, offset: int = 0) -> str:
             "pcb_saved_utc": _utc(pcb_saved),
             "netlist_updated_utc": _netlist_last_updated,
         }
+        if _offline(netlist):
+            context["netlist_source"] = NETLIST_SOURCE_OFFLINE
         if compiled:
             context["netlist_compiled_utc"] = _utc(compiled)
         if stale or stale_others:
@@ -5100,7 +5242,7 @@ def schematic_review() -> str:
     n = len(sheets)
     name = _project["name"]
 
-    return SCHEMATIC_REVIEW_PROMPT.format(
+    prompt = SCHEMATIC_REVIEW_PROMPT.format(
         name=name,
         sheets=", ".join(sheets),
         active_variant=active_variant,
@@ -5108,6 +5250,12 @@ def schematic_review() -> str:
         n=n,
         root_dir=_project["root_dir"],
     )
+    if _offline(_altium._netlist):
+        prompt += (
+            "\n\nNote: this project's netlist was compiled offline by the copilot from the "
+            "saved sheets (netlist_source offline_compiler): Altium's compiler and ERC did not "
+            "run. Say so in the review and pass on the load's compile_warnings.")
+    return prompt
 
 
 @mcp.tool(title="Project Tour", annotations=ToolAnnotations(readOnlyHint=True))
@@ -5248,6 +5396,11 @@ def _package_for_xfn_impl(
         f"({err['error']}); they are missing from this snapshot."
         for err in notes_errors
     )
+    if _offline(netlist):
+        incomplete_warning += (
+            "\nNote: the nets in this snapshot were compiled offline by the copilot from the "
+            "saved sheets (Altium Designer was not running, so no Altium compile and no ERC "
+            "ran); tell the team, or export again once the project is open in Altium.")
     registry_warning = ""
     try:
         mark_xfn_exported(prj_pcb_name)

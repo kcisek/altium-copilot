@@ -898,6 +898,10 @@ def test_bluetooth_sentinel_snapshot(sentinel):
     assert statuses["clone_status"] == "not_applicable"
     assert statuses["dnp_parts"] == "not_applicable"
     assert statuses["fab_drawing"] == "not_verified"  # no Draftsman drawing
-    assert sentinel["verdict"] == "not_ready_unverified"
+    # Loaded without Altium, the sheets are compiled offline, so the netlist gates run:
+    # the example's PcbDoc predates its sheets and carries duplicate designators (a stale
+    # .Annotation file), so it is not in sync.
+    assert statuses["netlist_fresh"] == "pass" and statuses["sch_pcb_sync"] == "fail"
+    assert sentinel["verdict"] == "fail"
     assert {"drc", "erc"} <= set(sentinel["blocking_not_verified"])
-    assert not sentinel["blocking_failed"]
+    assert sentinel["blocking_failed"] == ["sch_pcb_sync"]
