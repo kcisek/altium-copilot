@@ -54,6 +54,9 @@ try:
     from services.bom_checks import run_bom_checks
     from services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from services.pull_resistors import run_pull_resistor_check
+    from services.interfaces import (
+        DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
+    )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, page_result as page_testpoint_result,
@@ -131,6 +134,9 @@ except ImportError:
     from server.services.bom_checks import run_bom_checks
     from server.services.decoupling import DEFAULT_MAX_DISTANCE_MIL, run_decoupling_check
     from server.services.pull_resistors import run_pull_resistor_check
+    from server.services.interfaces import (
+        DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
+    )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, page_result as page_testpoint_result,
@@ -450,6 +456,20 @@ DNP reasons, fabrication requirements. Use it.
   estimate). A heuristic from names and pin types: pull-ups inside ICs are invisible,
   so present a missing pull as a question for the datasheet, not a fault.
 
+## Connector and Interface Protection
+
+- check_interfaces — "are my connectors protected?", "is there ESD on the USB port?",
+  "is the shield tied right?", EMC of cables and connectors, or a schematic or layout
+  review: per connector its exposure (external, internal, unknown, with the basis) and a
+  per-pin table (class, ESD/TVS on the path and on which side of a series part, series
+  parts, capacitors, pulls, first IC pin reached); findings for exposed pins without ESD,
+  shields through RC or floating, ground pins that reach ground only through a part,
+  sparse ground pins, low-speed lines with no series footprint and (with the PcbDoc) a
+  TVS far from its connector. Quote exposure_basis and ask the user when a connector's
+  exposure is unknown or looks wrong (external= and internal= correct it). Do not judge
+  the TVS part (standoff, clamping voltage, capacitance), or a transceiver's own ESD
+  claim, from the tool: look up the datasheet. shield_rc quotes guidance, not a fault.
+
 ## PCB / Layout Questions
 
 For questions about the physical board (where nets route, layers, stackup, crosstalk,
@@ -672,8 +692,8 @@ _design_notes = DesignNotesCache()
 # netlist_required. Every other tool works from the project files alone.
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
-    "check_bom", "check_decoupling", "check_pull_resistors", "check_sch_pcb_sync",
-    "schematic_review", "package_for_xfn",
+    "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
+    "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
 )
 
 
@@ -4053,6 +4073,127 @@ def check_pull_resistors(
         if "error" in result:
             return json.dumps(result)
         result = {"netlist_updated_utc": _netlist_last_updated, **result}
+        if limit < 100:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Check Interfaces",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_interfaces(
+    connector: str | None = None,
+    checks: list[str] | None = None,
+    external: str | None = None,
+    internal: str | None = None,
+    max_distance: float | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Audit connector and interface protection offline: ESD/TVS, series parts, shields
+    and ground pins per connector. Call it when the user asks whether connectors or I/O
+    are protected, about ESD, TVS diodes, surge, shield or chassis connections, EMC of
+    cables and connectors, or for a schematic or layout review. Each connector fitted in
+    the active variant is judged external (USB, RJ45, D-Sub, terminal block, jack, coax,
+    SFP port ...), internal (board-to-board, FPC, debug or test header, card edge,
+    configuration jumper) or unknown, with the basis; external= and internal=
+    (comma-separated designators) correct that guess. Each signal pin is followed through
+    series resistors, 0 ohm links, ferrites, inductors, common-mode chokes and series
+    capacitors to the first IC, transistor, transformer or other connector, recording the
+    ESD/TVS devices on the way (connector side or behind a series element), series
+    elements, capacitors to ground and pulls; LED and magnetics centre-tap pins are not
+    counted as lines. Findings: no_esd (warning on external connectors; info when unknown,
+    behind integrated magnetics, on RF coax or an SFP/QSFP port, or when the parts reached
+    claim ESD-protected pins in their text), shield_floating (warning on external),
+    ground_indirect (a ground pin reaching board ground only through a capacitor,
+    resistor or ferrite: warning on external with no DC path, else info),
+    esd_behind_series, shield_rc (a shield reaching ground only through an RC network,
+    quoting the guidance, not a fault), sparse_ground (few ground pins per signal pin) and
+    no_series_element (low-speed external lines with no series resistor, 0 ohm or ferrite
+    footprint), all info; with a PcbDoc, tvs_far_from_connector when a TVS pad more than
+    2 mm from the connector pin is nearer the IC (warning beyond 5 mm on external
+    connectors) or farther than max_distance (default 10 mm); straight line in plan view,
+    and opposite_side marks a TVS on the other side of the board. Internal connectors get
+    findings only when named in connector=.
+
+    It is a heuristic, not ERC: parts are recognised by designator prefix and the words
+    in their text and part numbers (a TVS known only by an unlisted part number is
+    missed), and choosing the protection part (standoff and clamping voltage,
+    capacitance, direction) needs its datasheet. connector takes comma-separated
+    designators and adds their per-pin tables (pin_tables; cut to their signal pins when
+    they do not fit, as pin_tables_truncated says; the tables of all connectors are also
+    given when they fit); checks narrows to the names in summary. Findings are paginated
+    (offset from next_offset), warnings first. Distances, in the fields and the text, are
+    in units, default mm."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if units not in (None, "mm", "mil"):
+        return json.dumps({"error": "invalid_units", "message": "units must be 'mil' or 'mm'."})
+    resolved = units or "mm"
+    to_mm = resolved == "mm"
+    max_mil = DEFAULT_TVS_MAX_DISTANCE_MIL
+    if max_distance is not None:
+        if not _finite_nonnegative(max_distance) or max_distance == 0:
+            return json.dumps({"error": "invalid_max_distance",
+                               "message": "max_distance must be a positive number."})
+        max_mil = _input_to_mil(max_distance, resolved)
+    index, pcb_unavailable = None, None
+    if project.get("pcb_doc_paths"):
+        index, error = _pcb_session.get(project, netlist)
+        if error:
+            pcb_unavailable = f"{error['error']}: {error.get('message', '')}".strip(": ")
+    else:
+        pcb_unavailable = "the project lists no PcbDoc"
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    named = _split_names(connector)
+    # (findings, connector rows, pin tables, rows per table): named connectors keep their
+    # tables, cut to their signal pins last; otherwise the tables go first.
+    steps = ((100, 60, True, None), (40, 20, True, None), (15, 8, True, 200),
+             (15, 8, True, 60), (15, 8, True, 20)) if named else (
+        (100, 60, True, None), (100, 60, ("external",), None), (100, 60, False, None),
+        (40, 20, False, None), (15, 8, False, None))
+    for limit, connector_limit, pin_tables, table_rows in steps:
+        result = run_interface_check(
+            netlist, plan, project.get("parameters") or {}, index=index,
+            pcb_unavailable=pcb_unavailable, checks=checks, connectors=named,
+            external=_split_names(external), internal=_split_names(internal),
+            max_distance_mil=max_mil, offset=offset, limit=limit,
+            connector_limit=connector_limit, pin_tables=pin_tables, table_rows=table_rows,
+            units=resolved,
+        )
+        if "error" in result:
+            return json.dumps(result)
+        context: dict = {"netlist_updated_utc": _netlist_last_updated}
+        if index is not None:
+            context.update({"pcb_doc": Path(project["pcb_doc_paths"][0]).name,
+                            "units": resolved})
+            if len(project["pcb_doc_paths"]) > 1:
+                context["note"] = (
+                    f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; measured on "
+                    f"'{Path(project['pcb_doc_paths'][0]).name}'."
+                )
+        result = _convert_units({**context, **result}, to_mm)
+        if pin_tables is not True:
+            result["pin_tables_omitted"] = (
+                "The per-pin tables did not fit"
+                + (" (external connectors' are given)" if result.get("pin_tables") else "")
+                + ": name connectors in connector= to get theirs."
+            )
+        elif table_rows is not None:
+            result["pin_tables_omitted"] = (
+                "The named connectors' full pin tables did not fit: pin_tables_truncated "
+                "says what each one gives; name fewer connectors for more."
+            )
         if limit < 100:
             result["findings_limited_to"] = limit
         rendered = json.dumps(result, indent=2)

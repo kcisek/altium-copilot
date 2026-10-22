@@ -55,7 +55,7 @@ FILTER_OHMS = 100.0  # a resistor up to this filters a supply; above, it biases 
 FINDING_LIMIT = 100
 RAIL_LIMIT = 60
 DETAIL_CAPACITORS = 5  # nearest capacitors listed per pair when ICs are named
-_THT_LAYER = 74
+THT_LAYER = 74  # a through-hole pad's layer (multi-layer)
 
 # ---------- names ----------
 
@@ -120,7 +120,7 @@ _CAP_TEXT = re.compile(
     r"feed-?through",
     re.IGNORECASE,
 )
-_FERRITE_TEXT = re.compile(r"ferrite|\bbead", re.IGNORECASE)
+FERRITE_TEXT = re.compile(r"ferrite|\bbead", re.IGNORECASE)
 _FARAD_TEXT = re.compile(r"\d\s*[pnuµμmPNU]?F\b|\d[pnuµμ]\d", re.IGNORECASE)
 _CAP_VALUE = re.compile(
     r"(?<![\w.])(\d+(?:[.,]\d+)?)\s*([pnuµμPNU])\s*[fF]?(?![a-zA-Z\d])"
@@ -200,7 +200,16 @@ def capacitance(*texts: str | None) -> float | None:
     return None
 
 
-def _farads_text(value: float | None) -> str | None:
+def is_capacitor(prefix: str, text: str) -> bool:
+    """A C part, or another C-prefixed part whose text says capacitor or a value in
+    farads (CA, CN arrays); never a C-prefixed connector (CN, CON) or diode (CR)."""
+    return prefix == "C" or (
+        prefix.startswith("C") and prefix not in _NOT_CAP_PREFIXES
+        and bool(_CAP_TEXT.search(text) or _FARAD_TEXT.search(text))
+    )
+
+
+def farads_text(value: float | None) -> str | None:
     if value is None:
         return None
     for unit, scale in (("uF", 1e-6), ("nF", 1e-9), ("pF", 1e-12)):
@@ -224,7 +233,7 @@ class _Cap:
         return self.farads is not None and self.farads < SMALL_FARADS
 
     def describe(self) -> dict:
-        out = {"designator": self.designator, "value": _farads_text(self.farads)}
+        out = {"designator": self.designator, "value": farads_text(self.farads)}
         if not self.fitted:
             out["not_fitted"] = True
         return out
@@ -350,7 +359,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
         prefix = designator_prefix(ref)
         part_nets = list(dict.fromkeys(connected.values()))
         is_filter = prefix in _FILTER_PREFIXES or (
-            _FERRITE_TEXT.search(text) and prefix not in IC_PREFIXES
+            FERRITE_TEXT.search(text) and prefix not in IC_PREFIXES
         )
         if is_filter:
             if len(connected) == 2 and len(part_nets) == 2 and fitted[ref]:
@@ -369,11 +378,7 @@ def _design(netlist: dict, plan, project_params: dict | None) -> _Design:
                     filters[net_a].append((ref, net_b))
                     filters[net_b].append((ref, net_a))
             continue
-        is_cap = prefix == "C" or (
-            prefix.startswith("C") and prefix not in _NOT_CAP_PREFIXES
-            and (_CAP_TEXT.search(text) or _FARAD_TEXT.search(text))
-        )
-        if not is_cap or len(part_nets) < 2:
+        if not is_capacitor(prefix, text) or len(part_nets) < 2:
             continue
         capacitors.add(ref)
         farads = capacitance(
@@ -578,14 +583,36 @@ def _schematic_findings(design: _Design, pairs: list[_Pair], variant: str) -> li
 
 # ---------- PCB ----------
 
+def pcb_components(index) -> dict[str, list[dict]]:
+    """The PCB's component rows by schematic designator (several when the board holds
+    more than one copy of a part)."""
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for row in index.db.execute("SELECT * FROM components"):
+        if row["sch_refdes"]:
+            by_name[row["sch_refdes"]].append(dict(row))
+    return by_name
+
+
+def component_pads(index, by_name: dict[str, list[dict]], wanted) -> dict[int, list]:
+    """Pad rows (with net_name) of the named parts, by PCB component id."""
+    ids = [row["id"] for name in wanted for row in by_name.get(name, [])]
+    pads: dict[int, list] = defaultdict(list)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        rows = index.db.execute(
+            "SELECT p.*, n.name AS net_name FROM prims p LEFT JOIN nets n ON n.id = p.net_id "
+            f"WHERE p.kind = 'pad' AND p.component IN ({','.join('?' * len(chunk))})", chunk,
+        )
+        for row in rows:
+            pads[row["component"]].append(row)
+    return pads
+
+
 def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
                   stats: dict, detail: bool) -> tuple[list[dict], list[dict]]:
     """Findings, and one measured row per pair."""
     db = index.db
-    by_name: dict[str, list[dict]] = defaultdict(list)
-    for row in db.execute("SELECT * FROM components"):
-        if row["sch_refdes"]:
-            by_name[row["sch_refdes"]].append(dict(row))
+    by_name = pcb_components(index)
     candidates_of: dict[str, list[_Cap]] = {}
     wanted = {pair.ic for pair in pairs}
     for pair in pairs:
@@ -595,16 +622,7 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
                 *(cap for _, _, found in _linked_caps(design, pair.rail) for cap in found),
             ]
         wanted.update(cap.designator for cap in candidates_of[pair.rail])
-    ids = [row["id"] for name in wanted for row in by_name.get(name, [])]
-    pads: dict[int, list] = defaultdict(list)
-    for start in range(0, len(ids), 500):
-        chunk = ids[start:start + 500]
-        rows = db.execute(
-            "SELECT p.*, n.name AS net_name FROM prims p LEFT JOIN nets n ON n.id = p.net_id "
-            f"WHERE p.kind = 'pad' AND p.component IN ({','.join('?' * len(chunk))})", chunk,
-        )
-        for row in rows:
-            pads[row["component"]].append(row)
+    pads = component_pads(index, by_name, wanted)
     links: dict[str, tuple[list, list]] = {}
 
     def links_of(net: str) -> tuple[list, list]:
@@ -614,7 +632,7 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
             net_id = index.net_id(net)
             vias = list(db.execute(
                 "SELECT * FROM prims WHERE net_id = ? AND (kind = 'via' OR "
-                "(kind = 'pad' AND layer = ?))", (net_id, _THT_LAYER),
+                "(kind = 'pad' AND layer = ?))", (net_id, THT_LAYER),
             )) if net_id is not None else []
             pours = [dict(row) for row in db.execute(
                 "SELECT layer, vertices FROM pours WHERE net_id = ? AND NOT shelved",
@@ -694,7 +712,7 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
         if distance > max_mil:
             text = (
                 f"{pair.ic} on {pair.rail}: the nearest capacitor is {cap.designator} "
-                f"({_farads_text(cap.farads) or 'value unknown'}), "
+                f"({farads_text(cap.farads) or 'value unknown'}), "
                 f"{distance / MIL_PER_MM:.1f} mm from its nearest power pad (straight line, "
                 "pad edge to pad edge). Vendor guides ask for 'as close as possible', often "
                 "a few mm; on boards with closely spaced planes the via connection matters "
@@ -721,7 +739,7 @@ def _pcb_findings(index, design: _Design, pairs: list[_Pair], max_mil: float,
                     [pair.ic], ic=pair.ic, rail=pair.rail, pads_far=len(far),
                     pads=len(power), farthest_mil=round(worst[0], 1),
                 ))
-        if cap_row["side"] != ic_side and cap_pad["layer"] != _THT_LAYER:
+        if cap_row["side"] != ic_side and cap_pad["layer"] != THT_LAYER:
             vias, pours = links_of(cap.rail)
             via_near = any(
                 via["id"] != cap_pad["id"]
