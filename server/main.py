@@ -23,7 +23,7 @@ from pydantic import WithJsonSchema
 
 try:
     from altium import AltiumClient, is_netlist_fresh, netlist_sources
-    from parsers.prj_pcb import parse_prj_pcb, VariantState
+    from parsers.prj_pcb import parse_prj_options, parse_prj_pcb, VariantState
     from services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
     from services.page_netlist import build_sheet_context, MAX_RESULT_SIZE_CHARS
     from parsers.pcb_doc import parse_pcb_doc
@@ -90,6 +90,7 @@ try:
     )
     from services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from services.project_options import build_project_options, page_project_options
+    from services.erc import build_erc, page_erc
     from services.project_integrity import build_project_integrity, page_project_integrity
     from services.output_jobs import build_output_jobs, draftsman_outputs, page_output_jobs
     from services.fab_drawing import (
@@ -106,7 +107,7 @@ try:
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
     from server.altium import AltiumClient, is_netlist_fresh, netlist_sources
-    from server.parsers.prj_pcb import parse_prj_pcb, VariantState
+    from server.parsers.prj_pcb import parse_prj_options, parse_prj_pcb, VariantState
     from server.parsers.pcb_doc import parse_pcb_doc
     from server.parsers.sch_doc import read_sch_doc_image
     from server.services.registry import read_registry, upsert_registry_entry, mark_xfn_exported
@@ -173,6 +174,7 @@ except ImportError:
     )
     from server.services.design_hierarchy import build_design_hierarchy, page_design_hierarchy
     from server.services.project_options import build_project_options, page_project_options
+    from server.services.erc import build_erc, page_erc
     from server.services.project_integrity import (
         build_project_integrity, page_project_integrity,
     )
@@ -364,8 +366,10 @@ DNP reasons, fabrication requirements. Use it.
   problems?", before an ERC review: the .PrjPcb settings (net scope and naming, diff-pair
   suffixes, class generation, multi-channel naming, ERC levels, Connection Matrix,
   Comparator, output path) and an audit. Quote each audit entry with its default and
-  hides/risk; a flagged No ERC is a question for the designer, not a proven fault. Never
-  guess what an unmapped key means. The saved file is read: Compile in Altium is final.
+  hides/risk; a flagged No ERC is a question for the designer, not a proven fault.
+  offline_erc cites run_erc's counts, and offline_erc_hidden what a switched-off check
+  hides here. Never guess what an unmapped key means. The saved file is read: Compile in
+  Altium is final.
 
 ## Project Integrity
 
@@ -414,7 +418,8 @@ DNP reasons, fabrication requirements. Use it.
   per variant and output age, fab notes vs stackup, title blocks, project integrity,
   Altium 365 copy, test access), each with status, blocking, evidence and the source_tool to call for
   details. Quote verdict_summary first. A blocking gate that failed fails the release;
-  not_verified is never a pass: say what would verify it (ERC always needs Altium).
+  not_verified is never a pass: say what would verify it (ERC always needs Altium; its
+  evidence cites run_erc's offline counts, which never make it pass).
 - release_review — a guided go / no-go: the gates, the causes from each source_tool, then
   the blocking items, what was not verified and the warnings.
 
@@ -488,6 +493,24 @@ DNP reasons, fabrication requirements. Use it.
   pins, shared nets and pins that change between variants. format csv, c_header or
   devicetree gives text for the firmware repo: present it as a starting point. All of it
   comes from names: check pin-mux questions against the datasheet.
+
+## Electrical Rules Check (offline)
+
+- run_erc — "why won't my project compile?", "what does ERC say?", "any ERC errors?",
+  "are there floating inputs or net labels, single-pin nets, unconnected wires, unmatched
+  ports, duplicate designators?", or first in a schematic review (schematic_review asks
+  for it): an offline approximation of Altium's ERC (Messages panel), its violations
+  named and worded as Altium does with level, sheet, object, location and a fix, judged
+  by the project's Error Reporting levels and Connection Matrix (No Report types counted
+  under suppressed, No ERC markers and compile masks honoured). Quote summary first,
+  then the errors; say it is an approximation (Altium never saves its ERC result) and
+  name not_checked when the user asks about one of those. Off-grid object can run to
+  hundreds when a sheet's snap grid differs from the placement grid: a page gives it
+  (and off-sheet objects) one row per sheet with a count; give the count, not the list.
+  A Duplicate Part Designators note means the .Annotation file made the clash: check in
+  Altium before re-annotating. Advisories (rail aliases, name casing, near-miss wire
+  ends, ground nets) are info, not Altium violations. report="single_pin_nets" lists
+  every single-pin net.
 
 ## PCB / Layout Questions
 
@@ -659,7 +682,8 @@ otherwise your data may be stale.
 
 Without Altium the netlist is compiled offline from the saved sheets (netlist_source
 offline_compiler; no active tab, so pass sheet_name to get_sheet_context). Answer from it
-as from Altium's, pass on compile_warnings, and say no ERC ran; refresh_netlist compiles
+as from Altium's, pass on compile_warnings, and say Altium's ERC did not run (run_erc
+approximates it offline); refresh_netlist compiles
 again, or takes Altium's netlist once Altium has the project open.
 
 For an Altium 365 project, set_project_dir's altium365 block says where the local copy
@@ -712,7 +736,8 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "get_firmware_pin_map", "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
+    "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync", "schematic_review",
+    "package_for_xfn",
 )
 
 
@@ -2088,7 +2113,10 @@ def get_project_options(offset: int = 0) -> str:
     suppresses at its point may hide real problems. With a
     compiled netlist each No ERC names its net and the net's pin count; without one,
     the names on its wiring and that sheet's pins. Keys that no Altium source verifies
-    are passed on raw under unmapped.
+    are passed on raw under unmapped. offline_erc cites run_erc's counts as evidence (an
+    offline approximation: Altium's ERC result is never saved), and an audit row of a
+    check set to No Report says how many violations it hides in this design
+    (offline_erc_hidden).
 
     No ERC directives are paginated (offset from next_offset), flagged first; the
     settings and audit come with the first page."""
@@ -2101,6 +2129,14 @@ def get_project_options(offset: int = 0) -> str:
         return json.dumps(model)
     if netlist is not None:
         model["netlist_updated_utc"] = _netlist_last_updated
+    offline_erc = _offline_erc_summary(project)
+    if offline_erc is not None:
+        # Evidence for the audit: what each switched-off check hides in this design.
+        hidden = offline_erc["hidden_by_no_report"]
+        for row in model["audit"]["erc_checks_off_or_downgraded"]:
+            if row.get("check") in hidden:
+                row["offline_erc_hidden"] = hidden[row["check"]]
+        model["offline_erc"] = offline_erc
     for limit in (200, 80, 30, 10, 1):
         rendered = json.dumps(page_project_options(model, offset, limit), indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
@@ -4316,6 +4352,147 @@ def get_firmware_pin_map(
     return rendered
 
 
+# (violations, advisories) per page, tried in turn until the result fits.
+ERC_PAGE_LIMITS = ((100, 40), (50, 20), (25, 10), (10, 5), (5, 3), (1, 1))
+# The last ERC model and the compile it was built from (a compile of unchanged files,
+# .PrjPcb included, is the same object, so the model is reused with it).
+_erc_cache: tuple | None = None
+
+
+def _offline_erc(project: dict) -> tuple:
+    """(CompiledNetlist, build_erc model) of the saved sheets, from the cached offline
+    compile and the project's ERC levels and Connection Matrix. Raises when the project
+    cannot be compiled."""
+    global _erc_cache
+    sheet_paths = [s["path"] for s in project.get("sheets") or []] or None
+    compiled = _altium.compiled_netlist(project["prj_pcb_path"], sheet_paths)
+    if _erc_cache is not None and _erc_cache[0] is compiled:
+        return compiled, _erc_cache[1]
+    options = parse_prj_options(project["prj_pcb_path"])
+    model = build_erc(compiled.erc, options.erc_levels, options.connection_matrix)
+    _erc_cache = (compiled, model)
+    return compiled, model
+
+
+def _offline_erc_summary(project: dict) -> dict | None:
+    """run_erc's counts for other tools to cite as evidence (None when the sheets cannot
+    be compiled): reported by level and type, and what No Report levels and No ERC
+    markers suppress."""
+    try:
+        _, model = _offline_erc(project)
+        summary = model["summary"]
+        return {
+            "source": ("run_erc: an offline approximation of Altium's ERC (Altium's own "
+                       "result is never saved in the files)"),
+            "reported": summary["reported"], "by_level": summary["by_level"],
+            "by_violation": summary["by_violation"][:12],
+            "hidden_by_no_report": summary["suppressed"]["no_report"],
+            "suppressed_by_no_erc": summary["suppressed"]["no_erc"],
+        }
+    except Exception as e:  # evidence only: the citing tool still answers without it
+        logging.info("offline ERC summary unavailable: %s", e)
+        return None
+
+
+@mcp.tool(
+    title="Run ERC",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def run_erc(
+    checks: list[str] | None = None,
+    sheet: str | None = None,
+    min_level: Literal["warning", "error", "fatal", "all"] = "warning",
+    report: Literal["violations", "single_pin_nets"] = "violations",
+    offset: int = 0,
+) -> str:
+    """Offline approximation of Altium's ERC (Compile / Validate, the Messages panel). Call
+    it when the user asks why the project will not compile, what ERC says, about ERC
+    errors or warnings, floating input pins or net labels, single-pin nets, nets with
+    several names, unconnected wires, ports or sheet entries with no match, duplicate or
+    unannotated designators, unused parts of a multi-part component, pin-type conflicts
+    (two outputs on one net), nets with no driving source, off-grid objects, or first in
+    a schematic review. Altium's own ERC result is never saved in the project files, so
+    the saved sheets are compiled offline and checked here; Compile in Altium is final.
+
+    Violations use Altium's violation-type names and groups (Components, Documents, Nets,
+    Others) and its message wording, each with level, sheet, object, net, location in mil
+    and a suggested fix. Nets: Nets with only one pin, Nets with multiple names, Duplicate
+    Nets, Global Power-Object scope changes (a power port wired to a port or off-sheet
+    connector, Hierarchical scope), Floating net labels, Floating power objects,
+    Unconnected wires, Port with no matching ports (Flat and Global scope), Nets
+    containing floating input pins (an Input pin that is its net's only pin), Nets with
+    no driving source (an input pin and no IO, Output, Open Collector, HiZ, Open Emitter
+    or Power pin), Net Parameters with no value or no name, Missing Positive/Negative Net
+    in Differential Pair; judged by the Connection Matrix: Nets with possible connection
+    problems, Nets containing multiple similar objects (pins against pins on the net,
+    ports and sheet entries against their own sheet and matching port), Unconnected
+    objects in net (a pin alone on its net, a port or sheet entry nothing touches on its
+    sheet). Components: Duplicate Part Designators (with a note when the .Annotation file
+    makes the clash), Un-Designated parts requiring annotation, Unused sub-part in
+    component, Components containing duplicate sub-parts, Components with duplicate pins,
+    Sheet Symbol with duplicate entries. Documents: Port not linked to parent sheet symbol
+    and Sheet Entry not linked to child sheet (hierarchical scopes), Missing child sheet
+    for sheet symbol, Duplicate sheet numbers, Sheet Names Clash, Sheets containing
+    duplicate ports. Others: Off-grid object (the sheet's snap grid, when snap is on),
+    Object not completely within sheet boundaries, Floating Directive Object;
+    not_checked lists the rest. Levels are the project's Error Reporting levels (Altium's
+    defaults where unset; Duplicate sheet numbers and Port with no matching ports, with
+    no documented default, are assumed No Report); Connection Matrix violations take the
+    matrix cell's level. Errors come first; off-grid and off-sheet violations come last
+    in their level, one row per sheet with a count and examples unless checks names
+    them. Types set to No Report, and violations under an active No ERC (on the object,
+    or anywhere on the net for a violation about the whole net), are counted in
+    summary.suppressed, not listed (min_level="all" lists them, marked); compile-masked
+    parts and objects give none.
+    Advisories (level info, not Altium violations): near_duplicate_power_aliases (3V3,
+    3.3V, VCC_3V3 on separate nets), label_casing (names differing only in case),
+    near_miss_wire_ends (a wire end a few mil short of a pin: drawn, not connected),
+    ground_nets (each ground net with its pin count).
+
+    checks narrows to violation names, groups or advisory names; sheet to one sheet;
+    min_level warning (default), error, fatal or all. report="single_pin_nets" lists every
+    single-pin net with its pin and sheet whatever its level. Paginated (offset from
+    next_offset); the summary, levels and advisories come with the first page."""
+    try:
+        project, netlist, _ = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    try:
+        compiled, model = _offline_erc(project)
+    except Exception as e:
+        return json.dumps({"error": "compile_failed", "message": f"{type(e).__name__}: {e}"})
+    context: dict = {"project": project.get("name"), "net_identifier_scope": compiled.scope,
+                     "netlist_updated_utc": _netlist_last_updated,
+                     "compiled_from": "the sheets as saved now"}
+    if not _offline(netlist):
+        context["netlist_note"] = (
+            "The loaded netlist is Altium's; the ERC compiled the saved sheets offline, so "
+            "a net may be named differently where compile_warnings say the offline "
+            "compile could not settle it.")
+    if not offset and report == "violations":
+        warnings = [{"kind": w["kind"], "count": w["count"]} for w in compiled.warnings]
+        if warnings:
+            context["compile_warnings"] = warnings
+        if compiled.sheet_errors:
+            context["sheet_errors"] = compiled.sheet_errors
+    for limit, advisories in ERC_PAGE_LIMITS:
+        page = page_erc(model, checks=checks, sheet=sheet, min_level=min_level, report=report,
+                        offset=offset, limit=limit, advisory_limit=advisories)
+        if "error" in page:
+            return json.dumps(page)
+        result = {**context, **page}
+        if limit < ERC_PAGE_LIMITS[0][0]:
+            result["page_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 @mcp.tool(
     title="Check Vias",
     annotations=ToolAnnotations(readOnlyHint=True),
@@ -5335,8 +5512,9 @@ def check_release_readiness(offset: int = 0) -> str:
     not_verified, not_applicable), blocking, one line of evidence from the check behind
     it and source_tool (the tool to call for the details). Gates: Batch DRC report clean
     and newer than the board (get_drc_report), ERC (blocking and always not_verified: no
-    ERC result is saved in the files; says whether an OutJob ERC validation output makes
-    the Releaser run it), netlist newer than every sheet, schematic and PCB in sync
+    ERC result is saved in the files; quotes run_erc's offline counts as evidence and
+    says whether an OutJob ERC validation output makes the Releaser run it), netlist
+    newer than every sheet, schematic and PCB in sync
     (check_sch_pcb_sync; both need the netlist), no unrouted nets (check_connectivity),
     polygons not shelved or modified (check_pcb_health), board outline, global fiducials
     per assembled side (check_dfm), mounting holes, Not Fitted parts left out of the BOM
@@ -5371,6 +5549,7 @@ def check_release_readiness(offset: int = 0) -> str:
         fab_board_reader=_fab_board_reader(project, netlist),
         fab_bom=_fab_bom(project, netlist, variant_state),
         clone_status=clone_status,
+        offline_erc=lambda: _offline_erc_summary(project),
     )
     model = build_release_readiness(inputs)
     for limit in (len(model["gates"]) or 1, 12, 6, 3, 1):
@@ -5385,16 +5564,24 @@ Project: {name}
 Sheets: {sheets}
 Active variant: {active_variant}
 
-You are starting a structured schematic review. Ask the user to choose
-a scope before doing anything:
+You are starting a structured schematic review.
+
+First call run_erc once: the offline approximation of Altium's ERC (Altium never saves
+its own ERC result; say so). Show its summary (counts by level and violation type) and
+its Errors and Fatal Errors in one short table (Violation | Sheet | Object | Message);
+mention the warning count and the advisories (near-miss wire ends, rail aliases) without
+listing every warning. These are the review's first evidence, not its conclusions.
+
+Then ask the user to choose a scope:
   - A specific sheet (e.g. "{first_sheet}")
   - The full project ({n} sheets, one at a time)
 
 For large projects, consider reviewing each sheet as an independent task dispatched
 in parallel — one agent per sheet or functional block. Each agent can self-initialize:
 set_project_dir("{root_dir}") → set_active_variant("{active_variant}") →
-get_sheet_context(sheet_name="<assigned sheet>"), then run Phases 1–2 and return
-their tables. Merge all results into a single Phase 3 report with an added "Sheet" column.
+get_sheet_context(sheet_name="<assigned sheet>") → run_erc(sheet="<assigned sheet>"),
+then run Phases 1–2 and return their tables. Merge all results into a single Phase 3
+report with an added "Sheet" column.
 
 Do not proceed until the user answers.
 
@@ -5451,6 +5638,12 @@ At minimum, check:
    all cross-sheet references; flag dangling or unexpected appearances
 5. Failure modes — for each sub-circuit: what happens if inputs are out
    of range, or a passive is off by 10%?
+6. ERC — run_erc(sheet="<sheet>", min_level="warning") for the sheet under review:
+   explain each Error and each connectivity warning (floating net labels or power
+   ports, unconnected wires, single-pin nets, ports or sheet entries with no match,
+   near_miss_wire_ends) from the circuit, and say whether it is a real fault or
+   intended (an intended one wants a No ERC or a level change, not a redesign).
+   Off-grid and off-sheet warnings are housekeeping: count them, do not list them.
 
 For circuit types that require it, apply first principles beyond this
 list. The topology determines what matters.
@@ -5467,7 +5660,7 @@ Present findings as three Markdown tables:
   Table 1 — Critical Issues
   | Component | Issue | Datasheet Requires | Schematic Shows |
 
-  Table 2 — Warnings & Nitpicks
+  Table 2 — Warnings & Nitpicks (ERC warnings judged in Phase 2 included)
   | Component | Observation |
 
   Table 3 — Verified Critical Nets
@@ -5573,9 +5766,12 @@ interface ICs, and say in the report that pins were not checked against the sche
 
 @mcp.tool(title="Schematic Review", annotations=ToolAnnotations(readOnlyHint=True))
 def schematic_review() -> str:
-    """Start a structured schematic review. Call when the user explicitly asks to review
-    or verify the schematic (e.g. 'review this', 'check my schematic', 'do a design review',
-    'is this correct?', 'does this look right?'). Do not call for general questions."""
+    """Start a structured schematic review: run_erc first (the offline approximation of
+    Altium's ERC, its errors shown before anything else), then a scope question,
+    understanding, an evidenced audit per sheet (ERC findings judged from the circuit)
+    and three tables. Call when the user explicitly asks to review or verify the
+    schematic (e.g. 'review this', 'check my schematic', 'do a design review', 'is this
+    correct?', 'does this look right?'). Do not call for general questions."""
     try:
         _require_project()
     except ProjectNotReady as e:
@@ -5601,7 +5797,8 @@ def schematic_review() -> str:
         prompt += (
             "\n\nNote: this project's netlist was compiled offline by the copilot from the "
             "saved sheets (netlist_source offline_compiler): Altium's compiler and ERC did not "
-            "run. Say so in the review and pass on the load's compile_warnings.")
+            "run (run_erc is the offline approximation). Say so in the review and pass on the "
+            "load's compile_warnings.")
     return prompt
 
 

@@ -508,21 +508,8 @@ class AltiumClient:
         compile_warnings. A compile of unchanged files is reused. Raises when the project
         cannot be compiled at all; a sheet that cannot be read is a sheet error."""
         started = time.time()
-        if sheet_paths is None:
-            sheet_paths = _sheet_paths_for(project_path)
-        if annotation_paths is None:
-            annotation_paths = _annotation_paths_for(project_path)
-        signature = file_signature([project_path, *sheet_paths, *annotation_paths])
-        annotation, annotation_errors = _read_annotation(annotation_paths)
-        if self._compiled is not None and self._compiled[0] == signature:
-            compiled = self._compiled[1]
-        else:
-            compiled = compile_netlist(project_path, annotation, sheet_paths)
-            self._compiled = (signature, compiled)
-        if not compiled.sheets:
-            # Nothing to compile: an empty netlist would pass for a design without nets.
-            errors = "; ".join(f"{e['sheet']}: {e['error']}" for e in compiled.sheet_errors[:3])
-            raise RuntimeError(f"no sheet of the project could be read ({errors or 'none listed'})")
+        compiled, annotation, annotation_errors = self._compile(
+            project_path, sheet_paths, annotation_paths)
         netlist: dict = {
             "nets": {name: list(pins) for name, pins in compiled.nets.items()},
             "pin_to_net": {refdes: dict(pins) for refdes, pins in compiled.pin_to_net.items()},
@@ -543,6 +530,34 @@ class AltiumClient:
             netlist["sheet_errors"] = [{"sheet": "*", "path": "", "error": f"{type(e).__name__}: {e}"}]
         self._netlist = netlist
         return netlist
+
+    def compiled_netlist(self, project_path: str, sheet_paths: list[str] | None = None,
+                         annotation_paths: list[str] | None = None):
+        """sch_netlister's CompiledNetlist of the saved sheets (with its ERC facts), from
+        the same cache as compile_offline; the loaded netlist is left as it is. Raises
+        when no sheet can be read."""
+        return self._compile(project_path, sheet_paths, annotation_paths)[0]
+
+    def _compile(self, project_path: str, sheet_paths: list[str] | None,
+                 annotation_paths: list[str] | None):
+        """(CompiledNetlist, .Annotation entries, annotation errors); a compile of
+        unchanged files is reused."""
+        if sheet_paths is None:
+            sheet_paths = _sheet_paths_for(project_path)
+        if annotation_paths is None:
+            annotation_paths = _annotation_paths_for(project_path)
+        signature = file_signature([project_path, *sheet_paths, *annotation_paths])
+        annotation, annotation_errors = _read_annotation(annotation_paths)
+        if self._compiled is not None and self._compiled[0] == signature:
+            compiled = self._compiled[1]
+        else:
+            compiled = compile_netlist(project_path, annotation, sheet_paths)
+            self._compiled = (signature, compiled)
+        if not compiled.sheets:
+            # Nothing to compile: an empty netlist would pass for a design without nets.
+            errors = "; ".join(f"{e['sheet']}: {e['error']}" for e in compiled.sheet_errors[:3])
+            raise RuntimeError(f"no sheet of the project could be read ({errors or 'none listed'})")
+        return compiled, annotation, annotation_errors
 
     def _load_enriched(self, net_path: str | Path, sheet_paths: list[str],
                        annotation_paths: list[str] | None = None) -> dict:

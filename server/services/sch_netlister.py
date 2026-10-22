@@ -13,7 +13,8 @@ placement or channel. The sheets are then joined by the project's Net Identifier
 - Global: ports and net labels join by name everywhere (a port and a net label of one
   name are not joined by the name alone).
 - Hierarchical: a sheet entry joins the port of its name on the sheet its symbol
-  places, in that copy only. A power port wired to a port is local to its sheet.
+  places, in that copy only. A power port wired to a port or an off-sheet connector is
+  local to its sheet (Altium: Global Power-Object scope changes).
 - Strict Hierarchical: as Hierarchical, and every power port is local to its sheet.
 - Automatic resolves to one of these as Altium does (design_hierarchy.effective_scope).
 
@@ -46,14 +47,16 @@ try:
     from parsers.annotation import AnnotationEntry
     from parsers.prj_pcb import parse_prj_options, parse_prj_pcb
     from parsers.sch_doc import (
-        ComponentMeta, LineIndex, SheetConnectivity, parse_sch_connectivity,
+        ComponentMeta, LineIndex, NoErc, ParameterSet, SheetConnectivity,
+        parse_sch_connectivity,
     )
     from services.design_hierarchy import child_sheet, effective_scope
 except ImportError:
     from server.parsers.annotation import AnnotationEntry
     from server.parsers.prj_pcb import parse_prj_options, parse_prj_pcb
     from server.parsers.sch_doc import (
-        ComponentMeta, LineIndex, SheetConnectivity, parse_sch_connectivity,
+        ComponentMeta, LineIndex, NoErc, ParameterSet, SheetConnectivity,
+        parse_sch_connectivity,
     )
     from server.services.design_hierarchy import child_sheet, effective_scope
 
@@ -62,6 +65,12 @@ except ImportError:
 # the PCB made from its netlist) joins: pin ends 0.6-1.3 mil off the wire drawn to them.
 # Net labels 3-5 mil off a wire are not joined to it.
 JUNCTION_TOLERANCE_MIL = 3.0
+# A wire end this close to a pin end it does not reach is reported as a near miss (ERC
+# advisory): drawn to the pin, but too far off to connect.
+NEAR_MISS_MIL = 10.0
+# ErcSheet.points' object number for a point the sheet-boundary check reads and the grid
+# check does not (a sheet symbol's far corner: its size need not be on the grid).
+SHEET_ONLY = -2
 MAX_DEPTH = 32
 MAX_EXAMPLES = 10
 DEFAULT_DESIGNATOR_FORMAT = "$Component_$RoomName"
@@ -91,6 +100,162 @@ def natural_key(text: str) -> list:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
+# ---------- what the offline ERC reads (services/erc.py) ----------
+
+@dataclass
+class ErcObject:
+    """An object on a compiled net. kind: pin, hidden_pin (joined by its HiddenNetName),
+    label, power, port, entry, off_sheet or harness_entry."""
+    kind: str
+    text: str                 # pins: <physical designator>-<pin>; else the name as drawn
+    sheet: str
+    x_mil: float
+    y_mil: float
+    io_type: str = ""         # pins: electrical type; ports and sheet entries: I/O type
+    bus: bool = False         # a ranged (bus) name, a harness port or entry, a Repeat entry
+    key: tuple = ()           # pins: (physical designator, pin); others: (copy, object)
+    copy: int = -1            # the compiled sheet copy it is drawn on
+    peers: tuple = ()         # sheet entries: the copies its symbol places (their ports)
+    obj: int = -1             # its number among its sheet's wired objects (every copy)
+    attached: bool = True     # touches a wire, bus or other object (else it floats)
+
+
+@dataclass
+class ErcNoErc:
+    """An active No ERC marker on a net, and the object it sits on (an ErcObject key;
+    None when it sits on a wire, line being that wire's number on its sheet)."""
+    sheet: str
+    x_mil: float
+    y_mil: float
+    suppress_all: bool
+    error_kinds: str = ""
+    connection_pairs: str = ""
+    on: tuple | None = None
+    obj: int | None = None    # the object's number on its sheet (ErcObject.obj)
+    line: int | None = None
+
+
+@dataclass
+class ErcNet:
+    """One compiled net (pinless ones included) as the ERC reads it."""
+    name: str                 # Altium's name for it: before any _1 suffix the netlist adds
+    generated: bool           # a Net<designator>_<pin> name
+    netlist_name: str | None  # its name in CompiledNetlist.nets, None when not listed there
+    pins: list[tuple[str, str]] = field(default_factory=list)  # distinct, natural order
+    objects: list[ErcObject] = field(default_factory=list)
+    wired: bool = False       # a wire is part of it
+    no_ercs: list[ErcNoErc] = field(default_factory=list)
+
+
+@dataclass
+class ErcPart:
+    """A placed part (one per compiled copy of its sheet)."""
+    sheet: str
+    index: int                # its position among the sheet's parts
+    copy: int                 # the compiled sheet copy
+    designator: str           # as drawn
+    physical: str | None      # compiled designator; None when masked or not annotated
+    part_id: str
+    part_count: str           # PartCount: number of parts + 1
+    x_mil: float
+    y_mil: float
+    masked: bool = False
+    annotated: bool = False   # physical from the board-level .Annotation file
+
+
+@dataclass
+class ErcParameterSet:
+    """A Parameter Set directive, per compiled copy, with the net it is attached to."""
+    sheet: str
+    copy: int
+    room: str
+    x_mil: float
+    y_mil: float
+    parameters: list[tuple[str, str]]
+    attached: bool            # on a wire, bus, harness or sheet symbol
+    net: str | None           # the wire's net (Altium's name), None when not on a net
+
+
+@dataclass
+class ErcScopeChange:
+    """A power port made local by the port or off-sheet connector on its wiring
+    (Hierarchical scope)."""
+    sheet: str
+    name: str
+    x_mil: float
+    y_mil: float
+    port: str                 # the port's (or off-sheet connector's) name
+    port_x_mil: float
+    port_y_mil: float
+    obj: int = -1             # the power port's number among its sheet's objects
+    port_kind: str = "Port"   # Port or Off Sheet Connector
+
+
+@dataclass
+class ErcSymbol:
+    """A sheet symbol as drawn, the project sheet its file names and its entries."""
+    index: int                # its number among the sheet's symbols
+    designator: str
+    file_name: str
+    child: str | None         # the child sheet's name; None when no sheet of the project
+    x_mil: float              # top-left corner
+    y_mil: float
+    width_mil: float
+    height_mil: float
+    entries: list[ErcObject] = field(default_factory=list)  # kind entry, text: the name
+
+
+@dataclass
+class ErcSheet:
+    """One sheet document as drawn (not per compiled copy): what the document checks
+    (ports and entries matched, duplicates, off-grid and off-sheet objects, floating
+    objects and wires) read, with its objects numbered as ErcObject.obj numbers them."""
+    name: str
+    path: str
+    sheet_style: str
+    width_mil: float
+    height_mil: float
+    portrait: bool
+    snap_grid_mil: float | None
+    snap_grid_on: bool
+    sheet_number: str
+    objects: list[ErcObject] = field(default_factory=list)   # wired objects, first copy
+    wires: list[list[tuple[float, float]]] = field(default_factory=list)  # kept wires
+    unconnected: list[int] = field(default_factory=list)     # wires joined to no object
+    line_group: list[int] = field(default_factory=list)      # each wire's group
+    symbols: list[ErcSymbol] = field(default_factory=list)
+    placed_by: list[tuple[str, int]] = field(default_factory=list)  # (parent, symbol)
+    no_ercs: list[ErcNoErc] = field(default_factory=list)    # active ones on this sheet
+    floating_no_ercs: list[ErcNoErc] = field(default_factory=list)  # on nothing at all
+    # Every drawn point to place on the grid and the sheet besides wire vertices:
+    # (object, x, y, ErcObject.obj or -1), for drawn pins (parts outside compile masks,
+    # annotated or not), net labels, power ports, ports, junctions, off-sheet connectors
+    # and the corners of sheet symbols (the far corner, SHEET_ONLY, is not a grid point).
+    points: list[tuple[str, float, float, int]] = field(default_factory=list)
+    # Pins of one placed part sharing a designator: (part as drawn, pin, first point,
+    # second point).
+    duplicate_pins: list[tuple[str, str, tuple, tuple]] = field(default_factory=list)
+    # Wire ends that miss a pin end by a few mil: (pin as drawn, x, y, distance).
+    near_misses: list[tuple[str, float, float, float]] = field(default_factory=list)
+
+
+@dataclass
+class ErcFacts:
+    scope: str = ""                                        # the effective net scope
+    nets: list[ErcNet] = field(default_factory=list)
+    parts: list[ErcPart] = field(default_factory=list)
+    parameter_sets: list[ErcParameterSet] = field(default_factory=list)
+    scope_changes: list[ErcScopeChange] = field(default_factory=list)
+    naming: dict[str, str] = field(default_factory=dict)   # the project's net naming keys
+    design: dict[str, str] = field(default_factory=dict)   # its [Design] options
+    sheets: list[ErcSheet] = field(default_factory=list)   # readable sheets, project order
+    project: str = ""                                      # the .PrjPcb's name
+    sheet_paths: list[str] = field(default_factory=list)   # every listed sheet
+    # .Annotation entries whose UniqueId path names no placed part (a sheet symbol or part
+    # replaced since the file was written): designators it gives may be stale.
+    stale_annotation: int = 0
+
+
 @dataclass
 class CompiledNetlist:
     """The netlist in the server's .NET shape, and what enrichment and diagnostics need."""
@@ -109,6 +274,8 @@ class CompiledNetlist:
     # Each compiled part's UniqueId path (symbols, then the part; upper case, no leading
     # backslash) -> its physical designator: what a PCB's SOURCEUNIQUEID names.
     part_paths: dict[str, str] = field(default_factory=dict)
+    # Every net with its objects, the placed parts, parameter sets and No ERC markers.
+    erc: ErcFacts | None = None
 
 
 class _UnionFind:
@@ -151,18 +318,55 @@ class _Wiring:
     connectors: dict[int, int] = field(default_factory=dict)  # harness connector -> object
     live: set[int] = field(default_factory=set)      # parts compiled (not masked, annotated)
     masked: int = 0                                   # parts removed by compile masks
+    # For the ERC: each object's first point, the groups holding a wire, the masked
+    # parts, and each No ERC marker / parameter set with the group it sits on (None: on
+    # no object or wire) and, for a No ERC, the object at its point.
+    points: list[tuple[float, float]] = field(default_factory=list)
+    wired: set[int] = field(default_factory=set)
+    masked_parts: set[int] = field(default_factory=set)
+    no_ercs: list[tuple[NoErc, int | None, int | None]] = field(default_factory=list)
+    parameter_sets: list[tuple[ParameterSet, int | None, bool]] = field(default_factory=list)
+    # The objects touching a wire, bus or other object at their points (a net label or
+    # power port that does not is floating); the wires kept (not under a compile mask) by
+    # line number with each one's group; the wires whose group holds no object but
+    # junctions; and per active No ERC (as in no_ercs) the wire it sits on and whether
+    # it sits on nothing at all (a bus counts as something).
+    attached: set[int] = field(default_factory=set)
+    lines: list[list[tuple[float, float]]] = field(default_factory=list)
+    line_group: list[int] = field(default_factory=list)
+    unconnected: list[int] = field(default_factory=list)
+    no_erc_lines: list[int | None] = field(default_factory=list)
+    no_erc_floating: list[bool] = field(default_factory=list)
+    # Wire ends touching nothing that pass within NEAR_MISS_MIL of a compiled pin's end
+    # (beyond the junction tolerance): (line, end point, pin index, distance).
+    near_misses: list[tuple[int, tuple[float, float], int, float]] = field(default_factory=list)
 
 
-def _live_parts(sheet: SheetConnectivity) -> tuple[set[int], int]:
-    """Parts that compile: annotated (no '?') and not removed by a compile mask. A part
-    inside a mask is removed even when another part of its component is outside one (its
-    pins connect nothing), as parse_sch_doc's components have it."""
+def _in_masks(sheet: SheetConnectivity, point) -> bool:
+    """Whether a point lies under one of the sheet's enabled compile masks."""
+    return any(x0 <= point[0] <= x1 and y0 <= point[1] <= y1
+               for x0, y0, x1, y1 in sheet.masks)
+
+
+def _port_groups(wiring: _Wiring) -> dict[int, int]:
+    """The wiring groups holding a port or an off-sheet connector, each with one of those
+    objects: a power port in such a group is local to its sheet under Hierarchical scope."""
+    found = {wiring.group[o]: o for objs in wiring.ports.values() for o in objs}
+    for obj, (kind, _) in enumerate(wiring.objects):
+        if kind == "off_sheet":
+            found.setdefault(wiring.group[obj], obj)
+    return found
+
+
+def _live_parts(sheet: SheetConnectivity) -> tuple[set[int], set[int]]:
+    """Parts that compile: annotated (no '?') and not removed by a compile mask, and the
+    masked ones. A part inside a mask is removed even when another part of its component
+    is outside one (its pins connect nothing), as parse_sch_doc's components have it."""
     live: set[int] = set()
-    masked = 0
+    masked: set[int] = set()
     for index, part in enumerate(sheet.parts):
-        x, y = part.origin
-        if any(x0 <= x <= x1 and y0 <= y <= y1 for x0, y0, x1, y1 in sheet.masks):
-            masked += 1
+        if _in_masks(sheet, part.origin):
+            masked.add(index)
         elif part.designator.strip() and "?" not in part.designator:
             live.add(index)
     return live, masked
@@ -171,11 +375,11 @@ def _live_parts(sheet: SheetConnectivity) -> tuple[set[int], int]:
 def wire_sheet(sheet: SheetConnectivity) -> _Wiring:
     """Join one sheet's objects by geometry and by name, see the module docstring."""
     result = _Wiring()
-    result.live, result.masked = _live_parts(sheet)
+    result.live, result.masked_parts = _live_parts(sheet)
+    result.masked = len(result.masked_parts)
 
     def inside(point) -> bool:
-        return any(x0 <= point[0] <= x1 and y0 <= point[1] <= y1
-                   for x0, y0, x1, y1 in sheet.masks)
+        return _in_masks(sheet, point)
 
     def kept(point) -> bool:
         return not (sheet.masks and inside(point))
@@ -216,18 +420,27 @@ def wire_sheet(sheet: SheetConnectivity) -> _Wiring:
         node = len(parent)
         parent.append(node)
         result.objects.append((kind, payload))
+        result.points.append(tuple(points[0]) if points else (0.0, 0.0))
+        touched = False
         for x, y in points:
             if wire:
                 for other in wires.at(x, y):
                     union(node, other)
+                    touched = True
+            on_buses = buses.at(x, y)
+            touched |= bool(on_buses)
             if bus:
-                for other in buses.at(x, y):
+                for other in on_buses:
                     union(node, offset + other)
             key = (round(x * 100), round(y * 100))
             if key in at:
                 union(node, at[key])
+                touched = True
+                result.attached.add(at[key] - first_object)
             else:
                 at[key] = node
+        if touched:
+            result.attached.add(node - first_object)
         if name is not None:
             # On one sheet, objects of one name in one name space are one net.
             if name in result.names:
@@ -241,6 +454,7 @@ def wire_sheet(sheet: SheetConnectivity) -> _Wiring:
             result.pins[index] = add("pin", index, [pin.point])
             for other in wires.near(pin.point[0], pin.point[1], JUNCTION_TOLERANCE_MIL):
                 union(first_object + result.pins[index], other)
+                result.attached.add(result.pins[index])
     for point in sheet.junctions:
         if kept(point):
             # A junction joins the wires at it, and the buses at it, never one to the other.
@@ -272,8 +486,78 @@ def wire_sheet(sheet: SheetConnectivity) -> _Wiring:
                                        bus=True)
         for name, point in connector.entries:
             add("harness_entry", (index, name), [point])
+    marks = [(item, _marked(item, at, wires, result.points, first_object))
+             for item in sheet.no_ercs if item.active and kept((item.x_mil, item.y_mil))]
     result.group = [find(first_object + i) for i in range(len(result.objects))]
+    result.wired = {find(node) for node in range(offset)}
+    result.lines = wires.lines
+    result.line_group = [find(node) for node in range(offset)]
+    electrical = {group for group, (kind, _) in zip(result.group, result.objects)
+                  if kind != "junction"}
+    result.unconnected = [node for node in range(offset)
+                          if result.line_group[node] not in electrical]
+    result.near_misses = _near_misses(sheet, result, wires, buses, at)
+    for item, (node, obj) in marks:
+        result.no_ercs.append((item, None if node is None else find(node), obj))
+        on_line = node if node is not None and obj is None else None
+        result.no_erc_lines.append(on_line)
+        result.no_erc_floating.append(node is None and not buses.at(item.x_mil, item.y_mil))
+    for item in sheet.parameter_sets:
+        # A parameter set attaches to a wire, bus, signal harness or sheet symbol; a
+        # compile mask hides it.
+        x, y = item.x_mil, item.y_mil
+        if not kept((x, y)):
+            continue
+        lines = sorted(wires.at(x, y)) or sorted(wires.near(x, y, JUNCTION_TOLERANCE_MIL))
+        elsewhere = not lines and (bool(buses.at(x, y)) or any(
+            s.x_mil <= x <= s.x_mil + s.width_mil and s.y_mil - s.height_mil <= y <= s.y_mil
+            for s, _ in sheet.symbols))
+        result.parameter_sets.append((item, find(lines[0]) if lines else None, elsewhere))
     return result
+
+
+def _near_misses(sheet: SheetConnectivity, wiring: _Wiring, wires: LineIndex,
+                 buses: LineIndex, at: dict) -> list[tuple[int, tuple[float, float], int, float]]:
+    """Wire ends that touch no other wire, object, bus or pin end yet lie within
+    NEAR_MISS_MIL of a compiled pin's end: a wire drawn to a pin that misses it."""
+    cells: dict[tuple[int, int], list[tuple[int, tuple[float, float]]]] = defaultdict(list)
+    for index in wiring.pins:
+        x, y = sheet.pins[index].point
+        cells[(int(x // NEAR_MISS_MIL), int(y // NEAR_MISS_MIL))].append((index, (x, y)))
+    if not cells:
+        return []
+    found = []
+    for line, vertices in enumerate(wires.lines):
+        for x, y in (vertices[0], vertices[-1]):
+            column, row = int(x // NEAR_MISS_MIL), int(y // NEAR_MISS_MIL)
+            ends = [end for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+                    for end in cells.get((column + dx, row + dy), ())]
+            if not ends or (wires.at(x, y) - {line} or (round(x * 100), round(y * 100)) in at
+                            or buses.at(x, y)):
+                continue
+            distance, index = min((((px - x) ** 2 + (py - y) ** 2) ** 0.5, index)
+                                  for index, (px, py) in ends)
+            if JUNCTION_TOLERANCE_MIL < distance <= NEAR_MISS_MIL:
+                found.append((line, (x, y), index, distance))
+    return found
+
+
+def _marked(item: NoErc, at: dict, wires: LineIndex, points: list,
+            first_object: int) -> tuple[int | None, int | None]:
+    """The node a No ERC marker sits on and the object there, as parse_sch_hierarchy
+    reads it: the object at its point (else one within the junction tolerance), else a
+    wire through it. It joins nothing."""
+    x, y = item.x_mil, item.y_mil
+    node = at.get((round(x * 100), round(y * 100)))
+    if node is None:
+        near = [(abs(px - x) + abs(py - y), i) for i, (px, py) in enumerate(points)
+                if abs(px - x) <= JUNCTION_TOLERANCE_MIL and abs(py - y) <= JUNCTION_TOLERANCE_MIL]
+        if near:
+            node = first_object + min(near)[1]
+    if node is not None:
+        return node, node - first_object
+    lines = sorted(wires.at(x, y)) or sorted(wires.near(x, y, JUNCTION_TOLERANCE_MIL))
+    return (lines[0], None) if lines else (None, None)
 
 
 # ---------- the sheet tree ----------
@@ -301,6 +585,7 @@ class _Compiler:
         except (OSError, UnicodeDecodeError):
             design = {}
         self.paths = list(sheet_paths if sheet_paths is not None else prj.sheet_paths)
+        self.project_name = Path(prj_pcb_path).stem
         self.mode = prj.hierarchy_mode
         self.naming = prj.net_naming
         self.design = design
@@ -331,6 +616,9 @@ class _Compiler:
         # union-find root (what a validation needs to tell duplicate designators apart).
         self.components: dict[str, list[dict]] = {}
         self.net_roots: dict = {}
+        # (compiled copy, part index on its sheet) -> physical designator, live parts only.
+        self.part_physical: dict[tuple[int, int], str] = {}
+        self.part_annotated: set[tuple[int, int]] = set()  # ... whose came from .Annotation
         self.annotation_by_path: dict[str, list[AnnotationEntry]] = defaultdict(list)
         for entry in annotation:
             self.annotation_by_path[entry.unique_id.strip("\\").upper()].append(entry)
@@ -416,7 +704,7 @@ class _Compiler:
 
     def _channel_text(self, number: int) -> str:
         style = _int(self.design.get("ChannelRoomNamingStyle", "0"))
-        return _alpha(number) if style in ALPHA_STYLES else str(number)
+        return alpha(number) if style in ALPHA_STYLES else str(number)
 
     def scope(self, instances: list[_Instance]) -> str:
         tops = {i.sheet for i in instances if i.depth == 0}
@@ -489,7 +777,7 @@ class _Compiler:
             def member(obj: int, name: str, number=number, wiring=wiring):
                 return _member(number, wiring.group[obj], name)
 
-            ported = {wiring.group[o] for objs in wiring.ports.values() for o in objs}
+            ported = _port_groups(wiring)
             suffix = f"_{instance.room}" if instance.room else ""
             for obj, (kind, payload) in enumerate(wiring.objects):
                 if kind == LABEL:
@@ -561,7 +849,7 @@ class _Compiler:
             self.warn("append_sheet_numbers", "Append Sheet Numbers to Local Nets is on, but "
                       "the offline compile does not append them: local net names lack "
                       "Altium's sheet-number suffix.")
-        return self._result(components, scope)
+        return self._result(components, scope, instances)
 
     def _join_entries(self, instances: list[_Instance]) -> None:
         """Hierarchical scopes: each sheet entry joins the port of its name on the copy
@@ -658,7 +946,7 @@ class _Compiler:
         index = instance.channel if instance.channel is not None else instance.index
         values = {
             "componentprefix": prefix, "componentindex": number, "component": designator,
-            "roomname": instance.room, "channelalpha": _alpha(index),
+            "roomname": instance.room, "channelalpha": alpha(index),
             "channelprefix": re.sub(r"\d+$", "", instance.level), "channelindex": str(index),
         }
         return _TOKEN_RE.sub(lambda m: values[m.group(1).lower()], text)
@@ -676,6 +964,9 @@ class _Compiler:
             for part_index in sorted(wiring.live):
                 part = sheet.parts[part_index]
                 physical, annotated = self._physical(instance, part)
+                self.part_physical[(number, part_index)] = physical
+                if annotated:
+                    self.part_annotated.add((number, part_index))
                 self.part_paths["\\".join([*instance.path, part.unique_id]).upper()] = physical
                 held = next((c for c in by_name[physical]
                              if part.part_id not in c["part_ids"]
@@ -723,7 +1014,8 @@ class _Compiler:
 
     # ----- nets, names and the result -----
 
-    def _result(self, components: dict[str, list[dict]], scope: str) -> CompiledNetlist:
+    def _result(self, components: dict[str, list[dict]], scope: str,
+                instances: list[_Instance]) -> CompiledNetlist:
         uf = self.uf
         self.components = components
         members: dict = defaultdict(set)
@@ -742,8 +1034,10 @@ class _Compiler:
         nets: dict[str, list[tuple[str, str]]] = {}
         taken: set[str] = set()
         harness_roots = {uf.find(entry) for entry, _, _ in self.harness}
+        bases: dict = {}  # root -> (name before any _1 suffix, generated)
         for pins, root in order:
             name, generated = self._name(candidates.get(root, []), pins)
+            bases[root] = (name, generated)
             if name.lower() in taken:
                 base, count = name, 1
                 while f"{base}_{count}".lower() in taken:
@@ -785,18 +1079,214 @@ class _Compiler:
         clashes = [{"sheet": Path(self.paths[i]).stem, "refdes": clash.refdes,
                     "lib_references": clash.lib_references}
                    for i, sheet in enumerate(self.sheets) if sheet for clash in sheet.clashes]
+        erc = self._erc_facts(instances, members, candidates, bases, scope)
         return CompiledNetlist(
             nets=nets, pin_to_net=pin_to_net, parts=parts, scope=scope,
             warnings=list(self.warnings.values()),
             sheets=[(Path(self.paths[i]).stem, sheet.components)
                     for i, sheet in enumerate(self.sheets) if sheet],
             sheet_errors=self.sheet_errors, designator_clashes=clashes,
-            channel_entries=self.channel_entries, part_paths=self.part_paths)
+            channel_entries=self.channel_entries, part_paths=self.part_paths, erc=erc)
 
-    def _name(self, found: list[tuple[str, str, int]],
-              pins: list[tuple[str, str]]) -> tuple[str, bool]:
+    def _erc_facts(self, instances: list[_Instance], members: dict, candidates: dict,
+                   bases: dict, scope: str) -> ErcFacts:
+        """Every net with its objects (pinless and single-pin ones included), the placed
+        parts, the parameter sets with their nets and, under Hierarchical scope, the power
+        ports a port or off-sheet connector makes local: what services/erc.py checks.
+        Entries of a compile-masked sheet symbol are left out (they are still wired)."""
+        uf = self.uf
+        facts = ErcFacts(scope=scope, naming=dict(self.naming), design=dict(self.design))
+        nets: dict = {}
+        placed: dict[tuple[int, int], list[int]] = defaultdict(list)  # (copy, symbol) -> copies
+        for number, instance in enumerate(instances):
+            if instance.parent is not None:
+                placed[(instance.parent, instance.symbol)].append(number)
+
+        def net(root) -> ErcNet:
+            held = nets.get(root)
+            if held is None:
+                pins = sorted(members.get(root, ()),
+                              key=lambda m: (natural_key(m[0]), natural_key(m[1])))
+                name, generated = bases.get(root) or self._name(
+                    candidates.get(root, []), pins, warn=False)
+                held = nets[root] = ErcNet(name, generated, self.net_roots.get(root), pins)
+            return held
+
+        changed: set[tuple[int, int]] = set()
+        documents: dict[int, ErcSheet] = {}
+        placed_paths: set[str] = set()  # every placed part's UniqueId path
+        for number, instance in enumerate(instances):
+            sheet, wiring = self.sheets[instance.sheet], self.wirings[instance.sheet]
+            stem = Path(self.paths[instance.sheet]).stem
+            groups = set(wiring.group)
+            document = documents.get(instance.sheet)
+            first = document is None
+            if first:
+                document = documents[instance.sheet] = self._erc_sheet(instance.sheet)
+            if instance.parent is not None:
+                where = (Path(self.paths[instances[instance.parent].sheet]).stem,
+                         instance.symbol)
+                if where not in document.placed_by:
+                    document.placed_by.append(where)
+
+            def root_of(group: int, number=number):
+                return uf.find(("g", number, group))
+
+            for obj, (kind, payload) in enumerate(wiring.objects):
+                item = self._erc_object(number, sheet, stem, wiring, obj, kind, payload)
+                if item is not None:
+                    item.copy, item.obj = number, obj
+                    item.attached = obj in wiring.attached
+                    if kind == ENTRY:
+                        item.peers = tuple(placed.get((number, payload[0]), ()))
+                    net(root_of(wiring.group[obj])).objects.append(item)
+                    if first:
+                        document.objects.append(item)
+            for group in wiring.wired & groups:
+                net(root_of(group)).wired = True
+            for index, pin in enumerate(sheet.pins):
+                if pin.hidden and pin.part in wiring.live and pin.hidden_net.strip():
+                    physical = self.part_physical.get((number, pin.part), "")
+                    net(uf.find(("h", number, index))).objects.append(ErcObject(
+                        "hidden_pin", f"{physical}-{pin.designator}", stem, *pin.point,
+                        _pin_type(sheet, pin), key=(physical, pin.designator), copy=number))
+            for (item, group, obj), line, floating in zip(
+                    wiring.no_ercs, wiring.no_erc_lines, wiring.no_erc_floating):
+                on = None
+                if obj is not None and wiring.objects[obj][0] == "pin":
+                    pin = sheet.pins[wiring.objects[obj][1]]
+                    on = (self.part_physical.get((number, pin.part), ""), pin.designator)
+                elif obj is not None:
+                    on = (number, obj)
+                mark = ErcNoErc(stem, item.x_mil, item.y_mil, item.suppress_all,
+                                item.error_kinds, item.connection_pairs, on, obj, line)
+                if first:
+                    (document.floating_no_ercs if floating else document.no_ercs).append(mark)
+                if group is not None and group in groups:
+                    net(root_of(group)).no_ercs.append(mark)
+            for item, group, on_bus in wiring.parameter_sets:
+                named = None
+                if group is not None and group in groups:
+                    named = net(root_of(group)).name or None
+                facts.parameter_sets.append(ErcParameterSet(
+                    stem, number, instance.room, item.x_mil, item.y_mil,
+                    list(item.parameters), group is not None or on_bus, named))
+            for index, part in enumerate(sheet.parts):
+                placed_paths.add("\\".join([*instance.path, part.unique_id]).upper())
+                facts.parts.append(ErcPart(
+                    stem, index, number, part.designator.strip(),
+                    self.part_physical.get((number, index)), part.part_id, part.part_count,
+                    *part.origin, masked=index in wiring.masked_parts,
+                    annotated=(number, index) in self.part_annotated))
+            if scope != "Hierarchical":
+                continue
+            ported = _port_groups(wiring)
+            for obj, (kind, payload) in enumerate(wiring.objects):
+                port = ported.get(wiring.group[obj])
+                if kind == POWER and port is not None and (instance.sheet, obj) not in changed:
+                    changed.add((instance.sheet, obj))
+                    port_kind, port_payload = wiring.objects[port]
+                    facts.scope_changes.append(ErcScopeChange(
+                        stem, payload.strip(), *wiring.points[obj],
+                        sheet.ports[port_payload][0].name if port_kind == PORT
+                        else port_payload.strip(), *wiring.points[port], obj=obj,
+                        port_kind="Port" if port_kind == PORT else "Off Sheet Connector"))
+        facts.nets = list(nets.values())
+        facts.sheets = [documents[index] for index in sorted(documents)]
+        facts.project = self.project_name
+        facts.sheet_paths = list(self.paths)
+        facts.stale_annotation = sum(1 for path in self.annotation_by_path
+                                     if path not in placed_paths)
+        return facts
+
+    def _erc_sheet(self, index: int) -> ErcSheet:
+        """One sheet document for the ERC's document checks (see ErcSheet)."""
+        sheet, wiring, path = self.sheets[index], self.wirings[index], self.paths[index]
+        document = ErcSheet(
+            Path(path).stem, path, sheet.sheet_style, sheet.width_mil, sheet.height_mil,
+            sheet.portrait, sheet.snap_grid_mil, sheet.snap_grid_on, sheet.sheet_number.strip(),
+            wires=wiring.lines, unconnected=wiring.unconnected, line_group=wiring.line_group)
+        for _, (x, y), pin_index, distance in wiring.near_misses:
+            pin = sheet.pins[pin_index]
+            document.near_misses.append(
+                (f"{sheet.parts[pin.part].designator.strip()}-{pin.designator}", x, y,
+                 round(distance, 2)))
+        points = document.points
+        seen: dict[tuple[int, str], tuple] = {}
+        for pin_index, pin in enumerate(sheet.pins):
+            if pin.part in wiring.masked_parts:
+                continue
+            drawn = sheet.parts[pin.part].designator.strip()
+            held = seen.setdefault((pin.part, pin.designator.strip().lower()), pin.point)
+            if held is not pin.point:
+                document.duplicate_pins.append((drawn, pin.designator, held, pin.point))
+            if not pin.hidden:
+                points.append((f"Pin {drawn}-{pin.designator}", *pin.point,
+                               wiring.pins.get(pin_index, -1)))
+        words = {LABEL: "Net Label", POWER: "Power Object", PORT: "Port",
+                 "off_sheet": "Off Sheet Connector", "junction": "Junction"}
+        for obj, (kind, payload) in enumerate(wiring.objects):
+            if kind in words:
+                text = sheet.ports[payload][0].name if kind == PORT else (payload or "")
+                label = f"{words[kind]} {text.strip()}".strip()
+                points.append((label, *wiring.points[obj], obj))
+        for symbol_index, (symbol, _) in enumerate(sheet.symbols):
+            if sheet.masks and _in_masks(sheet, (symbol.x_mil, symbol.y_mil)):
+                continue
+            child = child_sheet(self.paths, path, symbol.file_name)
+            item = ErcSymbol(symbol_index, symbol.designator.strip(), symbol.file_name,
+                             None if child is None else Path(self.paths[child]).stem,
+                             symbol.x_mil, symbol.y_mil, symbol.width_mil, symbol.height_mil)
+            label = f"Sheet Symbol {item.designator}".strip()
+            points.append((label, symbol.x_mil, symbol.y_mil, -1))
+            points.append((label, symbol.x_mil + symbol.width_mil,
+                           symbol.y_mil - symbol.height_mil, SHEET_ONLY))
+            for entry_index, entry in enumerate(symbol.entries):
+                obj = wiring.entries.get((symbol_index, entry_index))
+                if obj is not None:
+                    item.entries.append(ErcObject(
+                        ENTRY, entry.name.strip(), document.name, *wiring.points[obj],
+                        entry.io_type, bool(entry.harness_type), obj=obj,
+                        attached=obj in wiring.attached))
+            document.symbols.append(item)
+        return document
+
+    def _erc_object(self, number: int, sheet: SheetConnectivity, stem: str, wiring: _Wiring,
+                    obj: int, kind: str, payload) -> ErcObject | None:
+        x, y = wiring.points[obj]
+        if kind == "pin":
+            pin = sheet.pins[payload]
+            physical = self.part_physical.get((number, pin.part), "")
+            return ErcObject("pin", f"{physical}-{pin.designator}", stem, x, y,
+                             _pin_type(sheet, pin), key=(physical, pin.designator))
+        if kind in (LABEL, POWER, "off_sheet"):
+            text = payload.strip()
+            return ErcObject(kind, text, stem, x, y, bus=bus_members(text) is not None,
+                             key=(number, obj))
+        if kind == PORT:
+            port = sheet.ports[payload][0]
+            return ErcObject(PORT, port.name, stem, x, y, port.io_type,
+                             bool(port.harness_type) or bus_members(port.name) is not None,
+                             (number, obj))
+        if kind == ENTRY:
+            symbol, index = payload
+            drawn = sheet.symbols[symbol][0]
+            if sheet.masks and _in_masks(sheet, (drawn.x_mil, drawn.y_mil)):
+                # A compile-masked symbol's entries are still wired (the netlist keeps
+                # them), but the ERC reads nothing under a mask.
+                return None
+            entry = drawn.entries[index]
+            return ErcObject(ENTRY, entry.port_name, stem, x, y, entry.io_type,
+                             bool(entry.harness_type) or entry.repeated
+                             or bus_members(entry.port_name) is not None, (number, obj))
+        if kind == "harness_entry":
+            return ErcObject(kind, payload[1].strip(), stem, x, y, bus=True, key=(number, obj))
+        return None  # junctions, harness connectors
+
+    def _name(self, found: list[tuple[str, str, int]], pins: list[tuple[str, str]],
+              warn: bool = True) -> tuple[str, bool]:
         """The net's name by the project's netlist options (see the module docstring), and
-        whether it was generated from a pin."""
+        whether it was generated from a pin ("" for a net with neither)."""
         naming = self.naming
         order = [LABEL, POWER]
         if naming.get("PowerPortNamesTakePriority") == "1":
@@ -807,7 +1297,7 @@ class _Compiler:
             order.append(ENTRY)
         distinct = {name.lower() for kind, name, _ in found
                     if kind in (LABEL, POWER) and not bus_members(name)}
-        if len(distinct) > 1:
+        if warn and len(distinct) > 1:
             self.warn("multiple_net_names", "Nets carrying several names (net labels or power "
                       "ports); the name chosen follows the project's netlist options.",
                       ", ".join(sorted(distinct)[:4]))
@@ -820,8 +1310,16 @@ class _Compiler:
                 top = min(depth for depth, _ in named)
                 named = [item for item in named if item[0] == top]
             return min({name for _, name in named}, key=lambda n: (n.lower(), n)), False
+        if not pins:
+            return "", True
         refdes, pin = pins[0]
         return f"Net{refdes}_{pin}", True
+
+
+def _pin_type(sheet: SheetConnectivity, pin) -> str:
+    """A pin's electrical type from parse_sch_doc's components ("" when not known)."""
+    meta = sheet.components.get(sheet.parts[pin.part].designator.strip())
+    return meta.pin_types.get(pin.designator, "") if meta else ""
 
 
 def _member(copy: int, group: int, name: str) -> tuple:
@@ -836,7 +1334,7 @@ def _int(text: str) -> int:
         return 0
 
 
-def _alpha(number: int) -> str:
+def alpha(number: int) -> str:
     """1 -> A, 26 -> Z, 27 -> AA."""
     text = ""
     while number > 0:

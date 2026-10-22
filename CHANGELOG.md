@@ -6,6 +6,115 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `run_erc`: an offline approximation of Altium's ERC (roadmap #5, `services/erc.py`),
+  read-only, from the saved sheets compiled offline (the loaded netlist is left as it is)
+  and the project's Error Reporting levels and Connection Matrix. Altium never saves its
+  own ERC result in the project files; the output says so. Violations carry Altium's
+  violation-type names (project_options' list), groups (Components, Documents, Nets,
+  Others) and message wording from its Design Validation page, with
+  level, sheet, object, net, location in mil and a suggested fix. The level is the
+  project's for the type, else Altium's default (Nets with only one pin: No Report, as
+  Altium's documentation says; Duplicate sheet numbers and Port with no matching ports,
+  with no agreed default, are assumed No Report, as Altium's own project files write
+  them); Connection Matrix violations take the cell's level and are not reported when
+  their type is No Report. Errors come first; Off-grid object and Object not completely
+  within sheet boundaries come last in their level, and a page lists them one row per
+  sheet with a count and examples unless `checks` names them. 32 of Altium's types are
+  checked, each registered in a small registry:
+  - Nets: Nets with only one pin (a pin with a wire, label, port or power port on its net
+    and no other pin), Nets with multiple names (net labels, power ports, off-sheet
+    connectors, and sheet entries and ports when the project lets them name nets; bus
+    names left out), Duplicate Nets (two nets with one name, unless Append Sheet Numbers
+    to Local Nets is on), Global Power-Object scope changes (a power port wired to a port
+    or an off-sheet connector under Hierarchical scope; the compile now also makes a power
+    port on an off-sheet connector's wiring local, as Altium's documentation says, which
+    no example or surveyed board has), Floating net labels and Floating power objects
+    (touching no wire, bus, pin end or other object at their hot spot), Unconnected
+    wires (wiring that
+    reaches no object but junctions), Port with no matching ports (Flat and Global scope:
+    no other port of its name and no entry above it), Sheets containing duplicate ports,
+    Nets containing floating input pins (an Input pin that is its net's only pin: alone,
+    or on wiring that reaches no other pin), Nets with no driving source (an Input pin and
+    no IO, Output, Open Collector, HiZ, Open Emitter or Power pin, Altium's definition;
+    Passive pins drive nothing; the message lists the net's pins, as Altium's does), Net
+    Parameters with no value or no name, Missing Positive / Negative Net in Differential
+    Pair (Differential Pair directives on <pair>_P / <pair>_N nets, matched across the
+    design; a net with a channel's room suffix pairs within its channel).
+  - Judged by the Connection Matrix (group Nets, as on Altium's page): Nets with
+    possible connection problems and Nets containing multiple similar objects (pins
+    against pins on the whole net; ports and sheet entries
+    against the objects on their own sheet copy, each sheet entry against the port it
+    matches, ports against ports on every sheet under Flat and Global scope: judging
+    boundary objects across the flattened net reported correct hierarchical I/O as errors
+    on Altium's examples), Unconnected objects in net (the matrix's Unconnected column:
+    a pin alone on its net, a port or sheet entry nothing touches on its own sheet, even
+    when its net goes on through the hierarchy).
+  - Components: Duplicate Part Designators (with a note when a designator from the
+    project's .Annotation file makes the clash, and how many of its entries name no placed
+    part), Un-Designated parts requiring annotation, Unused sub-part in component and
+    Components containing duplicate sub-parts (from the
+    placed parts; compile-masked parts count as placed), Components with duplicate pins
+    (one placed part, its current display mode), Sheet Symbol with duplicate entries.
+  - Documents: Port not linked to parent sheet symbol (under a hierarchical scope, per
+    symbol placing the sheet), Sheet Entry not linked to child sheet, Missing child sheet
+    for sheet symbol, Duplicate sheet numbers (the SheetNumber sheet parameter; blank and
+    * left out), Sheet Names Clash (project sheets sharing a file name in different
+    folders).
+  - Others: Off-grid object (pin ends, wire vertices, net labels, power ports, ports,
+    junctions, off-sheet connectors and sheet symbols off the sheet's snap grid, as the
+    sheet header gives it; a sheet without one, or with snap off (SnapGridOn left out of
+    the header), is not checked and a note says so), Object not completely within sheet
+    boundaries (the same points beyond the sheet's size), Floating Directive Object
+    (Parameter Set and Differential Pair directives on no wire, bus, harness or sheet
+    symbol; No ERC markers on nothing).
+  Suppression: types at No Report, and violations under an active No ERC, are counted in
+  summary.suppressed and listed only with min_level="all". A No ERC suppresses a
+  violation about an object (an unconnected pin, port or sheet entry, a floating label, a
+  wire, an unmatched port, an off-grid point) when it sits on that object, and a violation
+  about a whole net (its names, drivers, pin types, its one pin, a floating input) when it
+  sits anywhere on that net: designers' markers in Altium's examples and the corpus sit on
+  a net's wiring or stub ends, not on the conflicting pins (unconfirmed in Altium); a
+  specific No ERC covers the types it names (all when they cannot be read). Compile masks
+  hide every part, wire, label, port, directive, sheet symbol (its entries included) and
+  point they cover. Advisories, level info and never mixed with Altium's names:
+  near-duplicate power aliases (separate nets read as one voltage, 3V3 / +3.3V /
+  VCC_3V3 / P3V3, by
+  `pull_resistors.rail_voltage` and `decoupling.net_kind`; a qualifier glued to the
+  voltage, 2V5OUT or 3V3A, names another rail), names differing only in case,
+  near-miss wire ends (a wire end touching nothing 3 to 10 mil from a pin's end: drawn to
+  the pin, not connected), and the ground nets with their pin counts.
+  report="single_pin_nets" lists every single-pin net with its pin and sheet whatever its
+  level. Filters: checks (violation names, groups, advisories), sheet, min_level
+  (warning, error, fatal, all); paginated and cut to fit. `schematic_review` now runs it
+  first (its errors before the scope question, its warnings judged per sheet in Phase 2);
+  `get_project_options` cites its counts (offline_erc) and says how many violations each
+  check set to No Report hides here (offline_erc_hidden); `check_release_readiness`
+  quotes its counts in the ERC gate's evidence, which stays blocking and not_verified.
+  Calibrated on Altium's AD25 examples (11 projects; MiniPC, the PC4 SODIMM, Harness A
+  report nothing; MiniPC's own levels switch off the 239 off-grid objects and 122
+  unmatched power entries this finds) and on a private corpus of 63 boards (aggregates
+  only: 12,988 violations, 12,481 of them off-grid objects on 57 boards drawn off their
+  sheet's snap grid; 55 errors; a first page is at most 52k characters, the off-grid
+  rows folded per sheet).
+- The offline compiler's ERC facts (`sch_netlister.ErcFacts`, `CompiledNetlist.erc`):
+  every net (single-pin and pinless ones included) with Altium's name for it, its pins,
+  objects (pins with their electrical type, labels, power ports, ports and sheet entries
+  with their I/O type, off-sheet connectors) with their locations and whether they touch
+  anything, its active No ERC markers and what each sits on; the placed parts per sheet
+  copy (and whether the .Annotation file named each), the .Annotation entries naming no
+  placed part; parameter sets with the net their wire is on; the power ports a port or
+  off-sheet connector makes local; and per sheet document (`ErcSheet`) its size and snap
+  grid, sheet number, symbols with their entries and child sheet, the sheets placing it,
+  unconnected wires,
+  floating No ERC markers, the points the grid and sheet checks read, duplicate pins and
+  near-miss wire ends. The netlist and its warnings are unchanged, but for a power port
+  wired to an off-sheet connector under Hierarchical scope (now local, as above).
+  `parse_sch_connectivity` reads No ERC markers (RECORD=22), parameter sets (43 with
+  their 41s), the sheet size and snap grid (31) and the SheetNumber parameter;
+  `AltiumClient.compiled_netlist` gives the cached compile without making it the loaded
+  netlist; `project_options.type_number` and `level_index` are public, with `erc_levels`
+  and `matrix_levels` reading the project's levels and matrix, and `sch_netlister.alpha`
+  (1 -> A) letters sub-parts.
 - `get_firmware_pin_map`: firmware pin map and firmware-facing pinout review (roadmap #20,
   `services/firmware_pins.py`), read-only and offline from the compiled netlist; the
   PcbDoc is read only when a debug or memory pin reaches no connector or test part, for

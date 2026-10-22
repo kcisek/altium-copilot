@@ -1305,6 +1305,17 @@ class HarnessConnector:
 
 
 @dataclass
+class ParameterSet:
+    """A Parameter Set directive (RECORD=43) and its parameters (RECORD=41 children) as
+    (name, value) in file order, unnamed ones included: a differential pair directive is
+    one with DifferentialPair=True. It applies to the wire or bus at its location."""
+    name: str
+    x_mil: float
+    y_mil: float
+    parameters: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
 class SheetConnectivity:
     """What a sheet draws that the netlist compiler joins, read in one pass."""
     parts: list[SchPart] = field(default_factory=list)
@@ -1323,14 +1334,28 @@ class SheetConnectivity:
     # parse_sch_doc's view of the same records, for the netlist's component metadata.
     components: dict[str, ComponentMeta] = field(default_factory=dict)
     clashes: list[DesignatorClash] = field(default_factory=list)
+    # Connect nothing; the offline ERC reads them (RECORD=22 and 43 with their 41s).
+    no_ercs: list[NoErc] = field(default_factory=list)
+    parameter_sets: list[ParameterSet] = field(default_factory=list)
+    # The sheet header (RECORD=31) and title block, for the offline ERC: the sheet size
+    # as parse_sch_integrity reads it, the snap grid (SnapGridSize, None when the header
+    # has none; SnapGridOn=T when snap is on, absent when off: Altium leaves a false flag
+    # out) and the SheetNumber sheet parameter (RECORD=41 without an owner).
+    sheet_style: str = "A4"
+    width_mil: float = 0.0
+    height_mil: float = 0.0
+    portrait: bool = False
+    snap_grid_mil: float | None = None
+    snap_grid_on: bool = False
+    sheet_number: str = ""
 
 
 def parse_sch_connectivity(path: str) -> SheetConnectivity:
     """Read a .SchDoc for the netlist compiler: the parts and their pins (hidden ones
     flagged), wires, buses, signal harnesses with their connectors and entries (in the
     Additional stream), junctions, net labels, power ports, off-sheet connectors, ports,
-    sheet symbols with their entries and the enabled compile masks, plus the component
-    metadata parse_sch_doc gives."""
+    sheet symbols with their entries, the enabled compile masks, No ERC markers and
+    parameter sets, plus the component metadata parse_sch_doc gives."""
     with olefile.OleFileIO(path) as f:
         additional = f.openstream("Additional").read() if f.exists("Additional") else b""
         return connectivity_from_stream(f.openstream("FileHeader").read(), additional,
@@ -1342,13 +1367,19 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
     """parse_sch_connectivity for the bytes of a FileHeader and an Additional stream."""
     records = _read_records(data)
     result = SheetConnectivity()
+    (result.sheet_style, result.width_mil, result.height_mil,
+     result.portrait) = _sheet_size({})
     parts: dict[int, int] = {}                  # record position -> index into parts
     modes: dict[int, tuple[str, str]] = {}      # record position -> (part id, display mode)
     symbols: dict[int, tuple[SheetSymbol, list[Point]]] = {}
+    parameter_sets: dict[int, ParameterSet] = {}
     for pos, props in enumerate(records):
         record = props.get("record")
         owner = _owner_position(props)
-        if record == "1":
+        if record == "41" and owner in parameter_sets:
+            parameter_sets[owner].parameters.append((props.get("name", ""),
+                                                     props.get("text", "")))
+        elif record == "1":
             parts[pos] = len(result.parts)
             modes[pos] = (props.get("currentpartid", "1"), props.get("displaymode", "0"))
             result.parts.append(SchPart("", props.get("uniqueid", ""), modes[pos][0],
@@ -1415,6 +1446,27 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
             result.labels.append((props["text"], _location(props)))
         elif record == "211" and props.get("collapsed", "").upper() != "T":
             result.masks.append(_rect(props))  # a collapsed compile mask is disabled
+        elif record == "22":
+            result.no_ercs.append(NoErc(
+                x_mil=_coord(props, "location.x"), y_mil=_coord(props, "location.y"),
+                active=_flag(props, "isactive"), suppress_all=_flag(props, "suppressall"),
+                symbol=props.get("symbol", ""),
+                error_kinds=props.get("errorkindsettosuppress", ""),
+                connection_pairs=props.get("connectionpairstosuppress", ""),
+                flags_written=any(k in props for k in ("isactive", "suppressall", "symbol"))))
+        elif record == "43":
+            parameter_sets[pos] = ParameterSet(props.get("name", ""),
+                                               *_location(props))
+            result.parameter_sets.append(parameter_sets[pos])
+        elif record == "31":
+            (result.sheet_style, result.width_mil, result.height_mil,
+             result.portrait) = _sheet_size(props)
+            if "snapgridsize" in props:
+                result.snap_grid_mil = _coord(props, "snapgridsize")
+            # Not _flag: a sheet header leaves out a false flag, so absent is off.
+            result.snap_grid_on = props.get("snapgridon", "").strip().upper() in ("T", "TRUE")
+        elif record == "41" and props.get("name", "").lower() == "sheetnumber":
+            result.sheet_number = props.get("text", "")
     connector: HarnessConnector | None = None
     for props in _read_records(additional) if additional else ():
         record = props.get("record")
