@@ -59,8 +59,11 @@ try:
     )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
-        build_profile as build_testpoint_profile, page_result as page_testpoint_result,
-        review_testpoints,
+        build_profile as build_testpoint_profile, marked_testpoint_nets,
+        page_result as page_testpoint_result, review_testpoints,
+    )
+    from services.firmware_pins import (
+        FORMATS as FIRMWARE_FORMATS, build_firmware_map, export_rows as firmware_export_rows,
     )
     from services.pcb_health import run_health_check
     from services.dfm import (
@@ -139,8 +142,11 @@ except ImportError:
     )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
-        build_profile as build_testpoint_profile, page_result as page_testpoint_result,
-        review_testpoints,
+        build_profile as build_testpoint_profile, marked_testpoint_nets,
+        page_result as page_testpoint_result, review_testpoints,
+    )
+    from server.services.firmware_pins import (
+        FORMATS as FIRMWARE_FORMATS, build_firmware_map, export_rows as firmware_export_rows,
     )
     from server.services.pcb_health import run_health_check
     from server.services.dfm import (
@@ -470,6 +476,19 @@ DNP reasons, fabrication requirements. Use it.
   the TVS part (standoff, clamping voltage, capacitance), or a transceiver's own ESD
   claim, from the tool: look up the datasheet. shield_rc quotes guidance, not a fault.
 
+## Firmware Pin Map
+
+- get_firmware_pin_map — "what is the MCU's pinout?", "give the firmware team a pin
+  header or devicetree", "are TX and RX swapped?", "can we debug or program it?", "what
+  are the boot pins set to?", "how is the flash reached?", or a review with the firmware
+  team: candidate processors ranked with scores (the top one mapped; mcu= names others),
+  and per pin its port and bit, net, the parts it reaches, pull and a likely function
+  with its basis; findings for TX meeting TX, debug or programming pins reaching no
+  header or test pad, boot and strap levels, external flash or EEPROM access, unused
+  pins, shared nets and pins that change between variants. format csv, c_header or
+  devicetree gives text for the firmware repo: present it as a starting point. All of it
+  comes from names: check pin-mux questions against the datasheet.
+
 ## PCB / Layout Questions
 
 For questions about the physical board (where nets route, layers, stackup, crosstalk,
@@ -693,7 +712,7 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
+    "get_firmware_pin_map", "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
 )
 
 
@@ -4202,6 +4221,101 @@ def check_interfaces(
     return rendered
 
 
+# Rows (and findings) per page, tried in turn until the result fits: text formats carry
+# short lines, JSON rows long ones.
+FIRMWARE_PAGE_LIMITS = {"table": (100, 50, 25, 10, 5), "text": (400, 200, 100, 50, 25)}
+
+
+@mcp.tool(
+    title="Get Firmware Pin Map",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_firmware_pin_map(
+    mcu: str | None = None,
+    format: Literal["table", "csv", "c_header", "devicetree"] = "table",
+    checks: list[str] | None = None,
+    offset: int = 0,
+) -> str:
+    """Firmware pin map of a processor and a firmware-facing pinout review, offline. Call it
+    when the user asks for a pin map, pinout or pin assignment of an MCU, SoC, FPGA or
+    radio module, a pin table or header for firmware, which pin does what, UART TX/RX
+    swaps, whether SWD/JTAG or programming pins reach a header or test pads, boot or strap
+    pins and their default level, how external flash or EEPROM is reached, unused pins, or
+    for a schematic review with the firmware team.
+
+    Without mcu it ranks candidates (U/IC and module parts fitted in the active variant)
+    by GPIO-named pins (PA0, PB12, P0.12, P1_05, PIO0_7, GPIO12, IO12, RB3, PTA1 ...),
+    IO-typed pins and processor words (an FPGA counts and is labelled one), returns them
+    with scores, and maps the top one; mcu takes comma-separated designators. Each pin row:
+    number, full name (alternate functions), port and bit parsed from the name, electrical
+    type, net, the parts it reaches directly and through up to two series parts, its pull,
+    and a likely function (UART, SPI, QSPI, I2C, SWD, JTAG, USB, CAN, Ethernet, analog,
+    PWM/timer, crystal, boot/strap, reset, LED, button ...) with its basis; power and
+    ground pins are summarised per net. Checks (findings, warnings first): uart_crossing
+    (on UART lines and CAN lines to a transceiver, TX meets TX or RX meets RX: warning
+    when both ends are certain by pin type, the pin's own name or the part (a USB-UART
+    bridge, another MCU or module whose pin lists no other function, a transceiver whose
+    TXD takes the MCU's TX), info for connector pins and net-name-only cases), debug_access (warning when no SWD, JTAG or vendor programming
+    pin reaches a connector, test point or testpoint pad, also when they are unconnected
+    and only USB is; info for partial sets, a JTAG chain, USB only, a port reached only
+    through another processor's GPIOs, or a part named in mcu= that is no processor),
+    boot_straps (each boot, strap, mode and reset pin with its resistor and default level:
+    tied, pulled, a divider with its voltage, set by a switch, driven, or the internal
+    default; warning for a mid-rail divider and for an STM32's BOOT0 held high or an
+    ESP32's GPIO0 held low with nothing to change it), external_memory (flash, EEPROM,
+    FRAM and FPGA configuration memories on the MCU: bus, pins, chip select, WP/HOLD/RESET
+    state, and whether its bus reaches a header or pads for programming), unused_pins (the
+    debug port's pins left out of the advice), conflicting_assignment (two MCU pins on one
+    net, a net named for a function the pin does not list), variant_changes (parts on a
+    pin's path fitted in some variants only, needs two or more variants). format: table
+    (JSON rows, default), csv (every pin), c_header (#define NET_PORT / NET_PIN: GPIOA only
+    on STM32-family parts, PTA for Kinetis, PORTB for PIC, else the port letter or number)
+    or devicetree (a Zephyr-style fragment with controller labels for STM32, Kinetis, nRF,
+    LPC, i.MX RT, ESP32 and RP2040; other parts' pins and unknown port schemes are
+    comments, never invented).
+
+    It is a heuristic, not ERC: most library pins are typed Passive, so names carry most
+    of it; the datasheet, the pin-mux table and the firmware decide. checks narrows to the
+    names in summary. Rows and findings page together (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if format not in FIRMWARE_FORMATS:
+        return json.dumps({"error": "invalid_format",
+                           "message": f"format must be one of {list(FIRMWARE_FORMATS)}."})
+    plan, names, _ = _bom_plan(netlist, variant_state, None)
+    plans = [plan_variant(variant, netlist, names) for variant in variant_state.variants]
+
+    def testpoint_loader():
+        if not project.get("pcb_doc_paths"):
+            return None, "the project lists no PcbDoc"
+        index, error = _pcb_session.get(project, netlist)
+        if error:
+            return None, f"{error['error']}: {error.get('message', '')}".strip(": ")
+        return marked_testpoint_nets(index), None
+
+    built = build_firmware_map(
+        netlist, plan, project.get("parameters") or {}, mcu=_split_names(mcu), checks=checks,
+        format=format, variant_plans=plans, testpoint_loader=testpoint_loader,
+    )
+    if isinstance(built, dict):
+        return json.dumps(built)
+    limits = FIRMWARE_PAGE_LIMITS["table" if format == "table" else "text"]
+    for limit in limits:
+        result = {"netlist_updated_utc": _netlist_last_updated, **built.page(offset, limit)}
+        if limit < limits[0]:
+            result["page_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 @mcp.tool(
     title="Check Vias",
     annotations=ToolAnnotations(readOnlyHint=True),
@@ -5602,6 +5716,18 @@ def brainstorm_circuits() -> str:
 
 # ---------- package_for_xfn ----------
 
+def _firmware_rows(project: dict, netlist: dict, variant_state) -> tuple[list[dict], str | None]:
+    """The firmware_pins table's rows for the active variant, and why not when the map
+    could not be built (the snapshot is written either way)."""
+    try:
+        plan = plan_variant(getattr(variant_state, "active", None), netlist,
+                            variant_names(netlist))
+        return firmware_export_rows(netlist, plan, project.get("parameters") or {}), None
+    except Exception as error:  # a heuristic must never block the snapshot
+        logging.warning("Firmware pin map not built for the snapshot: %s", error)
+        return [], f"{type(error).__name__}: {error}"
+
+
 def _package_for_xfn_impl(
     project: dict,
     netlist: dict,
@@ -5614,8 +5740,9 @@ def _package_for_xfn_impl(
     if no_components:
         return json.dumps(no_components)
     notes, notes_errors = note_rows(notes_cache, project) if notes_cache is not None else ([], [])
+    firmware, firmware_error = _firmware_rows(project, netlist, variant_state)
     try:
-        db_path = export_project(project, netlist, variant_state, version, notes)
+        db_path = export_project(project, netlist, variant_state, version, notes, firmware)
     except Exception as e:
         return json.dumps({"error": "export_failed", "message": str(e)})
     prj_pcb_name = Path(project["prj_pcb_path"]).name
@@ -5629,6 +5756,16 @@ def _package_for_xfn_impl(
         f"({err['error']}); they are missing from this snapshot."
         for err in notes_errors
     )
+    if firmware:
+        mcus = list(dict.fromkeys(row["mcu"] for row in firmware))
+        incomplete_warning += (
+            f"\nFirmware pin map: {len(firmware)} pins of {', '.join(mcus)} in the "
+            "firmware_pins table (a heuristic from pin and net names: functions and ports are "
+            "a starting point; get_firmware_pin_map reviews them).")
+    elif firmware_error:
+        incomplete_warning += (
+            f"\nWarning: the firmware pin map could not be built ({firmware_error}); the "
+            "firmware_pins table is empty.")
     if _offline(netlist):
         incomplete_warning += (
             "\nNote: the nets in this snapshot were compiled offline by the copilot from the "
@@ -5663,7 +5800,11 @@ def package_for_xfn() -> str:
     """Export the current schematic project to a portable .db snapshot file for the
     cross-functional team. Only call this tool when the user explicitly asks to package
     or export the project for sharing with firmware, mechanical, test, or reliability
-    engineers. Do not call speculatively."""
+    engineers. Do not call speculatively. The snapshot holds sheets, variants, components,
+    nets, pins, design notes and the firmware pin map (firmware_pins: pin, name, port, bit,
+    net, function, role, pull, the parts each pin reaches; a heuristic) of each fitted MCU,
+    radio or module candidate of get_firmware_pin_map in the active variant (at most four,
+    else its top candidate)."""
     try:
         project, netlist, variant_state = _require_project()
     except ProjectNotReady as e:

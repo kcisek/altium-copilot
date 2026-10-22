@@ -5,8 +5,8 @@ from pathlib import Path
 
 # IMPORTANT: Bump this — and SUPPORTED_SCHEMA_VERSION in pcb-copilot — when an existing
 # table or column changes or goes away. A new table that older readers can ignore (like
-# `notes`) does not need a bump: pcb-copilot refuses any version it does not know.
-# See CONTRIBUTING.md.
+# `notes` or `firmware_pins`) does not need a bump: pcb-copilot refuses any version it
+# does not know. See CONTRIBUTING.md.
 SCHEMA_VERSION = 1
 
 HIGH_FANOUT_THRESHOLD = 25
@@ -80,17 +80,43 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _create_derived_schema(conn: sqlite3.Connection) -> None:
+    """Tables computed from the design by the copilot's analyses rather than read from
+    it. They are new tables older readers ignore, so they need no SCHEMA_VERSION bump."""
+    conn.executescript("""
+        -- The firmware pin map (get_firmware_pin_map) of each processor it picks: one row
+        -- per pin. A heuristic from pin and net names: function and port are a starting
+        -- point for the firmware team, not a verified pin-mux.
+        CREATE TABLE firmware_pins (
+          id          INTEGER PRIMARY KEY,
+          mcu_refdes  TEXT NOT NULL,
+          pin_number  TEXT NOT NULL,
+          pin_name    TEXT NOT NULL DEFAULT '',
+          port        TEXT,                        -- 'A', '0'; NULL when the name gives none
+          bit         INTEGER,                     -- the port bit, or the GPIO number
+          net_name    TEXT,
+          function    TEXT NOT NULL,               -- uart, spi, i2c, swd, gpio, power ...
+          role        TEXT,                        -- tx, rx, sck, mosi, sda ...
+          pull        TEXT,                        -- 'up 10k to 3V3 (R5)'
+          peers       TEXT NOT NULL DEFAULT '[]'   -- parts the pin reaches, JSON
+        );
+        CREATE INDEX idx_firmware_pins_mcu ON firmware_pins(mcu_refdes);
+    """)
+
+
 def export_project(
     project: dict,
     netlist: dict,
     variant_state,
     version: str,
     notes: list[dict] | None = None,
+    firmware_pins: list[dict] | None = None,
 ) -> str:
     """Write in-memory project to a pcb-copilot .db file next to the .PrjPcb.
 
     notes are rows for the notes table (services.design_notes.note_rows); sheet notes
-    are linked to their sheet by name.
+    are linked to their sheet by name. firmware_pins are rows for the firmware_pins table
+    (services.firmware_pins.export_rows).
     Returns the absolute path to the written file.
     Raises ValueError if a duplicate refdes is detected during INSERT.
     Always overwrites any existing file at the same path.
@@ -106,6 +132,7 @@ def export_project(
     _committed = False
     try:
         _create_schema(conn)
+        _create_derived_schema(conn)
 
         exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         conn.execute(
@@ -193,6 +220,24 @@ def export_project(
                     note.get("author"),
                     json.dumps(note.get("near_refdes") or []),
                     json.dumps(note.get("data") or {}),
+                ),
+            )
+
+        for row in firmware_pins or []:
+            conn.execute(
+                "INSERT INTO firmware_pins (mcu_refdes, pin_number, pin_name, port, bit,"
+                " net_name, function, role, pull, peers) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row["mcu"],
+                    row["pin"],
+                    row.get("name") or "",
+                    row.get("port"),
+                    row.get("bit"),
+                    row.get("net"),
+                    row["function"],
+                    row.get("role"),
+                    row.get("pull"),
+                    json.dumps(row.get("peers") or []),
                 ),
             )
 

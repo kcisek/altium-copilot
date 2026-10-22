@@ -136,7 +136,7 @@ _ESD_CLAIM = re.compile(
     r"\bESD[ -]?protect\w*|\d+(?:\.\d+)?\s*kV\s+(?:HBM\s+|IEC\s+|contact\s+|air\s+)?ESD\b|"
     r"IEC ?61000-4-2", re.I)
 # A processor is not a bus transceiver or PHY, whatever buses its text lists.
-_PROCESSOR_TEXT = re.compile(_PROCESSOR_WORDS + r"|cortex|\bRISC-?V\b", re.I)
+PROCESSOR_TEXT = re.compile(_PROCESSOR_WORDS + r"|cortex|\bRISC-?V\b", re.I)
 _ZENER_TEXT = re.compile(r"zener", re.I)
 _DIODE_PREFIXES = frozenset({"D", "LED", "CR", "Z", "ZD", "DZ", "VD", "DS"})
 _INDUCTIVE_PREFIXES = frozenset({"L", "FB", "FL", "LF", "CMC", "CM", "BEAD", "FE"})
@@ -213,12 +213,14 @@ _EXTERNAL_TEXT = (
 )
 _MODULE_PORT_TEXT = re.compile(_MODULE_PORT, re.I)
 _MODULE_PORT_TOKEN = re.compile(r"(?:Q|O)?SFP\w*|XFP\w*")
+# A debug or programming header's text (get_firmware_pin_map reads it too).
+DEBUG_HEADER_WORDS = (r"\bJTAG\b|\bSWD\b|\bdebug|\bprogram(?:ming)?\b|\bISP\b|\bICSP\b|"
+                      r"tag[- ]?connect|\bTC20[35]0|\bSWO\b|\bUPDI\b")
 _INTERNAL_TEXT = (
     ("board-to-board", r"board[- ]to[- ]board|\bB2B\b|\bBTB\b|mezzanine|stacking|"
                        r"floating board"),
     ("FPC/FFC", r"\bFPC\b|\bFFC\b|\bZIF\b|flex(?:ible)? (?:flat|printed)|flat flex"),
-    ("debug or programming header", r"\bJTAG\b|\bSWD\b|\bdebug|\bprogram(?:ming)?\b|\bISP\b|"
-                                    r"\bICSP\b|tag[- ]?connect|\bTC20[35]0|\bSWO\b|\bUPDI\b"),
+    ("debug or programming header", DEBUG_HEADER_WORDS),
     ("test header", r"\btest (?:header|connector|port|pad)"),
     ("card edge or module socket", r"\bSO-?DIMM\b|\bDIMM\b|\bM\.2\b|mini ?PCIe?|\bPCIe?\b|"
                                    r"card edge|edge connector|golden finger|gold finger|"
@@ -373,7 +375,7 @@ def _categorize(prefix: str, text: str, pins: int, pin_types=()) -> str:
     return "other"
 
 
-def _context(netlist: dict, plan, project_params: dict | None) -> _Context:
+def build_context(netlist: dict, plan, project_params: dict | None) -> _Context:
     design = build_design(netlist, plan, project_params)
     components = netlist.get("components") or {}
     parts = {part.designator: part for part in build_parts(netlist, plan, project_params)[0]}
@@ -447,7 +449,7 @@ def _add_edges(ctx: _Context, ref: str, kind: str, meta: dict, part, connected: 
         add(nets[0], nets[1], "ferrite" if ferrite else "inductor", None)
         return
     if kind == "choke":
-        # Each winding joins two nets; which pins pair is read in _choke_far.
+        # Each winding joins two nets; which pins pair is read in choke_far.
         for net in nets:
             for other in nets:
                 if other != net and not design.fixed(net) and not design.fixed(other):
@@ -481,7 +483,7 @@ def _polarity(name: str) -> str | None:
     return None
 
 
-def _choke_far(ctx: _Context, edges: list[_Edge], connector: str, start: str) -> list[_Edge]:
+def choke_far(ctx: _Context, edges: list[_Edge], connector: str, start: str) -> list[_Edge]:
     """The common-mode choke edges a walk crosses: of a choke's other nets, those not
     on the starting connector (the partner line's connector side) and, when the nets carry
     a polarity (P/N, +/-, DP/DM), the one with the starting net's polarity."""
@@ -553,8 +555,8 @@ def _walk(ctx: _Context, connector: str, start: str) -> _Walk:
         for net in level:
             edges = ctx.edges.get(net, ())
             plain = [edge for edge in edges if edge.kind != "common_mode_choke"]
-            chokes = _choke_far(ctx, [edge for edge in edges if edge.kind == "common_mode_choke"
-                                      and edge.fitted], connector, net)
+            chokes = choke_far(ctx, [edge for edge in edges if edge.kind == "common_mode_choke"
+                                     and edge.fitted], connector, net)
             for edge in [*plain, *chokes]:
                 if not edge.fitted:
                     if all(edge.part != seen.part for seen in walk.unfitted):
@@ -806,10 +808,10 @@ def _classify_pins(ctx: _Context, ref: str, power_connector: bool) -> list[_Pin]
     return pins
 
 
-def _bus_transceiver(ctx: _Context, ref: str) -> bool:
+def bus_transceiver(ctx: _Context, ref: str) -> bool:
     """A CAN, RS-485, RS-232, LIN or line driver part, not a processor listing its buses."""
     text = ctx.text.get(ref, "")
-    return bool(_BUS_TRANSCEIVER_TEXT.search(text)) and not _PROCESSOR_TEXT.search(text)
+    return bool(_BUS_TRANSCEIVER_TEXT.search(text)) and not PROCESSOR_TEXT.search(text)
 
 
 def _config_targets(ctx: _Context, connector: _Connector) -> list[str]:
@@ -876,10 +878,10 @@ def _exposure(ctx: _Context, connector: _Connector, override: str | None) -> Non
     reached = sorted({pin.walk.first()[0] for pin in signals if pin.walk and pin.walk.first()
                       and ctx.kind.get(pin.walk.first()[0]) in ("ic", "other", "transformer")},
                      key=natural_key)
-    buses = [part for part in reached if _bus_transceiver(ctx, part)]
+    buses = [part for part in reached if bus_transceiver(ctx, part)]
     phys = [part for part in reached if ctx.kind.get(part) == "transformer" or (
         _PHY_TEXT.search(ctx.text.get(part, ""))
-        and not _PROCESSOR_TEXT.search(ctx.text.get(part, "")))]
+        and not PROCESSOR_TEXT.search(ctx.text.get(part, "")))]
     if buses or (phys and (bus or any("high_speed" in pin.tags for pin in signals))):
         connector.exposure, connector.basis = "external", [
             f"its pins reach {', '.join((buses or phys)[:3])} (a bus transceiver, PHY, "
@@ -1391,7 +1393,7 @@ def run_interface_check(
     if invalid := [check for check in requested if check not in CHECKS]:
         return {"error": "invalid_checks",
                 "message": f"Unknown checks {invalid}; use {list(CHECKS)}."}
-    ctx = _context(netlist, plan, project_params)
+    ctx = build_context(netlist, plan, project_params)
     variant = getattr(plan, "name", None) or "[No Variations]"
     notes: list[str] = []
     found = [ref for ref, kind in ctx.kind.items() if kind == "connector"]
@@ -1436,7 +1438,7 @@ def run_interface_check(
                 first = pin.walk.first()
                 # A line into a CAN, RS-485 or RS-232 transceiver is a field bus whatever
                 # its name (RS-485 A and B); one into a PHY's LED pin drives a LED.
-                if first and _bus_transceiver(ctx, first[0]):
+                if first and bus_transceiver(ctx, first[0]):
                     pin.tags += [tag for tag in ("field_bus", "differential")
                                  if tag not in pin.tags]
                 if first and "led" not in pin.tags and _LED_PIN.fullmatch(

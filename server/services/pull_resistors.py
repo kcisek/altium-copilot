@@ -484,7 +484,7 @@ def _bootstrap(design: _Design, net: str, ref: str) -> bool:
     )
 
 
-def _link_group(design: _Design, net: str) -> list[str]:
+def link_group(design: _Design, net: str) -> list[str]:
     """The net and the nets joined to it by fitted series resistors under LINK_OHMS."""
     group, queue = [net], [net]
     while queue and len(group) < GROUP_LIMIT:
@@ -497,7 +497,7 @@ def _link_group(design: _Design, net: str) -> list[str]:
     return group
 
 
-def _drivers(design: _Design, net: str) -> list[str]:
+def push_pull_drivers(design: _Design, net: str) -> list[str]:
     """Push-pull outputs on a net: Output pins, and IC pins named like an output (OUT,
     VOUT) or a gate drive (GATE, DRV, HO, LO), unless they are open-drain, inputs or a
     comparator's (LM393 outputs are open-collector)."""
@@ -587,7 +587,7 @@ def _signals(design: _Design) -> list[_Net]:
                                                natural_key(name))):
         if net in done:
             continue
-        group = _link_group(design, net)
+        group = link_group(design, net)
         done.update(group)
         signal = _Net(net, group=group)
         for member in group:
@@ -598,10 +598,10 @@ def _signals(design: _Design) -> list[_Net]:
                 for reason in reasons:
                     signal.add(kind, reason if member == net else f"{member}: {reason}")
             signal.control_kind = signal.control_kind or entry.control_kind
-            signal.drivers += _drivers(design, member)
+            signal.drivers += push_pull_drivers(design, member)
         for member in group:
             if member not in found:
-                signal.drivers += _drivers(design, member)
+                signal.drivers += push_pull_drivers(design, member)
             signal.offboard += [ref for ref, _ in design.nets.get(member, ())
                                 if _is_connector(design, ref) and ref not in signal.offboard]
         active = [(ref, pin) for member in group for ref, pin in design.nets.get(member, ())
@@ -636,7 +636,7 @@ def _gate_driven(design: _Design, signal: _Net) -> bool:
     signal.extra = list(dict.fromkeys(source for source, _, _ in drivers
                                       if source not in signal.group))
     for source in signal.extra:
-        signal.drivers += _drivers(design, source)
+        signal.drivers += push_pull_drivers(design, source)
     for source, ref, pin in drivers[:2]:
         via = "" if source in signal.group else f" through {source}"
         for kind in ("gate", "base"):
@@ -1088,7 +1088,7 @@ def run_pull_resistor_check(
                 continue
             notes.append(f"{net}: no reset, enable, boot, open-drain, I2C, gate or "
                          "comparator evidence was found; its pulls are listed in signals.")
-            signals.append(_Net(net, group=_link_group(design, net)))
+            signals.append(_Net(net, group=link_group(design, net)))
         signals = [signal for signal in signals
                    if {*signal.group, *signal.extra} & wanted_nets]
     pulls ={signal.name: _pulls_of(design, signal, open_drain_names) for signal in signals}

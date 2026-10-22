@@ -46,6 +46,7 @@ NETLIST_TOOL_CALLS = {
     "check_decoupling": lambda: main.check_decoupling(),
     "check_pull_resistors": lambda: main.check_pull_resistors(),
     "check_interfaces": lambda: main.check_interfaces(),
+    "get_firmware_pin_map": lambda: main.get_firmware_pin_map(),
     "check_sch_pcb_sync": lambda: main.check_sch_pcb_sync(),
     "schematic_review": lambda: main.schematic_review(),
     "package_for_xfn": lambda: main.package_for_xfn(),
