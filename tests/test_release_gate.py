@@ -306,6 +306,24 @@ def test_erc_gate_is_never_verified(project):
     assert _run("erc", _ctx(dict(project, sheets=[])))["status"] == "not_applicable"
 
 
+def test_erc_gate_cites_the_offline_erc_and_stays_not_verified(project):
+    counts = {"by_level": {"Fatal Error": 0, "Error": 2, "Warning": 1}}
+    for summary in (counts, {"by_level": {"Fatal Error": 0, "Error": 0, "Warning": 0}}):
+        ctx = _ctx(project, offline_erc=lambda summary=summary: summary)
+        ctx.outjobs = {"coverage": {"erc": {"status": "connected", "outputs": ["a", "b"]}},
+                       "summary": {"by_check": {"erc_settings_differ": "warning"}}}
+        row = _run("erc", ctx)
+        # A clean offline approximation is evidence, never a pass; the longest evidence
+        # still ends with what to do in Altium.
+        assert row["status"] == "not_verified" and row["blocking"]
+        assert "run_erc (offline approximation): " in row["evidence"]
+        assert row["evidence"].endswith("(Project > Validate PCB Project).")
+    assert "2 errors, 1 warning" in _run("erc", _ctx(project, offline_erc=lambda: counts))[
+        "evidence"]
+    broken = _ctx(project, offline_erc=lambda: (_ for _ in ()).throw(RuntimeError("x")))
+    assert "run_erc" not in _run("erc", broken)["evidence"]
+
+
 # ---------- netlist and sync ----------
 
 def test_netlist_fresh_gate(project):

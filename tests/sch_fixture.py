@@ -15,11 +15,12 @@ def record(body: str) -> bytes:
     return struct.pack("<I", len(data)) + data
 
 
-def stream(records: list[str]) -> bytes:
-    """A stream: the header, the sheet record (position 1), then the records, the first
-    at position 2 (so its children have OwnerIndex=1)."""
+def stream(records: list[str], sheet: str = "") -> bytes:
+    """A stream: the header, the sheet record (position 1, with sheet's extra fields such
+    as |SNAPGRIDSIZE=10), then the records, the first at position 2 (so its children
+    have OwnerIndex=1)."""
     out = record("|HEADER=Protel for Windows - Schematic Capture Binary File Version 5.0")
-    out += record("|RECORD=31|FONTIDCOUNT=1|SIZE1=10")
+    out += record(f"|RECORD=31|FONTIDCOUNT=1|SIZE1=10{sheet}")
     for body in records:
         out += record(body)
     return out
@@ -32,7 +33,8 @@ def _points(points) -> str:
 class Sheet:
     """One sheet's records, built in order; children own to the record that adds them."""
 
-    def __init__(self):
+    def __init__(self, header: str = ""):
+        self.header = header  # extra fields of the sheet record (RECORD=31)
         self.records: list[str] = []
         self.additional: list[str] = []
         self._uid = 0
@@ -95,12 +97,21 @@ class Sheet:
     def no_erc(self, x, y) -> None:
         self._add(f"|RECORD=22|LOCATION.X={x}|LOCATION.Y={y}|ISACTIVE=T|SUPPRESSALL=T")
 
+    def parameter_set(self, x, y, parameters, name: str = "Parameter Set") -> None:
+        """A Parameter Set directive at (x, y) with (name, value) parameters."""
+        position = self._add(f"|RECORD=43|LOCATION.X={x}|LOCATION.Y={y}|NAME={name}")
+        for key, value in parameters:
+            self._add(f"|RECORD=41|OWNERINDEX={position - 1}|NAME={key}|TEXT={value}")
+
     def mask(self, x0, y0, x1, y1) -> None:
         self._add(f"|RECORD=211|LOCATION.X={x0}|LOCATION.Y={y0}|CORNER.X={x1}|CORNER.Y={y1}")
 
-    def port(self, name: str, x, y, width: int = 10, harness: str = "") -> tuple[int, int]:
-        """A horizontal port from (x, y) to (x + width, y); returns its right end."""
+    def port(self, name: str, x, y, width: int = 10, harness: str = "",
+             io: int | None = None) -> tuple[int, int]:
+        """A horizontal port from (x, y) to (x + width, y), of IOTYPE io when given (1
+        Output, 2 Input, 3 Bidirectional); returns its right end."""
         extra = f"|HARNESSTYPE={harness}" if harness else ""
+        extra += f"|IOTYPE={io}" if io is not None else ""
         self._add(f"|RECORD=18|STYLE=3|WIDTH={width}|LOCATION.X={x}|LOCATION.Y={y}"
                   f"|NAME={name}{extra}")
         return x + width, y
@@ -147,7 +158,8 @@ class Sheet:
         return (x + size[0], y - primary), points
 
     def streams(self) -> tuple[bytes, bytes]:
-        return stream(self.records), stream(self.additional) if self.additional else b""
+        return (stream(self.records, self.header),
+                stream(self.additional) if self.additional else b"")
 
 
 def project(folder: Path, sheets: dict[str, Sheet], design: str = "", devices=(),

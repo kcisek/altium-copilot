@@ -503,7 +503,8 @@ def _outputs(project: dict, design: dict[str, str]) -> dict:
 
 # ---------- ERC report levels and the connection matrix ----------
 
-def _type_number(key: str) -> int | None:
+def type_number(key: str) -> int | None:
+    """N of an [Electrical Rules Check] key (TypeN, or a type Altium writes by name)."""
     if key in NAMED_TYPES:
         return NAMED_TYPES[key]
     if key[:4].lower() == "type" and key[4:].isdigit() and int(key[4:]) >= 1:
@@ -511,8 +512,32 @@ def _type_number(key: str) -> int | None:
     return None  # Type0 is no slot: TypeN is ordinal N-1
 
 
-def _level(value: str) -> int | None:
+def level_index(value: str) -> int | None:
+    """A TErrorLevel as written (0 No Report .. 3 Fatal Error), else None."""
     return int(value) if value.isdigit() and int(value) < len(LEVELS) else None
+
+
+def erc_levels(levels: dict[str, str]) -> dict[int, int]:
+    """The project's report level per violation TypeN, for the keys it writes validly."""
+    found: dict[int, int] = {}
+    for key, value in levels.items():
+        number, level = type_number(key), level_index(value)
+        if number is not None and number <= len(ERC_CHECKS) and level is not None:
+            found[number] = level
+    return found
+
+
+def matrix_levels(rows: dict[str, str]) -> tuple[list[list[int]], bool]:
+    """The Connection Matrix as levels (0 No Report, 1 Warning, 2 Error) in MATRIX_LABELS
+    order, row by column, and whether it is the project's: a matrix that is missing or
+    not 17 x 17 is Altium's default, and a cell with an unknown letter takes the
+    default's."""
+    size = len(MATRIX_LABELS)
+    lines = [rows.get(f"L{i}", "") for i in range(1, size + 1)]
+    own = all(len(line) == size for line in lines)
+    source = lines if own else MATRIX_DEFAULT
+    return [[MATRIX_LETTERS.get(source[i][j], MATRIX_LETTERS[MATRIX_DEFAULT[i][j]])
+             for j in range(size)] for i in range(size)], own
 
 
 def _erc(levels: dict[str, str], unmapped: dict) -> tuple[dict, list[dict]]:
@@ -522,7 +547,7 @@ def _erc(levels: dict[str, str], unmapped: dict) -> tuple[dict, list[dict]]:
     at_default = 0
     found: dict[int, int] = {}
     for key, value in levels.items():
-        number, level = _type_number(key), _level(value)
+        number, level = type_number(key), level_index(value)
         if number is None or number > len(ERC_CHECKS) or level is None:
             raw[key] = value
             continue

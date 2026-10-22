@@ -147,7 +147,8 @@ class ReleaseInputs:
     sheet names saved after a time; dfm_variant() -> dfm.AssemblyContext of the active
     variant; fab_board_reader and fab_bom: check_fab_drawing's board and BOM readers
     (fab_bom None without a netlist); clone_status(project_dir) -> get_clone_status's
-    dict."""
+    dict; offline_erc() -> run_erc's summary counts (main._offline_erc_summary) or None,
+    cited by the ERC gate as evidence only."""
 
     project: dict
     netlist: dict | None
@@ -160,6 +161,7 @@ class ReleaseInputs:
     fab_board_reader: Callable
     fab_bom: Callable | None = None
     clone_status: Callable[[str], dict] = field(default=read_clone_status)
+    offline_erc: Callable[[], dict | None] | None = None
 
 
 class GateResult(Exception):
@@ -228,6 +230,16 @@ class ReleaseContext:
         issues = notes + assess(report, path, self.pcb_path, self.project,
                                 index.pcb if index is not None else None)
         return {"report": report, "path": path, "issues": issues}
+
+    @cached_property
+    def offline_erc(self) -> dict | None:
+        """run_erc's summary counts, None when not given or the sheets do not compile."""
+        if self.inputs.offline_erc is None:
+            return None
+        try:
+            return self.inputs.offline_erc()
+        except Exception:
+            return None
 
     @cached_property
     def outjobs(self) -> dict:
@@ -343,10 +355,18 @@ def gate_drc(ctx: ReleaseContext) -> tuple[str, str]:
 
 
 def gate_erc(ctx: ReleaseContext) -> tuple[str, str]:
+    """Blocking and always not_verified: no ERC result is saved in the files. The offline
+    approximation's counts (run_erc) are quoted as evidence, never as a pass."""
     if not ctx.project.get("sheets"):
         return "not_applicable", "The project has no schematic sheets."
-    parts = ["No ERC result is saved in the project files (Altium shows ERC in the "
-             "Messages panel), so ERC cannot be verified offline"]
+    parts = ["ERC results are not saved in the files: unverifiable offline"]
+    offline = ctx.offline_erc
+    if offline is not None:
+        levels = offline.get("by_level") or {}
+        counts = ", ".join(_plural(levels.get(level, 0), word) for level, word in (
+            ("Fatal Error", "fatal error"), ("Error", "error"), ("Warning", "warning"))
+            if levels.get(level) or level != "Fatal Error")
+        parts.append(f"run_erc (offline approximation): {counts}")
     model = ctx.outjobs
     if "error" in model:
         parts.append("the OutJobs could not be read")
@@ -354,13 +374,12 @@ def gate_erc(ctx: ReleaseContext) -> tuple[str, str]:
         erc = (model.get("coverage") or {}).get("erc") or {}
         if erc.get("status") == "connected":
             parts.append(f"{_plural(len(erc.get('outputs') or []), 'ERC validation output')} "
-                         "connected: the Project Releaser runs ERC and stops on errors")
+                         "connected: the Project Releaser runs ERC")
         else:
-            parts.append("no ERC validation output is connected, so a release does not "
-                         "run ERC")
+            parts.append("no ERC validation output: a release does not run ERC")
         if "erc_settings_differ" in (model.get("summary") or {}).get("by_check", {}):
             parts.append("the OutJob's ERC levels differ from Project Options")
-    parts.append("run Project > Validate PCB Project and clear the Messages panel")
+    parts.append("validate in Altium (Project > Validate PCB Project)")
     return "not_verified", "; ".join(parts) + "."
 
 
@@ -1055,6 +1074,7 @@ def page_release_readiness(model: dict, offset: int, limit: int) -> dict:
 RELEASE_REVIEW_TOOLS = (
     "check_release_readiness",
     "get_drc_report",
+    "run_erc",
     "get_project_options",
     "check_sch_pcb_sync",
     "refresh_netlist",
@@ -1105,8 +1125,9 @@ State the verdict and verdict_summary as given.
 ### Phase 2 — Causes
 
 For each blocking gate that failed, then each warn, call its source_tool once:
-drc and silkscreen → get_drc_report; erc → get_project_options (ERC levels, No ERC
-directives) and get_output_jobs (the ERC validation output); netlist_fresh and
+drc and silkscreen → get_drc_report; erc → run_erc (the offline approximation: its
+errors, never a pass), get_project_options (ERC levels, No ERC directives) and
+get_output_jobs (the ERC validation output); netlist_fresh and
 sch_pcb_sync → check_sch_pcb_sync; unrouted_nets → check_connectivity; polygons →
 check_pcb_health; board_outline → get_board_info; fiducials → check_dfm with checks
 ["fiducials"]; mounting_holes → get_assembly_guide; dnp_parts, outjob_coverage and
