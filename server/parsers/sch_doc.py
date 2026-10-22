@@ -40,6 +40,25 @@ class ComponentMeta:
     # UniqueIDs of compile-masked copies with this designator that this live part
     # replaced: they are not this part's (a variation on one names no compiled part).
     masked_unique_ids: list[str] = field(default_factory=list)
+    # Every pin's electrical type (pin designator -> PIN_TYPES name), unnamed pins
+    # included; each pin of a multi-part component keeps its own record's type.
+    pin_types: dict[str, str] = field(default_factory=dict)
+
+
+# A pin record's Electrical property, as Altium's pin dialog lists it; a pin without the
+# property is an Input. Checked on the AD25 examples: supply pins are Power, resistor
+# and capacitor pins Passive, transceiver TX pins Output, alert, interrupt and power-good
+# pins of supervisors and regulators OpenCollector, FPGA and MCU I/O pins IO.
+PIN_TYPES = {
+    "0": "Input", "1": "IO", "2": "Output", "3": "OpenCollector", "4": "Passive",
+    "5": "HiZ", "6": "OpenEmitter", "7": "Power",
+}
+
+
+def pin_type(props: dict[str, str]) -> str:
+    """A RECORD=2 pin's electrical type name; an unknown value reads as written."""
+    value = props.get("electrical", "").strip() or "0"
+    return PIN_TYPES.get(value, value)
 
 
 @dataclass
@@ -161,6 +180,8 @@ class _Component:
         self.part_ids.add(part.part_id)
         for pin, name in meta.pins.items():
             self.meta.pins.setdefault(pin, name)
+        for pin, kind in meta.pin_types.items():
+            self.meta.pin_types.setdefault(pin, kind)
         _merge_part_lists(self.meta, meta)
         self.meta.description = self.meta.description or meta.description
         self.meta.value = self.meta.value or meta.value
@@ -390,6 +411,9 @@ def _handle_pin(
     component = components_by_owner[key]
     if designator not in component.pin_designators:
         component.pin_designators.append(designator)
+    # A pin drawn in several display modes keeps the normal mode's type.
+    if designator not in component.pin_types or props.get("ownerpartdisplaymode", "0") == "0":
+        component.pin_types[designator] = pin_type(props)
     if not name or name == "?":
         return
     component.pins[designator] = name

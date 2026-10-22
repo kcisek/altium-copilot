@@ -51,7 +51,7 @@ try:
     from parsers.pcb_doc import MULTI_LAYER, pad_copper_on
     from services import dfm_assembly as assembly
     from services import dfm_geometry as geometry
-    from services.decoupling import _net_kind
+    from services.decoupling import net_kind
     from services.fab_profiles import MM
     from services.pcb_geometry import point_in_polygon, point_polygon_distance
     from services.pcb_rules import (
@@ -68,7 +68,7 @@ except ImportError:
     from server.parsers.pcb_doc import MULTI_LAYER, pad_copper_on
     from server.services import dfm_assembly as assembly
     from server.services import dfm_geometry as geometry
-    from server.services.decoupling import _net_kind
+    from server.services.decoupling import net_kind
     from server.services.fab_profiles import MM
     from server.services.pcb_geometry import point_in_polygon, point_polygon_distance
     from server.services.pcb_rules import (
@@ -178,7 +178,7 @@ def _plural(count: int, word: str) -> str:
 def _supply_kind(name: str) -> str | None:
     """ground, power or None by check_decoupling's name rules: a supply name with a signal
     token (3V3_EN, PWR_PG, VBUS_DET, GND_SENSE) is a signal, as there."""
-    kind = _net_kind(name)
+    kind = net_kind(name)
     if kind["signal"]:
         return None
     return "ground" if kind["ground"] else "power" if kind["power"] else None

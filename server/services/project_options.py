@@ -24,11 +24,11 @@ from pathlib import Path
 
 try:
     from parsers.prj_pcb import parse_prj_options
-    from services.decoupling import _net_kind
+    from services.decoupling import net_kind
     from services.design_hierarchy import _NetIndex, build_design_hierarchy
 except ImportError:
     from server.parsers.prj_pcb import parse_prj_options
-    from server.services.decoupling import _net_kind
+    from server.services.decoupling import net_kind
     from server.services.design_hierarchy import _NetIndex, build_design_hierarchy
 
 HIGH_FANOUT_PINS = 25
@@ -716,7 +716,7 @@ def _directive(sheet: str, item, nets: _NetIndex | None, pin_counts: Counter,
         row["on_sheet_entries"] = [f"{symbol}/{entry}" for symbol, entry in wiring.entries[:6]]
     # A rail by name: a supply or ground name with no signal token (VCC_EN, VBUS_SENSE
     # and 3V3_PGOOD are signals), as the decoupling check reads net names.
-    kinds = [_net_kind(name) for name in (found or names)]
+    kinds = [net_kind(name) for name in (found or names)]
     if not (wiring.pins or wiring.wires or wiring.labels or wiring.power_ports or reaches):
         kind = "nothing"
     elif wiring.power_ports or any((k["power"] or k["ground"]) and not k["signal"]
