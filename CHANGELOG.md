@@ -8,9 +8,60 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ### Added
 - The fork has its own identity: the repository is `kcisek/altium-copilot-kc`, the MCP server
   and the manifest are `altium-copilot-kc` ("Altium Copilot (KC)"), and `install.ps1` installs
-  `altium-copilot-kc.exe` into `%LOCALAPPDATA%ltium-copilot-kc`, registers it under that name in
+  `altium-copilot-kc.exe` into `%LOCALAPPDATA%\altium-copilot-kc`, registers it under that name in
   Claude Desktop and Claude Code, and keeps its own state file. The update check and the release
   build follow the fork, so it installs beside upstream `altium-copilot` instead of replacing it
+- Offline schematic netlister (`services/sch_netlister.py`): without Altium Designer and
+  without an up-to-date `.NET`, the project's netlist is compiled from the saved sheets,
+  so `query_net`, `get_component`, `search_components`, `get_sheet_context`, `get_bom`,
+  `check_bom`, `check_decoupling`, `check_sch_pcb_sync`, `schematic_review` and
+  `package_for_xfn` work without Altium, `get_design_hierarchy` names each port's net and
+  the PCB tools link `sch_refdes` again. Each sheet is wired once (`parse_sch_connectivity`
+  reads parts and pins, hidden ones flagged, wires, buses, harnesses with their connectors
+  and entries, junctions, labels, power ports, off-sheet connectors, ports, symbols with
+  their entries and compile masks in one pass, with the component metadata enrichment
+  reuses) and every sheet copy (several symbols or a `Repeat(...)` placing it) is joined
+  by the project's Net Identifier Scope (Automatic resolved as in `get_design_hierarchy`):
+  ports by name (Flat, Global), net labels by name (Global), sheet entries to their child
+  port in that copy (Hierarchical, Strict), power ports by name (local under Strict, and
+  under Hierarchical when wired to a port), a net label and a power port of one name on a
+  sheet, off-sheet connectors among the sheets one symbol places, ranged bus names on
+  labels, ports and entries by member along the bus's own wiring (`D[0..7]`), `Repeat(X)`
+  entries giving channel N the member XN, harness entries of one name on joined harnesses,
+  junctions and pin ends within 3 mil of a wire (a wire, or a junction, never joins a bus),
+  the parts of a multi-part component across sheets, compile masks removing parts, wires
+  and labels, and hidden pins only through a legacy HiddenNetName. Physical designators
+  come from the `.Annotation` file, else the sheet, else the project's multi-channel
+  Designator Format and room naming; local net labels of a sheet compiled several times
+  take its room name as a suffix. Nets are named by the netlist options (Power Port Names
+  Take Priority, Allow Ports / Sheet Entries to Name Nets, Higher Level Names Take
+  Priority), ties going to the case-insensitive smallest name, else
+  `Net<designator>_<pin>` from the smallest designator and pin in natural order;
+  single-pin nets are left out unless `NetlistSinglePinNets` keeps them. The result has
+  the `.NET` load's shape (`nets`, `pin_to_net`, `parts` with footprint and the Comment as
+  shown, then the same enrichment) plus `source: offline`, the compile time as
+  `net_file_mtime` (so sheets saved later read as stale) and `compile_warnings`
+  (duplicate designators and net names, nets with several names, sheet entries without a
+  port, missing child sheets, compile-masked and unannotated parts, unconnected hidden
+  pins, and what no sample confirmed: channel designators, `Repeat(X)` entries, harness
+  member names, off-sheet connectors, Append Sheet Numbers to Local Nets, which is reported
+  and not applied).
+  `set_project_dir` loads with it (`load_mode: offline_netlist`, `netlist_source:
+  offline_compiler`, `netlist_note`, `compile_warnings`, `net_identifier_scope`) instead
+  of the netlist-free load, also when the cached `.NET` is stale (`cached_netlist_stale`);
+  Altium's netlist is still used whenever it is up to date or Altium has the project
+  open. `refresh_netlist` compiles again, or takes Altium's netlist once Altium has the
+  project open; an unchanged compile is reused. `query_net`, `get_sheet_context` and
+  `check_sch_pcb_sync` name the source when it is the offline compile, and the release
+  gate's netlist check, `schematic_review` and `package_for_xfn` (whose snapshot leaves
+  the session) say so. Validated against Altium's own output: 4 private
+  projects' `.NET` files match exactly (208 of 208 nets with members and case-exact
+  names, 235 of 235 parts with footprint and comment); Altium's 5 public AD25 example
+  boards match their PcbDoc on every pin and all 1,274 net names; 62 of 63 private
+  projects match their PcbDoc on every pin (13,623 of 13,639 pins; the other 16 sit on a
+  board whose PCB lacks 30 of the sheets' parts) and 2,769 of 2,778 nets carry the PCB's
+  name (the other 9 PCB names are on no schematic object); the 63 compile in 1.8 s
+  in all (at most 0.11 s), Altium's 46-sheet MiniPC example in about 1.1 s
 - `check_testpoints`: test access (DFT) review of the saved PcbDoc (roadmap #33), offline
   and netlist-free (`services/testpoints.py`). Probe sites are pads and vias marked as
   Fabrication Testpoints (top and bottom, now decoded from the Pads6 main subrecord and the
@@ -876,6 +927,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   uncommitted `.PcbDoc`, in about 0.3 s per clone
 
 ### Changed
+- The netlist-free (partial) load is now the fallback for a project whose sheets cannot be
+  compiled offline (`compile_error`) or that lists none; `netlist_required` and the
+  partial-load message say so. Load and refresh responses name `netlist_source` (`altium`
+  or `offline_compiler`)
 - `check_vias` is described as the via inventory and drill review, no longer a "fab
   review", in its description, the server instructions and the README; questions about
   a fabricator's capability ("can my fab make this?") go to `check_dfm`
@@ -963,6 +1018,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   89 boards
 
 ### Fixed
+- `get_design_hierarchy` read an off-sheet connector (a RECORD=17 with
+  IsCrossSheetConnector=T) as a power port; it is no longer listed among the power ports
+  or joined by name with them
 - Layer-specific keepout tracks and arcs on signal layers (Tracks6/Arcs6 flags2 = 2)
   were read as no-net copper: `get_board_info` counted them as tracks and arcs, and
   `check_rule_compliance` listed them among the no-net copper it skips. They are now

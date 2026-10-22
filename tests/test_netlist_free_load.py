@@ -1,6 +1,8 @@
-"""Netlist-free load: set_project_dir without Altium and without an up-to-date cached
-netlist loads the project from its files. PCB, rule, notes, picture and variant tools
-work; the netlist tools answer netlist_required."""
+"""Loads without Altium: set_project_dir without Altium and without an up-to-date cached
+netlist compiles the netlist offline from the saved sheets, and every tool works
+(offline_env). Only when that compile fails or there are no sheets is the load
+netlist-free (env): PCB, rule, notes, picture and variant tools work and the netlist
+tools answer netlist_required."""
 import asyncio
 import json
 import os
@@ -100,10 +102,13 @@ def _write_project(root: Path, prj_text: str = PRJ_TEXT) -> Path:
     return prj
 
 
-@pytest.fixture
-def env(tmp_path, pcb_data):
+COMPILE_ERROR = "RuntimeError: sheets unreadable"
+
+
+def _environment(tmp_path, pcb_data, compiles: bool):
     """Isolated main state, Altium not running, an empty registry, and a PcbDoc that
-    parses to the synthetic pcb_data. loads records the netlist each PCB parse gets."""
+    parses to the synthetic pcb_data. loads records the netlist each PCB parse gets.
+    compiles False makes the offline compile fail, so loads are netlist-free."""
     root = tmp_path / "Board"
     _write_project(root)
     loads: list = []
@@ -123,7 +128,24 @@ def env(tmp_path, pcb_data):
          patch.object(main, "read_registry", return_value={"projects": []}), \
          patch.object(main, "upsert_registry_entry") as upsert, \
          patch.object(main._altium, "get_status", return_value={"running": False}):
-        yield root, upsert, loads
+        if compiles:
+            yield root, upsert, loads
+        else:
+            with patch.object(main._altium, "compile_offline",
+                              side_effect=RuntimeError("sheets unreadable")):
+                yield root, upsert, loads
+
+
+@pytest.fixture
+def env(tmp_path, pcb_data):
+    """Altium not running and the offline compile failing: a netlist-free load."""
+    yield from _environment(tmp_path, pcb_data, compiles=False)
+
+
+@pytest.fixture
+def offline_env(tmp_path, pcb_data):
+    """Altium not running: the sheets are compiled offline."""
+    yield from _environment(tmp_path, pcb_data, compiles=True)
 
 
 def _load(root: Path) -> dict:
@@ -145,6 +167,8 @@ def test_load_without_altium_is_partial(env):
     assert result["netlist_updated_utc"] is None
     assert result["netlist_required_tools"] == list(main.NETLIST_TOOLS)
     assert "Altium Designer is not running" in result["message"]
+    assert "could not be compiled offline" in result["message"]
+    assert result["compile_error"] == COMPILE_ERROR
     assert "get_sheet_context" in result["session_start"]
     assert "netlist_stale" not in result
     assert main._altium._netlist is None
@@ -171,7 +195,8 @@ def test_netlist_tools_answer_netlist_required(env, tool):
     result = json.loads(NETLIST_TOOL_CALLS[tool]())
     assert result["error"] == "netlist_required"
     assert "Project 'Board' was loaded without a netlist" in result["message"]
-    assert "Open the project in Altium Designer once" in result["message"]
+    assert "the sheets could not be compiled offline" in result["message"]
+    assert "open the project in Altium Designer once" in result["message"]
 
 
 @pytest.mark.parametrize("tool", sorted(WORKING_TOOL_CALLS))
@@ -434,3 +459,134 @@ def test_full_load_netlist_reaches_the_pcb_index(tmp_path, pcb_data):
         result = json.loads(main.get_board_info())
     assert result["refdes_mapping_unmatched"] == 0
     assert "netlist" not in result
+
+
+# ---------- the offline netlist (the default load without Altium) ----------
+
+def test_load_without_altium_compiles_the_sheets_offline(offline_env):
+    root, upsert, _ = offline_env
+    result = _load(root)
+
+    assert result["loaded"] is True
+    assert "partial" not in result and "netlist_required_tools" not in result
+    assert result["load_mode"] == "offline_netlist"
+    assert result["netlist_source"] == "offline_compiler"
+    assert result["net_identifier_scope"] == "Flat"
+    assert isinstance(result["compile_warnings"], list)
+    assert "Altium Designer was not involved" in result["netlist_note"]
+    assert "sheet_name" in result["session_start"]
+    assert result["sheets"] == ["sheet1", "sheet2"] and result["pcb_doc"] == "Board.PcbDoc"
+    assert result["component_count"] == 127 and result["netlist_updated_utc"]
+    netlist = main._altium._netlist
+    assert netlist["source"] == "offline" and netlist["net_file"] is None
+    assert netlist["net_file_mtime"] > 0
+    # Registered without a netlist mtime: an offline compile never vouches for a .NET.
+    upsert.assert_called_once_with("Board.PrjPcb", str(root))
+
+
+@pytest.mark.parametrize("tool", sorted(NETLIST_TOOL_CALLS))
+def test_netlist_tools_work_with_the_offline_netlist(offline_env, tool):
+    root, _, _ = offline_env
+    _load(root)
+    with patch.object(main, "mark_xfn_exported"):
+        result = NETLIST_TOOL_CALLS[tool]()
+    try:
+        error = json.loads(result).get("error")
+    except ValueError:  # sheet context text and the review prompts
+        error = None
+    assert error is None
+
+
+def test_offline_netlist_names_its_source_and_links_the_pcb(offline_env):
+    root, _, loads = offline_env
+    _load(root)
+    net = json.loads(main.query_net("^GND_BATT$"))
+    assert net["netlist_source"] == "offline_compiler" and net["pin_count"] > 25
+    context = main.get_sheet_context("sheet1")
+    assert context.splitlines()[1] == "netlist_source:offline_compiler"
+    board = json.loads(main.get_board_info())
+    assert "netlist" not in board and "refdes_mapping_unmatched" in board
+    assert loads and loads[-1] is main._altium._netlist
+
+
+def test_the_snapshot_and_the_review_say_the_nets_were_compiled_offline(offline_env):
+    # The team snapshot leaves the session: whoever runs package_for_xfn must be able to
+    # tell its receivers that no Altium compile (and no ERC) is behind its nets.
+    root, _, _ = offline_env
+    _load(root)
+    with patch.object(main, "mark_xfn_exported"):
+        exported = main.package_for_xfn()
+    assert "compiled offline" in exported and "no ERC" in exported
+    assert "compiled offline" in main.schematic_review()
+
+
+def test_refresh_compiles_the_sheets_again(offline_env):
+    root, _, _ = offline_env
+    _load(root)
+    first = main._altium._netlist
+    # sheet2 dropped from the project: its parts leave the netlist.
+    (root / "Board.PrjPcb").write_text(PRJ_TEXT.replace(
+        "[Document2]\nDocumentPath=source\\sheet2.SchDoc\n", ""), encoding="utf-8")
+    result = json.loads(main.refresh_netlist())
+    assert result["refreshed"] is True and result["netlist_source"] == "offline_compiler"
+    assert "netlist_note" in result
+    assert main._altium._netlist is not first
+    assert {c["sheet"] for c in main._altium._netlist["components"].values()} == {"sheet1"}
+    assert main._project["sheets"] == [{"name": "sheet1",
+                                        "path": str(root / "source" / "sheet1.SchDoc")}]
+
+
+def test_refresh_recompiles_when_altium_has_another_project(offline_env):
+    root, _, _ = offline_env
+    _load(root)
+    status = {"running": True, "project_file": "Other.PrjPcb", "tab_type": "schematic"}
+    with patch.object(main._altium, "get_status", return_value=status), \
+         patch.object(main._altium, "generate_netlist") as generate:
+        result = json.loads(main.refresh_netlist())
+    assert result["netlist_source"] == "offline_compiler"
+    generate.assert_not_called()
+
+
+def test_refresh_takes_altiums_netlist_once_it_has_the_project(offline_env):
+    root, _, _ = offline_env
+    _load(root)
+
+    def generate(prj_pcb_path, sheet_paths=None, annotation_paths=None):
+        main._altium._netlist = {
+            "nets": {"GND": [("R1", "1"), ("R2", "1")]}, "source": "altium",
+            "pin_to_net": {"R1": {"1": "GND"}, "R2": {"1": "GND"}},
+            "components": {"R1": {"pins": {"1": {"name": "1", "net": "GND"}}}},
+        }
+        return False  # the .NET on disk was fresh: still a change of source
+
+    with patch.object(main._altium, "get_status", return_value=ALTIUM_HAS_BOARD), \
+         patch.object(main._altium, "generate_netlist", side_effect=generate):
+        result = json.loads(main.refresh_netlist())
+    assert result["refreshed"] is True and result["netlist_source"] == "altium"
+    assert "netlist_source" not in json.loads(main.query_net("GND"))
+
+
+def test_stale_cached_netlist_gives_way_to_the_offline_compile(offline_env):
+    root, _, _ = offline_env
+    net = root / "Project Outputs for Board" / "Board.NET"
+    net.parent.mkdir()
+    net.write_text("(\nGND\nR1-1\n)\n", encoding="utf-8")
+    registry = {"projects": [{"dir": str(root), "netlist_mtime": net.stat().st_mtime}]}
+    os.utime(root / "source" / "sheet1.SchDoc", (net.stat().st_mtime + 100,) * 2)
+    with patch.object(main, "read_registry", return_value=registry):
+        result = _load(root)
+    assert result["load_mode"] == "offline_netlist" and result["cached_netlist_stale"] is True
+    assert "compiled instead" in result["netlist_note"]
+    assert main._altium._netlist["source"] == "offline"
+
+
+def test_a_fresh_altium_netlist_still_wins_over_the_offline_compile(offline_env):
+    root, _, _ = offline_env
+    net = root / "Project Outputs for Board" / "Board.NET"
+    net.parent.mkdir()
+    net.write_text("(\nGND\nR1-1\n)\n", encoding="utf-8")
+    newest = max(f.stat().st_mtime for f in root.rglob("*") if f.is_file() and f != net)
+    os.utime(net, (newest + 100, newest + 100))
+    result = _load(root)
+    assert result["netlist_source"] == "altium" and "load_mode" not in result
+    assert main._altium._netlist["source"] == "altium"

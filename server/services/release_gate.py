@@ -386,6 +386,10 @@ def gate_netlist_fresh(ctx: ReleaseContext) -> tuple[str, str]:
             what.append(_names(others))
         return "fail", (f"Saved after the netlist was compiled ({compiled}): "
                         + "; ".join(what) + ". Call refresh_netlist after saving in Altium.")
+    if ctx.netlist.get("source") == "offline":
+        return "pass", (f"Compiled offline by the copilot from the saved sheets ({compiled}), "
+                        f"newer than all {_plural(len(sheets), 'sheet')}; Altium's own "
+                        "compile did not run (ERC is its own gate).")
     return "pass", f"Compiled {compiled}, newer than all {_plural(len(sheets), 'sheet')}."
 
 

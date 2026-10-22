@@ -947,6 +947,9 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
             )
             result.no_ercs.append(no_erc)
             wiring.add_no_erc(no_erc, _location(props))
+        elif record == "17" and _off_sheet(props):
+            # An off-sheet connector: a RECORD=17 too, but not a power port.
+            wiring.add_object("off_sheet", props.get("text", ""), [_location(props)])
         elif record in ("17", "25") and props.get("text"):
             kind = "power_port" if record == "17" else "label"
             wiring.add_object(kind, props["text"], [_location(props)])
@@ -970,6 +973,12 @@ def _int(text: str) -> int:
         return int(text)
     except ValueError:
         return 0
+
+
+def _off_sheet(props: dict[str, str]) -> bool:
+    """A RECORD=17 that is an off-sheet connector (IsCrossSheetConnector=T), not a power
+    port."""
+    return props.get("iscrosssheetconnector", "").strip().upper() in ("T", "TRUE")
 
 
 def _flag(props: dict[str, str], key: str) -> bool:
@@ -1038,26 +1047,27 @@ def _on_segment(x: float, y: float, x0: float, y0: float, x1: float, y1: float) 
     return (x0 + t * dx - x) ** 2 + (y0 + t * dy - y) ** 2 < _EPS_MIL ** 2
 
 
-class _Wiring:
-    """A sheet's connectivity. Lines (wires, buses, harnesses) join where an end of one
-    lies on another (Altium's automatic junctions); objects (pins, ports, entries,
-    labels, power ports, junctions) join the lines their points lie on and objects at
-    the same point. Lines crossing without a junction stay apart."""
+class LineIndex:
+    """Polylines (wires, buses, harnesses) indexed for point queries: which lines pass
+    through a point, or within a distance of it. Line numbers count from 0 in the order
+    added; a line of fewer than two vertices is not added."""
+
+    _CELL_MIL = 10.0  # row and column width of the index near() reads
 
     def __init__(self):
-        self._lines: list[list[tuple[float, float]]] = []
-        self._objects: list[tuple[str, object, list[tuple[float, float]]]] = []
+        self.lines: list[list[tuple[float, float]]] = []
         self._horizontal: dict[int, list[tuple[float, float, int]]] = {}
         self._vertical: dict[int, list[tuple[float, float, int]]] = {}
         self._other: list[tuple[float, float, float, float, int]] = []
-        self._parent: list[int] = []
-        self._no_ercs: list[tuple[NoErc, tuple[float, float]]] = []
+        self._rows: dict[int, list[tuple[float, float, float, int]]] | None = None
+        self._columns: dict[int, list[tuple[float, float, float, int]]] | None = None
 
-    def add_line(self, vertices: list[tuple[float, float]]) -> None:
+    def add(self, vertices: list[tuple[float, float]]) -> int | None:
         if len(vertices) < 2:
-            return
-        node = len(self._lines)
-        self._lines.append(vertices)
+            return None
+        node = len(self.lines)
+        self.lines.append(vertices)
+        self._rows = self._columns = None
         for (x0, y0), (x1, y1) in zip(vertices, vertices[1:]):
             if abs(y0 - y1) < _EPS_MIL:
                 self._horizontal.setdefault(_key(y0), []).append((min(x0, x1), max(x0, x1), node))
@@ -1065,16 +1075,9 @@ class _Wiring:
                 self._vertical.setdefault(_key(x0), []).append((min(y0, y1), max(y0, y1), node))
             else:
                 self._other.append((x0, y0, x1, y1, node))
+        return node
 
-    def add_object(self, kind: str, item, points: list[tuple[float, float]]) -> None:
-        self._objects.append((kind, item, points))
-
-    def add_no_erc(self, item: "NoErc", point: tuple[float, float]) -> None:
-        """A No ERC marker: it joins nothing (two wires crossing under it stay apart) but
-        takes the wiring of the object at its point, else of a line through it."""
-        self._no_ercs.append((item, point))
-
-    def _lines_at(self, x: float, y: float) -> set[int]:
+    def at(self, x: float, y: float) -> set[int]:
         found = set()
         for key in (_key(y) - 1, _key(y), _key(y) + 1):
             for x0, x1, node in self._horizontal.get(key, ()):
@@ -1088,6 +1091,71 @@ class _Wiring:
             if _on_segment(x, y, x0, y0, x1, y1):
                 found.add(node)
         return found
+
+    def near(self, x: float, y: float, distance: float) -> set[int]:
+        """Lines with a segment no farther than distance (mil) from the point."""
+        if self._rows is None:
+            self._rows, self._columns = {}, {}
+            for key, segments in self._horizontal.items():
+                for x0, x1, node in segments:
+                    self._rows.setdefault(int(key * _EPS_MIL // self._CELL_MIL), []).append(
+                        (key * _EPS_MIL, x0, x1, node))
+            for key, segments in self._vertical.items():
+                for y0, y1, node in segments:
+                    self._columns.setdefault(int(key * _EPS_MIL // self._CELL_MIL), []).append(
+                        (key * _EPS_MIL, y0, y1, node))
+        found = set()
+        span = range(int((y - distance) // self._CELL_MIL), int((y + distance) // self._CELL_MIL) + 1)
+        for row in span:
+            for level, x0, x1, node in self._rows.get(row, ()):
+                dx = max(x0 - x, 0.0, x - x1)
+                if dx * dx + (y - level) ** 2 <= distance * distance:
+                    found.add(node)
+        span = range(int((x - distance) // self._CELL_MIL), int((x + distance) // self._CELL_MIL) + 1)
+        for column in span:
+            for level, y0, y1, node in self._columns.get(column, ()):
+                dy = max(y0 - y, 0.0, y - y1)
+                if dy * dy + (x - level) ** 2 <= distance * distance:
+                    found.add(node)
+        for x0, y0, x1, y1, node in self._other:
+            if _distance_to_segment(x, y, x0, y0, x1, y1) <= distance:
+                found.add(node)
+        return found
+
+
+def _distance_to_segment(x: float, y: float, x0: float, y0: float, x1: float, y1: float) -> float:
+    dx, dy = x1 - x0, y1 - y0
+    length2 = dx * dx + dy * dy
+    t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((x - x0) * dx + (y - y0) * dy) / length2))
+    return ((x0 + t * dx - x) ** 2 + (y0 + t * dy - y) ** 2) ** 0.5
+
+
+class _Wiring:
+    """A sheet's connectivity. Lines (wires, buses, harnesses) join where an end of one
+    lies on another (Altium's automatic junctions); objects (pins, ports, entries,
+    labels, power ports, junctions) join the lines their points lie on and objects at
+    the same point. Lines crossing without a junction stay apart."""
+
+    def __init__(self):
+        self._index = LineIndex()
+        self._lines = self._index.lines
+        self._objects: list[tuple[str, object, list[tuple[float, float]]]] = []
+        self._parent: list[int] = []
+        self._no_ercs: list[tuple[NoErc, tuple[float, float]]] = []
+
+    def add_line(self, vertices: list[tuple[float, float]]) -> None:
+        self._index.add(vertices)
+
+    def add_object(self, kind: str, item, points: list[tuple[float, float]]) -> None:
+        self._objects.append((kind, item, points))
+
+    def add_no_erc(self, item: "NoErc", point: tuple[float, float]) -> None:
+        """A No ERC marker: it joins nothing (two wires crossing under it stay apart) but
+        takes the wiring of the object at its point, else of a line through it."""
+        self._no_ercs.append((item, point))
+
+    def _lines_at(self, x: float, y: float) -> set[int]:
+        return self._index.at(x, y)
 
     def _find(self, i: int) -> int:
         while self._parent[i] != i:
@@ -1173,6 +1241,194 @@ def _group(wires: int, members: list[tuple[str, object]]) -> WireGroup:
         if kind in ("port", "entry") or value not in target:
             target.append(value)
     return group
+
+
+# ---------- connectivity: every object the netlist compiler joins ----------
+
+Point = tuple[float, float]
+
+
+@dataclass
+class SchPart:
+    """One placed part (RECORD=1); a multi-part component has one per part."""
+    designator: str
+    unique_id: str
+    part_id: str              # CurrentPartId: 1 = part A, ...
+    part_count: str           # PartCount: number of parts + 1
+    origin: Point
+
+
+@dataclass
+class SchPin:
+    """A pin of a placed part, drawn for that part and display mode."""
+    part: int                 # index into SheetConnectivity.parts
+    designator: str
+    point: Point              # the electrical end
+    hidden: bool = False
+    name: str = ""
+    hidden_net: str = ""      # HiddenNetName: the legacy net of a hidden pin
+
+
+@dataclass
+class HarnessConnector:
+    """A harness connector (RECORD=215 in the Additional stream) and its entries (216):
+    the harness side takes the signal harness, each entry a wire of its own."""
+    point: Point              # where the signal harness attaches
+    entries: list[tuple[str, Point]] = field(default_factory=list)
+    harness_type: str = ""
+    # Location (top-left), XSize, YSize and HarnessConnectorSide, placing the entries.
+    box: tuple[float, float, float, float, str] = (0.0, 0.0, 0.0, 0.0, "0")
+
+
+@dataclass
+class SheetConnectivity:
+    """What a sheet draws that the netlist compiler joins, read in one pass."""
+    parts: list[SchPart] = field(default_factory=list)
+    pins: list[SchPin] = field(default_factory=list)
+    wires: list[list[Point]] = field(default_factory=list)       # RECORD=27
+    buses: list[list[Point]] = field(default_factory=list)       # RECORD=26
+    harnesses: list[list[Point]] = field(default_factory=list)   # RECORD=218
+    junctions: list[Point] = field(default_factory=list)         # RECORD=29
+    labels: list[tuple[str, Point]] = field(default_factory=list)       # RECORD=25
+    power_ports: list[tuple[str, Point]] = field(default_factory=list)  # RECORD=17
+    off_sheet: list[tuple[str, Point]] = field(default_factory=list)    # 17, cross-sheet
+    ports: list[tuple[SheetPort, list[Point]]] = field(default_factory=list)  # 18, both ends
+    symbols: list[tuple[SheetSymbol, list[Point]]] = field(default_factory=list)  # entry points
+    connectors: list[HarnessConnector] = field(default_factory=list)
+    masks: list[list[float]] = field(default_factory=list)       # enabled compile masks
+    # parse_sch_doc's view of the same records, for the netlist's component metadata.
+    components: dict[str, ComponentMeta] = field(default_factory=dict)
+    clashes: list[DesignatorClash] = field(default_factory=list)
+
+
+def parse_sch_connectivity(path: str) -> SheetConnectivity:
+    """Read a .SchDoc for the netlist compiler: the parts and their pins (hidden ones
+    flagged), wires, buses, signal harnesses with their connectors and entries (in the
+    Additional stream), junctions, net labels, power ports, off-sheet connectors, ports,
+    sheet symbols with their entries and the enabled compile masks, plus the component
+    metadata parse_sch_doc gives."""
+    with olefile.OleFileIO(path) as f:
+        additional = f.openstream("Additional").read() if f.exists("Additional") else b""
+        return connectivity_from_stream(f.openstream("FileHeader").read(), additional,
+                                        source=path)
+
+
+def connectivity_from_stream(data: bytes, additional: bytes = b"",
+                             source: str = "") -> SheetConnectivity:
+    """parse_sch_connectivity for the bytes of a FileHeader and an Additional stream."""
+    records = _read_records(data)
+    result = SheetConnectivity()
+    parts: dict[int, int] = {}                  # record position -> index into parts
+    modes: dict[int, tuple[str, str]] = {}      # record position -> (part id, display mode)
+    symbols: dict[int, tuple[SheetSymbol, list[Point]]] = {}
+    for pos, props in enumerate(records):
+        record = props.get("record")
+        owner = _owner_position(props)
+        if record == "1":
+            parts[pos] = len(result.parts)
+            modes[pos] = (props.get("currentpartid", "1"), props.get("displaymode", "0"))
+            result.parts.append(SchPart("", props.get("uniqueid", ""), modes[pos][0],
+                                        props.get("partcount", ""), _location(props)))
+        elif record == "2" and owner in parts:
+            part, mode = modes[owner]
+            conglomerate = _int(props.get("pinconglomerate", "0"))
+            if (props.get("ownerpartid", part) in (part, "-1", "0")
+                    and props.get("ownerpartdisplaymode", "0") == mode
+                    and props.get("designator")):
+                result.pins.append(SchPin(
+                    parts[owner], props["designator"], _pin_end(props, conglomerate),
+                    hidden=bool(conglomerate & 0x04), name=props.get("name", ""),
+                    hidden_net=props.get("hiddennetname", "")))
+        elif record == "34" and owner in parts:
+            if props.get("name", "").lower() == "designator":
+                result.parts[parts[owner]].designator = props.get("text", "")
+        elif record == "15" and owner is None:
+            symbol = SheetSymbol(
+                unique_id=props.get("uniqueid", ""),
+                symbol_type=props.get("symboltype", ""),
+                design_item_id=props.get("designitemid", ""),
+                x_mil=_coord(props, "location.x"),
+                y_mil=_coord(props, "location.y"),
+                width_mil=_coord(props, "xsize"),
+                height_mil=_coord(props, "ysize"),
+            )
+            symbols[pos] = (symbol, [])
+            result.symbols.append(symbols[pos])
+        elif record in ("32", "33") and owner in symbols:
+            name = "designator" if record == "32" else "file_name"
+            setattr(symbols[owner][0], name, props.get("text", "").strip())
+        elif record == "16" and owner in symbols:
+            symbol, points = symbols[owner]
+            entry = SheetEntry(
+                name=props.get("name", "").strip(),
+                io_type=IO_TYPES.get(props.get("iotype", "0"), "Unspecified"),
+                side=_SIDES.get(props.get("side", "0"), "left"),
+                harness_type=props.get("harnesstype", ""),
+            )
+            symbol.entries.append(entry)
+            points.append(_entry_point(symbol, entry, props))
+        elif owner is not None:
+            continue  # symbol graphics, template content
+        elif record == "18":
+            port = SheetPort(
+                name=props.get("name", "").strip(),
+                io_type=IO_TYPES.get(props.get("iotype", "0"), "Unspecified"),
+                harness_type=props.get("harnesstype", ""),
+            )
+            result.ports.append((port, _port_ends(props)))
+        elif record == "27":
+            result.wires.append(_vertices(props))
+        elif record == "26":
+            result.buses.append(_vertices(props))
+        elif record == "218":
+            result.harnesses.append(_vertices(props))
+        elif record == "29":
+            result.junctions.append(_location(props))
+        elif record == "17" and props.get("text"):
+            target = result.off_sheet if _off_sheet(props) else result.power_ports
+            target.append((props["text"], _location(props)))
+        elif record == "25" and props.get("text"):
+            result.labels.append((props["text"], _location(props)))
+        elif record == "211" and props.get("collapsed", "").upper() != "T":
+            result.masks.append(_rect(props))  # a collapsed compile mask is disabled
+    connector: HarnessConnector | None = None
+    for props in _read_records(additional) if additional else ():
+        record = props.get("record")
+        if record == "218":
+            result.harnesses.append(_vertices(props))
+        elif record == "215":
+            connector = _harness_connector(props)
+            result.connectors.append(connector)
+        elif record == "216" and connector is not None:
+            connector.entries.append((props.get("name", "").strip(),
+                                      _harness_entry_point(connector, props)))
+        elif record == "217" and connector is not None:
+            connector.harness_type = props.get("text", "").strip()
+    result.components = _components_from_records(records, source, result.clashes)
+    return result
+
+
+def _harness_connector(props: dict[str, str]) -> HarnessConnector:
+    """A harness connector box from its top-left Location, XSize and YSize. The signal
+    harness attaches on HarnessConnectorSide (0 left, 1 right, 2 top, 3 bottom) at
+    PrimaryConnectionPosition along it; the entries sit on the opposite side."""
+    x, y = _location(props)
+    width, height = _coord(props, "xsize"), _coord(props, "ysize")
+    side = props.get("harnessconnectorside", "0")
+    along = _coord(props, "primaryconnectionposition")
+    point = {"1": (x + width, y - along), "2": (x + along, y),
+             "3": (x + along, y - height)}.get(side, (x, y - along))
+    return HarnessConnector(point, box=(x, y, width, height, side))
+
+
+def _harness_entry_point(connector: HarnessConnector, props: dict[str, str]) -> Point:
+    """A harness entry on the side of its connector opposite the harness, DistanceFromTop
+    (100 mil units, plus DistanceFromTop_Frac1) from the top or left corner."""
+    x, y, width, height, side = connector.box
+    distance = (_int(props.get("distancefromtop", "0")) * 10
+                + _int(props.get("distancefromtop_frac1", "0")) / 100_000) * _UNIT_MIL
+    return {"1": (x, y - distance), "2": (x + distance, y - height),
+            "3": (x + distance, y)}.get(side, (x + width, y - distance))
 
 
 # ---------- integrity: the sheet size, parts and names as written ----------

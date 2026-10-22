@@ -188,23 +188,27 @@ def page_design_hierarchy(model: dict, offset: int, limit: int, issue_limit: int
 
 # ---------- the tree ----------
 
-def _child_index(sheets: list[_Sheet], parent: _Sheet, file_name: str) -> int | None:
-    """The project sheet a symbol's file name points at: a relative path from the
-    parent's folder when it holds one, else the sheet of that file name (the one in the
-    parent's folder first)."""
+def child_sheet(paths: list[str], parent_path: str, file_name: str) -> int | None:
+    """The project sheet (index into paths) a symbol's file name points at: a relative
+    path from the parent's folder when it holds one, else the sheet of that file name
+    (the one in the parent's folder first)."""
     if not file_name:
         return None
     normalized = file_name.replace("\\", "/")
-    by_path = {os.path.normcase(s.path): i for i, s in enumerate(sheets)}
+    by_path = {os.path.normcase(p): i for i, p in enumerate(paths)}
     if "/" in normalized:
-        target = os.path.normcase(str((Path(parent.path).parent / normalized).resolve()))
+        target = os.path.normcase(str((Path(parent_path).parent / normalized).resolve()))
         if target in by_path:
             return by_path[target]
     name = Path(normalized).name.lower()
-    matches = [i for i, s in enumerate(sheets) if Path(s.path).name.lower() == name]
-    folder = os.path.normcase(str(Path(parent.path).parent))
-    same = [i for i in matches if os.path.normcase(str(Path(sheets[i].path).parent)) == folder]
+    matches = [i for i, p in enumerate(paths) if Path(p).name.lower() == name]
+    folder = os.path.normcase(str(Path(parent_path).parent))
+    same = [i for i in matches if os.path.normcase(str(Path(paths[i]).parent)) == folder]
     return (same or matches or [None])[0]
+
+
+def _child_index(sheets: list[_Sheet], parent: _Sheet, file_name: str) -> int | None:
+    return child_sheet([s.path for s in sheets], parent.path, file_name)
 
 
 def _link(sheets: list[_Sheet]) -> None:
@@ -304,6 +308,16 @@ def _tree_lines(nodes: list[_Node], sheets: list[_Sheet]) -> list[str]:
 
 # ---------- the scope ----------
 
+def effective_scope(mode: str, top_entries: bool, ports: bool) -> str:
+    """The Net Identifier Scope a HierarchyMode compiles with. Automatic (and a value
+    this tool does not know) follows Altium's rule: Hierarchical when the top sheet has
+    sheet entries, else Flat when there are ports, else Global."""
+    setting = SCOPES.get(mode.strip(), "Automatic")
+    if setting != "Automatic":
+        return setting
+    return "Hierarchical" if top_entries else "Flat" if ports else "Global"
+
+
 def _scope(mode: str, naming: dict[str, str], sheets: list[_Sheet], nodes: list[_Node]) -> dict:
     setting = SCOPES.get(mode.strip(), "Automatic" if not mode.strip() else f"Unknown ({mode})")
     tops = {n.sheet for n in nodes if n.depth == 0}
@@ -311,15 +325,12 @@ def _scope(mode: str, naming: dict[str, str], sheets: list[_Sheet], nodes: list[
     ports = any(s.data and s.data.ports for s in sheets)
     scope: dict = {"setting": SCOPE_LABELS.get(setting, setting), "hierarchy_mode": mode or None}
     if setting == "Automatic":
-        if top_entries:
-            effective = "Hierarchical"
-            reason = "the top sheet has sheet entries, so Automatic uses Hierarchical"
-        elif ports:
-            effective = "Flat"
-            reason = "no sheet entries on the top sheet but ports present, so Automatic uses Flat"
-        else:
-            effective = "Global"
-            reason = "no sheet entries on the top sheet and no ports, so Automatic uses Global"
+        effective = effective_scope(mode, top_entries, ports)
+        reason = {
+            "Hierarchical": "the top sheet has sheet entries, so Automatic uses Hierarchical",
+            "Flat": "no sheet entries on the top sheet but ports present, so Automatic uses Flat",
+            "Global": "no sheet entries on the top sheet and no ports, so Automatic uses Global",
+        }[effective]
         scope["effective"] = effective
         scope["automatic_rule"] = (
             "Altium's rule: Hierarchical when the top sheet has sheet entries, else Flat "
@@ -329,7 +340,7 @@ def _scope(mode: str, naming: dict[str, str], sheets: list[_Sheet], nodes: list[
     elif setting in SCOPE_EXPLANATIONS:
         scope["effective"] = setting
     else:
-        scope["effective"] = "Hierarchical" if top_entries else "Flat" if ports else "Global"
+        scope["effective"] = effective_scope("0", top_entries, ports)
         scope["note"] = (f"HierarchyMode={mode} is not a value this tool knows; read as "
                          f"Automatic would resolve it ({scope['effective']}).")
     if mode.strip() == "4":

@@ -1,6 +1,6 @@
 # Altium Copilot (KC)
 
-> **This is the KC fork** of [ee-in-a-box/altium-copilot](https://github.com/ee-in-a-box/altium-copilot), with many more tools (see the CHANGELOG). It installs as its own MCP server, `altium-copilot-kc` (in `%LOCALAPPDATA%ltium-copilot-kc`, with its own state file and update check), so it can sit beside the upstream `altium-copilot` and Claude always shows which one a tool comes from.
+> **This is the KC fork** of [ee-in-a-box/altium-copilot](https://github.com/ee-in-a-box/altium-copilot), with many more tools (see the CHANGELOG). It installs as its own MCP server, `altium-copilot-kc` (in `%LOCALAPPDATA%\altium-copilot-kc`, with its own state file and update check), so it can sit beside the upstream `altium-copilot` and Claude always shows which one a tool comes from.
 
 [![CI](https://github.com/kcisek/altium-copilot-kc/actions/workflows/ci.yml/badge.svg)](https://github.com/kcisek/altium-copilot-kc/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/kcisek/altium-copilot-kc/total?color=brightgreen)](https://github.com/kcisek/altium-copilot-kc/releases)
@@ -137,8 +137,8 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | File | What is read |
 |---|---|
 | `.PrjPcb` | Sheet list (subfolders, `..\` paths and device sheets included), variants, project parameters, output folder, Comparator settings, Project Options (ERC report levels, Connection Matrix, class generation, multi-channel naming, Net Identifier Scope) |
-| `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks, No ERC directives, sheet size, names as written (for `check_project_integrity`) |
-| Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel. With Altium closed the project loads without it (see [Requirements](#requirements)) |
+| `.SchDoc` | Components, parameters, pins, footprints, compile masks, notes, text frames, labels, pictures, directives, title blocks, No ERC directives, sheet size, names as written (for `check_project_integrity`); for the [offline netlist](#offline-netlist) also wires, buses, junctions, net labels, power ports, ports, sheet symbols and entries, off-sheet connectors, signal harnesses with their connectors and entries |
+| Protel netlist (`.NET`) | Connectivity and the compiled part list. Altium writes it: when it is missing or older than the sheets, the copilot sends Altium the keystrokes for Design » Netlist For Project » Protel. With Altium closed the copilot compiles the netlist itself from the sheets (see [Offline netlist](#offline-netlist)) |
 | `.Annotation` | Board designators of board-annotated and multi-channel designs |
 | `.PcbDoc` | Tracks, arcs, vias, pads, saved pour outlines (shelved or not), the copper a pour was last poured into (solid pours' regions, hatched pours' tracks and arcs), copper regions and fills, internal plane nets, components and designators, stackup, impedance profiles, rules, classes, differential pairs, xSignals, DRC settings; for the health check also region shapes, the board shape and Health Check settings; for the DFM check also pad holes (plated or not, a slot's angle, whether the hole is offset from the pad), bare holes such as mounting holes, board cutouts and the number of embedded board arrays (panels) |
 | `fab_profile.json` (optional) | A fabricator's limits for `check_dfm`, from the project folder (or `<name>.json` named in the chat): name, source, `based_on` and limits in mm or mil. See [examples/fab_profile.json](examples/fab_profile.json) |
@@ -148,11 +148,42 @@ Everything comes from the files Altium saves. Nothing is written back to your de
 | Git clone of an Altium 365 project (`.git`) | When the origin is `https://<workspace>.365.altium.com/git/<project GUID>.git`: the project GUID, the last fetch time (`FETCH_HEAD`), the local commit against the remote-tracking branch as of that fetch, uncommitted changes and the last commit. Read with local `git` commands that cannot open a connection (`protocol.allow=never`), do not rewrite the index (`--no-optional-locks`) and start no program the repository's configuration names (filters, fsmonitor, signature checks); nothing is fetched and no credential is used |
 | Git history of the project's clone (`.git`, any origin) | For `diff_design`: the commits that changed the design files (`git log`), the files of each revision (`git ls-tree`, `git cat-file`, no filters run) written to a temporary folder outside the clone and deleted after the comparison. The same hardening as the Altium 365 clone above: no connection, no lazy fetch, no optional locks, no prompts; no command that writes is run |
 
-Not read: schematic wires for the design's connectivity (it comes from the netlist;
-wiring is read per sheet only for the sheet hierarchy and the net a No ERC sits on),
-ERC results, the contents of generated outputs and the DRC XML report, ActiveBOM and supply-chain data
-(lifecycle, stock, price), and Altium 365 review comments. The copilot never runs
-Altium's ERC or DRC.
+Not read: ERC results, the contents of generated outputs and the DRC XML report, ActiveBOM
+and supply-chain data (lifecycle, stock, price), and Altium 365 review comments. The
+copilot never runs Altium's ERC or DRC. Altium's own netlist is preferred whenever it is up
+to date or Altium has the project open; the sheets' wiring is compiled only without it.
+
+### Offline netlist
+
+With Altium closed and no up-to-date `.NET`, `set_project_dir` compiles the netlist from
+the saved sheets (`load_mode: offline_netlist`, `netlist_source: offline_compiler`), and
+`refresh_netlist` compiles it again after a save. It follows Altium's compile rules: the
+project's Net Identifier Scope (Flat, Global, Hierarchical, Strict Hierarchical, or what
+Automatic resolves to), power ports global (local under Strict Hierarchical, and under
+Hierarchical when wired to a port), a net label and a power port of one name joined on a
+sheet, sheet entries and ports, off-sheet connectors, buses as their own layer (a wire or
+a junction never joins one) with ranged names (`D[0..7]`) standing for their members along
+the bus's wiring, junctions and pin ends within 3 mil of a wire, signal harnesses joined entry by entry,
+multi-part components across sheets, compile masks, hidden pins only through a legacy
+hidden net name, sheets placed several times or by `Repeat(...)` compiled once per channel
+with the `.Annotation` file's designators (else the project's multi-channel format) and
+channel-suffixed local net names, and the netlist naming options (power port priority,
+ports and sheet entries naming nets, higher-level names first, `Net<designator>_<pin>`
+otherwise). The result has the shape of Altium's netlist, so every tool reads it the same
+way; `compile_warnings` in the load response lists what the files cannot settle
+(duplicate designators or net names, unconnected sheet entries, unvalidated naming and
+`Repeat(...)` entries).
+
+Validated against Altium's own output: 4 private projects' `.NET` files match exactly
+(208 of 208 nets with the same members and names, 235 of 235 parts with the same
+footprint and comment); on Altium's 5 public AD25 example boards every pin lands on the
+PcbDoc's net and all 1,274 nets carry the PCB's name; on 63 private projects 62 match their
+PcbDoc's pad nets on every pin, 13,623 of 13,639 pins agree (the other 16 are on a board
+whose PCB lacks 30 of the sheets' parts) and net names agree except where the PCB renamed
+a net. A project of 46 sheets compiles in about a second. Not validated (no sample):
+`Repeat(...)` channel designators and member distribution, names of harness nets no label
+names, off-sheet connectors, and Append Sheet Numbers to Local Nets (reported, not applied).
+No ERC runs offline: open the project in Altium for its compile messages.
 
 ---
 
@@ -161,7 +192,7 @@ Altium's ERC or DRC.
 - Windows
 - [Altium Designer](https://www.altium.com/altium-designer) — running with the project open and a schematic sheet active whenever the netlist has to be generated: the first time a project is loaded and after schematic changes
   - A project whose netlist is still up to date loads with Altium closed; the board, rule, DRC report, BOM and notes tools only read the saved files
-  - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the project loads partially: the board, rule, length, differential-pair, via, connectivity, health, DFM, DRC report, notes, picture and variant tools work. Nets, components, sheet context, BOM, decoupling, schematic-PCB sync, schematic review and the team snapshot need the netlist: open the project in Altium once, then load it again
+  - Without Altium and without an up-to-date netlist (for example a fresh copy of an Altium 365 project, which never contains `Project Outputs`), the copilot compiles the netlist from the saved sheets and every tool works (see [Offline netlist](#offline-netlist)). Only when no sheet can be compiled does the project load partially: the board, rule, length, differential-pair, via, connectivity, health, DFM, DRC report, notes, picture and variant tools work, and the netlist tools ask for the project to be opened in Altium once
   - Altium Designer 17 and older (`DXP.exe`) are detected too
 - [Git](https://git-scm.com/download/win) (optional) — only to report where an Altium 365 project's local clone stands; without it everything else works
 - [Claude Desktop](https://claude.com/download) or [Claude Code](https://claude.com/product/claude-code) — works with Pro and Enterprise subscriptions
