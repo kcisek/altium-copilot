@@ -6,6 +6,85 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_firmware_pin_map`: firmware pin map and firmware-facing pinout review (roadmap #20,
+  `services/firmware_pins.py`), read-only and offline from the compiled netlist; the
+  PcbDoc is read only when a debug or memory pin reaches no connector or test part, for
+  pads and vias marked as Fabrication Testpoints. Candidate processors are U/IC and module
+  parts fitted in the active variant, ranked by GPIO-named pins (PA0, PB12, PTA1, RB3,
+  P0.12, P1_05, PIO0_7, P407, GPIO1_IO05; GPIO12, IO12, PIO[2], DIO_5 as GPIO numbers;
+  FPGA IO names; a scheme counts only with enough pins of it, so a flash's IO0-IO3 or a
+  PHY's RD0 never make a processor), IO-typed pins and processor, MCU-family, FPGA, radio
+  or module words; memory parts are never candidates; an FPGA is labelled one. The top
+  candidate is mapped (mcu= names others). Each pin: number, full name and its
+  alternatives, port and bit, electrical type, net, the parts it reaches on its net and
+  behind up to two series parts (check_interfaces' series edges; a resistor of 1 kohm or
+  more or a series capacitor only as the last step), pulls (check_pull_resistors'
+  reading) and a likely function with its basis: a dedicated pin name first (NRST, BOOT0,
+  OSC_IN, MSEL0), then the net name (a bus token such as USART2 or SPI1 wins over a bare
+  role token such as TX or CS; a role token of two buses such as RTS1_DP names neither,
+  LED_RX is a LED and DDR4_SPD_SDA an I2C line; a crystal only when a crystal is
+  reached; Altium's own NetR9_2 names are skipped), then the parts reached (a LED or
+  switch, a crystal, a transistor, a bridge's RXD as the MCU's TX, a SPI device's SI as
+  MOSI, an Ethernet PHY's TXD0 as Ethernet, a CAN transceiver's TXD as CAN; a peer pin
+  that lists several functions gives none), then the pin's alternate functions when they
+  agree (I2C among several when the line is pulled up); a pin's own single alternate
+  function wins over a peer pin's name it does not list. Functions: UART, debug UART,
+  SPI, QSPI, I2C, SWD, JTAG, vendor programming, USB, CAN, Ethernet, SDIO, I2S, memory
+  bus, high-speed lanes, display, camera, crystal, reset, boot/strap, enable, interrupt,
+  analog, PWM/timer, LED, button, wake-up, RF, tied, NC. Power and ground pins are
+  summarised per net. Checks: `uart_crossing` (TX meeting TX or RX meeting RX on UART
+  lines and on a CAN controller's lines to its transceiver: warning when both ends are
+  certain by pin type, the MCU pin's own name or the peer's part: a USB-UART bridge,
+  another processor or module whose pin lists no other function, a CAN, RS-485, RS-232
+  or IrDA transceiver whose TXD/DI takes the MCU's TX; info for a connector pin named TX,
+  for net-name-only cases and for a pin named TX on a net named RX), `debug_access` (SWD,
+  JTAG, UPDI, PDI, Spy-Bi-Wire, C2, ICSP, a vendor SPI debug port and UART bootloaders,
+  with STM32's PA13/PA14/PB3 and USART1 and each ESP32 or ESP8266 family's boot pin, EN
+  and UART0 as vendor defaults; per role a pin's own name wins over a vendor default and
+  a net name, so a dedicated TCK beats a soft-core JTAG on user I/O; a GPIO on a net named
+  for another part's debug pin drives that part's port, and that part is reported as
+  programmed in-system through the GPIOs; a TDO into another part's TDI is named as a JTAG
+  chain; a switch or jumper on the boot pin counts as access; warning when no set reaches
+  a connector, test point or testpoint pad, also when the debug pins are unconnected and
+  only USB reaches a connector, info for partial sets, USB only, in-system access, nothing
+  recognised, and for a part named in mcu= that is no processor), `boot_straps` (boot,
+  strap, mode, program and reset pins, FPGA mode pins (MSEL, M0-M2), ESP32 strapping pins
+  and the STM32F1/F2/F4 BOOT1 on PB2: tied, pulled, a divider with its ratio and voltage,
+  a 0 ohm tie, set by a switch or jumper, driven by an output or by another processor's
+  GPIO, shared with the part's own pin (a PHY's CONFIG pin on its LED pin's net), Not
+  Fitted pulls, or the internal default; warning for a divider between 30% and 70% of the
+  rail and for an STM32's BOOT0 held high or an ESP32's boot pin held low with no switch,
+  jumper or driver to change it; info for a strap driven only by another processor's GPIO
+  and for a floating BOOT1 when BOOT0 can be high), `external_memory` (flash, EEPROM,
+  FRAM and FPGA configuration memories (EPCQ, EPCS, Platform Flash) by words or family
+  part numbers on the mapped MCU: bus I2C, SPI, QSPI, parallel or serial configuration,
+  the MCU pins and memory pins, chip select, WP/HOLD/RESET and address pins' state, a
+  warning for a floating HOLD or RESET on a SPI memory, and info on whether its bus
+  reaches a connector or test point for programming), `unused_pins` (the debug port's
+  unconnected pins are left out of the advice, strap pins are named),
+  `conflicting_assignment` (two MCU pins on one net, a warning when both are typed Output;
+  pins tied together through a 0 ohm link and strap pins on a shared line are left out; a
+  net named for a bus the pin's listed alternate functions lack) and `variant_changes`
+  (parts on a pin's path Not Fitted in some of the project's variants, or valued
+  differently). Notes name a part that reads as a processor but has no connected pin, and
+  duplicate designators from the compile among the parts involved. Formats: JSON rows
+  (default), CSV of every pin, a C header (`#define NET_PORT GPIOA` / `NET_PIN 9`: GPIOA
+  only on STM32-family parts, PTA for Kinetis, PORTB for PIC, else the port letter or
+  number; names unique across pages) and a Zephyr-style devicetree fragment (controller
+  labels only for STM32, Kinetis, nRF, LPC, i.MX RT, ESP32 and RP2040; `GPIO_ACTIVE_LOW`
+  from negated names, _B and _L only after a control name such as RESET_B; GPIO uses and
+  GPIOs that drive another part's debug pins as `zephyr,user` gpios, peripheral pins as
+  pinctrl comments; property names of at most 31 characters); anything else is a comment,
+  never invented. Rows and findings page together with a shrink loop. Calibrated on
+  Altium's public examples (an STM32 with a Wi-Fi module, a Bluetooth SoC, two FPGAs: 2
+  warnings, for the STM32's unconnected SWD and its BOOT0 held high, and 16 infos); the
+  private boards hold no processor, so there it showed no false candidate on 49 unique
+  boards and, mapped by force on their largest ICs, no warning.
+- `package_for_xfn` snapshots gain a `firmware_pins` table (MCU, pin, name, port, bit,
+  net, function, role, pull and the parts reached as JSON) for every fitted MCU, radio or
+  module candidate (at most four, else the top candidate). A new table older readers
+  ignore: `SCHEMA_VERSION` stays 1. A map that cannot be built leaves the table empty
+  with a warning; the snapshot is written either way.
 - `check_interfaces`: connector and interface protection audit (roadmap #16,
   `services/interfaces.py`), read-only and offline from the compiled netlist and, when it
   loads, the PcbDoc. Connectors are J, P, CN, X, CON, CONN, USB, RJ, HDR (and a few more)
@@ -1049,6 +1128,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   uncommitted `.PcbDoc`, in about 0.3 s per clone
 
 ### Changed
+- Compiled components carry `pin_names` (every named pin, connected or not, united across
+  the sheets a part is placed on), so unconnected pins have names. Helpers reused by
+  `get_firmware_pin_map` are public: `pull_resistors.link_group` and
+  `push_pull_drivers`, `interfaces.build_context`, `choke_far`, `bus_transceiver`,
+  `PROCESSOR_TEXT` and `DEBUG_HEADER_WORDS`, `testpoints.TP_DESIGNATOR`
+  and `TP_FOOTPRINT`, and the new `testpoints.marked_testpoint_nets`
 - The netlist-free (partial) load is now the fallback for a project whose sheets cannot be
   compiled offline (`compile_error`) or that lists none; `netlist_required` and the
   partial-load message say so. Load and refresh responses name `netlist_source` (`altium`

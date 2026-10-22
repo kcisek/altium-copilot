@@ -163,8 +163,8 @@ NET_SAMPLE = 20  # nets listed per grouped finding
 TOOLING_LISTED = 10
 EPS_MIL = 0.001
 _TOP, _BOTTOM = 1, 32
-_TP_DESIGNATOR = re.compile(r"^TP(?![A-Za-z])", re.IGNORECASE)
-_TP_FOOTPRINT = re.compile(r"test[ _-]?points?", re.IGNORECASE)
+TP_DESIGNATOR = re.compile(r"^TP(?![A-Za-z])", re.IGNORECASE)
+TP_FOOTPRINT = re.compile(r"test[ _-]?points?", re.IGNORECASE)
 _SEVERITY_ORDER = {"warning": 0, "info": 1}
 _CELL_MIL = 200.0
 _FABRICATION_USAGE = ("FabricationTestPointUsage", "TestPointUsage")
@@ -287,8 +287,23 @@ def tp_components(index) -> set[int]:
     found = set()
     for number, component in enumerate(index.pcb.components):
         designator = index.designator(number) or ""
-        if _TP_DESIGNATOR.match(designator) or _TP_FOOTPRINT.search(component.footprint or ""):
+        if TP_DESIGNATOR.match(designator) or TP_FOOTPRINT.search(component.footprint or ""):
             found.add(number)
+    return found
+
+
+def marked_testpoint_nets(index) -> set[str]:
+    """Net names with a probe site on the board: a pad or via marked as a Fabrication
+    Testpoint on either side, or a pad of a TP part (tp_components)."""
+    parts = tp_components(index)
+    nets = index.pcb.nets
+    found = set()
+    for prim in index.pcb.primitives:
+        if prim.kind not in ("pad", "via") or prim.net is None or not 0 <= prim.net < len(nets):
+            continue
+        if prim.test_fab_top or prim.test_fab_bottom or (
+                prim.kind == "pad" and prim.component in parts):
+            found.add(nets[prim.net])
     return found
 
 
