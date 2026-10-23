@@ -1312,8 +1312,9 @@ class _Across:
 _CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
-def _across(net_a: str, net_b: str, voltages: dict[str, Volt], switch_nodes: set[str]
-            ) -> _Across:
+def across_voltage(net_a: str, net_b: str, voltages: dict[str, Volt], switch_nodes: set[str]
+                   ) -> _Across:
+    """The voltage across two nets (both known), or which end is known."""
     va, vb = voltages.get(net_a), voltages.get(net_b)
     if va is not None and vb is not None:
         confidence = max((va.confidence, vb.confidence), key=_CONFIDENCE_RANK.get)
@@ -1528,7 +1529,7 @@ def resistor_limits(part: Part, policy: dict) -> tuple[Field | None, Field | Non
     return power, voltage
 
 
-def _shunt(part: Part, text: str) -> bool:
+def is_shunt(part: Part, text: str) -> bool:
     return (part.ohms is not None and 0 < part.ohms <= LINK_OHMS) or bool(
         re.search(r"\bshunt\b|current[- ]sens", text, re.I))
 
@@ -1549,12 +1550,12 @@ def _resistor_findings(part: Part, tree, voltages: dict[str, Volt], switch_nodes
             "max_voltage_source": max_v.describe() if max_v else None}
     text = tree.text(part.ref)
     for net_a, net_b in part.sections:
-        across = _across(net_a, net_b, voltages, switch_nodes)
+        across = across_voltage(net_a, net_b, voltages, switch_nodes)
         nets = [net_a, net_b]
         leds = sorted({led for net in nets for led in led_nets.get(net, ())}, key=natural_key)
         if across.volts is not None:
             row.update(across_v=round(across.volts, 3), voltage_basis=across.basis)
-        if _shunt(part, text):
+        if is_shunt(part, text):
             out.append(_finding(
                 "needs_current", "info",
                 f"Current-sense shunt ({part.value or 'value not read'} ohm): its power is "
@@ -1816,7 +1817,7 @@ def prepare_derating(
     cap_stats: Counter = Counter()
     res_stats: Counter = Counter()
     for part in checked:
-        across = [_across(a, b, voltages, switch_nodes) for a, b in part.sections]
+        across = [across_voltage(a, b, voltages, switch_nodes) for a, b in part.sections]
         if part.kind == "capacitor":
             _count_cap(part, across, cap_stats)
             known = [item for item in across if item.volts is not None]

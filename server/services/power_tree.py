@@ -690,7 +690,7 @@ def _transformer_outputs(tree: _Tree, net: str, skip: set[str]) -> list[tuple[st
     return out
 
 
-def _gate_fets(tree: _Tree, conv: _Converter) -> dict[str, set[str]]:
+def gate_fets(tree: _Tree, conv: _Converter) -> dict[str, set[str]]:
     """The MOSFETs whose gate the part's gate pins drive: each one's drain and source
     nets, not ground."""
     fets: dict[str, set[str]] = {}
@@ -752,7 +752,7 @@ def _trace_io(tree: _Tree, conv: _Converter) -> None:
         entry.pins.append(pin)
     sw_nets = conv.nets("sw")
     conv.switch_nodes = set(sw_nets)
-    fets = _gate_fets(tree, conv) if conv.pins.get("gate") else {}
+    fets = gate_fets(tree, conv) if conv.pins.get("gate") else {}
     if conv.kind in SWITCHING_KINDS or conv.kind == "pmic":
         conv.switch_nodes |= {net for nets in fets.values() for net in nets
                               if net not in conv.inputs}

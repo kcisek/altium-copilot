@@ -6,6 +6,111 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_thermal`: thermal estimate and thermal-via audit (roadmap #21,
+  `services/thermal.py`), read-only and offline from the compiled netlist, the active
+  variant and the PcbDoc. Everything is labelled an estimate: thetaJA, Tj max, loads and
+  efficiencies come from the datasheets or the user, and the datasheet and a thermal
+  simulation decide. After Altium's IC thermal management article (thermal vias close to
+  the heat source, heating from neighbouring parts, thetaJA x P as the rise) and 'Beyond
+  the PCB review' (a thermal estimate as a final verification step).
+  - Hot parts, each with its basis: get_power_tree's converters (linear regulators and
+    LDOs, switchers and modules, chargers, load switches, eFuses, hot-swap and ideal-diode
+    controllers), the FETs a converter's gate pins drive (switch FETs, or a pass
+    controller's pass FET) and the diodes on its switch node, transistors and diodes in
+    series with a rail, current-sense shunts, resistors whose computed power
+    (check_derating's V^2/R, or I^2 x R at an LED current get_circuit_calculations
+    computes) reaches 0.25 W or half their rating, LEDs at 0.2 W or more, processors and
+    FPGAs (get_firmware_pin_map's candidates), Ethernet PHYs (check_logic_levels'
+    classes), LED drivers, motor, bridge and power-stage drivers and power amplifiers by
+    their words, parts named in power= (and listed, as no heat source, when named in
+    part=), and with a PcbDoc any part with an exposed pad or thermal tab, placed parts
+    the compiled netlist lacks included.
+  - Dissipation where the inputs allow: linear P = (Vin - Vout) x I_out + Vin x Iq,
+    switcher P = Vout x I_out x (1/eta - 1) (the converter's total loss), per output for a
+    multi-output part (the outputs with a load counted, the rest listed), shunt I^2 x R
+    (never V^2/R: nominal net voltages cannot resolve the millivolts across it), diode
+    Vf x I with its stated Vf (a forward-voltage parameter, 'Vf 0.55V' in its text, or
+    the one voltage under 1.6 V in a rectifier's text), else a typical one (0.45 V
+    Schottky, 0.8 V silicon, labelled), resistor V^2/R, LED Vf x I; a FET, a switch, a
+    processor or a driver needs its figure in power=. Voltages are check_derating's net
+    voltages (rails=, names, the power tree, vref=); an iq= whose Vin is unknown is asked
+    for, not dropped. Loads are never guessed: load= takes amps per designator or output
+    rail, read without float noise ('700mA' is 0.7). With thetaJA (theta=) the junction
+    temperature Tj = Ta + thetaJA x P at ta (default 25 C) and at a worst-case ta_max,
+    against tj_max (per designator or one for all, default 125 C). inputs_needed lists the
+    designators waiting for each argument.
+  - Thermal pads on the PcbDoc: a component's largest SMD pad (with same-named pads of at
+    least a quarter of its area: a split pad; then a second pad of another name: dual
+    pads), or a fill or region its footprint draws on its pads' layer and on one of its
+    nets (a PowerPAK's drain paddle, with the pads it carries), at 2.5 times the median
+    area of its other pads or more and 0.5 mm^2 or more, in the box of the other pads'
+    centres (an exposed pad) or at one edge (a DPAK, D2PAK or SOT-223 tab), of ICs,
+    transistors (T and TR ones too), diodes, converters and unknown parts; connectors,
+    switches, crystals, inductors, transformers, capacitors, resistors and other
+    mechanical parts are left out, and so is a no-net tab of a part not known to dissipate
+    (a holder's anchor). More than four such pads make a pad array (an LGA module, a power
+    stage): its large pads on ground (else on the largest one's net) are audited as one
+    pad, and pad_array gives how many large pads there are and how many were audited.
+    Vias count when their centre lies inside the pad's copper (rotation and side as
+    placed) and their span reaches the pad's layer (a blind via under a bottom pad does
+    not), with the footprint's own plated holes in it; each pad's count, drills, unplated
+    holes, vias on another net, same-net vias within 1 mm of its edge, whether it meets a
+    pour of its net, and the layers where its vias meet its net's copper as
+    check_connectivity joins it (planes, poured regions with their relief spokes, fills,
+    and hatched pours' outlines). A shelved or never-poured pour holds no copper: vias
+    landing in one are listed under reaches_pours_without_copper, not as reached and not
+    as unconnected, and a board note counts those pours.
+  - Findings: tj_over_max (warning), tj_near_max (above 80% of tj_max: info),
+    thermal_pad_no_vias (warning for a part known to dissipate, info otherwise or when
+    four or more vias of its net sit beside it or a tab sits in its pour),
+    thermal_vias_wrong_net (warning), thermal_pad_few_vias (fewer than one via per
+    1.5 mm^2, or 4 on pads over 4 mm^2, labelled a common guideline: info),
+    thermal_pad_unconnected (a pad with no net, or vias reaching no plane or pour of its
+    net on another layer: info), hot_neighbours (two hot parts, one at least known to
+    dissipate and neither only named in part=, within max_distance, default 5 mm, edge to
+    edge between their pad boxes in plan view, same or opposite side; the parts of one
+    power stage (a converter, power switch or driver with the FETs, diodes and shunts on
+    its output, switch node or other nets, a part feeding its input, FETs in series or
+    parallel) are not paired, but a part drawing from the same supply as a converter is:
+    info) and sensitive_near_hot (an aluminium electrolytic or polymer capacitor,
+    supercapacitor, crystal or oscillator, voltage reference, temperature sensor or
+    thermistor, or battery near a part known to dissipate; a crystal, reference or sensor
+    wired to that part by a net other than a supply is beside it by design; a
+    temperature sensor's finding says it may be there to monitor the part: info). Without
+    a PcbDoc the PCB checks are listed in not_checked and the rest runs.
+  - The tool takes part=, checks=, load=, power=, theta=, ta=, ta_max=, tj_max=, eta=,
+    iq=, rails=, vref=, max_distance= and units= (mm default, or mil), pages hot parts
+    (hottest first) and findings (warnings first) together and shrinks the page to fit.
+    Listed among the netlist tools and in the server instructions.
+  - Shared readers made public in place for it: get_circuit_calculations' `Board`,
+    `LED_DRIVER_TEXT` and `VF_TEXT` and its LED rows as `led_calculations`,
+    check_derating's `across_voltage` and `is_shunt`, get_power_tree's `gate_fets` and
+    check_logic_levels' `POWER_DRIVER_TEXT`. The other tools' outputs are unchanged (103
+    calls of get_power_tree, check_derating, check_logic_levels, get_circuit_calculations,
+    get_firmware_pin_map, check_decoupling, check_pull_resistors, check_vias, check_dfm and
+    check_testpoints on the public examples, compared with the base branch: identical).
+  - Calibrated on the 11 public Altium example projects (5 with a PcbDoc): 50 hot parts
+    (43 known to dissipate), 37 thermal pads (35 exposed pads, 2 TO-263 tabs; 11 of them
+    PowerPAK drain paddles drawn as footprint fills, with 4 to 15 vias each; the other 26
+    checked by hand against pad and via coordinates, rotations 0 to 270 degrees, 5 on the
+    bottom side: every via count matched); 4 no-via warnings (two VLDOs' DFN pads,
+    two regulators' TO-263 tabs that also have no net), 3 few-via, 3 unconnected, 14
+    neighbour pairs and 8 sensitive parts near heat. On 53 private boards (aggregates
+    only): 217 hot parts (189 known to dissipate: 85 switchers, 18 linear regulators, 11
+    power switches, 15 power-path transistors, 10 power-path and converter diodes, 36
+    shunts, 14 LED drivers), 129 thermal pads (116 exposed pads, 13 tabs; 25 pad arrays
+    of 8 large pads, their 4 ground pads audited as one; 1 footprint region; 13 with no
+    via, 45 with 1-3, 71 with 4 or more; 106 reaching a plane or pour, 10 landing only in
+    shelved or unpoured pours, no via on another net), 9 no-via warnings, 67 few-via and
+    1 unconnected infos, 29 neighbour pairs and 46 sensitive parts near heat. Default page
+    median 3,800 characters (the largest pages shrink to fit), runtime at most 1.3 s.
+  - Not covered: thetaJC and heatsinks, copper-area spreading and airflow, the split of
+    a converter's loss between its controller, FETs, diode and inductor, inductors and
+    transformers as heat sources, switching losses, duty-cycle-weighted diode and FET
+    currents, through-hole tabs on heatsinks, vias that touch a pad without their centre
+    inside it, tracks as heat paths, component bodies (3D) for neighbour distance, a pad
+    array's large pads on other nets (counted, not audited), and sibling load switches on
+    one shared rail (still grouped as one power path).
 - `get_circuit_calculations`: circuit calculators (roadmap #19,
   `services/circuit_calcs.py`), read-only and offline from the compiled netlist and the
   active variant. Each result carries its inputs (every value with where it came from),
