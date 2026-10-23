@@ -6,6 +6,124 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_logic_levels`: driver/receiver logic-level compatibility candidates (roadmap
+  #18, `services/logic_levels.py`), read-only and offline from the compiled netlist. For
+  every signal that links ICs powered from different rails, each IC pin's I/O supply
+  with its basis and confidence: an FPGA's (or any part's) bank supply when the part has
+  bank-numbered I/O supplies on two or more nets and the pin name gives the bank
+  (Xilinx IO_L1P_T0_14 and DONE_0 by their last token, Intel LVDS3G_6p, DIFFIO2L_16p,
+  CLK_3G_1p, PLL_3G_FB0 and RZQ_3G, BANK2/B14 tokens, or a token equal to a bank such as
+  HPS; a pin whose bank is not in its name takes the part's I/O supply outside its banks,
+  such as VCCPGM, at medium confidence, else the highest bank at low, never the part's
+  core supply); a level translator's or isolator's side (A/B pins on VCCA/VCCB, 1/2 on
+  VCC1/VCC2, VDD1/VDD2 or VREF1/VREF2, VL/VCC; DIR and OE on the A side; else the half of
+  the numbered pins the side's supply sits in, medium); a clock generator's or buffer's
+  outputs on its VDDO pins (per output when VDDO0, VDDO1 ... sit on different nets) and
+  its inputs on the rest; else the part's only supply (high), its one I/O supply (VDDIO,
+  VCCIO, VIO, VDD_IO, OVDD, VCCO, VDDQ, VL, VDRIVE, DRVDD ...: high), its one digital
+  supply among analog, core, PLL or battery ones (medium; low when a lone numbered I/O
+  supply such as an STM32's VDDIO2 sits on another net, since that powers one port only)
+  or the highest of several (low). Supply pins are read by name (pin_role) and classed
+  I/O, digital, analog, core, battery, power input (VIN, PVIN, VIN0/VIN1, VDDH, VM: used
+  only when a part names no other supply, so a regulator module's PMBus pins take its
+  VDD33 and a radio SoC's GPIOs its VDD) or skipped (VPP, VBUS, references, a regulator's
+  own outputs and bias pins such as VDDB, and any supply pin whose net reaches only the
+  part and capacitors). Voltages come from `derating.net_voltages`: `rails` given by the
+  user (they win), net names, the power tree (`vref`) and divider midpoints, each with
+  its source and confidence. Signals are nets joined through series resistors under
+  1 kohm and 0 ohm links (`link_group`); a fitted series resistor of 1 kohm or more is
+  crossed once, a pull-down behind it divides the level, and such lines are counted
+  apart (`series_resistor_links`, `series_resistor_links_judged`) and shown under
+  `series_crossings` in the `net` view. Pin directions come from the electrical type
+  when it is not Passive (Output and HiZ drive, OpenCollector and OpenEmitter are
+  open-drain, Input receives, IO both), else from the name for the part's class
+  (processors, FPGAs, bridges, bus transceivers, Ethernet PHYs, SPI peripherals, logic
+  gates, comparators, optocouplers, clock parts): a processor's TX, MOSI, SCK, CS drive
+  and RX, MISO receive; a SPI peripheral's SDO drives and its SDI, SCK and CS receive; a
+  transceiver's TXD and DI receive and RXD and RO drive; a PHY's TXD receives; JTAG TDO
+  drives; I2C lines are open-drain; peripherals' INT, ALERT and PG drive (open-drain or
+  push-pull) and their RESET, EN and mode pins receive; OUTPUT and INPUT name
+  themselves; a processor GPIO named by its port is a GPIO first, its alternate ADC, LVDS
+  or oscillator functions do not exclude the net, and the net name (UART TX, SPI MISO)
+  gives it a likely direction. On a line with a certain push-pull output, bidirectional
+  and unknown pins only receive. Candidates: driver_low_for_receiver (a push-pull
+  driver's rail below 70% of a receiver's, the usual CMOS VIH, or below 2.0 V into a
+  TTL-input part: info; warning at or below 50%, such as 1.8 V into 5 V),
+  receiver_overvoltage (a driver's rail, or a pull-up on a push-pull line, more than
+  0.3 V above a receiver's supply: warning; info when the receiver pin is 5 V tolerant
+  by its name (FT, 5VT), its description or its 74LVC, 74LCX, 74LVT, 74AHC, 74VHC or NC7S
+  family, up to 5.5 V, or when a series resistor of 1 kohm or more limits the current,
+  with that current; an Output pin under such a pull-up is judged as well, since it is
+  back-driven while tri-stated or high), open_drain_pullup_mismatch (an open-drain
+  line's pull-up rail above a receiver's by more than 0.3 V: warning, softened the same
+  way, and info on an open-drain output pin, many of which are rated above their supply;
+  OpenCollector-typed I2C and MDIO pins receive; optocoupler, comparator, regulator and
+  driver outputs are rated apart and not judged; below a receiver's VIH: info),
+  unknown_rail (one row listing the I/O and pull-up rails of unknown voltage on signals
+  between ICs, most signals first and every rail of a pair at once, each with the rails
+  behind a 0 ohm link, ferrite, inductor or fuse that take its voltage (`joined_rails`);
+  supply pins on nets named like signals, such as PA1, are flagged under
+  `supply_pins_on_signal_nets` for a library check instead of a voltage, and parts with
+  no supply pin read are listed; to pass in `rails`) and translator_ok (level
+  translators and isolators listed, as handled when both sides are read;
+  `translators_sides_unknown` counts the others). A pair is a warning only when one
+  end's direction is certain (typed or named) and both rails and voltages are read with
+  medium or high confidence; two bidirectional or unknown pins are judged both ways at
+  info. Regulators', references' and supervisors' inputs are judged for overvoltage
+  only, at info, and their pins drive only when typed or named outputs; gate, motor and
+  LED drivers and parts powered above 5.5 V get info only (fixed thresholds). Left out:
+  analog nets (ADC, DAC, sense, temperature names; op-amp and comparator inputs;
+  optocoupler LEDs; a sensor's VOUT or AOUT), power nets, crystal lines (a crystal or
+  resonator on them, or crystal pins no active clock drives; an XTAL_IN or CLKIN pin an
+  oscillator or clock buffer drives is judged at info against the part's highest supply,
+  and an oscillator with a supply pin drives whatever its prefix, Y1 included),
+  differential pairs (a net whose complement exists, read with
+  `diff_pair_checks.complement`: P/N, +/-, DP/DM, CAN H/L and its other styles; a pin
+  named as one half of a pair, Intel's lower-case p/n suffix included; USB D+/D-, LVDS,
+  MIPI, TMDS, CAN_H/L or MDI by name; an active-low RESET_N alone is no pair, and
+  single-ended PERST, GTX_CLK or SFP status pins are judged), a bus transceiver's line-side pins (CANH/CANL, A/B, Y/Z, LIN, RS232 TxOUT and
+  RxIN) and nets reaching one IC. Findings with the same check, severity, driver,
+  receiver (and its role) and rails group into one row with the nets, the pin pairs and
+  `count`, the number of signals; each names the line's off-board connectors. The
+  summary comes first (ICs by part class, rail basis and confidence, signals checked,
+  judged and between different levels with pull-up idle levels and terminations left
+  out, open-drain lines, exclusions, candidates by check and severity, the unknown rails
+  to ask about, translators handled); `part` lists each named IC's supplies, banks and
+  sides and, as `part_pins`, every pin's rail, direction and basis, `net` each named
+  signal's pins, pull-ups, connectors and series crossings; findings and listed rows
+  page together through the shrink loop, the design read once. Registered in
+  `NETLIST_TOOLS`, the manifest, the README and the server instructions;
+  `schematic_review` gains a Logic levels checklist item. `derating.net_voltages`,
+  `derating.read_parts` and `derating.SAME_VOLTAGE_EDGES`, `firmware_pins.part_kind`,
+  `port_like`, `ethernet_part`, `BRIDGE_TEXT`, `CRYSTAL_TEXT`, `OUT_NAME`, `IN_NAME`,
+  `XCVR_IN`, `XCVR_OUT`, `SLAVE_IN` and `SLAVE_OUT`, and `pull_resistors.COMPARATOR_TEXT`
+  and `DRIVER_TEXT` are public now and their callers use them; the other tools' output
+  is unchanged. Calibrated on Altium's 11 public AD25 example projects (56 ICs, 49 with
+  an I/O rail read, 30 with its voltage known without `rails`; 212 signals between ICs
+  checked, 93 judged; 210 differential, 17 crystal and 10 analog nets left out; the
+  Arria 10 board's 14 banks mapped from LVDS, DIFFIO, CLK and HPS pin names, its RGMII
+  lines to the PHY's 1.8 V DVDDH, its USB 3.0 FIFO bus on bank 2A, its regulator
+  modules' PMBus pins on VDD33 and its oscillators into the PHYs' XI and XTAL1 pins
+  against 3.3 V AVDDH and 2.5 V matched; 1 warning: a configuration clock reaching its
+  flash through a 10k series resistor with a 10k pull-down, 0.9 V at a 1.8 V input; with
+  `rails` for the Spartan-IIE board's VCCO, a 5 V character LCD's pull-ups into 3.3 V
+  FPGA pins as 2 warnings, 8 data lines and 3 FPGA Output pins, and the two directions
+  between the LCD and the FPGA's IO pins as info; the rails asked about were the DDR
+  rail, the FPGA VCCO with the 0 ohm-fed accelerometer rail joined to it, the battery
+  rail, and a DIMM's VTT and VDD in one pass, while a supply pin the offline netlist puts
+  on a port-named net is flagged instead of asked; output at most 4.7k characters,
+  runtime under 0.7 s)
+  and on 53 private boards read in aggregate (mostly power and analog designs: 188 ICs,
+  100 of them regulators or supervisors, 148 with an I/O rail read; 58 signals between
+  ICs checked, 1509 reaching one IC and 279 differential; 0 warning or info candidates,
+  8 unknown-rail rows
+  over 8 rails, 6 parts without a supply pin read, 4 isolators whose sides are not
+  named; output at most 3.7k characters, runtime under 0.1 s). Not covered: mapping a
+  port supply such as VDDIO2 to its port's pins (those parts get a low-confidence
+  guess), VBAT-domain pins, the actual VOH, VIH, VIL, VOL and absolute maximum of each
+  part (estimated from its supply), LVDS, SSTL and other referenced or differential
+  standards, signals through transistors, MOSFET level shifters judged as such (each
+  side is judged on its own), drive strength and injection-current limits, and timing.
 - `check_derating`: component derating check (roadmap #17, `services/derating.py`),
   read-only and offline from the compiled netlist. Net voltages carry their source and
   confidence: `rails` given by the user ('VIN=24,VBUS=5', or 'VIN,VIN_F=24' for names

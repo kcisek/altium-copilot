@@ -422,14 +422,14 @@ _FAMILY_BY_NAME = {family.name: family for family in _FAMILIES}
 _PHY_ROLES = tuple((re.compile(pattern), role) for pattern, role in _ETHERNET_ROLES)
 
 
-def _port_like(alt: str) -> bool:
+def port_like(alt: str) -> bool:
     return alt in _GENERIC_IO or parse_port(alt) is not None
 
 
 def name_functions(name: str | None) -> list[tuple[str, str | None]]:
     """(function, role) of each alternative a pin name lists, GPIO port names left out:
     'PB6/USART1_TX/I2C1_SCL' -> [uart tx, i2c scl]."""
-    return [found for alt in alternatives(name) if not _port_like(alt)
+    return [found for alt in alternatives(name) if not port_like(alt)
             and (found := classify(alt, pin=True)) and found[0] != "nc"]
 
 
@@ -486,12 +486,12 @@ _MEMORY_FAMILY = re.compile(
 # An FPGA's configuration memory (Intel EPCQ/EPCS, Xilinx Platform Flash XCF).
 _CONFIG_MEMORY = re.compile(r"configuration|\bPROM\b|(?<![A-Z0-9])(?:EPCQ|EPCS\d|XCF\d)", re.I)
 _RAM_WORDS = re.compile(r"S?D?RAM\b|\bDDR\d?\b|PSRAM|SDRAM|\bSRAM\b|\bDRAM\b", re.I)
-_BRIDGE_TEXT = re.compile(
+BRIDGE_TEXT = re.compile(
     r"USB[- ]?(?:to[- ])?(?:UART|serial)|UART[- ]bridge|serial (?:converter|bridge)|"
     r"(?<![A-Z0-9])(?:FT23\d|FT2232|FT4232|FT230|FT231|CP210\d|CH340|CH341|CH9102|CH343|"
     r"PL2303|MCP2200|MCP2221|CY7C652)", re.I)
 _IRDA_TEXT = re.compile(r"\bIrDA\b|infrared transceiver", re.I)
-_CRYSTAL_TEXT = re.compile(r"crystal|\bxtal|resonator|oscillat|\d\s*[kM]Hz\b", re.I)
+CRYSTAL_TEXT = re.compile(r"crystal|\bxtal|resonator|oscillat|\d\s*[kM]Hz\b", re.I)
 _ETHERNET_TEXT = re.compile(r"ethernet|\bPHY\b|10/100|\d+BASE-?T|\bR?G?MII\b|\bRMII\b", re.I)
 _USB_TEXT = re.compile(r"\bUSB", re.I)
 _CAN_TEXT = re.compile(r"\bCAN\b|CAN[- ]?FD", re.I)
@@ -674,7 +674,7 @@ def _accepted_schemes(counts: dict[str, int]) -> set[str]:
     return {scheme for scheme, count in counts.items() if count >= _SCHEME_MIN.get(scheme, 1)}
 
 
-def _part_kind(text: str) -> str:
+def part_kind(text: str) -> str:
     if _FPGA_TEXT.search(text):
         return "fpga"
     if PROCESSOR_TEXT.search(text) or _MCU_FAMILY.search(text):
@@ -688,7 +688,7 @@ def _part_kind(text: str) -> str:
     return "other"
 
 
-def _ethernet_part(text: str) -> bool:
+def ethernet_part(text: str) -> bool:
     """An Ethernet PHY or transceiver by its text (not a processor with a MAC, not USB)."""
     return bool(_ETHERNET_TEXT.search(text)) and not (
         PROCESSOR_TEXT.search(text) or _MCU_FAMILY.search(text) or _USB_TEXT.search(text))
@@ -713,7 +713,7 @@ def rank_candidates(fmap: _Map) -> list[Candidate]:
         if designator_prefix(ref) not in _CANDIDATE_PREFIXES:
             continue
         text = fmap.text(ref)
-        kind = _part_kind(text)
+        kind = part_kind(text)
         if kind not in ("mcu", "fpga") and _memory(text):
             continue
         pins = fmap.all_pins(ref)
@@ -827,7 +827,7 @@ def _reach(fmap: _Map, ref: str, pin: str, net: str, limit: int = HOP_LIMIT) -> 
 def _crystal(fmap: _Map, ref: str) -> bool:
     prefix = designator_prefix(ref)
     return prefix in ("Y", "XTAL", "XT", "OSC") or (
-        prefix == "X" and bool(_CRYSTAL_TEXT.search(fmap.text(ref))))
+        prefix == "X" and bool(CRYSTAL_TEXT.search(fmap.text(ref))))
 
 
 def _peer_function(fmap: _Map, peer: _Peer) -> tuple[str, str | None, str, bool] | None:
@@ -848,7 +848,7 @@ def _peer_function(fmap: _Map, peer: _Peer) -> tuple[str, str | None, str, bool]
     if prefix in ("BZ", "BUZ", "LS"):
         return "pwm_timer", "buzzer", f"reaches {peer.label()}", False
     if peer.kind in ("ic", "other", "connector") and peer.name and peer.direct:
-        if peer.kind != "connector" and _ethernet_part(text):
+        if peer.kind != "connector" and ethernet_part(text):
             # A PHY's strap-shared pin (RXD0/MODE0, nINT/REFCLKO) is its Ethernet line.
             role = next((role for alt in alternatives(peer.name) if (role := _phy_role(alt))),
                         None)
@@ -863,8 +863,8 @@ def _peer_function(fmap: _Map, peer: _Peer) -> tuple[str, str | None, str, bool]
     return None
 
 
-_SLAVE_IN = frozenset({"SI", "SDI", "DI", "DIN", "MOSI", "SIMO", "COPI", "PICO"})
-_SLAVE_OUT = frozenset({"SO", "SDO", "DO", "DOUT", "MISO", "SOMI", "CIPO", "POCI"})
+SLAVE_IN = frozenset({"SI", "SDI", "DI", "DIN", "MOSI", "SIMO", "COPI", "PICO"})
+SLAVE_OUT = frozenset({"SO", "SDO", "DO", "DOUT", "MISO", "SOMI", "CIPO", "POCI"})
 
 
 def _complement(function: str, role: str | None, peer_name: str = "") -> str | None:
@@ -874,9 +874,9 @@ def _complement(function: str, role: str | None, peer_name: str = "") -> str | N
         return {"tx": "rx", "rx": "tx", "rts": "cts", "cts": "rts"}.get(role or "", role)
     if function == "spi":
         tokens = set(_tokens(peer_name))
-        if tokens & _SLAVE_IN:
+        if tokens & SLAVE_IN:
             return "mosi"
-        if tokens & _SLAVE_OUT:
+        if tokens & SLAVE_OUT:
             return "miso"
     return role
 
@@ -1042,7 +1042,7 @@ def _rows(fmap: _Map, candidate: Candidate) -> list[PinRow]:
     names = [fmap.pin_name(ref, pin) for pin in fmap.all_pins(ref)]
     schemes = _accepted_schemes(_scheme_counts(names))
     fpga = candidate.kind == "fpga"
-    ethernet = _ethernet_part(fmap.text(ref))
+    ethernet = ethernet_part(fmap.text(ref))
     return [_build_row(fmap, ref, pin, schemes, fpga, ethernet) for pin in fmap.all_pins(ref)]
 
 
@@ -1193,11 +1193,11 @@ def _pin_label(row: PinRow) -> str:
 
 
 # UART direction of a pin by its name: what a device's own TX/RX means.
-_OUT_NAME = re.compile(r"TXD?\d?|U\d?TXD?|UTXD\d?|TXO|SOUT|DOUT\d?|DO|OUT[A-Z]?|R\d?OUT|ROUT|RO")
-_IN_NAME = re.compile(r"RXD?\d?|U\d?RXD?|URXD\d?|RXI|SIN|DIN\d?|DI|IN[A-Z]?|T\d?IN|TIN")
+OUT_NAME = re.compile(r"TXD?\d?|U\d?TXD?|UTXD\d?|TXO|SOUT|DOUT\d?|DO|OUT[A-Z]?|R\d?OUT|ROUT|RO")
+IN_NAME = re.compile(r"RXD?\d?|U\d?RXD?|URXD\d?|RXI|SIN|DIN\d?|DI|IN[A-Z]?|T\d?IN|TIN")
 # A transceiver's logic side: TXD/DI/TxIN take the MCU's TX, RXD/RO/RxOUT drive its RX.
-_XCVR_IN = re.compile(r"TXD?\d?|DI|D|T\d?IN|TIN|TX_?IN")
-_XCVR_OUT = re.compile(r"RXD?\d?|RO|R|R\d?OUT|ROUT|RX_?OUT")
+XCVR_IN = re.compile(r"TXD?\d?|DI|D|T\d?IN|TIN|TX_?IN")
+XCVR_OUT = re.compile(r"RXD?\d?|RO|R|R\d?OUT|ROUT|RX_?OUT")
 
 
 def _peer_class(fmap: _Map, ref: str, candidates: set[str]) -> str:
@@ -1207,7 +1207,7 @@ def _peer_class(fmap: _Map, ref: str, candidates: set[str]) -> str:
         return "connector"
     if bus_transceiver(fmap.ctx, ref) or _IRDA_TEXT.search(text):
         return "transceiver"
-    if _BRIDGE_TEXT.search(text):
+    if BRIDGE_TEXT.search(text):
         return "bridge"
     if ref in candidates or PROCESSOR_TEXT.search(text) or _MCU_FAMILY.search(text) or \
             _RADIO_TEXT.search(text) or _MODULE_TEXT.search(text):
@@ -1226,19 +1226,19 @@ def _uart_direction(fmap: _Map, peer: _Peer, cls: str) -> tuple[str | None, bool
     # PB6/USART1_TX/I2C1_SCL) is not certain to be a UART end.
     mixed = bool({function for function, _ in name_functions(peer.name)}
                  - _SERIAL)
-    alts = [alt for alt in alternatives(peer.name) if not _port_like(alt) and (
+    alts = [alt for alt in alternatives(peer.name) if not port_like(alt) and (
         (found := classify(alt, pin=True)) is None or found[0] in _SERIAL)]
     tokens = [form for alt in alts for token in _tokens(alt) for form in _forms(token)]
     if cls == "transceiver":
-        if any(_XCVR_IN.fullmatch(token) for token in tokens):
+        if any(XCVR_IN.fullmatch(token) for token in tokens):
             return "in", True, (f"{peer.label()} is a bus transceiver's driver input: it takes "
                                 "the MCU's TX")
-        if any(_XCVR_OUT.fullmatch(token) for token in tokens):
+        if any(XCVR_OUT.fullmatch(token) for token in tokens):
             return "out", True, (f"{peer.label()} is a bus transceiver's receiver output: it "
                                  "drives the MCU's RX")
         return None, False, ""
-    direction = ("out" if any(_OUT_NAME.fullmatch(token) for token in tokens) else
-                 "in" if any(_IN_NAME.fullmatch(token) for token in tokens) else None)
+    direction = ("out" if any(OUT_NAME.fullmatch(token) for token in tokens) else
+                 "in" if any(IN_NAME.fullmatch(token) for token in tokens) else None)
     if direction is None:
         return None, False, ""
     if cls == "connector":
@@ -2305,7 +2305,7 @@ def build_map(netlist: dict, plan=None, project_params: dict | None = None,
                 notes.append(f"{ref} is not recognised as a processor (few GPIO-named pins, no "
                              "processor words); mapped as asked.")
                 names = [fmap.pin_name(ref, pin) for pin in fmap.all_pins(ref)]
-                by_ref[ref] = Candidate(ref, _part_kind(fmap.text(ref)), 0.0, 0,
+                by_ref[ref] = Candidate(ref, part_kind(fmap.text(ref)), 0.0, 0,
                                         sum(1 for pin in fmap.all_pins(ref)
                                             if fmap.pin_type(ref, pin) == "IO"),
                                         len(names), None, ["named in mcu="], fmap.fitted(ref),

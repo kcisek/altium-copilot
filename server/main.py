@@ -62,6 +62,7 @@ try:
         load_policy as load_derating_policy, parse_rail_map, prepare_derating,
         render_derating,
     )
+    from services.logic_levels import prepare_logic_levels, render_logic_levels
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -151,6 +152,7 @@ except ImportError:
         load_policy as load_derating_policy, parse_rail_map, prepare_derating,
         render_derating,
     )
+    from server.services.logic_levels import prepare_logic_levels, render_logic_levels
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -519,6 +521,19 @@ DNP reasons, fabrication requirements. Use it.
   currents needs_current asks for. policy says which thresholds applied
   (derating_policy.json).
 
+## Logic Levels
+
+- check_logic_levels — "do my logic levels match?", "is this 1.8 V output OK into
+  that 3.3 V input?", "can this 5 V signal damage the MCU?", FPGA bank voltages, level
+  translators, I2C pull-up rails, or the interface part of a schematic review: each
+  signal linking ICs on different rails, with each pin's I/O supply (VDDIO, VCCO_n bank
+  pins, translator sides, else its only or highest digital supply, with basis and
+  confidence) and direction (pin type, else name). Candidates: driver_low_for_receiver
+  (VOH < VIH likely), receiver_overvoltage and open_drain_pullup_mismatch (above VDD +
+  0.3 V). It only finds candidates: look up VOH, VIH, 5 V tolerance and absolute maximum
+  in both datasheets before calling one a fault, and say so. Ask the user for the
+  unknown_rails voltages and pass rails='VCCO=3.3'; part= lists each pin's rail.
+
 ## Firmware Pin Map
 
 - get_firmware_pin_map — "what is the MCU's pinout?", "give the firmware team a pin
@@ -774,8 +789,8 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "get_power_tree", "check_derating", "get_firmware_pin_map", "run_erc",
-    "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
+    "get_power_tree", "check_derating", "check_logic_levels", "get_firmware_pin_map",
+    "run_erc", "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
 )
 
 
@@ -4545,6 +4560,112 @@ def check_derating(
     return rendered
 
 
+# Findings (and named parts or signals) per page, tried in turn until the result fits; the
+# design is read once and only rendered per step.
+LOGIC_LEVEL_STEPS = (100, 40, 15, 5, 2, 1)
+
+
+@mcp.tool(
+    title="Check Logic Levels",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_logic_levels(
+    part: str | None = None,
+    net: str | None = None,
+    checks: list[str] | None = None,
+    rails: str | None = None,
+    vref: str | None = None,
+    offset: int = 0,
+) -> str:
+    """Driver/receiver logic-level compatibility candidates, offline: for every signal
+    that links ICs powered from different rails, each pin's I/O supply and the pairs whose
+    levels likely do not meet. Call it when the user asks whether logic levels match,
+    about 1.8 V, 3.3 V and 5 V parts talking to each other, VOH/VIH, 5 V tolerant inputs,
+    FPGA bank voltages (VCCO, VCCIO), level translators or isolators, I2C pull-up rails,
+    or for the interface part of a schematic review.
+
+    I/O rail per IC pin, with basis and confidence: an FPGA's (or any part's) bank supply
+    when the pin name gives the bank (VCCO_14 for IO_L1P_T0_14 or DONE_0, VCCIO3G for
+    LVDS3G_6p or CLK_3G_1p); a level translator's or isolator's side (A/B pins on
+    VCCA/VCCB, 1/2 on VCC1/VCC2 or VDD1/VDD2, VL/VCC; DIR and OE on the A side, else the
+    half of the pins its side's supply sits in); a clock part's outputs on VDDO; else the
+    part's only supply (high), its one I/O supply (VDDIO, VCCIO, VIO, OVDD, VDDQ, VL ...:
+    high), its one digital supply among analog or core ones (medium; low beside a lone
+    VDDIO2-style port supply) or the highest of its digital supplies (low); power inputs
+    (VIN, PVIN, VDDH) only when nothing else is named, and a bank pin never takes its
+    part's core supply. Voltages come from rails (the user's, 'VCCO=3.3,VIO=1.8';
+    they win), net names, the power tree (vref, e.g. 'U5=0.8') and divider midpoints.
+    Signals are nets joined through series resistors under 1 kohm and 0 ohm links; a
+    series resistor of 1 kohm or more is crossed once (a pull-down behind it divides the
+    level). Pin direction: the electrical type when not Passive, else the name for the
+    part's class (a processor's TX, MOSI, SCK, CS drive; a SPI peripheral's SDO drives;
+    a transceiver's TXD receives; I2C lines are open-drain; peripherals' INT and ALERT
+    drive, their RESET, EN and CS receive); a GPIO named only by its port takes the
+    direction its peers leave. Open-drain lines (OpenCollector pins, I2C or interrupt
+    names with a pull-up) take the pull-up's rail as their high level, which every pin
+    on the line sees.
+
+    Candidates: driver_low_for_receiver (a push-pull driver's rail below 70% of a
+    receiver's, the usual CMOS VIH: info, warning at or below 50%, e.g. 1.8 V into 5 V);
+    receiver_overvoltage (a driver's or a pull-up's rail more than 0.3 V above a receiver's,
+    the usual VDD + 0.3 V absolute maximum: warning, info when the pin is 5 V tolerant by
+    its name (FT, 5VT), its description or its 74LVC/AHC/VHC family, or a series resistor
+    of 1 kohm or more limits the current; an output pin under such a pull-up is judged
+    too); open_drain_pullup_mismatch (a pull-up rail above a receiver's by more than
+    0.3 V: warning, info on an open-drain output; below its VIH: info); unknown_rail (one
+    row: the I/O and pull-up rails of unknown voltage on signals between ICs, every rail
+    of a pair at once, with the rails behind a 0 ohm link or ferrite under the one they
+    follow, to ask the user about and pass in rails; supply pins on nets named like
+    signals and parts with no supply pin read are listed apart); translator_ok (level
+    translators and isolators, listed as handled when their two sides are read). A pair
+    is a warning only when one end's direction is certain (typed or named) and both rails
+    are read with medium or high confidence: two bidirectional or unknown pins are judged
+    both ways at info. Inputs of regulators, supervisors and gate or motor drivers and of
+    parts powered above 5.5 V have fixed thresholds (info only). Left out: analog nets
+    (and a sensor's VOUT), power nets, crystal lines (a crystal pin an oscillator or
+    clock buffer drives is judged at info), differential pairs (by partner net or pair-
+    half pin name; single-ended PERST or GTX_CLK pins are judged), bus transceivers'
+    line-side pins (CANH/CANL, A/B) and nets reaching one IC; lines across a series
+    resistor of 1 kohm or more are counted apart (series_resistor_links).
+
+    It only produces candidates: VOH, VIH, 5 V tolerance and absolute maximum ratings are
+    datasheet facts, so confirm each candidate in both datasheets before calling it a
+    fault, and say so. part and net (comma-separated) narrow the findings; part also lists
+    each named IC's supplies, banks and sides, and every pin's rail, direction and basis
+    (part_pins), net each named signal's pins, pull-ups and series crossings. checks
+    narrows to the names in summary. Findings (warnings first), the listed parts, their
+    part_pins and the listed signals page together (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    user_rails, error = parse_rail_map(rails)
+    if error:
+        return json.dumps(error)
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_logic_levels(netlist, plan, project.get("parameters") or {},
+                                    checks=checks, parts=_split_names(part),
+                                    nets=_split_names(net), rails=user_rails, vref=vrefs)
+    if "error" in prepared:
+        return json.dumps(prepared)
+    for step in LOGIC_LEVEL_STEPS:
+        result = {"netlist_updated_utc": _netlist_last_updated,
+                  **render_logic_levels(prepared, offset=offset, limit=step)}
+        if step != LOGIC_LEVEL_STEPS[0]:
+            result["page_limited_to"] = step
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 # Rows (and findings) per page, tried in turn until the result fits: text formats carry
 # short lines, JSON rows long ones.
 FIRMWARE_PAGE_LIMITS = {"table": (100, 50, 25, 10, 5), "text": (400, 200, 100, 50, 25)}
@@ -5941,6 +6062,10 @@ At minimum, check:
    names carry no voltage): capacitor voltage ratings against the rail (ripple nets
    need 2x), DC bias on small ceramics, resistor power and working voltage, and the
    LED and shunt currents to look up. Confirm each rating in the datasheet.
+9. Logic levels — check_logic_levels (part= for the sheet's ICs, rails= for I/O rails
+   whose names carry no voltage): drivers whose rail is below a receiver's VIH, inputs
+   driven or pulled up above their supply + 0.3 V, FPGA banks and translator sides.
+   Confirm VOH, VIH and absolute maximum ratings in both datasheets.
 
 For circuit types that require it, apply first principles beyond this
 list. The topology determines what matters.

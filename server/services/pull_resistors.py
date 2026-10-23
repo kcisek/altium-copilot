@@ -99,9 +99,9 @@ _PASSIVE_PREFIXES = frozenset({
     "Z", "RV", "RT", "VR",
 })
 NOT_CONNECTOR_TEXT = re.compile(r"crystal|xtal|oscillat|resonator|transformer", re.I)
-_COMPARATOR_TEXT = re.compile(r"comparator", re.I)
-_DRIVER_TEXT = re.compile(r"gate driver|mosfet driver|fet driver|half[- ]bridge driver|"
-                          r"igbt driver|low[- ]side driver|high[- ]side driver", re.I)
+COMPARATOR_TEXT = re.compile(r"comparator", re.I)
+DRIVER_TEXT = re.compile(r"gate driver|mosfet driver|fet driver|half[- ]bridge driver|"
+                         r"igbt driver|low[- ]side driver|high[- ]side driver", re.I)
 
 _NEGATION = re.compile(r"^[~!#*]+|[~!#*]+$")
 _CONTROL_WORDS = {
@@ -521,7 +521,7 @@ def push_pull_drivers(design: _Design, net: str) -> list[str]:
             designator_prefix(ref) in IC_PREFIXES
             and electrical not in ("Input", "OpenCollector", "OpenEmitter", "HiZ")
             and (pin_role(name) == "out" or _DRIVER_PIN.fullmatch(name or "-"))
-            and not _COMPARATOR_TEXT.search(design.text.get(ref, ""))
+            and not COMPARATOR_TEXT.search(design.text.get(ref, ""))
         ):
             out.append(f"{ref}.{pin} ({name})" if name else f"{ref}.{pin}")
     return out
@@ -570,7 +570,7 @@ def _classify_net(design: _Design, net: str) -> _Net | None:
             entry.control_kind = entry.control_kind or control
         if open_drain_name(name, pin=True):
             entry.add("open_drain", f"{label} ({name})")
-        if _COMPARATOR_TEXT.search(design.text.get(ref, "")) and (
+        if COMPARATOR_TEXT.search(design.text.get(ref, "")) and (
             pin_role(name) == "out" or name.startswith("OUT")
         ):
             entry.add("comparator", f"{ref} output {pin} ({name})")
