@@ -620,11 +620,12 @@ class PinRow:
         return self.function in ("power", "ground")
 
 
-class _Map:
+class PinMap:
     """The design read once: check_interfaces' context and the part pin names."""
 
-    def __init__(self, netlist: dict, plan, project_params: dict | None):
-        self.ctx = build_context(netlist, plan, project_params)
+    def __init__(self, netlist: dict, plan, project_params: dict | None, ctx=None):
+        # ctx: check_interfaces' context when the caller has built it already.
+        self.ctx = ctx if ctx is not None else build_context(netlist, plan, project_params)
         self.design = self.ctx.design
         self.components = netlist.get("components") or {}
         self.variant = getattr(plan, "name", None) or "[No Variations]"
@@ -705,7 +706,7 @@ def _memory(text: str) -> bool:
         _RAM_WORDS.search(text) and not re.search(r"flash|EEPROM|FRAM", text, re.I))
 
 
-def rank_candidates(fmap: _Map) -> list[Candidate]:
+def rank_candidates(fmap: PinMap) -> list[Candidate]:
     """Parts that look like a processor: U/IC (and module) parts fitted in the variant, by
     GPIO-named pins, IO-typed pins and the words in their text."""
     out = []
@@ -767,7 +768,7 @@ def _link(edge) -> bool:
     return True
 
 
-def _reach(fmap: _Map, ref: str, pin: str, net: str, limit: int = HOP_LIMIT) -> _Reach:
+def _reach(fmap: PinMap, ref: str, pin: str, net: str, limit: int = HOP_LIMIT) -> _Reach:
     """The parts on a pin's net and on the nets behind up to limit series parts (fitted or
     not; a peer behind a Not Fitted part is marked unfitted). A resistor of 1 kohm or more
     or a capacitor ends the walk. Pulls, capacitors to ground, ESD parts and the series
@@ -824,13 +825,13 @@ def _reach(fmap: _Map, ref: str, pin: str, net: str, limit: int = HOP_LIMIT) -> 
 
 # ---------- one MCU's pins ----------
 
-def _crystal(fmap: _Map, ref: str) -> bool:
+def _crystal(fmap: PinMap, ref: str) -> bool:
     prefix = designator_prefix(ref)
     return prefix in ("Y", "XTAL", "XT", "OSC") or (
         prefix == "X" and bool(CRYSTAL_TEXT.search(fmap.text(ref))))
 
 
-def _peer_function(fmap: _Map, peer: _Peer) -> tuple[str, str | None, str, bool] | None:
+def _peer_function(fmap: PinMap, peer: _Peer) -> tuple[str, str | None, str, bool] | None:
     """(function, the peer pin's role, basis, read from the peer's pin name) a peer gives
     the MCU pin. A peer pin that lists several functions (PB6/USART1_TX/I2C1_SCL on another
     MCU) gives none; on an Ethernet PHY TXD and RXD are Ethernet lines."""
@@ -896,7 +897,7 @@ def _own_role(others: list[tuple[str, str | None]], function: str) -> str | None
     return roles.pop() if len(roles) == 1 else None
 
 
-def _build_row(fmap: _Map, ref: str, pin: str, schemes: set[str],
+def _build_row(fmap: PinMap, ref: str, pin: str, schemes: set[str],
                fpga: bool = False, ethernet: bool = False) -> PinRow:
     """One pin's row. On an FPGA the alternate names (LVDS2A_17p, DATA31) say what a pin
     can do, not what the design does with it, so they give no function there. On an
@@ -1037,13 +1038,15 @@ _PEER_RANK = {"ic": 0, "other": 1, "transistor": 2, "diode": 3, "zener": 3, "swi
               "passive": 5, "connector": 6}
 
 
-def _rows(fmap: _Map, candidate: Candidate) -> list[PinRow]:
+def pin_rows(fmap: PinMap, candidate: Candidate, pins=None) -> list[PinRow]:
+    """The candidate's pin rows (only the pins in pins, when given)."""
     ref = candidate.designator
     names = [fmap.pin_name(ref, pin) for pin in fmap.all_pins(ref)]
     schemes = _accepted_schemes(_scheme_counts(names))
     fpga = candidate.kind == "fpga"
     ethernet = ethernet_part(fmap.text(ref))
-    return [_build_row(fmap, ref, pin, schemes, fpga, ethernet) for pin in fmap.all_pins(ref)]
+    return [_build_row(fmap, ref, pin, schemes, fpga, ethernet) for pin in fmap.all_pins(ref)
+            if pins is None or pin in pins]
 
 
 # ---------- pulls and levels ----------
@@ -1070,7 +1073,7 @@ def _parallel(values: list[float]) -> float:
     return 1.0 / sum(1.0 / value for value in values)
 
 
-def _gpio_drivers(fmap: _Map, row: PinRow, hosts: set[str]) -> list[_Peer]:
+def _gpio_drivers(fmap: PinMap, row: PinRow, hosts: set[str]) -> list[_Peer]:
     """Another processor's GPIO pins that drive a pin's net (directly or through series
     resistors; a series capacitor passes no level): a host MCU driving a module's BOOT0."""
     out = []
@@ -1086,7 +1089,7 @@ def _gpio_drivers(fmap: _Map, row: PinRow, hosts: set[str]) -> list[_Peer]:
     return out
 
 
-def default_level(fmap: _Map, row: PinRow, hosts: set[str] = frozenset()) -> dict:
+def default_level(fmap: PinMap, row: PinRow, hosts: set[str] = frozenset()) -> dict:
     """The level a strap or reset pin sits at with nothing driving it: tied, pulled up or
     down, a divider (with the computed voltage when the values and the rail's voltage are
     known), set by a switch or jumper, driven (by a push-pull output, or by another
@@ -1200,7 +1203,7 @@ XCVR_IN = re.compile(r"TXD?\d?|DI|D|T\d?IN|TIN|TX_?IN")
 XCVR_OUT = re.compile(r"RXD?\d?|RO|R|R\d?OUT|ROUT|RX_?OUT")
 
 
-def _peer_class(fmap: _Map, ref: str, candidates: set[str]) -> str:
+def _peer_class(fmap: PinMap, ref: str, candidates: set[str]) -> str:
     kind = fmap.ctx.kind.get(ref)
     text = fmap.text(ref)
     if kind == "connector":
@@ -1215,7 +1218,7 @@ def _peer_class(fmap: _Map, ref: str, candidates: set[str]) -> str:
     return "other"
 
 
-def _uart_direction(fmap: _Map, peer: _Peer, cls: str) -> tuple[str | None, bool, str]:
+def _uart_direction(fmap: PinMap, peer: _Peer, cls: str) -> tuple[str | None, bool, str]:
     """('out' or 'in', certain, basis) for a peer pin on a UART line."""
     electrical = fmap.pin_type(peer.ref, peer.pin)
     if electrical in ("Output", "OpenCollector", "OpenEmitter"):
@@ -1253,7 +1256,7 @@ def _uart_direction(fmap: _Map, peer: _Peer, cls: str) -> tuple[str | None, bool
         " (the pin also lists other functions)" if mixed else "")
 
 
-def _mcu_uart_direction(fmap: _Map, row: PinRow, schemes_base: set[str]) -> tuple[str | None, bool, str]:
+def _mcu_uart_direction(fmap: PinMap, row: PinRow, schemes_base: set[str]) -> tuple[str | None, bool, str]:
     electrical = row.type
     if electrical == "Output":
         return "out", True, "the MCU pin is typed Output"
@@ -1273,7 +1276,7 @@ def _mcu_uart_direction(fmap: _Map, row: PinRow, schemes_base: set[str]) -> tupl
     return None, False, ""
 
 
-def _uart_findings(fmap: _Map, rows: list[PinRow], candidates: set[str]) -> list[dict]:
+def _uart_findings(fmap: PinMap, rows: list[PinRow], candidates: set[str]) -> list[dict]:
     findings = []
     for row in rows:
         if row.function not in _SERIAL or row.reach is None:
@@ -1339,7 +1342,7 @@ _DEBUG_SPI = (
 )
 
 
-def _debug_roles(fmap: _Map, row: PinRow, mcu_text: str) -> list[tuple[str, str]]:
+def _debug_roles(fmap: PinMap, row: PinRow, mcu_text: str) -> list[tuple[str, str]]:
     """(role, basis) of the debug or programming roles a pin carries."""
     out: list[tuple[str, str]] = []
     names = [(alt, "pin name") for alt in row.alternatives]
@@ -1414,7 +1417,7 @@ def _basis_rank(basis: str) -> int:
     return next((rank for prefix, rank in _BASIS_RANK if basis.startswith(prefix)), 3)
 
 
-def _access(fmap: _Map, row: PinRow, testpoint_nets: set[str] | None,
+def _access(fmap: PinMap, row: PinRow, testpoint_nets: set[str] | None,
             role: str | None = None) -> list[str]:
     """Where a probe or cable reaches a pin: connectors, test points and testpoint pads; for
     a boot pin also the switch or jumper that sets it."""
@@ -1429,14 +1432,14 @@ def _access(fmap: _Map, row: PinRow, testpoint_nets: set[str] | None,
     return list(dict.fromkeys(found))
 
 
-def _chain(fmap: _Map, row: PinRow) -> list[str]:
+def _chain(fmap: PinMap, row: PinRow) -> list[str]:
     """Other parts' JTAG pins a JTAG pin reaches (a JTAG chain: TDO to the next TDI)."""
     return [peer.label() for peer in (row.reach.fitted_peers() if row.reach else [])
             if peer.kind in ("ic", "other") and peer.direct
             and any(function == "jtag" for function, _ in name_functions(peer.name))]
 
 
-def _debug_section(fmap: _Map, mcu: Candidate, rows: list[PinRow],
+def _debug_section(fmap: PinMap, mcu: Candidate, rows: list[PinRow],
                    testpoint_nets: set[str] | None,
                    hosts: set[str] = frozenset()) -> tuple[list[dict], list[dict]]:
     text = fmap.text(mcu.designator)
@@ -1565,7 +1568,7 @@ def _debug_section(fmap: _Map, mcu: Candidate, rows: list[PinRow],
 _BOOT1_TEXT = re.compile(r"(?<![A-Z0-9])(?:STM32F[124]|GD32F[14]0)", re.I)
 
 
-def _strap_rows(fmap: _Map, mcu: Candidate,
+def _strap_rows(fmap: PinMap, mcu: Candidate,
                 rows: list[PinRow]) -> list[tuple[PinRow, str, str, str | None]]:
     """(row, kind, basis, vendor role): boot, strap, mode and reset pins of the MCU; vendor
     role 'boot1' for an STM32F1/F2/F4's PB2."""
@@ -1624,7 +1627,7 @@ def _bootloader_level(text: str, row: PinRow) -> tuple[str, str] | None:
     return None
 
 
-def _strap_section(fmap: _Map, mcu: Candidate, rows: list[PinRow],
+def _strap_section(fmap: PinMap, mcu: Candidate, rows: list[PinRow],
                    hosts: set[str] = frozenset()) -> tuple[list[dict], list[dict]]:
     text = fmap.text(mcu.designator)
     entries, findings, listed = [], [], []
@@ -1734,7 +1737,7 @@ def _mem_role(name: str) -> str | None:
     return None
 
 
-def _pin_state(fmap: _Map, ref: str, pin: str, net: str | None, mcu_refs: set[str]) -> str:
+def _pin_state(fmap: PinMap, ref: str, pin: str, net: str | None, mcu_refs: set[str]) -> str:
     design = fmap.design
     if net is None:
         return "not connected"
@@ -1757,7 +1760,7 @@ def _pin_state(fmap: _Map, ref: str, pin: str, net: str | None, mcu_refs: set[st
     return f"on {net}"
 
 
-def _memory_section(fmap: _Map, mcu_rows: dict[str, list[PinRow]], candidates: set[str],
+def _memory_section(fmap: PinMap, mcu_rows: dict[str, list[PinRow]], candidates: set[str],
                     testpoint_nets: set[str] | None) -> tuple[list[dict], list[dict]]:
     design = fmap.design
     mcu_refs = set(mcu_rows)
@@ -1867,7 +1870,7 @@ def _memory_section(fmap: _Map, mcu_rows: dict[str, list[PinRow]], candidates: s
 _DEBUG_PORT_ROLES = frozenset({"swdio", "swclk", "swo", "tck", "tms", "tdi", "tdo", "trst"})
 
 
-def _unused_findings(fmap: _Map, mcu: Candidate, rows: list[PinRow]) -> list[dict]:
+def _unused_findings(fmap: PinMap, mcu: Candidate, rows: list[PinRow]) -> list[dict]:
     """Unused GPIO pins; the debug port's pins (SWD after reset on an STM32) are left out of
     the advice, since setting them to analog or output disables debugging, and strap pins
     are named apart."""
@@ -1906,7 +1909,7 @@ def _unused_findings(fmap: _Map, mcu: Candidate, rows: list[PinRow]) -> list[dic
                      debug_pins=[row.pin for row in unused if row.pin in debug] or None)]
 
 
-def _conflict_findings(fmap: _Map, mcu: Candidate, rows: list[PinRow]) -> list[dict]:
+def _conflict_findings(fmap: PinMap, mcu: Candidate, rows: list[PinRow]) -> list[dict]:
     findings = []
     by_net: dict[str, list[PinRow]] = defaultdict(list)
     for row in rows:
@@ -1953,7 +1956,7 @@ def _conflict_findings(fmap: _Map, mcu: Candidate, rows: list[PinRow]) -> list[d
     return findings
 
 
-def _variant_findings(fmap: _Map, mcu: Candidate, rows: list[PinRow], plans: list) -> list[dict]:
+def _variant_findings(fmap: PinMap, mcu: Candidate, rows: list[PinRow], plans: list) -> list[dict]:
     findings = []
     names = [plan.name for plan in plans]
     for row in rows:
@@ -2285,8 +2288,8 @@ def _overview(rows_by_mcu: dict[str, list[PinRow]]) -> list[dict]:
 
 def build_map(netlist: dict, plan=None, project_params: dict | None = None,
               mcu: list[str] | None = None, all_processors: bool = False):
-    """(_Map, candidates, mapped Candidates, error or None, notes)."""
-    fmap = _Map(netlist, plan, project_params)
+    """(PinMap, candidates, mapped Candidates, error or None, notes)."""
+    fmap = PinMap(netlist, plan, project_params)
     candidates = rank_candidates(fmap)
     notes: list[str] = []
     if mcu:
@@ -2325,7 +2328,7 @@ def build_map(netlist: dict, plan=None, project_params: dict | None = None,
     return fmap, candidates, mapped, None, notes
 
 
-def _netlist_notes(fmap: _Map, netlist: dict, plan, involved: set[str]) -> list[str]:
+def _netlist_notes(fmap: PinMap, netlist: dict, plan, involved: set[str]) -> list[str]:
     """Notes on what the compiled netlist hides: a part that reads as a processor but has
     no connected pin, and duplicate designators (compile_warnings) among the parts involved,
     whose pins and nets the compile merged."""
@@ -2372,7 +2375,7 @@ class FirmwareMap:
     """A built pin map and review, paged by page() (the tool shrinks its pages to fit)."""
     head: dict
     fmt: str
-    fmap: _Map | None = None
+    fmap: PinMap | None = None
     mapped: list[Candidate] = field(default_factory=list)
     rows_by_mcu: dict[str, list[PinRow]] = field(default_factory=dict)
     sections: dict = field(default_factory=dict)
@@ -2496,7 +2499,7 @@ def build_firmware_map(
         notes.append("An FPGA is mapped: its pin functions come from its HDL design, so "
                      "functions here come from net names and the parts each pin reaches, not from its "
                      "alternate names.")
-    rows_by_mcu = {candidate.designator: _rows(fmap, candidate) for candidate in mapped}
+    rows_by_mcu = {candidate.designator: pin_rows(fmap, candidate) for candidate in mapped}
     all_rows = [row for rows in rows_by_mcu.values() for row in rows]
     candidate_refs = {candidate.designator for candidate in candidates}
     findings: list[dict] = []
@@ -2588,7 +2591,7 @@ def export_rows(netlist: dict, plan=None, project_params: dict | None = None) ->
         return []
     out = []
     for candidate in mapped:
-        for row in _rows(fmap, candidate):
+        for row in pin_rows(fmap, candidate):
             peers = [] if row.reach is None else [
                 peer.describe() for peer in row.reach.fitted_peers()[:8]]
             out.append({

@@ -530,15 +530,15 @@ def _diode_graph(tree: _Tree) -> None:
         if len(pins) != 2 or len(set(pins.values())) != 2:
             continue
         (pin_a, net_a), (pin_b, net_b) = pins.items()
-        side_a = _diode_side(tree.design.pin_name(ref, pin_a))
-        side_b = _diode_side(tree.design.pin_name(ref, pin_b))
+        side_a = diode_side(tree.design.pin_name(ref, pin_a))
+        side_b = diode_side(tree.design.pin_name(ref, pin_b))
         if side_a and side_b and side_a == side_b:
             side_a = side_b = None
         tree.diodes[net_a].append((ref, net_b, side_a or _opposite(side_b)))
         tree.diodes[net_b].append((ref, net_a, side_b or _opposite(side_a)))
 
 
-def _diode_side(name: str | None) -> str | None:
+def diode_side(name: str | None) -> str | None:
     clean = _clean(name)
     if _DIODE_ANODE.fullmatch(clean):
         return "anode"
@@ -1333,7 +1333,7 @@ def _ends(tree: _Tree, start: str, skip: set[str]) -> list[tuple[str, float | No
     return out
 
 
-def _parallel(values: list[float | None]) -> float | None:
+def parallel(values: list[float | None]) -> float | None:
     if not values or None in values:
         return None
     if min(values) <= 0:
@@ -1381,8 +1381,8 @@ def _feedback(tree: _Tree, conv: _Converter, vref: float | None) -> list[dict]:
                 row["bottom"] = [part for _, _, parts in bottoms for part in parts]
             rows.append(row)
             continue
-        rtop = _parallel([ohms for _, ohms, _ in tops])
-        rbot = _parallel([ohms for _, ohms, _ in bottoms])
+        rtop = parallel([ohms for _, ohms, _ in tops])
+        rbot = parallel([ohms for _, ohms, _ in bottoms])
         rail = tops[0][0]
         row.update({
             "state": "divider", "rail": rail,
@@ -1396,16 +1396,13 @@ def _feedback(tree: _Tree, conv: _Converter, vref: float | None) -> list[dict]:
             row["note"] = "a divider value could not be read"
             rows.append(row)
             continue
-        floating = _floating_reference(tree, conv)
+        floating = floating_reference(tree, conv)
         if floating and rtop == 0:
             row["note"] = "a 0 ohm top resistor: the ratio cannot be read"
             rows.append(row)
             continue
-        gain = _gain(rtop, rbot, floating)
-        row["formula"] = (
-            "Vout = Vref x (1 + Rbot/Rtop): a three-terminal adjustable regulator, its Vref "
-            "between OUT and ADJ (plus Iadj x Rbot)" if floating else
-            "Vout = Vref x (1 + Rtop/Rbot)")
+        gain = fb_gain(rtop, rbot, floating)
+        row["formula"] = fb_formula(floating)
         row["vout_over_vref"] = round(gain, 4)
         named = None
         for candidate in [rail, *sorted(group, key=natural_key)]:
@@ -1414,21 +1411,21 @@ def _feedback(tree: _Tree, conv: _Converter, vref: float | None) -> list[dict]:
                 row["vout_from_name"] = named
                 row["named_rail"] = candidate
                 break
-        _vout_or_vref(row, gain, named, vref)
+        vout_or_vref(row, gain, named, vref)
         # A resistor a jumper or switch joins to ground or the output: a selectable leg.
         for far, ohms, parts in others:
             switched = _switched_leg(tree, far, group)
             if not switched or not ohms:
                 continue
             via, to = switched
-            alt_top = _parallel([rtop, ohms]) if to == "output" else rtop
-            alt_bot = _parallel([rbot, ohms]) if to == "ground" else rbot
+            alt_top = parallel([rtop, ohms]) if to == "output" else rtop
+            alt_bot = parallel([rbot, ohms]) if to == "ground" else rbot
             if not alt_top or not alt_bot:
                 continue
-            alt = _gain(alt_top, alt_bot, floating)
+            alt = fb_gain(alt_top, alt_bot, floating)
             leg: dict = {"resistors": parts, "through": via, "to": to,
                          "vout_over_vref": round(alt, 4)}
-            _vout_or_vref(leg, alt, named, vref)
+            vout_or_vref(leg, alt, named, vref)
             leg.pop("vref_given", None)
             row["selectable_leg"] = leg
             break
@@ -1436,11 +1433,19 @@ def _feedback(tree: _Tree, conv: _Converter, vref: float | None) -> list[dict]:
     return rows
 
 
-def _gain(rtop: float, rbot: float, floating: bool) -> float:
+def fb_gain(rtop: float, rbot: float, floating: bool) -> float:
+    """Vout / Vref of a feedback divider (floating: a three-terminal adjustable regulator,
+    its Vref across the top resistor)."""
     return 1 + rbot / rtop if floating else 1 + rtop / rbot
 
 
-def _vout_or_vref(row: dict, gain: float, named: float | None, vref: float | None) -> None:
+def fb_formula(floating: bool) -> str:
+    return ("Vout = Vref x (1 + Rbot/Rtop): a three-terminal adjustable regulator, its Vref "
+            "between OUT and ADJ (plus Iadj x Rbot)" if floating else
+            "Vout = Vref x (1 + Rtop/Rbot)")
+
+
+def vout_or_vref(row: dict, gain: float, named: float | None, vref: float | None) -> None:
     """With a given Vref, the output it sets (and its error against the rail name's
     voltage); without one, the Vref the rail name implies and the nearest common one."""
     if vref is not None:
@@ -1494,7 +1499,7 @@ def _unnamed_feedback(tree: _Tree, conv: _Converter) -> None:
                               "to ground")
 
 
-def _floating_reference(tree: _Tree, conv: _Converter) -> bool:
+def floating_reference(tree: _Tree, conv: _Converter) -> bool:
     """A three-terminal adjustable regulator (LM317, LM1117-ADJ): no pin on ground, so
     its reference sits between OUT and ADJ and Vout = Vref x (1 + Rbot/Rtop)."""
     nets = (tree.design.part_pins.get(conv.ref) or {}).values()
@@ -1690,8 +1695,8 @@ def _on_level(name: str | None, module: bool = False) -> str | None:
 
 
 def _uvlo(row: dict, ups, downs) -> None:
-    top = _parallel([pull.ohms for pull in ups])
-    bottom = _parallel([pull.ohms for pull in downs])
+    top = parallel([pull.ohms for pull in ups])
+    bottom = parallel([pull.ohms for pull in downs])
     row["from"] = ups[0].other
     if top is None or bottom is None or top + bottom == 0:
         return
