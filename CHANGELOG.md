@@ -6,6 +6,122 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_circuit_calculations`: circuit calculators (roadmap #19,
+  `services/circuit_calcs.py`), read-only and offline from the compiled netlist and the
+  active variant. Each result carries its inputs (every value with where it came from),
+  its formula, its result and a confidence; Vf, Vref, EN thresholds, GPIO current limits
+  and ADC sample capacitors are datasheet values, so the results are calculations to
+  check, not verdicts.
+  - dividers: a midpoint with a resistor leg (one resistor, parallel resistors to one
+    net, or a series chain through nodes holding only the chain and capacitors, a test
+    point, jumper or header pin, noted, or high-impedance IC inputs) to ground and one to
+    a rail, a net of known voltage or a driven signal (a push-pull output, a processor
+    GPIO that is not an input: its high level is its I/O rail), or legs to two rails of
+    known voltage. Each tap of a resistor stack (a window comparator's two inputs, an EN
+    pin with a hysteresis tap) is a midpoint of its own, the rest of the stack its leg; an
+    open-drain output on the bottom leg gives the ratio while it sinks too. A midpoint a
+    push-pull output drives, one with a supply pin or a processor bus pin, a rail's source
+    net, a series resistor into a pull-up with no ground leg, or a series resistor of up
+    to 1 kohm from a driving pin into a pull-down (a termination; kept and labelled at a
+    transistor's gate or base) is not a divider. Ratio Rbot/(Rtop+Rbot), the unloaded
+    midpoint voltage (net voltages with source and confidence, as check_derating reads
+    them), Rtop||Rbot, the divider current, a min/max ratio and midpoint voltage when
+    every resistor's tolerance is read (a Tolerance parameter, '1%' in its text, or the
+    tolerance letter of Yageo/Samsung RC, Stackpole RMC, Vishay CRCW, Panasonic ERJ or
+    Bourns CR part numbers), legs a jumper, header or switch joins to an end (each with
+    its ratio, not a connector consumer), and what it feeds, on the midpoint or one series
+    resistor beyond: a converter's FB/ADJ (get_power_tree's feedback row when it reads the
+    same divider, else the same formula; the Vref the top's voltage implies, from rails=
+    or a joined rail too, with a three-terminal regulator's Vref across the top resistor,
+    or the output a given vref sets), a converter's EN/UVLO (V_top at trip = V_th / ratio
+    for vth, else at 1.2 V and 0.8 V as examples only), a supervisor or comparator input
+    (with vth), a shunt reference such as a TL431 (the top a vref per designator sets, or
+    the implied Vref), an ADC input, an op-amp input (the non-inverting gain when the top
+    is its own output), an IC's reference pin, a transistor, a processor or IC pin, or a
+    connector; other resistors on the midpoint are listed.
+  - leds: each LED (check_derating's reading; two pins by their A/K names, else by the
+    circuit: the side on ground is the cathode's, a rail beats a sinking pin, an
+    open-drain pin only sinks; a multi-colour part by its common pin or channel numbers; a
+    part with supply or data pins has its own driver and is only counted; LED+/LED- pin
+    pairs on another part, such as a display's backlight, with no indicator rating)
+    walked to its supply (a rail directly or through series or parallel resistors, a GPIO
+    with its I/O rail, a high-side transistor to its emitter's or source's rail) and its
+    sink (ground, a sinking pin, a low-side transistor; an LED driver or a converter's pin
+    sets its own current): I = (V_supply - V_sink - Vf)/R - Vf/R_across (a resistor across
+    the LED takes its share, and can hold it below Vf) with Vf from vf (per designator or
+    colour), a stated forward-voltage parameter, a Vf in the text (VF=, or a voltage
+    beside a current such as '30 mA, 2 V'), else typical for the colour read from
+    parameters, text or wavelength (red 2.0 V, orange/amber/yellow 2.1 V, green 2.2 V,
+    true green and blue/white 3.0 V, IR 1.3 V; a colour or Vf shared with the LEDs of the
+    same part number), else the current at 2.0 V and 3.0 V; each resistor's power at that
+    current against check_derating's rating (stated, else typical for its size). A side
+    that is not followed says why (another diode, resistors to different nets, unnamed
+    transistor pins).
+  - optos: optocouplers by their words or part-number families (PC817, TLP, 4N35, H11,
+    LTV, EL, CNY17, SFH6, HCPL, ACPL, FOD, VO, PS2, MOC, TCMT, 6N13x ...), their input
+    diode by A/K pin names, else the standard 4-, 6- and 8-pin pinouts when the names it
+    has agree (low confidence): I_F with Vf 1.2 V typical, less the current of a resistor
+    across the input, a resistor or capacitor across the input, the output's pull-up (or
+    emitter resistor) with its rail, the current at saturation (V/R) and the CTR it needs
+    (I_out/I_F, from unrounded currents).
+  - adc_inputs: processor pins get_firmware_pin_map reads as analog (not DAC or
+    comparator pins), pins that list an ADC function and carry a divider or a capacitor,
+    and the AIN/CH/IN pins of ADC parts: the series R (or the divider's source impedance,
+    plus a series resistor between), the shunt C and any capacitor to another input, fc =
+    1/(2 pi R C), and the divider feeding it.
+  - rc_filters: other nodes with one series resistor from a driving pin (or a connector
+    or switch) and a capacitor to ground into an IC or transistor input, with fc (a pull
+    on the node joins R as its Thevenin resistance).
+  - Findings: led_overcurrent (above the stated or a typical 20 mA rating: a warning when
+    Vf is known, both voltages are read and I exceeds 30 mA or a rating a parameter
+    states, else info; with an unknown colour, info only when even 3.0 V gives too much),
+    diode_shunted_off (a resistor across an LED or optocoupler input holds it below Vf:
+    warning, info when a typical Vf decides it by less than 15%),
+    divider_output_above_input_rating (the midpoint, at its tolerance high bound, above
+    the reached pin's rail + 0.3 V: warning, info when the rail is a guess; an EN pin
+    against its converter's input), divider_output_below_ground (the low bound below
+    -0.3 V on a pin powered from a positive rail), resistor_overpower (at the computed
+    current: warning above the rating, info above the derated limit, derating_policy.json
+    applies; with an unknown Vf, a warning when even 3.0 V overloads it, info when only
+    2.0 V does), adc_no_filter and opto_no_input_shunt (info). Each finding stays with its
+    kind of calculation when kinds narrows the result.
+  - The tool takes part=, net=, kinds= (dividers, leds, optos, adc_inputs, rc_filters),
+    rails=, vref=, vf= ('LED1=2.9,red=1.9') and vth= ('U3=1.2', or one for all), pages
+    calculations and findings together and shrinks the page to fit (finer steps than other
+    tools': its rows are long). voltages_needed lists the nets whose voltage the
+    calculations lack, most calculations first. Listed among the netlist tools, in the
+    server instructions and as step 10 of schematic_review.
+  - Shared readers made public in place for it: check_derating's `resistor_limits`,
+    `merged_params` and `is_led` (its parts keep the parameters, texts and part numbers
+    they were read from), get_power_tree's `diode_side`, `parallel`, `fb_gain`,
+    `fb_formula`, `floating_reference` and `vout_or_vref`, check_logic_levels'
+    `OPTO_TEXT` and `AMPLIFIER_TEXT`, and get_firmware_pin_map's `PinMap` (which can reuse
+    a built context) and `pin_rows` (for chosen pins). The other tools' outputs on the
+    public examples are unchanged.
+  - Calibrated on the 11 public Altium example projects: 36 dividers (13 feedback
+    dividers, every one get_power_tree reads, 2 of them with jumper-selected legs; 11
+    memory reference pins, 4 transistor inputs, 4 connector pins, 2 window-comparator taps
+    of one stack, 1 EN/UVLO, 1 IC input; the midpoint voltage known for 15 and a
+    tolerance range for 32), 31 LEDs (15 currents, 15 waiting for their supply's voltage
+    in rails, 1 display backlight whose switch has unnamed pins), 6 RC filters, no ADC
+    input, no finding; about 60 results checked by hand (feedback ratios and implied
+    Vrefs, the EN trip examples, gate and reference dividers, LED currents and resistor
+    power, RC cutoffs), and the stack taps and jumper legs recomputed. On 53 private
+    boards (aggregates only): 51 dividers (34 feedback, every feedback pin with a resistor
+    to ground and another resistor, including 3 whose chain passes a test point or header
+    pin; 9 op-amp, 4 transistor, 2 EN, 2 supervisor), the midpoint voltage known for 29, a
+    tolerance range for 47, all 24 implied Vrefs near a common one; 86 LED parts (36 with
+    their own driver counted only; of 50 calculated, 17 currents, 15 set by a driver or
+    converter, 10 waiting for a supply voltage, 3 unread), 10 optocouplers (all read, 6
+    by the standard pinout; 10 opto_no_input_shunt infos), 1 ADC input, 1 RC filter, no
+    warning. Default page median 2,000 characters (max 25,700; the largest example pages
+    at 25 rows), runtime at most 0.55 s.
+  - Not covered: a divider whose bottom is switched by a transistor (a P-FET gate
+    divider), LED strings and series diodes on an LED's supply side, constant-current
+    driver set resistors, triac-output optocouplers' output side, comparator thresholds
+    from the other input, an ADC's own sample capacitor and source-impedance limit, loads
+    on a midpoint, and a header that shorts resistors inside a chain (the ratio is given
+    with nothing fitted).
 - Full variant support (roadmap #9, `services/variants.py`): varied parameters, alternate
   parts and the new `compare_variants` tool, read-only and offline.
   - Parser (`parsers/prj_pcb.py`): each `[ProjectVariantN]` keeps its UniqueId,

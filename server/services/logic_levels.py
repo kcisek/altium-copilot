@@ -198,10 +198,10 @@ _TRANSLATOR_TEXT = re.compile(
 _ISOLATOR_TEXT = re.compile(
     r"(?:digital|signal|I2C|I²C|SPI|CAN|RS-?485|USB|data)[- ]?isolat|\bisolator\b|"
     r"isolated (?:transceiver|interface|buffer|driver)|galvanic", re.I)
-_OPTO_TEXT = re.compile(r"opto-?coupler|opto-?isolat|photo-?coupler|photo-?transistor|\bopto\b",
-                        re.I)
-_AMPLIFIER_TEXT = re.compile(r"op-?amp|operational amplifier|amplifier|\bINA\d|instrumentation",
-                             re.I)
+OPTO_TEXT = re.compile(r"opto-?coupler|opto-?isolat|photo-?coupler|photo-?transistor|\bopto\b",
+                       re.I)
+AMPLIFIER_TEXT = re.compile(r"op-?amp|operational amplifier|amplifier|\bINA\d|instrumentation",
+                            re.I)
 _POWER_DRIVER_TEXT = re.compile(
     r"(?:MOSFET|gate|FET|IGBT|bridge|motor|LED|relay|solenoid|stepper|laser) drivers?\b|"
     r"\bH[- ]?bridge|half[- ]bridge|full[- ]bridge|power stage|DrMOS|smart (?:high|low)[- ]side|"
@@ -346,7 +346,7 @@ def _chip_class(tree, ref: str, text: str, supplies: list[Supply]) -> str:
     if ref in tree.converters or ref in tree.references or ref in tree.supervisors or \
             ref in tree.not_fitted:
         return "power"
-    if _OPTO_TEXT.search(text):
+    if OPTO_TEXT.search(text):
         return "optocoupler"
     names = {first_function(supply.name) for supply in supplies}
     # VCCA/VCCB or VREF1/VREF2 pairs make a translator; VL beside VCC only with the words
@@ -372,7 +372,7 @@ def _chip_class(tree, ref: str, text: str, supplies: list[Supply]) -> str:
         return "driver"
     if COMPARATOR_TEXT.search(text):
         return "comparator"
-    if _AMPLIFIER_TEXT.search(text):
+    if AMPLIFIER_TEXT.search(text):
         return "amplifier"
     output_supply = any(first_function(supply.name).startswith(("VDDO", "VCCO"))
                         for supply in supplies)
@@ -577,7 +577,7 @@ def build_chips(tree, voltages: dict[str, Volt]) -> dict[str, Chip]:
         supplies = _supplies(tree, ref, names)
         text = tree.text(ref)
         if kind == "other" and not supplies and part_kind(text) == "other" and \
-                not _OPTO_TEXT.search(text):
+                not OPTO_TEXT.search(text):
             continue
         if kind == "passive" and not (supplies and (_OSCILLATOR_TEXT.search(text) or any(
                 design.pin_type(ref, pin) == "Output" for pin in design.part_pins[ref]))):

@@ -747,9 +747,14 @@ class Part:
     rated_ac: float | None = None
     ohms: float | None = None
     value: str | None = None
+    # What the fields were read from, for other readers (circuit_calcs' tolerance):
+    # normalised parameter name -> (raw name, value), (label, text) and part numbers.
+    params: dict[str, tuple[str, str]] = field(default_factory=dict)
+    texts: list[tuple[str, str]] = field(default_factory=list)
+    mpns: list[str] = field(default_factory=list)
 
 
-def _merged_params(meta: dict, plan, ref: str) -> dict[str, tuple[str, str]]:
+def merged_params(meta: dict, plan, ref: str) -> dict[str, tuple[str, str]]:
     """normalised name -> (raw name, value), the variant's parameter variations applied."""
     params = dict(meta.get("params") or {})
     for key, (_, value) in ((getattr(plan, "params", {}) or {}).get(ref) or {}).items():
@@ -925,7 +930,7 @@ def read_parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counte
         connected = tree.design.part_pins.get(ref) or {}
         meta = components.get(ref) or {}
         if kind == "diode":
-            if _is_led(tree, ref):
+            if is_led(tree, ref):
                 leds.append(ref)
             continue
         bom = tree.parts.get(ref)
@@ -937,7 +942,7 @@ def read_parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counte
             stats[f"{kind}_sections_unread"] += 1
             continue
         part = Part(ref, kind, sections)
-        params = _merged_params(meta, plan, ref)
+        params = merged_params(meta, plan, ref)
         texts = [(label, text) for label, text in (
             ("value", bom.value if bom else meta.get("value")),
             ("comment", bom.comment if bom else None),
@@ -951,6 +956,7 @@ def read_parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counte
                  if len(token) >= 8 and any(ch.isdigit() for ch in token)]
         footprint = bom.footprint if bom else meta.get("footprint")
         _read_part(part, params, texts, mpns, footprint)
+        part.params, part.texts, part.mpns = params, texts, mpns
         if kind == "resistor":
             part.ohms = resistance(bom.value if bom else meta.get("value"),
                                    bom.comment if bom else None,
@@ -967,7 +973,7 @@ def read_parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counte
 _LED_TEXT = re.compile(r"\bLEDs?\b|light[- ]?emitting", re.I)
 
 
-def _is_led(tree, ref: str) -> bool:
+def is_led(tree, ref: str) -> bool:
     return designator_prefix(ref) in ("LED", "DS") or bool(_LED_TEXT.search(tree.text(ref)))
 
 
@@ -1498,7 +1504,7 @@ def _dc_bias(part: Part, applied: float, rated: float, ratio: float, common: dic
         [part.ref], loss_band=band, **common)]
 
 
-def _resistor_limits(part: Part, policy: dict) -> tuple[Field | None, Field | None]:
+def resistor_limits(part: Part, policy: dict) -> tuple[Field | None, Field | None]:
     """(power rating, maximum working voltage) as stated, else typical for the size. An
     array whose sources disagree takes the lowest stated power: a per-element rating, not
     the package's."""
@@ -1530,7 +1536,7 @@ def _shunt(part: Part, text: str) -> bool:
 def _resistor_findings(part: Part, tree, voltages: dict[str, Volt], switch_nodes: set[str],
                        led_nets: dict[str, list[str]], series_nets: set[frozenset],
                        policy: dict) -> tuple[list[dict], dict]:
-    power, max_v = _resistor_limits(part, policy)
+    power, max_v = resistor_limits(part, policy)
     derating = policy["resistor_power_derating"]
     ohms = part.ohms
     case = _value(part, "case")
@@ -1902,7 +1908,7 @@ def _count_resistor(part: Part, across: list[_Across], stats: Counter, policy: d
     stats["resistors"] += 1
     known = any(item.volts is not None for item in across)
     stats["across_known" if known else "across_unknown"] += 1
-    power, max_v = _resistor_limits(part, policy)
+    power, max_v = resistor_limits(part, policy)
     for name, found in (("case", part.fields.get("case")), ("power_w", power),
                         ("rated_v", max_v)):
         stats[f"{name}:{found.source if found else 'unknown'}"] += 1

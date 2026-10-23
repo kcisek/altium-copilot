@@ -63,6 +63,9 @@ try:
         render_derating,
     )
     from services.logic_levels import prepare_logic_levels, render_logic_levels
+    from services.circuit_calcs import (
+        parse_vf, parse_vth, prepare_circuit_calculations, render_circuit_calculations,
+    )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -162,6 +165,9 @@ except ImportError:
         render_derating,
     )
     from server.services.logic_levels import prepare_logic_levels, render_logic_levels
+    from server.services.circuit_calcs import (
+        parse_vf, parse_vth, prepare_circuit_calculations, render_circuit_calculations,
+    )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -565,6 +571,20 @@ DNP reasons, fabrication requirements. Use it.
   in both datasheets before calling one a fault, and say so. Ask the user for the
   unknown_rails voltages and pass rails='VCCO=3.3'; part= lists each pin's rail.
 
+## Circuit Calculations
+
+- get_circuit_calculations — "check my dividers", "what does this feedback divider
+  set?", "at what input does the UVLO trip?", "how much current through this LED or
+  opto?", "is the ADC input filtered?", "what is this RC's cutoff?", or the calculation
+  part of a schematic review: dividers (ratio, unloaded output, source impedance,
+  tolerance range, what they feed: FB with implied Vref, EN with trip voltages, ADC,
+  comparator, reference), LED and opto currents from rail, Vf and R (resistor power,
+  opto CTR needed), ADC input RC cutoffs and other RC filters, each with its inputs and
+  their sources, formula and confidence. Vf, Vref and thresholds are datasheet values:
+  present results as calculations to check, not verdicts. Ask the user for the
+  voltages_needed and pass rails=; vf= for LED forward voltages, vth= for EN,
+  supervisor or comparator thresholds.
+
 ## Firmware Pin Map
 
 - get_firmware_pin_map — "what is the MCU's pinout?", "give the firmware team a pin
@@ -820,8 +840,9 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "get_power_tree", "check_derating", "check_logic_levels", "get_firmware_pin_map",
-    "run_erc", "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
+    "get_power_tree", "check_derating", "check_logic_levels", "get_circuit_calculations",
+    "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync", "schematic_review",
+    "package_for_xfn",
 )
 
 
@@ -4930,6 +4951,114 @@ def check_logic_levels(
     return rendered
 
 
+# Calculations and findings per page, tried in turn until the result fits; the board is
+# read once and only rendered per step. Its rows are long (inputs with their sources), so
+# the steps are finer than other tools' to use the budget.
+CIRCUIT_CALC_STEPS = (100, 60, 40, 25, 15, 10, 5, 2, 1)
+
+
+@mcp.tool(
+    title="Get Circuit Calculations",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_circuit_calculations(
+    part: str | None = None,
+    net: str | None = None,
+    kinds: list[str] | None = None,
+    rails: str | None = None,
+    vref: str | None = None,
+    vf: str | None = None,
+    vth: str | None = None,
+    offset: int = 0,
+) -> str:
+    """Circuit calculators, offline: resistor dividers, LED and optocoupler currents, ADC
+    input filters and RC low-pass filters, each with its inputs (every value with where it
+    came from), its formula, its result and a confidence. Call it when the user asks to
+    check or recalculate a divider, a feedback or UVLO divider's output or trip voltage,
+    an LED's or optocoupler's current or its resistor, whether ADC inputs are filtered, an
+    RC filter's cutoff, or for the calculation part of a schematic review.
+
+    dividers: a midpoint with a resistor leg (one resistor, parallel ones or a series
+    chain, also through a test point or connector pin) to ground or a lower rail and one
+    to a rail, a net of known voltage or a driven signal; each tap of a resistor stack
+    (window comparators, EN with a hysteresis tap) is a midpoint of its own. Skipped: a
+    midpoint a push-pull output drives (a pull-up/pull-down pair) and a series resistor
+    up to 1 kohm from a driving pin into a pull-down (kept and labelled at a transistor's
+    gate or base). Ratio Rbot/(Rtop+Rbot), the unloaded midpoint voltage when the top's
+    voltage is known, Rtop||Rbot and the current, a min/max ratio when every tolerance is
+    read (Tolerance parameter, '1%' in text, part-number letter), legs a jumper or switch
+    selects (their ratio), and what it feeds: a converter's FB (Vout/Vref, the Vref the
+    top's voltage implies, rails= included, or the output vref sets), EN/UVLO (V_top at
+    trip = V_th / ratio for vth, else 1.2 V and 0.8 V as examples only), a supervisor or
+    comparator (with vth), a reference IC such as a TL431 (vref per designator), an ADC
+    input, an op-amp (non-inverting gain), a reference pin, a transistor, a processor or
+    IC pin, a connector. leds: each LED's (and LED+/LED- pins on another part, such as a
+    display's backlight) supply side (rail, GPIO with its I/O rail, high-side transistor)
+    and sink side (ground, a sinking pin, low-side transistor) and I = (V_supply - V_sink
+    - Vf)/R - Vf/R_across (parallel resistors combined; a resistor across the LED takes its
+    share, and can hold it off) with Vf from vf, a stated forward voltage, the colour
+    (typical: red 2.0 V, yellow/amber 2.1 V, green 2.2 V, true green and blue/white 3.0 V,
+    IR 1.3 V), else at 2.0 V and 3.0 V; each resistor's power at that current. optos: the
+    input diode's I_F (Vf 1.2 V typical), an R or C across it, the output's pull-up and
+    rail, the saturation current and the CTR it needs. adc_inputs: processor analog pins
+    and ADC parts' inputs with their series R (or divider impedance), shunt C and fc =
+    1/(2 pi R C). rc_filters: other series-R-then-C nodes between ICs, with fc.
+
+    Findings: led_overcurrent (I above the stated or a typical 20 mA rating: warning when
+    Vf is known and I > 30 mA or above a rating a parameter states, else info),
+    diode_shunted_off (a resistor across an LED or opto input holds it below Vf),
+    divider_output_above_input_rating (the midpoint above the reached pin's rail + 0.3 V:
+    warning) and divider_output_below_ground (below -0.3 V), resistor_overpower (at the
+    computed current: warning above the rating; with an unknown Vf, when even 3.0 V
+    overloads it), adc_no_filter and opto_no_input_shunt (info).
+
+    Vf, Vref, EN thresholds, GPIO current limits and ADC sample capacitors are datasheet
+    values: present results as calculations to check against the datasheet, not verdicts,
+    and say so. voltages_needed lists nets whose voltage the calculations lack: ask the
+    user and pass rails ('VIN=24,VBAT=3.7'; names before a value share it). vf takes
+    forward voltages per designator or colour ('LED1=2.9,red=1.9'), vth thresholds per
+    designator or one for all ('U3=1.2'), vref Vrefs ('U5=0.8'). part and net
+    (comma-separated) narrow to the calculations touching them; kinds narrows to
+    dividers, leds, optos, adc_inputs, rc_filters. Calculations and findings page together
+    (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    user_rails, error = parse_rail_map(rails)
+    if error:
+        return json.dumps(error)
+    forward, error = parse_vf(vf)
+    if error:
+        return json.dumps(error)
+    thresholds, error = parse_vth(vth)
+    if error:
+        return json.dumps(error)
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_circuit_calculations(
+        netlist, plan, project.get("parameters") or {}, kinds=kinds,
+        parts=_split_names(part), nets=_split_names(net), rails=user_rails, vref=vrefs,
+        vf=forward, vth=thresholds, root_dir=project.get("root_dir"))
+    if "error" in prepared:
+        return json.dumps(prepared)
+    for step in CIRCUIT_CALC_STEPS:
+        result = {"netlist_updated_utc": _netlist_last_updated,
+                  **render_circuit_calculations(prepared, offset=offset, limit=step)}
+        if step != CIRCUIT_CALC_STEPS[0]:
+            result["page_limited_to"] = step
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 # Rows (and findings) per page, tried in turn until the result fits: text formats carry
 # short lines, JSON rows long ones.
 FIRMWARE_PAGE_LIMITS = {"table": (100, 50, 25, 10, 5), "text": (400, 200, 100, 50, 25)}
@@ -6344,6 +6473,11 @@ At minimum, check:
    whose names carry no voltage): drivers whose rail is below a receiver's VIH, inputs
    driven or pulled up above their supply + 0.3 V, FPGA banks and translator sides.
    Confirm VOH, VIH and absolute maximum ratings in both datasheets.
+10. Calculations — get_circuit_calculations (part= or net= for the sheet): recalculate
+   every divider (FB against the datasheet's Vref, EN/UVLO trip voltages against its
+   threshold, ADC inputs within their rail), LED and optocoupler currents against their
+   ratings (Vf from the datasheet), and a filter on every ADC input. Results are
+   calculations from datasheet-dependent inputs, not verdicts.
 
 For circuit types that require it, apply first principles beyond this
 list. The topology determines what matters.
