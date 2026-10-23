@@ -908,8 +908,9 @@ def _read_part(part: Part, params: dict, texts: list[tuple[str, str]], mpns: lis
                                               "a chip case of no stated kind")
 
 
-def _parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counter]:
-    """Fitted capacitors and resistors with their fields, and fitted LEDs."""
+def read_parts(tree, netlist: dict, plan) -> tuple[list[Part], list[str], Counter]:
+    """Fitted capacitors and resistors with their fields, and fitted LEDs (with counts of
+    the parts left out)."""
     components = netlist.get("components") or {}
     caps_and_resistors: list[Part] = []
     leds: list[str] = []
@@ -1014,8 +1015,9 @@ class Volt:
         return f"{net} {_v(self.volts)} V ({self.source})"
 
 
-_SAME_VOLTAGE_EDGES = frozenset({"0_ohm", "shunt", "ferrite", "inductor", "fuse",
-                                 "common_mode_choke"})
+# Power-tree edges a net's voltage carries across unchanged (net_voltages joins through them).
+SAME_VOLTAGE_EDGES = frozenset({"0_ohm", "shunt", "ferrite", "inductor", "fuse",
+                                "common_mode_choke"})
 _NEGATIVE_TOKEN = re.compile(r"^[NM]\d+(?:V\d*|P\d+V?)$")
 _NEGATIVE_WORDS = frozenset({"NEG", "VNEG", "VEE", "MINUS", "VMINUS", "NEGATIVE"})
 # VDD33, VCC18: volts and tenths by convention (pull_resistors.rail_voltage reads only the
@@ -1131,9 +1133,12 @@ def _control_nets(tree) -> set[str]:
             for net in conv.nets(kind)} - powered
 
 
-def _net_voltages(tree, data: dict, user: dict[str, float] | None
-                  ) -> tuple[dict[str, Volt], list[str]]:
-    """Each net's voltage with its source: user, ground, name, then the power tree."""
+def net_voltages(tree, data: dict, user: dict[str, float] | None, parts: list | None = None
+                 ) -> tuple[dict[str, Volt], list[str]]:
+    """Each net's voltage with its source: user (rails=, which win), ground, name, then the
+    power tree (data is tree_data's, for the outputs a given Vref sets) and, when the
+    fitted parts read_parts gives are passed, the unloaded midpoints of resistor
+    dividers. Also the names in user that match no net."""
     nets = set(tree.design.nets)
     out: dict[str, Volt] = {}
     switch_nodes = {net: conv for conv in tree.converters.values()
@@ -1171,7 +1176,7 @@ def _net_voltages(tree, data: dict, user: dict[str, float] | None
                                  f"{conv['designator']}'s feedback divider with Vref "
                                  f"{row['vref_given']:g} V")
     edges = sorted(((edge.src, edge.dst, edge.part, edge.kind) for edge in tree.edges
-                    if edge.kind in _SAME_VOLTAGE_EDGES),
+                    if edge.kind in SAME_VOLTAGE_EDGES),
                    key=lambda item: (natural_key(item[2]), item[0], item[1]))
     changed = True
     while changed:
@@ -1194,6 +1199,8 @@ def _net_voltages(tree, data: dict, user: dict[str, float] | None
         if peak:
             out[net] = Volt(out[peak].volts, "power_tree", "low",
                             f"switch node of {conv.ref} ({conv.kind}): peaks at {peak}")
+    if parts is not None:
+        out.update(_divider_midpoints(tree, parts, out))
     return out, unknown
 
 
@@ -1776,7 +1783,8 @@ def prepare_derating(
                            "find the real name."}
     if unknown_parts or unknown_nets:
         notes.append(f"Not found: {', '.join([*unknown_parts, *unknown_nets])}.")
-    voltages, unknown_rails = _net_voltages(tree, data, rails)
+    checked, leds, stats = read_parts(tree, netlist, plan)
+    voltages, unknown_rails = net_voltages(tree, data, rails, checked)
     if unknown_rails:
         notes.append(f"rails names no net {unknown_rails}: ignored (use query_net to find "
                      "the real name).")
@@ -1784,8 +1792,6 @@ def prepare_derating(
     switch_nodes = {net for conv in tree.converters.values() for net in conv.switch_nodes}
     series_nets = {frozenset((edge.src, edge.dst)) for edge in tree.edges
                    if edge.kind in ("resistor", "shunt")}
-    checked, leds, stats = _parts(tree, netlist, plan)
-    voltages.update(_divider_midpoints(tree, checked, voltages))
     if values["ceramic_ripple_max_ratio"] > values["ceramic_max_ratio"]:
         notes.append(f"ceramic_ripple_max_ratio ({values['ceramic_ripple_max_ratio']:g}) is "
                      f"looser than ceramic_max_ratio ({values['ceramic_max_ratio']:g}): "
