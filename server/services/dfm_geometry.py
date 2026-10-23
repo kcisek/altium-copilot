@@ -1,6 +1,8 @@
 """Copper geometry for check_dfm: copper spacing, hole to hole, copper to board edge and
 the walls of holes without copper around them (copper to the wall, the wall to the edge)
 over a PcbIndex. The engine holds no fabrication limits: the caller passes each distance.
+check_hv_clearance uses the same model through net_gaps (the copper of chosen nets
+against every other net's, each pair within its own reach) and openings_near.
 
 Pure logic, no MCP. Lengths are mils and coordinates absolute (the caller makes them
 origin-relative). What does not depend on a distance is built once per index, when a pass
@@ -57,9 +59,10 @@ try:
         decode_region_records,
         pad_copper_on,
     )
-    from services.connectivity import _closest_pair, _toward
+    from services.connectivity import _closest_on, _closest_pair, _toward
     from services.pcb_compliance import CLEARANCE_TOLERANCE_MIL, EPS_MIL
     from services.pcb_geometry import (
+        in_arc_span,
         oriented_rect_vertices,
         point_arc_distance,
         point_polygon_distance,
@@ -76,9 +79,10 @@ except ImportError:
         decode_region_records,
         pad_copper_on,
     )
-    from server.services.connectivity import _closest_pair, _toward
+    from server.services.connectivity import _closest_on, _closest_pair, _toward
     from server.services.pcb_compliance import CLEARANCE_TOLERANCE_MIL, EPS_MIL
     from server.services.pcb_geometry import (
+        in_arc_span,
         oriented_rect_vertices,
         point_arc_distance,
         point_polygon_distance,
@@ -210,6 +214,22 @@ class GapRecord:
         if self._at is None:
             self._at = _meeting_point(*self._geometries, self.gap_mil)
         return self._at
+
+    @property
+    def ends(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The point of each copper nearest the other (first's, second's): the closest
+        points of their cores, arcs on the true arc (unlike `at`, which takes an arc's
+        chord), past each one's copper; one point twice when they touch (where first's
+        copper meets second's). Their midpoint is where the gap is."""
+        first, second = self._geometries
+        distance, on_first, on_second = _nearest_true_cores(first, second)
+        if distance == 0.0:
+            return on_first, on_first
+        if self.gap_mil <= 0.0:
+            point = _toward(on_first, on_second, first[1])
+            return point, point
+        return (_toward(on_first, on_second, first[1]),
+                _toward(on_second, on_first, second[1]))
 
 
 @dataclass
@@ -528,6 +548,102 @@ def _near_point(copper, edge) -> tuple[float, float]:
     """The point of copper nearest an edge piece (arcs measured on their chords)."""
     _, on_copper, on_edge = _nearest_cores(copper, edge)
     return _toward(on_copper, on_edge, copper[1])
+
+
+def _on_arc(px: float, py: float, arc: tuple) -> tuple[float, float]:
+    """The point of an arc piece (pcb_geometry's) nearest a point."""
+    cx, cy, radius, x1, y1, x2, y2 = arc
+    if in_arc_span(px, py, arc):
+        apart = math.hypot(px - cx, py - cy)
+        if apart:
+            return cx + (px - cx) * radius / apart, cy + (py - cy) * radius / apart
+        return x1, y1
+    if math.hypot(px - x1, py - y1) <= math.hypot(px - x2, py - y2):
+        return x1, y1
+    return x2, y2
+
+
+def _on_piece(px: float, py: float, piece: tuple) -> tuple[float, float]:
+    return _on_arc(px, py, piece) if len(piece) == 7 else _closest_on(px, py, *piece)
+
+
+def _closest_pieces(a: tuple, b: tuple) -> tuple[float, tuple, tuple]:
+    """(distance, point on a, point on b) of two core pieces, each a segment (x1, y1,
+    x2, y2) or an arc piece (cx, cy, r, x1, y1, x2, y2), on the true arc. The candidates
+    are pcb_geometry's seg_arc_distance and arc_arc_distance ones: an end of either,
+    the foot of the perpendicular from an arc's centre, the line through two centres,
+    and crossings."""
+    if len(a) == 4 and len(b) == 4:
+        return _closest_pair(a, b)
+    if len(a) == 4:
+        distance, on_b, on_a = _closest_pieces(b, a)
+        return distance, on_a, on_b
+    ends_b = ((b[0], b[1]), (b[2], b[3])) if len(b) == 4 else ((b[3], b[4]), (b[5], b[6]))
+    candidates = []
+    for point in ((a[3], a[4]), (a[5], a[6])):
+        other = _on_piece(*point, b)
+        candidates.append((math.dist(point, other), point, other))
+    for point in ends_b:
+        other = _on_arc(*point, a)
+        candidates.append((math.dist(other, point), other, point))
+    cx, cy, radius = a[0], a[1], a[2]
+    if len(b) == 4:
+        x1, y1, x2, y2 = b
+        dx, dy = x2 - x1, y2 - y1
+        length_squared = dx * dx + dy * dy
+        if length_squared > 0:
+            fx, fy = x1 - cx, y1 - cy
+            along = -(fx * dx + fy * dy) / length_squared
+            if 0 < along < 1:
+                foot = (x1 + along * dx, y1 + along * dy)
+                on = _on_arc(*foot, a)
+                candidates.append((math.dist(on, foot), on, foot))
+            discriminant = along * along - (fx * fx + fy * fy - radius * radius) / (
+                length_squared)
+            if discriminant >= 0:
+                root = math.sqrt(discriminant)
+                for t in (along - root, along + root):
+                    point = (x1 + t * dx, y1 + t * dy)
+                    if 0 <= t <= 1 and in_arc_span(*point, a):
+                        return 0.0, point, point
+    else:
+        c2x, c2y, radius_b = b[0], b[1], b[2]
+        dx, dy = c2x - cx, c2y - cy
+        apart = math.hypot(dx, dy)
+        if apart > 0:
+            ux, uy = dx / apart, dy / apart
+            for sign in (1.0, -1.0):
+                point = (cx + sign * radius * ux, cy + sign * radius * uy)
+                if in_arc_span(*point, a):
+                    other = _on_arc(*point, b)
+                    candidates.append((math.dist(point, other), point, other))
+                point = (c2x + sign * radius_b * ux, c2y + sign * radius_b * uy)
+                if in_arc_span(*point, b):
+                    other = _on_arc(*point, a)
+                    candidates.append((math.dist(other, point), other, point))
+            if abs(radius - radius_b) <= apart <= radius + radius_b:
+                along = (radius * radius - radius_b * radius_b + apart * apart) / (2.0 * apart)
+                height = math.sqrt(max(0.0, radius * radius - along * along))
+                for sign in (1.0, -1.0):
+                    point = (cx + along * ux - sign * height * uy,
+                             cy + along * uy + sign * height * ux)
+                    if in_arc_span(*point, a) and in_arc_span(*point, b):
+                        return 0.0, point, point
+    return min(candidates, key=lambda item: item[0])
+
+
+def _true_core(geometry) -> list[tuple]:
+    """_core with an arc as its arc piece, not its chord."""
+    arc = geometry[3]
+    return [arc] if arc is not None and geometry[2] is None else _core(geometry)
+
+
+def _nearest_true_cores(first, second) -> tuple[float, tuple, tuple]:
+    """_nearest_cores on the true arcs."""
+    return min(
+        (_closest_pieces(a, b) for a in _true_core(first) for b in _true_core(second)),
+        key=lambda item: item[0],
+    )
 
 
 def _point_distance(px: float, py: float, geometry) -> float:
@@ -1114,11 +1230,26 @@ def _group(groups: dict, key, geometry, layer: int, base: tuple, items: dict) ->
     items[layer].append(group[1])
 
 
-def _model(index) -> _Model:
+def copper_model(index) -> _Model:
+    """The index's cached model (built on first use): per-layer copper items, area copper,
+    the board edge and the holes, shared by check_dfm, its assembly checks and
+    check_hv_clearance."""
     model = getattr(index, "_dfm_geometry", None)
     if model is None:
         model = index._dfm_geometry = _Model(index)
     return model
+
+
+def _net_tie(ties: dict[int, set[int]], first, second) -> int | None:
+    """The net-tie part (Model.ties) two copper sides belong to as its tie: one side is
+    the part's own copper and the other is too or carries one of its pads' nets."""
+    for mine, other in ((first, second), (second, first)):
+        nets = ties.get(mine[9])
+        if nets is not None and (
+            other[9] == mine[9] or (other[4] is not None and other[4] in nets)
+        ):
+            return mine[9]
+    return None
 
 
 def _copper(side) -> Copper:
@@ -1155,14 +1286,7 @@ class _Spacing:
         self.item_grids: dict[int, tuple] = {}
 
     def _tie(self, first, second) -> int | None:
-        ties = self.model.ties
-        for mine, other in ((first, second), (second, first)):
-            nets = ties.get(mine[9])
-            if nets is not None and (
-                other[9] == mine[9] or (other[4] is not None and other[4] in nets)
-            ):
-                return mine[9]
-        return None
+        return _net_tie(self.model.ties, first, second)
 
     def found(self, first, second, layer: int, gap: float, first_geometry, second_geometry):
         """first and second are closer than the limit on layer."""
@@ -1535,7 +1659,7 @@ def spacing(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> SpacingRe
     """Every pair of copper owners of different nets closer than
     reach_mil - CLEARANCE_TOLERANCE_MIL on a signal layer (see the module docstring
     for what is skipped and marked). Cached on the index (Model.cached)."""
-    model = _model(index)
+    model = copper_model(index)
 
     def compute():
         run = _Spacing(model, reach_mil, cap)
@@ -1546,6 +1670,480 @@ def spacing(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> SpacingRe
         return run.result()
 
     return model.cached("spacing", reach_mil, cap, compute, _narrow_spacing)
+
+
+# ---------- copper of chosen nets (check_hv_clearance) ----------
+
+
+@dataclass
+class NetGapResult:
+    """net_gaps: the copper of chosen (source) nets against other nets' copper."""
+
+    # The smallest gap per (net pair, layer, whether a pad is one side), smallest first;
+    # first.net < second.net.
+    records: list[GapRecord]
+    no_net_owners: int  # no-net copper owners within a source net's reach (not measured)
+    net_tie_pairs: int  # owner pairs skipped as a net tie's own copper
+    distance_calls: int
+    stopped: bool  # the cap was reached: the records are incomplete
+
+
+def _grid_near(grid: dict, size: float, x0: float, y0: float, x1: float, y1: float) -> set:
+    """The members of the grid cells a box touches."""
+    found: set[int] = set()
+    xs, ys = _cells(x0, y0, x1, y1, size)
+    for gx in xs:
+        for gy in ys:
+            cell = grid.get((gx, gy))
+            if cell:
+                found.update(cell)
+    return found
+
+
+def _edge_near(geometry, points, window, least: float) -> tuple[tuple | None, float, int]:
+    """(edge, distance, edges measured) of the ring edges in `points` within the window
+    nearest the copper geometry, when nearer than `least` (edge None otherwise)."""
+    x0, y0, x1, y1 = window
+    segment, radius, polygon, arc = geometry
+    capsule = polygon is None and arc is None
+    edge, tested = None, 0
+    px, py = points[0]
+    for qx, qy in points[1:]:
+        if (px < x0 and qx < x0) or (px > x1 and qx > x1) or \
+                (py < y0 and qy < y0) or (py > y1 and qy > y1):
+            px, py = qx, qy
+            continue
+        tested += 1
+        if capsule:
+            distance = seg_seg_distance(*segment, px, py, qx, qy) - radius
+        else:
+            distance = _GEO(geometry, ((px, py, qx, qy), 0.0, None, None))
+        if distance < least:
+            least, edge = max(0.0, distance), (px, py, qx, qy)
+        px, py = qx, qy
+    return edge, least, tested
+
+
+def _chunk_gap(ca, cb, reach: float, least: float) -> tuple[float, tuple | None, tuple | None, int]:
+    """(distance, edge of ca, edge of cb, edges compared) of the nearest edges of two
+    area chunks within the window both can reach, when nearer than `least`."""
+    ox0, oy0 = max(ca[0], cb[0]) - reach, max(ca[1], cb[1]) - reach
+    ox1, oy1 = min(ca[2], cb[2]) + reach, min(ca[3], cb[3]) + reach
+
+    def near(points):
+        return [
+            (p[0], p[1], q[0], q[1]) for p, q in zip(points, points[1:])
+            if not ((p[0] < ox0 and q[0] < ox0) or (p[0] > ox1 and q[0] > ox1)
+                    or (p[1] < oy0 and q[1] < oy0) or (p[1] > oy1 and q[1] > oy1))
+        ]
+
+    first = near(ca[5])
+    second = near(cb[5]) if first else []
+    best, pair = least, (None, None)
+    for a in first:
+        for b in second:
+            distance = seg_seg_distance(*a, *b)
+            if distance < best:
+                best, pair = distance, (a, b)
+    return best, pair[0], pair[1], len(first) * len(second)
+
+
+class _NetGaps:
+    """One net_gaps run: the source nets' copper on each layer against every other net's,
+    each pair within its own reach. A pair of two source nets is measured from one side."""
+
+    def __init__(self, model: _Model, reach_by_net: dict[int, float], pair_reach, cap: int):
+        self.model = model
+        self.reach_by_net = reach_by_net
+        self.sources = set(reach_by_net)
+        self.pair_reach = pair_reach
+        self.cap = cap
+        self.calls = 0
+        self.stopped = False
+        # (net a, net b, layer, pad) -> [gap, first side, second side, geometries]
+        self.pairs: dict[tuple, list] = {}
+        self.no_net: set = set()
+        self.ties: set = set()
+        self._reaches: dict[tuple, float | None] = {}
+
+    def reach(self, a: int, b: int) -> float | None:
+        """The pair's reach (pair_reach, never past its source sides' own reach), or None
+        when the pair is not wanted."""
+        key = (a, b) if a <= b else (b, a)
+        if key not in self._reaches:
+            widest = max(self.reach_by_net.get(a, 0.0), self.reach_by_net.get(b, 0.0))
+            value = widest if self.pair_reach is None else self.pair_reach(*key)
+            self._reaches[key] = min(value, widest) if value and widest else None
+        return self._reaches[key]
+
+    def over_cap(self) -> bool:
+        if self.calls > self.cap:
+            self.stopped = True
+        return self.stopped
+
+    def found(self, first, second, layer: int, gap: float, first_geometry, second_geometry):
+        ties = self.model.ties
+        if ties and (first[9] in ties or second[9] in ties) and \
+                _net_tie(ties, first, second) is not None:
+            a, b = first[5], second[5]
+            self.ties.add((a, b) if a <= b else (b, a))
+            return
+        if first[4] > second[4]:
+            first, second = second, first
+            first_geometry, second_geometry = second_geometry, first_geometry
+        key = (first[4], second[4], layer, first[8] == "pad" or second[8] == "pad")
+        entry = self.pairs.get(key)
+        if entry is None or gap < entry[0]:
+            self.pairs[key] = [gap, first, second, (first_geometry, second_geometry)]
+
+    def run(self, layers=None) -> None:
+        for layer in self.model.stack_signal:
+            if layers is not None and layer not in layers:
+                continue
+            if self.over_cap():
+                return
+            self._layer(layer)
+
+    def _layer(self, layer: int) -> None:
+        model, sources = self.model, self.sources
+        items = model.items.get(layer, [])
+        areas = model.area_layers.get(layer, [])
+        source_items = [number for number, item in enumerate(items) if item[4] in sources]
+        source_areas = [area for area in areas if area.net in sources]
+        if not source_items and not source_areas:
+            return
+        widest = max([self.reach_by_net[items[number][4]] for number in source_items]
+                     + [self.reach_by_net[area.net] for area in source_areas])
+        size = max(ITEM_CELL_MIL, widest / 4.0)
+        grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for number, item in enumerate(items):
+            xs, ys = _cells(item[0], item[1], item[2], item[3], size)
+            for gx in xs:
+                for gy in ys:
+                    grid[(gx, gy)].append(number)
+        self._items_vs_items(layer, items, grid, size, source_items)
+        chunks = model.chunks.get(layer, [])
+        if chunks:
+            chunk_grid = model.grid(layer, AREA_GROW_MIL)[0]
+            own: dict = defaultdict(list)  # a source area -> its chunks
+            for number, chunk in enumerate(chunks):
+                if chunk[4].net in sources:
+                    own[chunk[4]].append(number)
+            self._items_vs_areas(layer, items, chunks, chunk_grid, source_items)
+            self._areas_vs_items(layer, items, grid, size, chunks, own)
+            self._areas_vs_areas(layer, chunks, chunk_grid, own)
+        self._containment(layer, items, grid, size, areas, source_items, source_areas)
+
+    def _limit(self, net_a: int, net_b: int, layer: int, pad: bool, reach: float) -> float:
+        """How near a candidate must come to matter: the smallest gap found so far for
+        its (pair, layer, pad) record, else the pair's reach."""
+        key = (net_a, net_b, layer, pad) if net_a < net_b else (net_b, net_a, layer, pad)
+        entry = self.pairs.get(key)
+        return reach if entry is None or entry[0] >= reach else entry[0]
+
+    def _items_vs_items(self, layer, items, grid, size, source_items) -> None:
+        sources, geo = self.sources, _GEO
+        for number in source_items:
+            if self.over_cap():
+                return
+            a = items[number]
+            net = a[4]
+            r = self.reach_by_net[net]
+            pad = a[8] == "pad"
+            near = []
+            for other in _grid_near(grid, size, a[0] - r, a[1] - r, a[2] + r, a[3] + r):
+                b = items[other]
+                nb = b[4]
+                if nb == net or b[5] == a[5]:
+                    continue
+                dx = max(0.0, b[0] - a[2], a[0] - b[2])
+                dy = max(0.0, b[1] - a[3], a[1] - b[3])
+                box = dx * dx + dy * dy
+                if nb is None:
+                    if box < r * r:
+                        self.no_net.add(b[5])
+                    continue
+                near.append((box, other))
+            # Nearest boxes first: the first gaps found prune the rest.
+            near.sort()
+            for box, other in near:
+                b = items[other]
+                nb = b[4]
+                reach = self.reach(net, nb)
+                if reach is None or (nb in sources and other < number
+                                     and self.reach_by_net[nb] >= reach):
+                    continue  # not wanted, or measured from the other side
+                limit = self._limit(net, nb, layer, pad or b[8] == "pad", reach)
+                if box >= limit * limit:
+                    continue
+                self.calls += 1
+                gap = geo(a[6], b[6])
+                if gap < limit:
+                    self.found(a, b, layer, gap, a[6], b[6])
+
+    def _items_vs_areas(self, layer, items, chunks, chunk_grid, source_items) -> None:
+        for number in source_items:
+            if self.over_cap():
+                return
+            item = items[number]
+            net = item[4]
+            r = self.reach_by_net[net]
+            pad = item[8] == "pad"
+            query = max(0.0, r - AREA_GROW_MIL)
+            near = []
+            for chunk in _grid_near(chunk_grid, AREA_CELL_MIL, item[0] - query,
+                                    item[1] - query, item[2] + query, item[3] + query):
+                cx0, cy0, cx1, cy1, area, _ = chunks[chunk]
+                if area.net == net:
+                    continue
+                dx = max(0.0, cx0 - item[2], item[0] - cx1)
+                dy = max(0.0, cy0 - item[3], item[1] - cy1)
+                box = dx * dx + dy * dy
+                if area.net is None:
+                    if box < r * r:
+                        self.no_net.add(area.side[5])
+                    continue
+                near.append((box, chunk))
+            near.sort()
+            for box, chunk in near:
+                area, points = chunks[chunk][4], chunks[chunk][5]
+                reach = self.reach(net, area.net)
+                if reach is None:
+                    continue
+                limit = self._limit(net, area.net, layer, pad, reach)
+                if box >= limit * limit:
+                    continue
+                window = (item[0] - limit, item[1] - limit, item[2] + limit, item[3] + limit)
+                edge, gap, tested = _edge_near(item[6], points, window, limit)
+                self.calls += tested
+                if edge is not None:
+                    self.found(item, area.side, layer, gap, item[6], (edge, 0.0, None, None))
+
+    def _areas_vs_items(self, layer, items, grid, size, chunks, own) -> None:
+        sources = self.sources
+        for area, numbers in own.items():
+            net = area.net
+            r = self.reach_by_net[net]
+            for chunk in numbers:
+                if self.over_cap():
+                    return
+                cx0, cy0, cx1, cy1, _, points = chunks[chunk]
+                near = []
+                for other in _grid_near(grid, size, cx0 - r, cy0 - r, cx1 + r, cy1 + r):
+                    item = items[other]
+                    nb = item[4]
+                    if nb == net:
+                        continue
+                    dx = max(0.0, cx0 - item[2], item[0] - cx1)
+                    dy = max(0.0, cy0 - item[3], item[1] - cy1)
+                    box = dx * dx + dy * dy
+                    if nb is None:
+                        if box < r * r:
+                            self.no_net.add(item[5])
+                        continue
+                    near.append((box, other))
+                near.sort()
+                for box, other in near:
+                    item = items[other]
+                    nb = item[4]
+                    reach = self.reach(net, nb)
+                    if reach is None or (nb in sources and self.reach_by_net[nb] >= reach):
+                        continue  # not wanted, or the item measured itself against this area
+                    limit = self._limit(net, nb, layer, item[8] == "pad", reach)
+                    if box >= limit * limit:
+                        continue
+                    window = (item[0] - limit, item[1] - limit, item[2] + limit,
+                              item[3] + limit)
+                    edge, gap, tested = _edge_near(item[6], points, window, limit)
+                    self.calls += tested
+                    if edge is not None:
+                        self.found(item, area.side, layer, gap, item[6],
+                                   (edge, 0.0, None, None))
+
+    def _areas_vs_areas(self, layer, chunks, chunk_grid, own) -> None:
+        sources = self.sources
+        for area, numbers in own.items():
+            net = area.net
+            r = self.reach_by_net[net]
+            query = max(0.0, r - AREA_GROW_MIL)
+            for chunk in numbers:
+                if self.over_cap():
+                    return
+                ca = chunks[chunk]
+                near = []
+                for other in _grid_near(chunk_grid, AREA_CELL_MIL, ca[0] - query,
+                                        ca[1] - query, ca[2] + query, ca[3] + query):
+                    cb = chunks[other]
+                    area_b = cb[4]
+                    nb = area_b.net
+                    if area_b is area or nb == net:
+                        continue
+                    dx = max(0.0, cb[0] - ca[2], ca[0] - cb[2])
+                    dy = max(0.0, cb[1] - ca[3], ca[1] - cb[3])
+                    box = dx * dx + dy * dy
+                    if nb is None:
+                        if box < r * r:
+                            self.no_net.add(area_b.side[5])
+                        continue
+                    near.append((box, other))
+                near.sort()
+                for box, other in near:
+                    cb = chunks[other]
+                    area_b = cb[4]
+                    nb = area_b.net
+                    reach = self.reach(net, nb)
+                    if reach is None or (nb in sources and area_b.number < area.number
+                                         and self.reach_by_net[nb] >= reach):
+                        continue  # not wanted, or measured from the other side
+                    limit = self._limit(net, nb, layer, False, reach)
+                    if box >= limit * limit:
+                        continue
+                    gap, edge_a, edge_b, tested = _chunk_gap(ca, cb, limit, limit)
+                    self.calls += tested
+                    if edge_a is not None:
+                        self.found(area.side, area_b.side, layer, gap,
+                                   (edge_a, 0.0, None, None), (edge_b, 0.0, None, None))
+
+    def _containment(self, layer, items, grid, size, areas, source_items, source_areas) -> None:
+        """Copper wholly inside another net's area copper, which no edge pass sees: source
+        objects inside free regions, fills and stale pours (a valid pour is poured around
+        other nets' copper) and other nets' objects inside the source nets' ones, and
+        areas inside areas."""
+        model, sources = self.model, self.sources
+        holders = [area for area in areas if area.checks_containment and area.net is not None]
+        cell = 4.0 * AREA_CELL_MIL
+        holder_grid: dict[tuple[int, int], list] = defaultdict(list)
+        for area in holders:
+            xs, ys = _cells(*area.bbox, cell)
+            for gx in xs:
+                for gy in ys:
+                    holder_grid[(gx, gy)].append(area)
+        for number in source_items:
+            if self.over_cap():
+                return
+            item = items[number]
+            x, y = _ref_point(item[6])
+            for area in holder_grid.get((math.floor(x / cell), math.floor(y / cell)), ()):
+                minx, miny, maxx, maxy = area.bbox
+                if area.net == item[4] or not (minx <= item[0] and item[2] <= maxx
+                                               and miny <= item[1] and item[3] <= maxy):
+                    continue
+                if self.reach(item[4], area.net) is None:
+                    continue
+                self.calls += 1
+                if model.area_contains(area, x, y):
+                    self.found(item, area.side, layer, 0.0, item[6], _point(x, y))
+        for area in source_areas:
+            if self.over_cap():
+                return
+            minx, miny, maxx, maxy = area.bbox
+            if area.checks_containment:
+                for other in _grid_near(grid, size, minx, miny, maxx, maxy):
+                    item = items[other]
+                    nb = item[4]
+                    if nb is None or nb == area.net or nb in sources or not (
+                            minx <= item[0] and item[2] <= maxx
+                            and miny <= item[1] and item[3] <= maxy):
+                        continue
+                    if self.reach(area.net, nb) is None:
+                        continue
+                    self.calls += 1
+                    x, y = _ref_point(item[6])
+                    if model.area_contains(area, x, y):
+                        self.found(item, area.side, layer, 0.0, item[6], _point(x, y))
+            for other in areas:
+                nb = other.net
+                if other is area or nb is None or nb == area.net or (
+                        nb in sources and other.number < area.number):
+                    continue
+                if self.reach(area.net, nb) is None:
+                    continue
+                for inner, outer in ((area, other), (other, area)):
+                    ib, ob = inner.bbox, outer.bbox
+                    if not (ob[0] <= ib[0] and ib[2] <= ob[2] and ob[1] <= ib[1]
+                            and ib[3] <= ob[3]):
+                        continue
+                    x, y = inner.rings[0][0]
+                    self.calls += 1
+                    if model.area_contains(outer, x, y):
+                        point = _point(x, y)
+                        self.found(inner.side, outer.side, layer, 0.0, point, point)
+                        break
+
+    def result(self) -> NetGapResult:
+        stale = self.model.stale_pours
+        records = []
+        for (_, _, layer, _), (gap, first, second, geometries) in self.pairs.items():
+            marks = set()
+            if gap <= TOUCH_MIL:
+                marks.add("touching")
+            pours = tuple(sorted({side[10] for side in (first, second) if side[10] in stale}))
+            if pours:
+                marks.add("stale_pour")
+            records.append(GapRecord(
+                first=_copper(first), second=_copper(second), gap_mil=gap, layer=layer,
+                layers=(layer,), marks=frozenset(marks), stale_pours=pours,
+                _geometries=geometries,
+            ))
+        records.sort(key=lambda record: (record.gap_mil, record.first.net, record.second.net,
+                                         record.layer, record.first.owner, record.second.owner))
+        return NetGapResult(records=records, no_net_owners=len(self.no_net),
+                            net_tie_pairs=len(self.ties), distance_calls=self.calls,
+                            stopped=self.stopped)
+
+
+def net_gaps(index, reach_by_net: dict[int, float], pair_reach=None, layers=None,
+             cap: int = MAX_DISTANCE_CALLS) -> NetGapResult:
+    """The copper of the source nets (reach_by_net: net id -> its search reach in mil) on
+    each signal layer against every other net's copper (tracks, arcs, vias' pads on the
+    layer, pads' copper on the layer, hatched pour copper, poured regions, free regions and
+    fills; shelved pours hold none), as spacing measures it: the smallest gap per net pair,
+    layer and whether a pad is one side, below the pair's reach. pair_reach(a, b) (a < b,
+    net ids) gives a pair's own reach, or None to skip the pair; it is never wider than
+    its source sides' reach. layers narrows to those signal layers. No-net copper is
+    counted, not measured; a net tie's own copper is skipped (counted). Not cached."""
+    run = _NetGaps(copper_model(index), reach_by_net, pair_reach, cap)
+    run.run(layers)
+    return run.result()
+
+
+def openings_near(index, start, end, near_mil: float) -> list[dict]:
+    """What a surface path between two points crosses or passes: the board outline, board
+    cutouts, and holes without copper of their own (non-plated pad holes and slots, bare
+    holes) within near_mil of the straight segment start -> end. Each: kind (board_edge,
+    board_cutout, slot, hole), in_path (it crosses or touches the segment), distance_mil
+    and where (a hole's centre, the nearest point of an edge), absolute mil; nearest
+    first."""
+    model = copper_model(index)
+    segment = ((start[0], start[1], end[0], end[1]), 0.0, None, None)
+    x0, y0, x1, y1 = _BOUNDS(segment)
+    x0, y0, x1, y1 = x0 - near_mil, y0 - near_mil, x1 + near_mil, y1 + near_mil
+    found: dict[tuple, tuple] = {}
+    for geometry, box, _, kind, cutout, _ in model.edge.pieces:
+        if box[0] > x1 or box[2] < x0 or box[1] > y1 or box[3] < y0:
+            continue
+        distance = _GEO(segment, geometry)
+        key = ("board_cutout", cutout) if kind == "cutout" else ("board_edge", None)
+        if distance < near_mil and (key not in found or distance < found[key][0]):
+            found[key] = (distance, _near_point(geometry, segment))
+    for number, hole in enumerate(model.holes):
+        if hole.kind != "bare_hole" and hole.plated is not False:
+            continue
+        geometry = hole.geometry
+        box = _BOUNDS(geometry)
+        if box[0] > x1 or box[2] < x0 or box[1] > y1 or box[3] < y0:
+            continue
+        distance = _GEO(segment, geometry)
+        if distance < near_mil:
+            slot = hole.hole_shape == 2 and (hole.slot_length_mil or 0.0) > hole.hole_mil
+            found[("slot" if slot else "hole", number)] = (distance, (hole.x, hole.y))
+    out = [
+        {"kind": key[0], "in_path": distance <= TOUCH_MIL, "distance_mil": distance,
+         "at": point}
+        for key, (distance, point) in found.items()
+    ]
+    out.sort(key=lambda entry: (entry["distance_mil"], entry["kind"]))
+    return out
 
 
 # ---------- the board edge ----------
@@ -2013,7 +2611,7 @@ def copper_to_edge(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> Ed
     outline and board cutouts), one record per owner; copper wholly off the board;
     edge-connector fingers; plated holes the edge cuts. Cached on the index
     (Model.cached)."""
-    model = _model(index)
+    model = copper_model(index)
 
     def compute():
         edge = model.edge
@@ -2051,13 +2649,13 @@ def copper_to_edge(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> Ed
 def holes(index) -> list[Hole]:
     """Every drilled hole: vias, pad holes (plated or not) and bare holes. Builds no
     copper model."""
-    return _model(index).holes
+    return copper_model(index).holes
 
 
 def hole_to_hole(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> HoleResult:
     """Pairs of holes closer than reach_mil - CLEARANCE_TOLERANCE_MIL edge to edge (slots
     as capsules) whose drilled spans overlap. Cached on the index (Model.cached)."""
-    model = _model(index)
+    model = copper_model(index)
 
     def compute():
         return _hole_pairs(model, reach_mil, cap)
@@ -2269,7 +2867,7 @@ def hole_to_copper(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> Ho
     copper on the layer, a bare hole): copper of any net, no-net copper included, to a
     non-plated wall; copper of other nets to a plated bare hole's barrel. One record per
     (hole, copper owner). Cached on the index (Model.cached)."""
-    model = _model(index)
+    model = copper_model(index)
 
     def compute():
         run = _WallRun(model, reach_mil, cap)
@@ -2290,7 +2888,7 @@ def hole_to_edge(index, reach_mil: float, cap: int = MAX_DISTANCE_CALLS) -> Hole
     their wall to the nearest outline or cutout piece. Holes wholly off the board are
     left out, and so are plated bare holes the edge cuts (copper_to_edge's edge_holes).
     Cached on the index (Model.cached)."""
-    model = _model(index)
+    model = copper_model(index)
 
     def compute():
         edge = model.edge
@@ -2357,7 +2955,7 @@ def board_minimums(
     copper gap, copper-to-edge distance and hole-to-hole gap, each searched up to its
     reach (value_mil None: nothing closer than the reach). A cached result of a larger
     reach is used when there is one."""
-    model = _model(index)
+    model = copper_model(index)
     gaps = _widest(model, "spacing", gap_reach_mil) or spacing(index, gap_reach_mil)
     edges = (_widest(model, "copper_to_edge", edge_reach_mil)
              or copper_to_edge(index, edge_reach_mil))

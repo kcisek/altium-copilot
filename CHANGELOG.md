@@ -6,6 +6,134 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_hv_clearance`: voltage-aware clearance and creepage screen (roadmap #32,
+  `services/hv_clearance.py`), read-only and offline from the compiled netlist, the active
+  variant and the PcbDoc (a PcbDoc is required: `no_pcb_document` without one). A
+  screening tool, labelled so in every result: the product's spacing and safety
+  standards decide, and IPC-2221B and IPC-9592B are functional minimums, not safety
+  isolation.
+  - Net voltages: check_derating's resolution (rails= wins, grounds 0 V, names, the power
+    tree with vref=, divider midpoints), each with its source and confidence, plus hv=
+    for working voltages that are not DC rails ('L=230AC,N=0,HV_BUS=400'; hv= wins over
+    rails=; names before a value share it). AC is given as RMS and judged at its peak
+    (x sqrt 2); '325pk' gives a peak, '230AC@120' a phase, so two phases 120 degrees
+    apart see their line-to-line voltage (AC nets are otherwise in phase). A converter's
+    switch node swings between 0 V and the voltage it peaks at, the power tree's or the
+    value given in rails= or hv= (half of it plus a square wave of half, whose peak adds
+    to any other AC); one of unknown voltage is listed to ask about. The voltage between
+    two nets is their DC difference plus the peak of their AC difference when both are
+    known. groups= ('PRI:L,N,HV_*,PGND;SEC:GND,3V3', wildcards; undeclared PCB nets form
+    the board's group) declares isolated groups with their own reference: pairs across
+    groups take working_voltage= ('250AC' or '400'); without it they are not judged (a
+    note says so, and they are listed among unknown_voltage_pairs near a known
+    high-voltage net).
+  - Pairs: every pair of nets whose voltage difference (peak) is above threshold= (default
+    15 V). Its copper is searched from the side more than half the threshold from its
+    reference (across groups with a working voltage, from every group but the largest),
+    each pair within twice its largest requirement or user figure (at most 5 mm more; a
+    figure given for the other net counts), on every signal layer, through check_dfm's
+    copper model (net= searches only for the pairs of those nets): tracks, arcs (measured,
+    and located, on the arc, not the chord), pads with their copper on the layer, vias'
+    pads on the layer (the barrel
+    where the pad is removed), hatched pours' tracks, poured regions, free regions and
+    fills; shelved and never-poured pours hold no copper (a note counts them), a pour's
+    outline rows are not copper, internal plane layers are not measured, no-net copper
+    and a net tie's own copper are counted, not judged, and copper wholly inside another
+    net's region or fill touches. Per pair and layer: the smallest distance, its location
+    (origin-relative) and objects.
+  - Requirement per pair and layer from the peak voltage: IPC-2221B Table 6-1 (B1 on
+    internal layers, B2 on external ones, B3 above 3050 m with altitude=, B4 with
+    coating=true; with standard='ipc2221_assembly' A6/A7 where a component pad is one
+    side and A5 for coated conductors, the larger of A6 and B3 for an uncoated lead above
+    3050 m; above 500 V the per-volt value times the volts above 500 is added to the
+    301-500 V value; a voltage between two rows takes the higher row), or
+    standard='ipc9592' (0.13 mm below 15 V, 0.25 mm to 30 V, 0.1 + 0.01 x V to 100 V,
+    0.6 + 0.005 x V above, any layer). min_distance= replaces the standard ('2.5' every
+    pair, 'HV_BUS=4' a net's pairs, 'L&N=3' one pair, in units; for the pairs judged and
+    for the requirement listed beside an unknown pair): IEC 62368-1 and
+    IEC 60664-1 clearances and creepages depend on overvoltage category, pollution
+    degree, material group and insulation grade and are not encoded. The board's own
+    Clearance rule for each pair is resolved per net by priority (when higher rules apply
+    only to some objects, every candidate with its clearance; its object matrix's copper
+    cells counted, not copper to hole).
+  - Table sources, cross-checked cell by cell (the table is only an image in Altium's
+    article): Altair PollEx help 'IPC Material' and EMA Design Automation's 'PCB
+    Clearance and Creepage Distance Table' give the whole table, identical in every cell;
+    Sierra Circuits' reproduction differs in two cells (B3 151-170 V 6.4, B1 above 500 V
+    0.025 mm/V) and philipmcgaw.com's in one (B2 251-300 V 2.5) where three sources
+    agree, and the latter multiplies the per-volt values by the whole voltage, which the
+    worked examples contradict; the rule above 500 V from Altair's and Siemens EDA's
+    example (B1 at 600 V: 0.50 mm), viox.com's calculator (every column's 500 V value and
+    increment) and smpspowersupply.com (B1, B2, B4 to 5 kV). IPC-9592B from Altium's
+    'IPC-2221 calculator for high voltage design' and smps.us / smpspowersupply.com,
+    which agree. Cited in the module and in every result (sources).
+  - Findings: spacing_below_standard (warning: nets, voltage with its basis and
+    confidence, layer and layer type, objects and parts, distance, requirement, standard,
+    column and band, location, the board's rule, and slots, holes and cutouts within
+    1 mm of the straight path, in_path when they cross it), spacing_below_rule (info, one
+    per board Clearance rule, or set of candidate rules, that allows less than some pairs
+    need where their copper is close, listing those pairs), unknown_voltage_pairs (info:
+    nets that look like high voltage with no known voltage, each with why: HV, mains,
+    DC-link and line words in the name (L, N, PE, AC and LINE only as the whole name or
+    before a mains line's word such as L_F, AC_IN or LINE_L, so TX_N, L_EN and AC_OK are
+    not), 60 V or more or kilovolts as a word of the name (400V_BUS, not U100VCC), a
+    connector's power input, a mains connector's pin, a varistor's or an X/Y or 230 V AC
+    capacitor's pin, a converter's switch node; and unknown-voltage copper near a
+    high-voltage net with the requirement it would need at 0 V) and creepage_not_computed
+    (info: straight-line clearance only; creepage around slots and cutouts is longer and
+    not credited). pairs lists every pair measured with its distance per layer, its
+    closest point and the board's rule; the summary gives net voltages by source, the
+    high-voltage nets, pairs above threshold, searched and measured, per layer type,
+    findings by check and severity, the nets to ask about, and with groups= the pairs
+    across them and whether they are judged.
+  - The tool takes net=, layer= (a signal layer), checks=, hv=, rails=, groups=,
+    working_voltage=, threshold=, standard=, coating=, altitude=, min_distance=, vref=
+    and units= (mm default, or mil), pages findings and pairs together and shrinks the
+    page to fit; the prepared result is kept on the PCB index (the last four argument
+    sets) so later pages do not measure again. Listed among the netlist tools and in the
+    server instructions.
+  - Shared code made public in place: check_dfm's copper model as
+    `dfm_geometry.copper_model` (check_dfm, its assembly checks and check_testpoints
+    use it), with a net-focused pass `net_gaps` (the chosen nets' copper against every
+    other net's, each pair within its own reach, pruned by the smallest gap found so
+    far), `openings_near` (outline, cutouts and holes without copper along a path) and
+    `GapRecord.ends` (each copper's nearest point, on the true arc); the net-tie test is
+    shared by both passes. check_dfm's own results are unchanged.
+  - Calibrated on the 11 public Altium example projects (5 with a PcbDoc) and 53 private
+    boards (aggregates only). With names alone: the examples have no net above 15 V by
+    name (79 nets with a known voltage, 8 high-voltage-looking nets to ask about); the
+    private boards have 320 nets with a known voltage (129 grounds, 111 by name, 80 from
+    the power tree), 42 nets above 7.5 V on 10 boards, 117 pairs above 15 V of which 11
+    come within reach (all 16-30 V, 0.1-0.2 mm apart, none below B2), and 94 nets to ask
+    about (118 connector power inputs, 15 mains-rated parts: 12 capacitors rated 230 V AC
+    or more and 3 varistors, 9 switch nodes of unknown swing, 4 names). Answering those
+    as a user might (48 V for power inputs, 230 V AC for mains parts and words): 154
+    pairs measured on 408 pair-layers, 167 warnings on 110 pairs, all on outer layers and
+    mostly 48 V copper 0.1-0.5 mm from another net (B2 asks 0.6 mm in the 31-50 V band;
+    coating=true gives B4's 0.13 mm), and 130 pairs whose board rule allows less than
+    they need, in 48 spacing_below_rule infos (one per rule). A stress run (the three
+    non-ground nets with the most copper at 400 V) measured 122 pairs on 833 pair-layers
+    on the examples and 477 pairs on 1,286 pair-layers on the private boards, without
+    reaching the work limit. Every table lookup used (2,725 across the runs) was
+    recomputed from an independent copy of the cross-checked table: none differ. On the
+    public examples an independent brute-force geometry (true arcs, every pad shape,
+    vias' pads and barrels, regions, fills and poured copper) recomputed 17,227 pair-layer
+    minimums within reach over five scenarios (connector and rail voltages, every other
+    net at 0 V, ground at 400 V, padless-via and arc nets at 400 V): none missing, none
+    extra, every gap within 0.002 mil, and every gap's two end points on their copper,
+    their distance the gap. Runtime: at most 0.4 s on the private boards; on MiniPC,
+    the largest public board, 0.4 s with names alone, 3.0 s (1.8 s once the copper model
+    is built) with two of its largest nets at 400 V and 2.2 s with the stress run's
+    three; later pages and repeats 0.03 s. Default page median 3,500 characters with
+    names alone; large results shrink to fit.
+  - Not covered: true surface creepage (2D path-finding around slots and cutouts: they
+    are listed, not credited), IEC 62368-1 / IEC 60664-1 tables (min_distance takes
+    their figures), spacing between layers through the laminate (distance through
+    insulation), internal plane layers and their anti-pads, component bodies and leads
+    above the board, solder-mask coverage per object (coating= is one answer for every
+    outer layer), three-phase systems without phases given, transients and
+    overvoltage categories, and voltages of nets the user does not give (names are a
+    guess: unknown pairs are listed, never judged).
 - `check_thermal`: thermal estimate and thermal-via audit (roadmap #21,
   `services/thermal.py`), read-only and offline from the compiled netlist, the active
   variant and the PcbDoc. Everything is labelled an estimate: thetaJA, Tj max, loads and

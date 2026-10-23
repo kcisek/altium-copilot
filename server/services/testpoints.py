@@ -346,7 +346,7 @@ class _Review:
         self.notes: list[str] = []
         self.nets = self.pcb.nets
         self.tp = tp_components(index)
-        self.edge = geometry._model(index).edge
+        self.edge = geometry.copper_model(index).edge
         self.off_board = 0
         self.marks_without_copper = 0
         self.probes = self._collect()

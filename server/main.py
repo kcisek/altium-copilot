@@ -70,6 +70,11 @@ try:
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_THERMAL_DISTANCE_MIL, Inputs as ThermalInputs,
         parse_values as parse_thermal_values, prepare_thermal, render_thermal,
     )
+    from services.hv_clearance import (
+        Options as HvOptions, parse_groups as parse_hv_groups, parse_hv,
+        parse_min_distance as parse_hv_min_distance,
+        parse_working_voltage as parse_hv_working_voltage, prepare_hv_cached, render_hv,
+    )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -175,6 +180,11 @@ except ImportError:
     from server.services.thermal import (
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_THERMAL_DISTANCE_MIL, Inputs as ThermalInputs,
         parse_values as parse_thermal_values, prepare_thermal, render_thermal,
+    )
+    from server.services.hv_clearance import (
+        Options as HvOptions, parse_groups as parse_hv_groups, parse_hv,
+        parse_min_distance as parse_hv_min_distance,
+        parse_working_voltage as parse_hv_working_voltage, prepare_hv_cached, render_hv,
     )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
@@ -741,6 +751,18 @@ component locations, distances):
     from the datasheets and the user: ask for inputs_needed and pass load= ('U5=0.3' or
     '3V3=0.5' amps), eta=, theta= ('U5=45' C/W), ta_max=, power= (W), never guess them.
     Present every number as an estimate: the datasheet and a thermal simulation decide.
+24. check_hv_clearance — "is the HV / mains copper far enough from the rest?",
+    "check creepage and clearance", "what spacing does 400 V need?", or the high-voltage
+    part of a layout review: per pair of nets whose voltages differ by more than 15 V, the
+    smallest copper distance on each layer against IPC-2221B Table 6-1 (B1 inner, B2
+    outer, B3 above 3050 m, B4 coated, the A columns with standard='ipc2221_assembly') or
+    IPC-9592B, with the location and the board's own Clearance rule beside it. Names are
+    unreliable for high voltage: ask the user for the working voltages and pass hv=
+    ('L=230AC,N=0,HV_BUS=400'; AC is RMS, judged at its peak), groups= and
+    working_voltage= across an isolation barrier, min_distance= for an IEC 62368-1 or
+    60664-1 figure; unknown_voltage_pairs lists what to ask about. It is a screening tool
+    measuring straight-line clearance (creepage around slots is not computed): say so,
+    and that the product's spacing and safety standards decide.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -861,8 +883,8 @@ NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
     "get_power_tree", "check_derating", "check_logic_levels", "get_circuit_calculations",
-    "check_thermal", "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync",
-    "schematic_review", "package_for_xfn",
+    "check_thermal", "check_hv_clearance", "get_firmware_pin_map", "run_erc",
+    "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
 )
 
 
@@ -4561,6 +4583,156 @@ def check_thermal(
         result = _convert_units({**context, **render_thermal(prepared, offset=offset,
                                                              limit=step)}, to_mm)
         if step != THERMAL_STEPS[0]:
+            result["page_limited_to"] = step
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# Findings and pairs per page, tried in turn until the result fits.
+HV_STEPS = (100, 60, 40, 25, 15, 10, 5, 2, 1)
+
+
+@mcp.tool(
+    title="Check HV Clearance",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_hv_clearance(
+    net: str | None = None,
+    layer: str | None = None,
+    checks: list[str] | None = None,
+    hv: str | None = None,
+    rails: str | None = None,
+    groups: str | None = None,
+    working_voltage: str | None = None,
+    threshold: float | None = None,
+    standard: Literal["ipc2221", "ipc2221_assembly", "ipc9592"] | None = None,
+    coating: bool = False,
+    altitude: float | None = None,
+    min_distance: str | None = None,
+    vref: str | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Voltage-aware copper spacing screen on the PcbDoc, offline: the smallest
+    copper-to-copper distance on each layer between nets at different potentials against
+    IPC-2221B Table 6-1 (or IPC-9592B), with where it occurs. Call it when the user asks
+    about high voltage, mains, creepage or clearance by voltage, isolation spacing, whether
+    the HV or 400 V copper is far enough from the rest, or for a safety-spacing part of a
+    layout review.
+
+    Net voltages: check_derating's (rails= wins, grounds 0 V, names, the power tree, vref=),
+    plus hv= for working voltages that are not DC rails ('L=230AC,N=0,HV_BUS=400'; AC is RMS
+    and taken at its peak, x 1.414; '325pk' a peak, '230AC@120' a phase; a converter's
+    switch node swings 0 V to its peak, also when given in rails= or hv=). groups= declares
+    isolated groups ('PRI:L,N,HV_*,PGND;SEC:GND,3V3', wildcards) with their own reference:
+    pairs across groups take working_voltage= ('250AC' or '400'), and are not judged
+    without it (a note says so). A pair is judged when both voltages are known
+    and differ by more than threshold (default 15 V); its copper (tracks, arcs, pads and
+    vias on the layer, poured copper, regions, fills; shelved and unpoured pours have none,
+    internal planes are not measured) is searched from its high-voltage side.
+
+    Requirement per layer from the peak voltage: standard 'ipc2221' (default) B1 on
+    internal layers, B2 on external ones, B3 above 3050 m (altitude= in m), B4 with
+    coating=true, plus the per-volt increment above 500 V; 'ipc2221_assembly' the A
+    columns (A6/A7 for a component pad, A5 coated); 'ipc9592' IPC-9592B's formulas.
+    min_distance= replaces the standard ('2.5' every pair, 'HV_BUS=4' a net's pairs,
+    'L&N=3' one pair, in units; unknown pairs' requirement too): IEC 62368-1 / IEC
+    60664-1 clearances and creepages are not encoded, ask the user for them. Findings:
+    spacing_below_standard (warning: layer, location, voltage, band, requirement, and
+    slots or cutouts in the path), spacing_below_rule (info, one per board Clearance rule
+    that allows less than some pairs need, listing them), unknown_voltage_pairs (info:
+    nets that look like high voltage by name, connector power input, mains connector or
+    part, or a switch node, with no known voltage, and unknown-voltage copper near a
+    high-voltage net: ask for hv=), creepage_not_computed (info). pairs lists every pair
+    measured with its distance per layer and the board's Clearance rule.
+
+    A screening tool: say so, and that the product's spacing and safety standards decide;
+    voltages from names are guesses, so ask for hv= before calling a board safe. net
+    (comma-separated) narrows the search and the result to pairs with those nets, layer to
+    one copper layer, checks to the names in checks_run. Findings and pairs page together
+    (offset from next_offset; the result is kept for paging). Distances in units, default
+    mm."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if units not in (None, "mm", "mil"):
+        return json.dumps({"error": "invalid_units", "message": "units must be 'mil' or 'mm'."})
+    resolved = units or "mm"
+    to_mm = resolved == "mm"
+    if threshold is not None and not (math.isfinite(threshold) and 0.0 <= threshold <= 10000.0):
+        return json.dumps({"error": "invalid_threshold",
+                           "message": "threshold is the smallest voltage difference judged, "
+                                      "0 to 10000 V (default 15)."})
+    if altitude is not None and not (math.isfinite(altitude) and -500.0 <= altitude <= 20000.0):
+        return json.dumps({"error": "invalid_altitude",
+                           "message": "altitude is the operating altitude in metres, -500 to "
+                                      "20000 (above 3050 m external layers take B3)."})
+    if standard not in (None, "ipc2221", "ipc2221_assembly", "ipc9592"):
+        return json.dumps({"error": "invalid_standard",
+                           "message": "standard must be 'ipc2221', 'ipc2221_assembly' or "
+                                      "'ipc9592'."})
+    user_rails, error = parse_rail_map(rails)
+    if error:
+        return json.dumps(error)
+    hv_levels, error = parse_hv(hv)
+    if error:
+        return json.dumps(error)
+    group_list, error = parse_hv_groups(groups)
+    if error:
+        return json.dumps(error)
+    working, error = parse_hv_working_voltage(working_voltage)
+    if error:
+        return json.dumps(error)
+    overrides, error = parse_hv_min_distance(min_distance, 1 / 0.0254 if to_mm else 1.0)
+    if error:
+        return json.dumps(error)
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    if not project.get("pcb_doc_paths"):
+        return json.dumps({"error": "no_pcb_document",
+                           "message": "check_hv_clearance measures copper on the PcbDoc and the "
+                                      "project lists none: add the board to the project."})
+    index, error = _pcb_session.get(project, netlist)
+    if error:
+        return json.dumps(error)
+    layer_id = None
+    if layer is not None:
+        layer_id, error = _resolve_layer_or_error(index, layer)
+        if error:
+            return json.dumps(error)
+        if layer_id not in index.signal_layers():
+            return json.dumps({"error": "layer_not_signal",
+                               "available_layers": list(index.signal_layers().values()),
+                               "message": f"Layer '{layer}' is not a signal layer: internal "
+                                          "planes are not measured."})
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_hv_cached(
+        netlist, plan, project.get("parameters") or {}, index=index, rails=user_rails,
+        hv=hv_levels, vref=vrefs, groups=group_list, working_voltage=working,
+        threshold=15.0 if threshold is None else float(threshold),
+        options=HvOptions(standard or "ipc2221", bool(coating),
+                          0.0 if altitude is None else float(altitude)),
+        min_distance=overrides, nets=_split_names(net), layer=layer_id, checks=checks,
+        units=resolved)
+    if "error" in prepared:
+        return json.dumps(prepared)
+    paths = project["pcb_doc_paths"]
+    context: dict = {"netlist_updated_utc": _netlist_last_updated,
+                     "pcb_doc": Path(paths[0]).name, "units": resolved}
+    if len(paths) > 1:
+        context["note"] = f"Project lists {len(paths)} PcbDocs; measured on '{Path(paths[0]).name}'."
+    for step in HV_STEPS:
+        result = _convert_units({**context, **render_hv(prepared, offset=offset, limit=step)},
+                                to_mm)
+        if step != HV_STEPS[0]:
             result["page_limited_to"] = step
         rendered = json.dumps(result, indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:

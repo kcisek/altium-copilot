@@ -994,7 +994,7 @@ class _Model:
         """The members whose centre is on the board (all without an outline): spacing's
         parts (a part parked off the board is part_to_edge's off_board)."""
         if self._on_board is None:
-            edge = geometry._model(self.index).edge
+            edge = geometry.copper_model(self.index).edge
             self._on_board = [part for part in self.members()
                               if not edge.has_outline or edge.outline.contains(*part.centre)]
         return self._on_board
@@ -1207,7 +1207,7 @@ class _Model:
         if key in self._edges:
             return self._edges[key]
         index = self.index
-        edge = geometry._model(index).edge
+        edge = geometry.copper_model(index).edge
         if not edge.has_outline:
             result = EdgeFacts(reach, False, {}, [], [])
         else:
@@ -1226,7 +1226,7 @@ class _Model:
             for cell in _cells(piece[1]):
                 grid[cell].append(piece)
         primitives = index.pcb.primitives
-        outer = geometry._model(index).outer
+        outer = geometry.copper_model(index).outer
         found: dict[int, PartEdge] = {}
         off: list[int] = []
         finger_parts = False

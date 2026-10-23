@@ -320,7 +320,7 @@ def test_large_areas_answer_points_from_the_chunk_grid():
     holes = [_square(450, 450, 100), [(200, 300), (300, 250), (250, 400)]]
     index = _index(pours=[PolygonPour(0, GND, 1, "Solid", ring)],
                    areas=[_area(1, ring, GND, holes=holes, pour_id=0)])
-    model = geometry._model(index)
+    model = geometry.copper_model(index)
     (area,) = model.areas
     assert area.points > geometry._BANDS_MAX_POINTS
     points = [(x, y) for x in range(60, 960, 37) for y in range(60, 960, 41)]
