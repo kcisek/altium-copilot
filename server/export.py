@@ -101,6 +101,21 @@ def _create_derived_schema(conn: sqlite3.Connection) -> None:
           peers       TEXT NOT NULL DEFAULT '[]'   -- parts the pin reaches, JSON
         );
         CREATE INDEX idx_firmware_pins_mcu ON firmware_pins(mcu_refdes);
+        -- What each variant changes besides Not Fitted (variants.dnp_refdes): one row per
+        -- varied parameter and per alternate part, bound to the parts by UniqueId like
+        -- the BOM (compare_variants).
+        CREATE TABLE variant_variations (
+          id          INTEGER PRIMARY KEY,
+          variant     TEXT NOT NULL,
+          refdes      TEXT NOT NULL,
+          kind        TEXT NOT NULL,              -- 'parameter' | 'alternate_part'
+          parameter   TEXT,                       -- parameter name as written
+          value       TEXT,                       -- the variant's value; alternate: its
+                                                  -- library reference
+          base_value  TEXT,                       -- the base design's
+          data        TEXT NOT NULL DEFAULT '{}'  -- alternate part: library, footprint, JSON
+        );
+        CREATE INDEX idx_variant_variations_refdes ON variant_variations(refdes);
     """)
 
 
@@ -111,12 +126,14 @@ def export_project(
     version: str,
     notes: list[dict] | None = None,
     firmware_pins: list[dict] | None = None,
+    variant_variations: list[dict] | None = None,
 ) -> str:
     """Write in-memory project to a pcb-copilot .db file next to the .PrjPcb.
 
     notes are rows for the notes table (services.design_notes.note_rows); sheet notes
     are linked to their sheet by name. firmware_pins are rows for the firmware_pins table
-    (services.firmware_pins.export_rows).
+    (services.firmware_pins.export_rows). variant_variations are rows for the
+    variant_variations table (services.variants.export_rows).
     Returns the absolute path to the written file.
     Raises ValueError if a duplicate refdes is detected during INSERT.
     Always overwrites any existing file at the same path.
@@ -238,6 +255,21 @@ def export_project(
                     row.get("role"),
                     row.get("pull"),
                     json.dumps(row.get("peers") or []),
+                ),
+            )
+
+        for row in variant_variations or []:
+            conn.execute(
+                "INSERT INTO variant_variations (variant, refdes, kind, parameter, value,"
+                " base_value, data) VALUES (?,?,?,?,?,?,?)",
+                (
+                    row["variant"],
+                    row["refdes"],
+                    row["kind"],
+                    row.get("parameter"),
+                    row.get("value"),
+                    row.get("base_value"),
+                    json.dumps(row.get("data") or {}),
                 ),
             )
 

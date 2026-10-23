@@ -1,7 +1,39 @@
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    from parsers.sch_doc import _read_records
+except ImportError:
+    from server.parsers.sch_doc import _read_records
+
+# Kind of a [ProjectVariantN] VariationN line, as the Variant Management dialog names it.
+KIND_FITTED, KIND_NOT_FITTED, KIND_ALTERNATE = 0, 1, 2
+KIND_NAMES = {KIND_FITTED: "fitted", KIND_NOT_FITTED: "not fitted",
+              KIND_ALTERNATE: "alternate part"}
+VARIANT_LIBRARY_SUFFIX = ".PrjPcbVariants"
+
+
+@dataclass
+class LibraryPart:
+    """An alternate part's copy in the project's <project>.PrjPcbVariants file: an OLE
+    schematic library holding one storage per alternate part (named by its library
+    reference) whose Data stream carries the part's records without OwnerIndex, plus a
+    default Component_1. Altium's docs: "The Alternate Parts are stored in the
+    <ProjectName>.PrjPcbVariants file"; the copy is not refreshed by library updates."""
+
+    lib_reference: str
+    storage: str = ""             # the OLE storage name (the library reference as saved)
+    design_item_id: str = ""
+    description: str = ""         # ComponentDescription
+    library: str = ""             # SourceLibraryName
+    library_path: str = ""        # LibraryPath
+    footprint: str | None = None  # the current PCBLIB model
+    footprints: list[str] = field(default_factory=list)
+    # Parameters: lower-case name -> (name as written, text); empty texts left out.
+    params: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -10,7 +42,9 @@ class Variation:
 
     kind: 1 Not Fitted, 2 an alternate part (AltLibLink_* fields), 0 fitted with
     parameter variations. Altium keys variations by the component's UniqueId path; the
-    designator is what it was when the variation was made.
+    designator is what it was when the variation was made. library_part is the
+    alternate's copy in the .PrjPcbVariants file, when it was found there;
+    library_error says why that file could not be read.
     """
 
     designator: str
@@ -18,10 +52,65 @@ class Variation:
     kind: int
     alternate_part: str = ""
     alt: dict[str, str] = field(default_factory=dict)  # AltLibLink_* without the prefix
+    library_part: LibraryPart | None = field(default=None, compare=False, repr=False)
+    library_error: str = field(default="", compare=False, repr=False)
 
     @property
     def uid_tail(self) -> str:
         return self.unique_id.rsplit("\\", 1)[-1]
+
+    @property
+    def kind_name(self) -> str:
+        return KIND_NAMES.get(self.kind, f"kind {self.kind}")
+
+    @property
+    def alternate_reference(self) -> str:
+        """The library reference an alternate part names: AlternatePart, else
+        AltLibLink_DesignItemID, else AltLibLink_SymbolReference ('' for none). On every
+        corpus alternate AlternatePart and DesignItemID are the part's library reference
+        and SymbolReference is neither."""
+        return (self.alternate_part or self.alt.get("DesignItemID")
+                or self.alt.get("SymbolReference") or "")
+
+    def alternate_identity(self) -> dict:
+        """What the variation says about its alternate part (Kind=2): library reference,
+        design item, library and footprint (None with IsSameFootprint: the base part's is
+        kept), every other AltLibLink_* field as written under link, and what its copy in
+        the .PrjPcbVariants file adds (description, Comment, Value). Sampled only on
+        alternates that re-select the base part with the same footprint (6 corpus lines):
+        another part, a database table or IsSameFootprint false are read as the key
+        names suggest, unvalidated."""
+        alt = {key: value for key, value in self.alt.items() if value}
+        same = alt.get("IsSameFootprint", "").strip().lower() in ("true", "t", "1")
+        identity: dict = {
+            "lib_reference": self.alternate_reference or None,
+            "design_item_id": alt.get("DesignItemID") or None,
+            "library": alt.get("SourceLibraryName") or alt.get("LibraryIdentifier") or None,
+            "footprint": None if same else (alt.get("Footprint") or None),
+            "same_footprint": same,
+        }
+        if alt.get("UseDBTableName", "").strip().lower() in ("true", "t", "1") and \
+                alt.get("DatabaseTableName"):
+            identity["database_table"] = alt["DatabaseTableName"]
+        shown = {"DesignItemID", "SourceLibraryName", "Footprint", "IsSameFootprint",
+                 "UseDBTableName", "DatabaseTableName"}
+        if alt.get("SymbolReference") == identity["lib_reference"]:
+            shown.add("SymbolReference")
+        link = {key: value for key, value in alt.items() if key not in shown}
+        if link:
+            identity["link"] = link
+        part = self.library_part
+        identity["library_copy"] = part is not None
+        if self.library_error:
+            identity["library_error"] = self.library_error
+        if part is not None:
+            identity["description"] = part.description or None
+            for name in ("comment", "value"):
+                if name in part.params:
+                    identity[name] = part.params[name][1]
+            if identity["footprint"] is None and not same and part.footprint:
+                identity["footprint"] = part.footprint
+        return {key: value for key, value in identity.items() if value is not None}
 
 
 @dataclass
@@ -32,6 +121,62 @@ class VariantDefinition:
     variations: list[Variation] = field(default_factory=list)
     # Parameter variations by designator: lower-case parameter name -> (name, value).
     param_variations: dict[str, dict[str, tuple[str, str]]] = field(default_factory=dict)
+    unique_id: str = ""            # the variant's own UniqueId
+    allow_fabrication: bool = False  # AllowFabrication: varies fabrication outputs too
+    # Variant parameters ([ParameterN_M] sections after the variant): name -> value.
+    parameters: dict[str, str] = field(default_factory=dict)
+    # Set by binding the variant to the loaded parts (bom.plan_variant): parameter
+    # variations and alternate parts by the designator they apply to now. None until
+    # bound; the stored designators are used meanwhile.
+    bound_params: dict[str, dict[str, tuple[str, str]]] | None = field(
+        default=None, compare=False, repr=False)
+    bound_alternates: dict[str, dict] | None = field(default=None, compare=False, repr=False)
+
+    def not_fitted(self) -> list[Variation]:
+        """The Not Fitted lines (or, in a variant known by designators only, one per
+        Not Fitted designator)."""
+        if self.variations:
+            return [v for v in self.variations if v.kind == KIND_NOT_FITTED]
+        return [Variation(designator=d, unique_id="", kind=KIND_NOT_FITTED)
+                for d in self.dnp_refdes]
+
+    def alternate_parts(self) -> list[dict]:
+        """Each alternate part: {designator, unique_id, **alternate_identity()}."""
+        return [{"designator": v.designator, "unique_id": v.unique_id,
+                 **v.alternate_identity()}
+                for v in self.variations if v.kind == KIND_ALTERNATE]
+
+    def varied_parameters(self) -> list[dict]:
+        """Each parameter variation: {designator, unique_id (of the variation line with
+        that designator, '' when none or several), parameter, value}. Altium stores
+        parameter variations by designator only."""
+        lines: dict[str, set[str]] = {}
+        for variation in self.variations:
+            lines.setdefault(variation.designator, set()).add(variation.unique_id)
+        out = []
+        for designator, params in self.param_variations.items():
+            uids = lines.get(designator) or set()
+            uid = next(iter(uids)) if len(uids) == 1 else ""
+            for name, value in params.values():
+                out.append({"designator": designator, "unique_id": uid,
+                            "parameter": name, "value": value})
+        return out
+
+    def variation_of(self, designator: str) -> tuple[dict[str, tuple[str, str]], dict | None]:
+        """(parameter variations, alternate part) this variant gives a loaded part: as
+        bound to the parts by UniqueId once bind() ran, else by the stored designator."""
+        if self.bound_params is not None:
+            return (self.bound_params.get(designator) or {},
+                    (self.bound_alternates or {}).get(designator))
+        alternate = next((v for v in self.variations
+                          if v.kind == KIND_ALTERNATE and v.designator == designator), None)
+        return (self.param_variations.get(designator) or {},
+                {"variation": alternate} if alternate is not None else None)
+
+    def bind(self, params: dict[str, dict[str, tuple[str, str]]],
+             alternates: dict[str, dict]) -> None:
+        self.bound_params = params
+        self.bound_alternates = alternates
 
 
 @dataclass
@@ -56,6 +201,11 @@ class PrjPcbData:
     hierarchy_mode: str = ""
     # [Design] net naming options as written (key -> '0'/'1'), see NET_NAMING_KEYS.
     net_naming: dict[str, str] = field(default_factory=dict)
+    # The <project>.PrjPcbVariants file the alternate parts were looked up in ('' when
+    # no variant has an alternate part or the file is absent), and why it could not be
+    # read ('' when it was).
+    variant_library_path: str = ""
+    variant_library_error: str = ""
 
 
 @dataclass
@@ -155,6 +305,7 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
     sections = _split_sections(text)
     sheet_paths = _extract_sheets(sections, project_dir)
     variants = _extract_variants(sections)
+    library_path, library_error = _attach_library_parts(variants, Path(path))
     pcb_doc_paths = _extract_documents(sections, project_dir, ".pcbdoc")
     net_naming = {key: _design_field(sections, key) for key in NET_NAMING_KEYS}
     return PrjPcbData(
@@ -170,6 +321,8 @@ def parse_prj_pcb(path: str) -> PrjPcbData:
         device_sheet_paths=_extract_documents(sections, project_dir, ".schdoc", "DeviceSheet"),
         hierarchy_mode=_design_field(sections, "HierarchyMode"),
         net_naming={key: value for key, value in net_naming.items() if value},
+        variant_library_path=library_path,
+        variant_library_error=library_error,
     )
 
 
@@ -272,9 +425,19 @@ def _normalize_uid(uid: str) -> str:
 
 def _extract_format_a(sections: list[tuple[str, list[str]]]) -> list[VariantDefinition]:
     variants: list[VariantDefinition] = []
+    current: VariantDefinition | None = None
     for header, lines in sections:
-        if not re.match(r"^ProjectVariant\d+$", header, re.IGNORECASE):
+        if re.match(r"^Parameter\d+_\d+$", header, re.IGNORECASE):
+            # A variant's parameters follow its section (corpus: [Parameter2_1] after
+            # ProjectVariant1); the indexes are not the variant's, so position decides.
+            name, value = _get_field(lines, "Name"), _get_field(lines, "Value")
+            if current is not None and name:
+                current.parameters[name] = value or ""
             continue
+        if not re.match(r"^ProjectVariant\d+$", header, re.IGNORECASE):
+            current = None
+            continue
+        current = None
         name = _get_field(lines, "Description")
         if not name:
             continue
@@ -284,13 +447,15 @@ def _extract_format_a(sections: list[tuple[str, list[str]]]) -> list[VariantDefi
         designators: dict[str, str] = {}
         values: dict[str, str] = {}
         for line in lines:
-            pair = re.match(r"^\s*(ParamDesignator|ParamVariation)(\d+)=(.*)$", line,
+            # 'Key = Value' as well as 'Key=Value', like _get_field (some saved projects
+            # write every key line with spaces around '=').
+            pair = re.match(r"^\s*(ParamDesignator|ParamVariation)(\d+)\s*=(.*)$", line,
                             re.IGNORECASE)
             if pair:
                 target = designators if pair.group(1).lower() == "paramdesignator" else values
                 target[pair.group(2)] = pair.group(3).strip()
                 continue
-            m = re.match(r"^\s*Variation\d+=(.+)$", line, re.IGNORECASE)
+            m = re.match(r"^\s*Variation\d+\s*=(.+)$", line, re.IGNORECASE)
             if not m:
                 continue
             props = _parse_inline_props(m.group(1))
@@ -321,11 +486,104 @@ def _extract_format_a(sections: list[tuple[str, list[str]]]) -> list[VariantDefi
                 param_variations.setdefault(designator, {})[parameter.lower()] = (
                     parameter, fields.get("VariantValue", ""),
                 )
-        variants.append(VariantDefinition(
+        current = VariantDefinition(
             name=name, dnp_refdes=dnp, dnp_uid=dnp_uid, variations=variations,
             param_variations=param_variations,
-        ))
+            unique_id=_get_field(lines, "UniqueId") or "",
+            allow_fabrication=(_get_field(lines, "AllowFabrication") or "0") not in ("", "0"),
+        )
+        variants.append(current)
     return variants or [VariantDefinition(name="Default")]
+
+
+def variant_library_path(prj_path: Path) -> Path | None:
+    """The project's <project>.PrjPcbVariants next to it (any case), or None."""
+    wanted = (prj_path.stem + VARIANT_LIBRARY_SUFFIX).lower()
+    candidate = prj_path.with_name(prj_path.stem + VARIANT_LIBRARY_SUFFIX)
+    if candidate.is_file():
+        return candidate
+    try:
+        return next((p for p in prj_path.parent.iterdir()
+                     if p.name.lower() == wanted and p.is_file()), None)
+    except OSError:
+        return None
+
+
+def parse_variant_library(path: str) -> list[LibraryPart]:
+    """The alternate parts saved in a .PrjPcbVariants file (see LibraryPart); the default
+    Component_N storage a new library starts with is left out."""
+    import olefile
+
+    parts: list[LibraryPart] = []
+    with olefile.OleFileIO(path) as ole:
+        for stream in ole.listdir():
+            if len(stream) != 2 or stream[1] != "Data" or \
+                    re.fullmatch(r"Component_\d+", stream[0]):
+                continue
+            records = _read_records(ole.openstream("/".join(stream)).read())
+            if not records or records[0].get("record") != "1":
+                continue
+            head = records[0]
+            part = LibraryPart(
+                lib_reference=head.get("libreference", "") or stream[0],
+                storage=stream[0],
+                design_item_id=head.get("designitemid", ""),
+                description=head.get("componentdescription", ""),
+                library=head.get("sourcelibraryname", ""),
+                library_path=head.get("librarypath", ""),
+            )
+            current = None
+            for record in records[1:]:
+                kind = record.get("record")
+                if kind == "41" and record.get("name") and record.get("text") \
+                        and not record["text"].startswith('"'):
+                    part.params.setdefault(record["name"].lower(),
+                                           (record["name"], record["text"]))
+                elif kind == "45" and record.get("modeltype", "").upper() == "PCBLIB" \
+                        and record.get("modelname"):
+                    name = record["modelname"]
+                    if name not in part.footprints:
+                        part.footprints.append(name)
+                    if record.get("iscurrent", "").upper() == "T" and current is None:
+                        current = name
+            part.footprint = current or (part.footprints[0] if part.footprints else None)
+            parts.append(part)
+    return parts
+
+
+def _attach_library_parts(variants: list[VariantDefinition], prj_path: Path) -> tuple[str, str]:
+    """Give each alternate-part variation its copy from the .PrjPcbVariants file, matched
+    by the names it gives in Variation.alternate_reference order against the storage
+    name, library reference and design item id. Returns (the file read, the error
+    reading it, also set on each alternate); ('', '') when no variant has an alternate
+    part."""
+    alternates = [v for variant in variants for v in variant.variations
+                  if v.kind == KIND_ALTERNATE]
+    if not alternates:
+        return "", ""
+    path = variant_library_path(prj_path)
+    if path is None:
+        return "", ""
+    try:
+        parts = parse_variant_library(str(path))
+    except Exception as error:  # an unreadable library leaves the alternates bare
+        logging.warning("Variant library %s not read: %s", path.name, error)
+        message = f"{type(error).__name__}: {error}"
+        for variation in alternates:
+            variation.library_error = message
+        return str(path), message
+    by_name: dict[str, LibraryPart] = {}
+    for part in parts:
+        for key in (part.storage, part.lib_reference, part.design_item_id):
+            if key:
+                by_name.setdefault(key.lower(), part)
+    for variation in alternates:
+        for key in (variation.alternate_part, variation.alt.get("DesignItemID", ""),
+                    variation.alt.get("SymbolReference", "")):
+            if key and key.lower() in by_name:
+                variation.library_part = by_name[key.lower()]
+                break
+    return str(path), ""
 
 
 class VariantState:

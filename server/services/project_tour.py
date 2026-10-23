@@ -37,6 +37,7 @@ PROJECT_TOUR_TOOLS = (
     "get_drc_report",
     "check_pcb_health",
     "get_bom",
+    "compare_variants",
     "get_output_jobs",
     "get_design_notes",
     "schematic_review",
@@ -228,8 +229,9 @@ _PHASE_4_BOM = (
 _PHASE_4_NO_BOM = "get_bom needs the netlist: the BOM is not covered in this load."
 
 _VARIANTS_FULL = (
-    "Variants: what each one changes, from get_bom(compare_variants=True). No variant\n"
-    "   defined: say the design has one build."
+    "Variants: what each one changes against the base design, from compare_variants\n"
+    "   (one call per variant; its documentation block says which outputs and drawings\n"
+    "   cover it). No variant defined: say the design has one build."
 )
 _VARIANTS_NETLIST_FREE = (
     "Variants: list_variants' Not Fitted designators, stored in the .PrjPcb (they can be\n"

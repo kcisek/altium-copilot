@@ -135,6 +135,8 @@ class BomPart:
     unresolved: list[str] = field(default_factory=list)  # special strings left as written
     mpn_placeholder: str | None = None  # 'N/A', 'TBD', ... written as the part number
     alternate_part: str | None = None  # the variant's alternate part (Kind=2)
+    # The alternate's data came from its copy in the .PrjPcbVariants file.
+    alternate_library: bool = False
 
 
 def needs_mpn(part: BomPart) -> bool:
@@ -228,14 +230,25 @@ def _bind(variation, index: _PartIndex, plan: VariantPlan) -> list[str]:
     return targets
 
 
-def _alternate(variation) -> dict:
-    """An alternate part (Kind=2): its library item and, when it differs, footprint."""
+def alternate_of(variation) -> dict:
+    """An alternate part (Kind=2): its library item ('part') and, when it differs, its
+    footprint, with the variation line itself ('variation': its alternate_identity()
+    and its copy in the .PrjPcbVariants file, library_part)."""
     alt = variation.alt or {}
     same = alt.get("IsSameFootprint", "").strip().lower() in ("true", "t", "1")
+    library = getattr(variation, "library_part", None)
+    footprint = None if same else (alt.get("Footprint") or (library.footprint if library else None))
     return {
-        "part": alt.get("DesignItemID") or variation.alternate_part or None,
-        "footprint": None if same else (alt.get("Footprint") or None),
+        "part": alternate_lib_reference(variation) or None,
+        "footprint": footprint or None,
+        "variation": variation,
     }
+
+
+def alternate_lib_reference(variation) -> str:
+    """The library reference an alternate-part variation names ('' for none):
+    Variation.alternate_reference."""
+    return getattr(variation, "alternate_reference", "") if variation is not None else ""
 
 
 def variant_names(netlist: dict) -> list[str]:
@@ -282,7 +295,7 @@ def plan_variant(variant, netlist: dict, names: list[str]) -> VariantPlan:
             plan.not_fitted.update(targets)
         elif variation.kind == 2 and targets:
             for target in targets:
-                plan.alternates[target] = _alternate(variation)
+                plan.alternates[target] = alternate_of(variation)
     for designator, params in (getattr(variant, "param_variations", None) or {}).items():
         bound = line_targets.get(designator)
         if bound and len(bound) > 1:
@@ -332,7 +345,13 @@ def build_parts(
         if kind not in BOM_KINDS:
             excluded.setdefault(KIND_NAMES.get(kind, str(kind)), []).append(name)
             continue
-        params = dict(meta.get("params") or {})
+        alternate = plan.alternates.get(name) or {}
+        library = getattr(alternate.get("variation"), "library_part", None)
+        # An alternate part is another library part: its saved copy's parameters and
+        # description replace the base part's (the variant's parameter variations then
+        # apply on top, as Altium stores the alternate's edited values there).
+        params = ({key: text for key, (_, text) in library.params.items()} if library
+                  else dict(meta.get("params") or {}))
         overrides: dict[str, str] = {}
         varied = plan.params.get(name) or {}
         for key, (original, value) in varied.items():
@@ -347,9 +366,10 @@ def build_parts(
             return None if _unset(value) else value.strip()
 
         block = compiled.get(name) or {}
-        comment = text(params.get("comment")) if "comment" in params else (
-            block.get("comment") or None
-        )
+        if "comment" in params:
+            comment = text(params["comment"])
+        else:  # the compiled Comment is the base part's
+            comment = None if library else (block.get("comment") or None)
         mpn, manufacturer, source = part_numbers(params)
         mpn, manufacturer = text(mpn), text(manufacturer)
         placeholder = None
@@ -360,9 +380,10 @@ def build_parts(
         # A variant can vary the footprint and description, which are not parameters.
         if "description" in varied:
             description = text(params["description"])
+        elif library:
+            description = library.description or text(params.get("description"))
         else:
             description = meta.get("description") or text(params.get("description"))
-        alternate = plan.alternates.get(name) or {}
         footprint = (
             text(params["footprint"]) if "footprint" in varied
             else alternate.get("footprint") or block.get("footprint") or meta.get("footprint")
@@ -380,11 +401,13 @@ def build_parts(
             fitted=name not in plan.not_fitted,
             logical=meta.get("logical_refdes"),
             sheet=meta.get("sheet"),
-            lib_reference=meta.get("lib_reference") or "",
+            lib_reference=(alternate_lib_reference(alternate.get("variation"))
+                           or meta.get("lib_reference") or ""),
             overrides=overrides,
             unresolved=unresolved,
             mpn_placeholder=placeholder,
             alternate_part=alternate.get("part"),
+            alternate_library=library is not None,
         )
         parts.append(part)
     parts.sort(key=lambda part: natural_key(part.designator))

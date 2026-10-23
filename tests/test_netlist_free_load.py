@@ -93,6 +93,7 @@ WORKING_TOOL_CALLS = {
     "diff_design": lambda: main.diff_design(project_dir_a=main._project["root_dir"]),
     "list_variants": lambda: main.list_variants(),
     "set_active_variant": lambda: main.set_active_variant("Prod"),
+    "compare_variants": lambda: main.compare_variants("Prod"),
     "get_clone_status": lambda: main.get_clone_status(),
 }
 

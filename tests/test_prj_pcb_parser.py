@@ -286,3 +286,50 @@ def test_output_and_log_folders(tmp_path):
     )
     data = parse_prj_pcb(str(prj))
     assert (data.output_path, data.log_folder_path) == ("Out\\Rev2", "")
+
+
+def test_format_a_variant_fields_and_variant_parameters(tmp_path):
+    """The variant's UniqueId and AllowFabrication, and its [ParameterN_M] sections, which
+    follow it (their indexes are not the variant's); a [ParameterN] section is a project
+    parameter, never a variant's."""
+    prj = tmp_path / "Demo.PrjPcb"
+    prj.write_text(
+        "[ProjectVariant1]\nDescription=A\nUniqueId=UIDA\nAllowFabrication=1\n"
+        "VariationCount=1\nVariation1=Designator=R1|UniqueId=\\RUID1|Kind=0|AlternatePart=\n"
+        "ParamVariationCount=1\nParamDesignator1=R1\n"
+        "ParamVariation1=ParameterName=Value|VariantValue=2k2\n"
+        "[Parameter2_1]\nName=Build\nValue=A\n"
+        "[ProjectVariant2]\nDescription=B\nUniqueId=UIDB\nAllowFabrication=0\n"
+        "[Parameter1]\nName=Revision\nValue=3\n",
+        encoding="utf-8",
+    )
+    data = parse_prj_pcb(str(prj))
+    a, b = data.variants
+    assert (a.unique_id, a.allow_fabrication, a.parameters) == ("UIDA", True, {"Build": "A"})
+    assert (b.unique_id, b.allow_fabrication, b.parameters) == ("UIDB", False, {})
+    assert data.parameters == {"Revision": "3"}
+    assert a.varied_parameters() == [
+        {"designator": "R1", "unique_id": "\\RUID1", "parameter": "Value", "value": "2k2"}]
+    assert a.alternate_parts() == [] and b.not_fitted() == []
+    assert (data.variant_library_path, data.variant_library_error) == ("", "")
+
+
+def test_format_a_alternate_part_fields_without_a_library_file(tmp_path):
+    prj = tmp_path / "Demo.PrjPcb"
+    prj.write_text(
+        "[ProjectVariant1]\nDescription=A\nVariationCount=1\n"
+        "Variation1=Designator=U1|UniqueId=\\UUID1|Kind=2|AlternatePart=OPAX"
+        "|AltLibLink_DesignItemID=OPAX|AltLibLink_SourceLibraryName=Amp.SchLib"
+        "|AltLibLink_UseDBTableName=True|AltLibLink_DatabaseTableName=Amps"
+        "|AltLibLink_Footprint=SO8|AltLibLink_IsSameFootprint=False\n",
+        encoding="utf-8",
+    )
+    (variant,) = parse_prj_pcb(str(prj)).variants
+    assert variant.dnp_refdes == []
+    assert variant.alternate_parts() == [{
+        "designator": "U1", "unique_id": "\\UUID1", "lib_reference": "OPAX",
+        "design_item_id": "OPAX", "library": "Amp.SchLib", "footprint": "SO8",
+        "same_footprint": False, "database_table": "Amps", "library_copy": False,
+    }]
+    params, alternate = variant.variation_of("U1")  # unbound: by stored designator
+    assert params == {} and alternate["variation"].kind == 2

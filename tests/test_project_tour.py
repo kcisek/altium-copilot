@@ -179,7 +179,7 @@ def test_full_tour_has_no_netlist_free_or_skip_text(project):
     assert "netlist_required" not in prompt and "(skipped" not in prompt
     assert "netlist-free" not in prompt.lower()
     assert "ask the user)" not in prompt  # key parts come from Phase 2
-    assert "get_bom(compare_variants=True)" in prompt
+    assert "from compare_variants" in prompt
 
 
 def test_netlist_free_text(project):

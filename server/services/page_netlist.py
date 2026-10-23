@@ -1,6 +1,11 @@
 import re
 from collections import defaultdict
 
+try:
+    from services.variants import sheet_line, shown_values
+except ImportError:
+    from server.services.variants import sheet_line, shown_values
+
 _HIGH_FANOUT_THRESHOLD = 25
 _PAGE_CHAR_BUDGET = 150_000
 MAX_RESULT_SIZE_CHARS = 200_000
@@ -29,6 +34,8 @@ def _render_component(comp: dict, current_sheet: str) -> str:
     Same-sheet neighbors are shortened to refdes.pin; cross-sheet neighbors
     keep @sheet suffix so the caller knows where to look next. A board designator
     that differs from the sheet's (board-level annotation) reads "U3 (U1 on sheet)".
+    A part the active variant varies shows the variant's MPN, description and value,
+    then a line "  variant <name>: value 4k7 (base 10k); ..." with the base values.
     """
     refdes = comp["refdes"]
     if comp.get("logical_refdes"):
@@ -39,6 +46,8 @@ def _render_component(comp: dict, current_sheet: str) -> str:
     dnp_flag = " [DNP]" if comp.get("dnp") else ""
 
     lines = [f"{refdes}|{mpn}|{desc}|{value}{dnp_flag}"]
+    if comp.get("variant_changes"):
+        lines.append(sheet_line(comp["variant_changes"]))
 
     for pin_num, pin in comp.get("pins", {}).items():
         net = pin.get("net", "")
@@ -97,13 +106,13 @@ def build_sheet_context(netlist: dict, sheet_name: str, variant_state, offset: i
                 ]
                 pins[pin_num] = {**base, "connected_to": neighbors}
 
+        shown, changes = shown_values(variant_state, refdes, comp)
         sheet_components.append({
             "refdes": refdes,
             "logical_refdes": comp.get("logical_refdes"),
-            "mpn": comp.get("mpn"),
-            "description": comp.get("description"),
-            "value": comp.get("value"),
+            **shown,
             "dnp": variant_state.is_dnp(refdes),
+            "variant_changes": changes,
             "pins": pins,
         })
 
