@@ -202,7 +202,7 @@ OPTO_TEXT = re.compile(r"opto-?coupler|opto-?isolat|photo-?coupler|photo-?transi
                        re.I)
 AMPLIFIER_TEXT = re.compile(r"op-?amp|operational amplifier|amplifier|\bINA\d|instrumentation",
                             re.I)
-_POWER_DRIVER_TEXT = re.compile(
+POWER_DRIVER_TEXT = re.compile(
     r"(?:MOSFET|gate|FET|IGBT|bridge|motor|LED|relay|solenoid|stepper|laser) drivers?\b|"
     r"\bH[- ]?bridge|half[- ]bridge|full[- ]bridge|power stage|DrMOS|smart (?:high|low)[- ]side|"
     r"(?:high|low)[- ]side (?:switch|driver)|darlington|\bIPM\b|intelligent power module", re.I)
@@ -368,7 +368,7 @@ def _chip_class(tree, ref: str, text: str, supplies: list[Supply]) -> str:
         return "fpga"
     if kind in ("mcu", "radio", "module"):
         return "processor"
-    if DRIVER_TEXT.search(text) or _POWER_DRIVER_TEXT.search(text):
+    if DRIVER_TEXT.search(text) or POWER_DRIVER_TEXT.search(text):
         return "driver"
     if COMPARATOR_TEXT.search(text):
         return "comparator"

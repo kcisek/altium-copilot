@@ -254,7 +254,7 @@ _PIN_COLOUR = {"R": "red", "RED": "red", "G": "green", "GRN": "green", "GREEN": 
 _WAVELENGTH = re.compile(r"(?<![\d.])(\d{3,4})\s?nm\b", re.I)
 _MILLIAMPS = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)\s?mA\b")
 _CURRENT = re.compile(r"(?<![\w.])(\d+(?:[.,]\d+)?)\s?(m|u|µ)?A\b")
-_VF_TEXT = re.compile(r"\bV_?F\b\s*(?:typ\.?)?\s*[=:]?\s*(\d(?:[.,]\d{1,2})?)\s?V\b", re.I)
+VF_TEXT = re.compile(r"\bV_?F\b\s*(?:typ\.?)?\s*[=:]?\s*(\d(?:[.,]\d{1,2})?)\s?V\b", re.I)
 # A current and a voltage side by side ('30 mA, 2 V', '2.1V @ 20mA'): the test current and Vf.
 _VF_PAIR = re.compile(
     r"(?<![\w.])\d+(?:[.,]\d+)?\s?mA\s*[,;/]\s*(\d(?:[.,]\d{1,2})?)\s?V\b"
@@ -356,7 +356,7 @@ def read_led(params: dict[str, tuple[str, str]], text: str) -> _Led:
         elif match := _WAVELENGTH.search(text or ""):
             if colour := wavelength_colour(float(match[1])):
                 out.colour, out.colour_source = colour, "text (wavelength)"
-    if out.vf is None and (match := _VF_TEXT.search(text or "")):
+    if out.vf is None and (match := VF_TEXT.search(text or "")):
         volts = float(match[1].replace(",", "."))
         if 0.8 <= volts <= 5.0:
             out.vf, out.vf_source = volts, "text"
@@ -536,7 +536,7 @@ _ADC_PART = re.compile(
     r"AD4\d{3}|LTC2[34]\d{2}|MAX11\d{3}|ADC\d{3}[A-Z]|ADC1[0-2]\d{2}|ADC08\d{2})", re.I)
 _ADC_PART_PIN = re.compile(r"[+-]?A?IN\d*[+-]?|AIN\d*[PN]?|AINCOM|AIN_?COM|IN[PN]\d*|IN\d+[PN]|"
                            r"CH\d+[+-]?|ADC\d*|AN\d+|V?IN\d*[+-]|COM")
-_LED_DRIVER_TEXT = re.compile(r"LED driver|constant[- ]current|current sink", re.I)
+LED_DRIVER_TEXT = re.compile(r"LED driver|constant[- ]current|current sink", re.I)
 _OPTO_FAMILY = re.compile(
     r"(?<![A-Z0-9])(?:PC8\d{2}|PC3\d{2}|PC4\d{2}|K8\d{2}P|TLP\d{2,4}|4N2[5-8]|4N3[5-7]|"
     r"H11[A-L]\d|LTV-?\d{3,4}|EL\d{3,4}|CNY1[7-9]|SFH6\d{2,3}|HCPL-?\d{4}|ACPL-?\w{3,5}|"
@@ -582,7 +582,7 @@ def _channel(name: str | None) -> str:
     return match[1] if match else ""
 
 
-class _Board:
+class Board:
     """The design read once: the power tree, the fitted resistors and capacitors (read by
     check_derating), net voltages, IC supplies (check_logic_levels) and processors
     (get_firmware_pin_map)."""
@@ -798,7 +798,7 @@ _TAP_USES = frozenset({"fb", "en", "supervisor", "reference", "reference_input",
                        "comparator", "opamp", "ic_input", "processor_pin"})
 
 
-def _chain_node(board: _Board, net: str, came: _Res) -> tuple[_Res, str, list[str]] | None:
+def _chain_node(board: Board, net: str, came: _Res) -> tuple[_Res, str, list[str]] | None:
     """(the next resistor, what the node holds, its pins) when a net links two resistors
     in series: 'plain' (only capacitors besides), 'passive' (a test point, jumper or
     connector pin), 'input' (high-impedance IC or processor inputs: a tap of a resistor
@@ -834,11 +834,11 @@ def _chain_node(board: _Board, net: str, came: _Res) -> tuple[_Res, str, list[st
     return nxt, what, pins
 
 
-def _is_end(board: _Board, net: str) -> bool:
+def _is_end(board: Board, net: str) -> bool:
     return net in board.grounds or board.fixed(net) or bool(board.driven(net))
 
 
-def _legs(board: _Board, mid: str) -> list[_Leg]:
+def _legs(board: Board, mid: str) -> list[_Leg]:
     """Each resistor's leg from the midpoint: on through series nodes (and the taps of a
     resistor stack) to the net it ends on. A leg that passes a tap but ends nowhere fixed
     stops at its first tap."""
@@ -865,7 +865,7 @@ def _legs(board: _Board, mid: str) -> list[_Leg]:
 _SELECTOR_PREFIXES = frozenset({"JP", "SJ", "W", "JMP"})
 
 
-def _selector(board: _Board, leg: _Leg, ends: set[str], leg_ends: set[str]
+def _selector(board: Board, leg: _Leg, ends: set[str], leg_ends: set[str]
               ) -> tuple[str, str, str] | None:
     """(part, its pin, the divider end it joins) when a jumper, header or switch on a leg's
     far end joins it to one of the divider's ends (or ground) and to nothing but this
@@ -883,7 +883,7 @@ def _selector(board: _Board, leg: _Leg, ends: set[str], leg_ends: set[str]
     return None
 
 
-def _candidate_mid(board: _Board, net: str) -> str | None:
+def _candidate_mid(board: Board, net: str) -> str | None:
     """Why a net cannot be a divider's midpoint, or None when it can."""
     if net in board.grounds:
         return "ground"
@@ -908,14 +908,14 @@ def _candidate_mid(board: _Board, net: str) -> str | None:
     return None
 
 
-def _output_legs(board: _Board, others: list[_Leg]) -> list[_Leg]:
+def _output_legs(board: Board, others: list[_Leg]) -> list[_Leg]:
     """Legs that carry the midpoint on to a consumer: one series resistor to a net with no
     other resistor (a filter or isolation resistor before an input)."""
     return [leg for leg in others if len(leg.resistors) == 1 and not board.fixed(leg.end)
             and len(board.res_on.get(leg.end, ())) == 1]
 
 
-def _feeds(board: _Board, mid: str, legs: list[_Leg], outputs: list[_Leg]) -> list[dict]:
+def _feeds(board: Board, mid: str, legs: list[_Leg], outputs: list[_Leg]) -> list[dict]:
     used = {ref for leg in legs for ref in leg.refs}
     out = []
     reach = [(mid, []), *((leg.end, leg.refs) for leg in outputs)]
@@ -934,7 +934,7 @@ def _feeds(board: _Board, mid: str, legs: list[_Leg], outputs: list[_Leg]) -> li
     return out
 
 
-def _end_level(board: _Board, leg: _Leg) -> _Level | None:
+def _end_level(board: Board, leg: _Leg) -> _Level | None:
     if leg.end in board.grounds:
         return _Level(0.0, "ground", "high", leg.end)
     found = board.level(leg.end)
@@ -949,7 +949,7 @@ def _end_level(board: _Board, leg: _Leg) -> _Level | None:
     return _Level(None, "unknown", None, leg.end)
 
 
-def _leg_input(board: _Board, legs: list[_Leg]) -> dict:
+def _leg_input(board: Board, legs: list[_Leg]) -> dict:
     ohms = parallel([leg.ohms for leg in legs])
     tolerances = [resistor_tolerance(res.part) for leg in legs for res in leg.resistors]
     entry = {"value": ohms_text(ohms), "ohms": _r(ohms, 6),
@@ -1022,7 +1022,7 @@ def _tap_entries(top: list[_Leg], bottom: list[_Leg], rtop: float | None,
     return out
 
 
-def _divider(board: _Board, mid: str, vth, vref) -> tuple[dict | None, str]:
+def _divider(board: Board, mid: str, vth, vref) -> tuple[dict | None, str]:
     """The divider row at a midpoint, or (None, why not)."""
     why = _candidate_mid(board, mid)
     if why:
@@ -1231,7 +1231,7 @@ _FB_KEYS = ("formula", "vout_over_vref", "named_rail", "vout_from_name", "implie
             "near_common_vref", "vref_given", "vout_computed", "vout_error")
 
 
-def _fb_entry(board: _Board, row: dict, ref: str, feed: dict, rtop: float, rbot: float,
+def _fb_entry(board: Board, row: dict, ref: str, feed: dict, rtop: float, rbot: float,
               v_top: _Level, top_net: str, mid: str, vref) -> dict:
     """A converter's feedback: get_power_tree's row when it reads the same divider, else
     the same formula here; the Vref the top's voltage implies (or the output a given Vref
@@ -1271,7 +1271,7 @@ def _fb_entry(board: _Board, row: dict, ref: str, feed: dict, rtop: float, rbot:
     return _clean(entry)
 
 
-def _consumers(board: _Board, row: dict, feeds: list[dict], rtop: float, rbot: float,
+def _consumers(board: Board, row: dict, feeds: list[dict], rtop: float, rbot: float,
                v_top: _Level, top_net: str, mid: str, vth, vref, notes: list[str]) -> None:
     """What each recognised consumer makes of the divider: an FB's Vref, an EN's trip
     voltage, a reference's set point, an op-amp's gain."""
@@ -1328,7 +1328,7 @@ def _consumers(board: _Board, row: dict, feeds: list[dict], rtop: float, rbot: f
                          "the unloaded value")
 
 
-def _range_finding(board: _Board, row: dict) -> list[dict]:
+def _range_finding(board: Board, row: dict) -> list[dict]:
     """divider_output_above_input_rating (the midpoint's high bound above a reached pin's
     rail + 0.3 V) and divider_output_below_ground (its low bound below -0.3 V on a pin
     powered from a positive rail)."""
@@ -1401,7 +1401,7 @@ class _Side:
     def resistors(self) -> list[_Res]:
         return [res for group in self.groups for res in group]
 
-    def describe(self, board: _Board) -> dict:
+    def describe(self, board: Board) -> dict:
         """The side's voltage with what it ends on (via)."""
         out = self.level.describe() if self.level else {"net": self.net}
         if self.kind not in ("rail", "ground"):
@@ -1412,13 +1412,13 @@ class _Side:
         return _clean(out)
 
 
-def _open_drain(board: _Board, ref: str, pin: str) -> bool:
+def _open_drain(board: Board, ref: str, pin: str) -> bool:
     """A pin that can only sink: typed open-collector, or named as a status flag."""
     return board.design.pin_type(ref, pin) in ("OpenCollector", "OpenEmitter") or \
         open_drain_name(board.name(ref, pin), pin=True)
 
 
-def _transistor_far(board: _Board, ref: str, pin: str) -> tuple[str | None, str | None]:
+def _transistor_far(board: Board, ref: str, pin: str) -> tuple[str | None, str | None]:
     """The net on a transistor's other channel pin (emitter or source), same channel."""
     names = board.tree.pin_names(ref)
     channel = _channel(names.get(pin))
@@ -1430,7 +1430,7 @@ def _transistor_far(board: _Board, ref: str, pin: str) -> tuple[str | None, str 
     return None, None
 
 
-def _walk(board: _Board, net: str, own: str, high: bool, skip: set[str]) -> _Side:
+def _walk(board: Board, net: str, own: str, high: bool, skip: set[str]) -> _Side:
     """From an LED's anode (high) or cathode toward its supply or sink: through series
     resistors (or resistors in parallel to one net) to a rail, ground, a driving pin or a
     transistor."""
@@ -1469,7 +1469,7 @@ def _walk(board: _Board, net: str, own: str, high: bool, skip: set[str]) -> _Sid
         if actives and len(actives) == 1:
             ref, pin = actives[0]
             text = board.tree.text(ref)
-            if _LED_DRIVER_TEXT.search(text) or ref in board.tree.converters:
+            if LED_DRIVER_TEXT.search(text) or ref in board.tree.converters:
                 return _Side("driver", current, resistors, None, ref, pin,
                              "an LED driver or converter: it sets the current")
             kind = "gpio" if ref in board.processors else "ic_pin"
@@ -1534,7 +1534,7 @@ def _pin_colour(name: str) -> str | None:
     return _PIN_COLOUR.get(letters or name)
 
 
-def _orient(board: _Board, ref: str, net_a: str, net_b: str) -> str | None:
+def _orient(board: Board, ref: str, net_a: str, net_b: str) -> str | None:
     """The anode net of a two-pin LED whose pins are not named A/K, from what each side
     reaches: ground is the cathode's; a rail beats an IC pin or a transistor (a GPIO
     sinking), which beats ground; between rails the higher one. None when it stays open."""
@@ -1569,7 +1569,7 @@ _INTEGRATED_PIN = re.compile(r"VDD\w*|VCC\w*|VSS\w*|GND\w*|VS\d*|V\+|V-|DIN|DOUT
                              r"SDO|CKI|CKO")
 
 
-def _led_elements(board: _Board, ref: str) -> list[_Diode] | None:
+def _led_elements(board: Board, ref: str) -> list[_Diode] | None:
     """Each diode of an LED part, or None when its pins cannot be paired: a two-pin LED by
     its A/K pin names (else by the nets: the side on ground is the cathode), a common-anode
     or common-cathode part by its one common pin, else by channel numbers (A1/K1)."""
@@ -1624,7 +1624,7 @@ _PART_LED_ANODE = re.compile(r"(?:LED|BL)(\d*)(?:\+|_?A|_?ANODE)", re.I)
 _PART_LED_CATHODE = re.compile(r"(?:LED|BL)(\d*)(?:-|_?K|_?CATHODE)", re.I)
 
 
-def _part_led_elements(board: _Board, ref: str) -> list[_Diode]:
+def _part_led_elements(board: Board, ref: str) -> list[_Diode]:
     """The LEDs inside another part (a display's backlight, a jack's indicator): its
     anode and cathode pins paired by their channel number."""
     names = board.tree.pin_names(ref)
@@ -1645,14 +1645,14 @@ def _part_led_elements(board: _Board, ref: str) -> list[_Diode]:
             and anodes[channel] != cathodes[channel]]
 
 
-def _part_number(board: _Board, ref: str) -> str | None:
+def _part_number(board: Board, ref: str) -> str | None:
     bom = board.tree.parts.get(ref)
     meta = (board.netlist.get("components") or {}).get(ref) or {}
     text = (bom.mpn if bom else None) or meta.get("mpn")
     return re.sub(r"\s+", "", text).upper() if text and text.strip() else None
 
 
-def _led_infos(board: _Board) -> dict[str, _Led]:
+def _led_infos(board: Board) -> dict[str, _Led]:
     """Each LED's reading (read_led), with the colour or Vf one part states shared by the
     fitted parts of the same part number that state none."""
     components = board.netlist.get("components") or {}
@@ -1701,7 +1701,7 @@ def _vf_choice(info: _Led, ref: str, colour: str | None, user: dict | None,
     return None, "unknown (no colour read): pass vf=", True
 
 
-def _diode_row(board: _Board, ref: str, diode: _Diode, info: _Led, colour: str | None,
+def _diode_row(board: Board, ref: str, diode: _Diode, info: _Led, colour: str | None,
                colour_source: str | None, user_vf: dict | None, opto: bool,
                backlight: bool = False) -> tuple[dict, list[dict]]:
     """A diode's current: (row, findings). A resistor across the diode takes Vf / R_across
@@ -1909,7 +1909,7 @@ def _diode_row(board: _Board, ref: str, diode: _Diode, info: _Led, colour: str |
     return row, findings
 
 
-def _power_finding(board: _Board, res: _Res, watts: float, exact: bool,
+def _power_finding(board: Board, res: _Res, watts: float, exact: bool,
                    low_watts: float | None, diode: str, kind: str, row_kind: str
                    ) -> list[dict]:
     """resistor_overpower at the computed current; with an unknown Vf, watts is the power at
@@ -1976,12 +1976,12 @@ def _led_current_finding(row: dict, ref: str, current: float | None, result: dic
     return []
 
 
-def _is_opto(board: _Board, ref: str) -> bool:
+def _is_opto(board: Board, ref: str) -> bool:
     text = board.tree.text(ref)
     return bool(OPTO_TEXT.search(text) or _OPTO_FAMILY.search(text))
 
 
-def _opto_pins(board: _Board, ref: str) -> tuple[dict[str, dict[str, str]], bool]:
+def _opto_pins(board: Board, ref: str) -> tuple[dict[str, dict[str, str]], bool]:
     """channel -> {anode, cathode, collector, emitter: net}, and whether a standard pinout
     was assumed (unnamed pins)."""
     names = board.tree.pin_names(ref)
@@ -2024,7 +2024,7 @@ def _opto_pins(board: _Board, ref: str) -> tuple[dict[str, dict[str, str]], bool
     return dict(out), True
 
 
-def _opto_output(board: _Board, ref: str, item: dict[str, str]) -> dict:
+def _opto_output(board: Board, ref: str, item: dict[str, str]) -> dict:
     """The output transistor's load: a pull-up on the collector (or a resistor on the
     emitter) with its rail, and the current at saturation."""
     collector, emitter = item.get("collector"), item.get("emitter")
@@ -2073,7 +2073,7 @@ def _cap_input(caps: list[tuple[Part, float | None]]) -> dict:
                    "parts": [part.ref for part, _ in caps]})
 
 
-def _adc_row(board: _Board, ref: str, pin: str, net: str, basis: str,
+def _adc_row(board: Board, ref: str, pin: str, net: str, basis: str,
              dividers: dict[str, dict], adc_nets: set[str]) -> tuple[dict, list[dict]]:
     name = board.name(ref, pin)
     row: dict = {"kind": "adc_input", "part": ref, "pin": pin,
@@ -2179,7 +2179,7 @@ def _thevenin(divider: dict) -> float:
     return top * bottom / (top + bottom) if top and bottom else 0.0
 
 
-def _rc_row(board: _Board, net: str, taken: set[str]) -> dict | None:
+def _rc_row(board: Board, net: str, taken: set[str]) -> dict | None:
     """A node with one series resistor from a driven net and a capacitor to ground,
     feeding an IC or transistor: an RC low-pass filter."""
     if net in taken or board.fixed(net):
@@ -2257,6 +2257,63 @@ def _row_key(row: dict) -> tuple:
             natural_key(str(row.get("pin") or "")))
 
 
+def led_calculations(board: Board, user_vf: dict | None, stats: Counter
+                     ) -> tuple[list[dict], list[dict], set[str]]:
+    """Every LED's calculation (rows, findings, and the anode and cathode nets): LED parts,
+    and LED pins on other parts (a display's backlight, a jack's indicator). A row's
+    _current is the diode current in amps when computed. stats counts the LED states."""
+    tree = board.tree
+    rows: list[dict] = []
+    findings: list[dict] = []
+    nodes: set[str] = set()
+    user_vf = user_vf or {}
+    infos = _led_infos(board)
+    for ref in board.leds:
+        info = infos[ref]
+        names = tree.pin_names(ref)
+        if any(_INTEGRATED_PIN.fullmatch(first_function(names.get(pin) or ""))
+               for pin in tree.design.part_pins.get(ref) or {}):
+            stats["led_integrated"] += 1  # supply or data pins: a driver inside, no R
+            continue
+        elements = _led_elements(board, ref)
+        if not elements:
+            stats["led_unread"] += 1
+            rows.append({"kind": "led", "led": ref, "confidence": "low",
+                         "notes": ["its anode and cathode pins could not be told apart"],
+                         "inputs": {}, "result": {}, "_refs": {ref},
+                         "_nets": set((tree.design.part_pins.get(ref) or {}).values())})
+            continue
+        for diode in elements:
+            colour = diode.colour or info.colour
+            source = "pin name" if diode.colour else info.colour_source
+            row, found = _diode_row(board, ref, diode, info, colour, source, user_vf, False)
+            nodes |= {diode.anode, diode.cathode}
+            rows.append(row)
+            findings += found
+            stats[_led_state(row["result"])] += 1
+    # LED pins on another part (a display's backlight, a jack's indicator).
+    for ref in sorted(tree.design.part_pins, key=natural_key):
+        if ref in board.leds or not tree.fitted(ref) or tree.kind(ref) not in (
+                "ic", "other", "connector", "passive") or ref in tree.converters or \
+                ref in board.processors or LED_DRIVER_TEXT.search(tree.text(ref)) or \
+                _is_opto(board, ref):
+            continue
+        for diode in _part_led_elements(board, ref):
+            row, found = _diode_row(board, ref, diode, _Led(), None, None, user_vf, False,
+                                    backlight=True)
+            row.setdefault("notes", []).append(
+                f"LED pins on {ref} (a backlight or an indicator inside it): it may hold "
+                f"several LEDs, so its Vf and current come from its datasheet (pass "
+                f"vf='{ref}=volts')")
+            row["confidence"] = "low" if row["confidence"] == "low" else "medium"
+            nodes |= {diode.anode, diode.cathode}
+            rows.append(row)
+            findings += found
+            stats["led_in_other_part"] += 1
+            stats[_led_state(row["result"])] += 1
+    return rows, findings, nodes
+
+
 def prepare_circuit_calculations(
     netlist: dict,
     plan=None,
@@ -2283,7 +2340,7 @@ def prepare_circuit_calculations(
         policy_info, _ = load_policy(None)
         notes.append(f"{error.get('file') or 'derating_policy.json'} could not be read "
                      f"({error['message']}): the default resistor power limits apply.")
-    board = _Board(netlist, plan, project_params, rails, vref, policy_info["values"])
+    board = Board(netlist, plan, project_params, rails, vref, policy_info["values"])
     tree = board.tree
     wanted_parts, unknown_parts = resolve_names(parts, tree.design.part_pins)
     if parts and not wanted_parts:
@@ -2331,52 +2388,10 @@ def prepare_circuit_calculations(
     rows += list(dividers.values())
 
     # LEDs.
-    nodes: set[str] = set()
     user_vf = vf or {}
-    infos = _led_infos(board)
-    for ref in board.leds:
-        info = infos[ref]
-        names = tree.pin_names(ref)
-        if any(_INTEGRATED_PIN.fullmatch(first_function(names.get(pin) or ""))
-               for pin in tree.design.part_pins.get(ref) or {}):
-            stats["led_integrated"] += 1  # supply or data pins: a driver inside, no R
-            continue
-        elements = _led_elements(board, ref)
-        if not elements:
-            stats["led_unread"] += 1
-            rows.append({"kind": "led", "led": ref, "confidence": "low",
-                         "notes": ["its anode and cathode pins could not be told apart"],
-                         "inputs": {}, "result": {}, "_refs": {ref},
-                         "_nets": set((tree.design.part_pins.get(ref) or {}).values())})
-            continue
-        for diode in elements:
-            colour = diode.colour or info.colour
-            source = "pin name" if diode.colour else info.colour_source
-            row, found = _diode_row(board, ref, diode, info, colour, source, user_vf, False)
-            nodes |= {diode.anode, diode.cathode}
-            rows.append(row)
-            findings += found
-            stats[_led_state(row["result"])] += 1
-    # LED pins on another part (a display's backlight, a jack's indicator).
-    for ref in sorted(tree.design.part_pins, key=natural_key):
-        if ref in board.leds or not tree.fitted(ref) or tree.kind(ref) not in (
-                "ic", "other", "connector", "passive") or ref in tree.converters or \
-                ref in board.processors or _LED_DRIVER_TEXT.search(tree.text(ref)) or \
-                _is_opto(board, ref):
-            continue
-        for diode in _part_led_elements(board, ref):
-            row, found = _diode_row(board, ref, diode, _Led(), None, None, user_vf, False,
-                                    backlight=True)
-            row.setdefault("notes", []).append(
-                f"LED pins on {ref} (a backlight or an indicator inside it): it may hold "
-                f"several LEDs, so its Vf and current come from its datasheet (pass "
-                f"vf='{ref}=volts')")
-            row["confidence"] = "low" if row["confidence"] == "low" else "medium"
-            nodes |= {diode.anode, diode.cathode}
-            rows.append(row)
-            findings += found
-            stats["led_in_other_part"] += 1
-            stats[_led_state(row["result"])] += 1
+    led_rows, led_findings, nodes = led_calculations(board, user_vf, stats)
+    rows += led_rows
+    findings += led_findings
 
     # Optocouplers.
     for ref in sorted(tree.design.part_pins, key=natural_key):

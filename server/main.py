@@ -66,6 +66,10 @@ try:
     from services.circuit_calcs import (
         parse_vf, parse_vth, prepare_circuit_calculations, render_circuit_calculations,
     )
+    from services.thermal import (
+        DEFAULT_MAX_DISTANCE_MIL as DEFAULT_THERMAL_DISTANCE_MIL, Inputs as ThermalInputs,
+        parse_values as parse_thermal_values, prepare_thermal, render_thermal,
+    )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -167,6 +171,10 @@ except ImportError:
     from server.services.logic_levels import prepare_logic_levels, render_logic_levels
     from server.services.circuit_calcs import (
         parse_vf, parse_vth, prepare_circuit_calculations, render_circuit_calculations,
+    )
+    from server.services.thermal import (
+        DEFAULT_MAX_DISTANCE_MIL as DEFAULT_THERMAL_DISTANCE_MIL, Inputs as ThermalInputs,
+        parse_values as parse_thermal_values, prepare_thermal, render_thermal,
     )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
@@ -721,6 +729,18 @@ component locations, distances):
     numbers are guidance (profile ict or flying_probe): say so, and ask for the test
     house's numbers (limits) before calling the board untestable. Assembly Testpoint
     marks are not read: a net with only those reads as uncovered.
+23. check_thermal — "will this regulator run too hot?", "what is U5's junction
+    temperature?", "are there enough thermal vias under the exposed pad?", "what sits
+    near the hot parts?", or the thermal part of a design or layout review: hot parts
+    with their basis (converters, their FETs and diodes, power-path FETs, shunts and
+    power resistors, processors, FPGAs, PHYs, drivers, exposed pads), dissipation where
+    computable (LDO (Vin - Vout) x I, switcher Vout x I x (1/eta - 1), V^2/R, LED Vf x I)
+    and Tj = Ta + thetaJA x P; with the PcbDoc, the vias in each exposed pad or tab (count,
+    drill, net, plane or pour reached) and hot parts within 5 mm of each other or of
+    electrolytics, crystals, references and sensors. Loads, eta, thetaJA and Tj max come
+    from the datasheets and the user: ask for inputs_needed and pass load= ('U5=0.3' or
+    '3V3=0.5' amps), eta=, theta= ('U5=45' C/W), ta_max=, power= (W), never guess them.
+    Present every number as an estimate: the datasheet and a thermal simulation decide.
 
 get_board_info lists the stack manager's impedance profiles: target, solved width/gap and
 calculated impedance per layer, reference layers, the rules using each, and issues. Quote
@@ -841,8 +861,8 @@ NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
     "get_power_tree", "check_derating", "check_logic_levels", "get_circuit_calculations",
-    "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync", "schematic_review",
-    "package_for_xfn",
+    "check_thermal", "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync",
+    "schematic_review", "package_for_xfn",
 )
 
 
@@ -4390,6 +4410,158 @@ def check_decoupling(
         result = _convert_units({**context, **result}, to_mm)
         if limit < 100:
             result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+# Hot parts and findings per page, tried in turn until the result fits; the board is read
+# once and only rendered per step.
+THERMAL_STEPS = (100, 60, 40, 25, 15, 10, 5, 2, 1)
+
+
+@mcp.tool(
+    title="Check Thermal",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_thermal(
+    part: str | None = None,
+    checks: list[str] | None = None,
+    load: str | None = None,
+    power: str | None = None,
+    theta: str | None = None,
+    ta: float | None = None,
+    ta_max: float | None = None,
+    tj_max: str | None = None,
+    eta: str | None = None,
+    iq: str | None = None,
+    rails: str | None = None,
+    vref: str | None = None,
+    max_distance: float | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Thermal estimate and thermal-via audit, offline: which parts dissipate, their
+    dissipation and junction temperature where the inputs allow, and on the PcbDoc the vias
+    in each exposed or thermal pad and the hot parts sitting close together. Call it when
+    the user asks about heat, hot parts, thermal design, junction temperature, thetaJA,
+    thermal vias or exposed pads, whether a regulator or FET runs too hot, what sits
+    near a hot part, or for the thermal part of a design or layout review.
+
+    Hot parts, each with its basis: converters from the power tree (linear regulators and
+    LDOs, switchers and modules, chargers, load switches, eFuses), the FETs a converter's
+    gate pins drive and the diodes on its switch node, transistors and diodes in series with
+    a rail, current-sense shunts, resistors computed at 0.25 W or half their rating, LEDs at
+    0.2 W, processors, FPGAs and Ethernet PHYs, LED and motor drivers and power amplifiers,
+    and with a PcbDoc any part with an exposed pad or thermal tab (its largest SMD pad, or a
+    fill or region its footprint draws such as a PowerPAK's drain paddle, 2.5 times the
+    median of its other pads or more and 0.5 mm^2 or more: in the middle, or at one edge
+    such as a DPAK or SOT-223 tab; connectors and mechanical parts left out; more than four
+    such pads are a pad array, its large ground pads audited as one, pad_array says so).
+    Dissipation where computable: LDO/linear P = (Vin - Vout) x I_out (+ Vin x Iq),
+    switcher P = Vout x I_out x (1/eta - 1), shunt I^2 x R, diode Vf x I (its stated Vf,
+    else a typical one), resistor V^2/R (check_derating's voltages; not a shunt's), LED
+    Vf x I (get_circuit_calculations);
+    otherwise power.needs and inputs_needed say what to ask for. With thetaJA,
+    Tj = Ta + thetaJA x P at ta and at ta_max (worst case).
+
+    Findings: tj_over_max (Tj at the worst-case Ta above tj_max: warning), tj_near_max
+    (above 80% of it: info), thermal_pad_no_vias (a hot part's exposed pad with no via
+    inside: warning, info when the part is not known to dissipate or four or more vias of
+    its net sit within 1 mm of it or a tab sits in a pour), thermal_vias_wrong_net (a via
+    in the pad on another net: warning), thermal_pad_few_vias (fewer than one via per
+    1.5 mm^2, or 4 on pads over 4 mm^2, a common guideline: info), thermal_pad_unconnected
+    (a pad with no net, or vias reaching no plane or pour of its net on another layer;
+    vias landing in a shelved or unpoured pour are listed in
+    reaches_pours_without_copper instead: info), hot_neighbours (two hot parts within
+    max_distance, default 5 mm, edge to edge between their pad boxes, same or opposite
+    side; not parts of one power stage, nor a part only named in part=: info) and
+    sensitive_near_hot (an electrolytic, crystal, reference, temperature sensor or battery
+    near a hot part, unless a crystal, reference or sensor is wired to it by a net other
+    than a supply: info).
+    Without a PcbDoc the PCB checks are skipped (not_checked) and the rest runs.
+
+    Everything is an estimate: say so. thetaJA, Tj max and the loads come from the
+    datasheets and the user (Claude's datasheet lookup or the user's numbers), never
+    guessed; the datasheet and a thermal simulation decide. Pass load ('U5=0.3,3V3=0.5':
+    amps per designator or output rail), power ('U1=1.2' W per designator, overriding the
+    estimate), theta ('U5=45' C/W), ta (C, default 25), ta_max (worst-case ambient, e.g.
+    85), tj_max (per designator or one for all, default 125), eta ('U7=0.88' or one for
+    all), iq (a regulator's ground current, A), rails ('VIN=24') and vref as in
+    get_power_tree. part (comma-separated) narrows to those parts (and adds any part named
+    there); checks narrows to the names in checks_run. Hot parts (hottest first) and
+    findings (warnings first) page together (offset from next_offset). max_distance and
+    every distance are in units, default mm."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if units not in (None, "mm", "mil"):
+        return json.dumps({"error": "invalid_units", "message": "units must be 'mil' or 'mm'."})
+    resolved = units or "mm"
+    to_mm = resolved == "mm"
+    max_mil = DEFAULT_THERMAL_DISTANCE_MIL
+    if max_distance is not None:
+        if not _finite_nonnegative(max_distance) or max_distance == 0:
+            return json.dumps({"error": "invalid_max_distance",
+                               "message": "max_distance must be a positive number."})
+        max_mil = _input_to_mil(max_distance, resolved)
+    ambient = 25.0 if ta is None else ta
+    if not (math.isfinite(ambient) and -60.0 <= ambient <= 150.0):
+        return json.dumps({"error": "invalid_ta",
+                           "message": "ta is the ambient temperature in C, -60 to 150."})
+    if ta_max is not None and not (math.isfinite(ta_max) and ambient <= ta_max <= 200.0):
+        return json.dumps({"error": "invalid_ta_max",
+                           "message": "ta_max is the worst-case ambient in C, from ta to 200."})
+    values = {}
+    for name, text in (("load", load), ("power", power), ("theta", theta),
+                       ("tj_max", tj_max), ("eta", eta), ("iq", iq)):
+        values[name], error = parse_thermal_values(text, name)
+        if error:
+            return json.dumps(error)
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    user_rails, error = parse_rail_map(rails)
+    if error:
+        return json.dumps(error)
+    inputs = ThermalInputs(
+        load=values["load"] or {}, power=values["power"] or {}, iq=values["iq"] or {},
+        theta=values["theta"] or {}, tj_max=values["tj_max"], eta=values["eta"],
+        ta=float(ambient), ta_max=float(ta_max) if ta_max is not None else None)
+    index, pcb_unavailable = None, None
+    if project.get("pcb_doc_paths"):
+        index, error = _pcb_session.get(project, netlist)
+        if error:
+            pcb_unavailable = f"{error['error']}: {error.get('message', '')}".strip(": ")
+    else:
+        pcb_unavailable = "the project lists no PcbDoc"
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_thermal(
+        netlist, plan, project.get("parameters") or {}, index=index,
+        pcb_unavailable=pcb_unavailable, parts=_split_names(part), checks=checks,
+        rails=user_rails, vref=vrefs, inputs=inputs, max_distance_mil=max_mil,
+        units=resolved, root_dir=project.get("root_dir"))
+    if "error" in prepared:
+        return json.dumps(prepared)
+    context: dict = {"netlist_updated_utc": _netlist_last_updated}
+    if index is not None:
+        context.update({"pcb_doc": Path(project["pcb_doc_paths"][0]).name, "units": resolved})
+        if len(project["pcb_doc_paths"]) > 1:
+            context["note"] = (
+                f"Project lists {len(project['pcb_doc_paths'])} PcbDocs; measured on "
+                f"'{Path(project['pcb_doc_paths'][0]).name}'."
+            )
+    for step in THERMAL_STEPS:
+        result = _convert_units({**context, **render_thermal(prepared, offset=offset,
+                                                             limit=step)}, to_mm)
+        if step != THERMAL_STEPS[0]:
+            result["page_limited_to"] = step
         rendered = json.dumps(result, indent=2)
         if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
             break
