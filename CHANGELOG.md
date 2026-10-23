@@ -6,6 +6,108 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `get_power_tree`: power tree extraction and power-path checks (roadmap #15,
+  `services/power_tree.py`), read-only and offline from the compiled netlist, as JSON or
+  a Mermaid flowchart (sources -> protection -> converters -> rails -> load counts).
+  Converters fitted in the active variant are recognised by their words (category words
+  first: supervisor, reference, charger, ideal diode, hot-swap, eFuse, load switch,
+  PMIC, though a supervisor, reference or load-switch word after a regulator word is a
+  feature of that regulator; then the earliest topology word: buck, boost, buck-boost,
+  SEPIC, flyback, inverting, charge pump, LDO, switching, power module or PSU), by
+  part-number families when the words say nothing, and by pin names alone (VIN/IN with
+  VOUT/OUT or SW, plus FB, EN, PG, BST, SS or COMP) when no word names another function;
+  MOSFET and gate drivers are left out, and a regulator module on a connector's
+  designator (J, P, X) is a converter when its words name a regulator and its pins an
+  input and an output. Each carries its basis. A part's input is the net on its VIN/IN
+  pins (a supply pin when it has none); its output the net on its VOUT/OUT pins, the far
+  side of the inductor on its SW/LX/PH pin (past the diode for a boost, through a
+  transformer and diode for a flyback, through the MOSFETs its gate pins drive for a
+  controller), for a load switch, eFuse, hot-swap or ideal-diode controller with no OUT
+  pin the far side of the MOSFET it drives, pins named for their voltage (+15V, -15V on
+  a DC/DC module) or the top of its feedback divider; PMICs get an edge per output,
+  typed buck or LDO. References and supervisors are listed (with the rails a supervisor
+  monitors and who reads its outputs), never taken for converters. Rails are
+  `check_decoupling`'s rails and supply pins of any part, every converter's input and
+  output, connector and battery power pins and unnamed nets that only carry power between
+  two of them (dead-end branches pruned). Edges: converters, and fitted 0 ohm links and
+  shunts, resistors up to 100 ohm (a larger one only into reference inputs, such as a
+  DDR or FPGA VREF divider), ferrites, inductors, common-mode chokes, fuses and PTCs,
+  NTCs, diodes (anode to cathode), MOSFET and transistor channels (P or N by their
+  words), switches, relays and jumpers between rails, oriented outward from the power
+  inputs. Sources: connector power pins (`check_interfaces`' classes and exposure; a
+  connector on a rail made on the board, reached from a likelier input such as a power
+  jack, or less likely than another input connector on its net, is an outlet; as likely
+  ones on one net share one input row), batteries (their positive pins, one source per
+  net), converter outputs, voltage references' outputs, a converter's own bias pin
+  (VDDB, INTVCC, VDD33, an AVINO feeding its own AVIN), IC pins that regulate their net
+  (VCAP, VDD_CORE, an internal SMPS's LX through its inductor, not a regulator's own
+  input such as VDD_REG_IN) and IC output pins on a rail. Loads per rail are parts with a
+  supply, reference or capacitor pin on it, never passives. Per converter: EN state
+  (tied to its own input or another rail, pulled up or down, an undervoltage divider with
+  its ratio, held through a series resistor by a shared enable net, driven by a GPIO,
+  another converter's PG, a supervisor, a connector or a transistor, capacitor only,
+  floating or unconnected; held_off when tied or pulled to the level that keeps the part
+  off, read from the pin's name and negation: EN, RUN, ON high, EN\ low, SHDN\ high, INH
+  low, a plain SHDN or a module's ON pin not guessed), PG (pulled up to which rail, read
+  by which EN, reset or GPIO, or unused; PGATE, PG_DRV and PGM are not power-good, nor a
+  bare PG beside POK or PGOOD or on a capacitor to the part's own pin), input and output
+  capacitors (any capacitor prefix), the feedback divider (Rtop and Rbot, two resistors
+  in series followed, Vout/Vref, the Vref the rail name implies and the nearest common
+  reference within 3% (0.4, 0.5, 0.6, 0.75, 0.765, 0.8, 0.9, 1.0, 1.2, 1.215, 1.23 or
+  1.25 V), or with `vref` the output it sets, and the same with a leg a two-pin jumper,
+  header or switch joins to ground or the output; an unnamed pin with a divider from the
+  output is read as ADJ, and a regulator with no ground pin uses the LM317 formula Vout
+  = Vref (1 + Rbot/Rtop)), soft-start, current-limit, mode and sense pins, and for a
+  switcher whether an inductor or ferrite separates its input from its source (pi, LC,
+  shared; not one on a branch its input feeds). Per power input: the series chain inward
+  to the first branch or converter, with fuses or eFuses, reverse-polarity parts
+  (forward diode, a P-FET with its drain or an N-FET with its source toward the input,
+  ideal diode, a diode or TVS to ground behind the fuse as a crowbar; a P-FET with its
+  source toward the input is a switch, its body diode conducting a reversed supply), TVS
+  and clamp diodes, inrush parts, filters and bulk capacitance. Findings:
+  rail_without_source (warning; info for a rail that reaches one part only, a connector
+  or a test point, or one part only through a resistor above 100 ohm; none for a VREF
+  input or a rail fed through a series part from a net not read as a rail),
+  enable_floating (warning; info for a capacitor only), enable_held_off (warning; info
+  for one channel of a multi-output part), fb_divider_mismatch (warning when a given Vref
+  sets an output more than 5% from the rail name's voltage, also with the jumper leg,
+  else info with the implied Vref), no_input_fuse, no_reverse_protection (not for USB)
+  and no_input_tvs (one per input net, external inputs and power-only connectors of
+  unknown exposure), smps_input_unfiltered, no_output_capacitor, no_input_capacitor
+  (when `check_decoupling` does not cover the input), converter_unknown_rail (output or
+  input not traced, or an output reaching nothing), pgood_unused and sequencing (EN/PG
+  and rail-to-EN chains), all info; enable_tied_note runs only when named. `rail` and
+  `part` narrow the tree and findings (a converter's own findings only with that
+  converter); converters, findings, rails (those with loads and no source first),
+  sources and power inputs page together on one offset, and the tree is built once and
+  only rendered per step of the shrink loop. A `vref` for a part that is not a converter,
+  or a converter with no divider read, is noted. `build_power_tree` returns the tree as
+  plain data for the derating (#17) and thermal (#21) items, `power_findings` its
+  findings, `prepare_power_tree` and `render_power_tree` the built view and its pages.
+  `interfaces.audit_connector` (one connector's pins, walks, power feeds, exposure and
+  shield) is public now and `run_interface_check` uses it; the other tools' output on
+  the public examples is unchanged apart from `schematic_review`'s new Power checklist
+  item. Calibrated on Altium's 11 public AD25 example
+  projects (16 converters on 2 boards: MiniPC's ten bucks and modules, three VLDOs and a
+  current-limit switch, SL1's two LM1084-ADJ read with the three-terminal formula; 99 of
+  103 rails supplied; 7 warnings, all on MiniPC: six enable pins left unconnected or on
+  nets with nothing driving them and one held off by a pull-down with nothing driving
+  it; MiniPC's power jack gets no_reverse_protection, its P-FET being a switch) and on
+  53 private boards read in aggregate (114 converters on 23 boards, 113 by their words
+  and 1 by pin names alone, 7 of them modules on a connector's designator; 106 of 108
+  parts an independent word list names as regulators found; 95 outputs traced; 387 of
+  452 rails supplied; 20 of 20 implied Vrefs within 3% of a common reference; 2
+  warnings, both rails with two ICs' supply pins and nothing feeding them; 256 info,
+  most of them input-protection and SMPS-filter advice and converter outputs not
+  traced). Calibration removed false positives from converters' own bias regulators,
+  capacitors with other prefixes, internal regulator pins, enables held through a shared
+  enable net, connectors that pass power on or share a net with a likelier input,
+  gate-control branches taken for power paths, P-gate pins read as power-good,
+  regulators with a reset or watchdog read as supervisors, and modules' ON pins whose
+  logic varies. Not covered: ratings (current, voltage, power, thermal; items #17 and
+  #21), Vref and thresholds (datasheet facts, given with `vref`), converters whose pins
+  are all unnamed and whose rails carry no voltage in their name, isolated grounds, PMBus
+  or register-set outputs, and a load's actual current.
 - `run_erc`: an offline approximation of Altium's ERC (roadmap #5, `services/erc.py`),
   read-only, from the saved sheets compiled offline (the loaded netlist is left as it is)
   and the project's Error Reporting levels and Connection Matrix. Altium never saves its

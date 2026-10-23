@@ -1364,6 +1364,42 @@ def _connector_row(ctx: _Context, connector: _Connector) -> dict:
 
 # ---------- entry point ----------
 
+def audit_connector(ctx: _Context, ref: str, override: str | None = None) -> _Connector:
+    """One connector as run_interface_check reads it: each pin's class, a signal pin's
+    walk to the first part, a power pin's ESD and the rail it feeds through series
+    parts, the exposure (external, internal or unknown; override sets it) and the
+    shield. get_power_tree reads the power pins and the exposure."""
+    power_connector = bool(_POWER_CONNECTOR.search(ctx.text.get(ref, "")))
+    pins = _classify_pins(ctx, ref, power_connector)
+    connector = _Connector(ref, pins)
+    walks: dict[str, _Walk] = {}
+    for pin in pins:
+        if pin.cls == "signal":
+            if pin.net not in walks:
+                walks[pin.net] = _walk(ctx, ref, pin.net)
+            pin.walk = walks[pin.net]
+            first = pin.walk.first()
+            # A line into a CAN, RS-485 or RS-232 transceiver is a field bus whatever
+            # its name (RS-485 A and B); one into a PHY's LED pin drives a LED.
+            if first and bus_transceiver(ctx, first[0]):
+                pin.tags += [tag for tag in ("field_bus", "differential")
+                             if tag not in pin.tags]
+            if first and "led" not in pin.tags and _LED_PIN.fullmatch(
+                    first_function(ctx.design.pin_name(first[0], first[1]) or "")):
+                pin.tags.append("led")
+        elif pin.cls == "power":
+            rail, through = _power_feed(ctx, pin.net)
+            protection = sorted({part for part in ctx.esd.get(pin.net, ())
+                                 if ctx.fitted.get(part, True)}, key=natural_key)
+            if protection:
+                pin.power["esd"] = protection[:3]
+            if rail and rail != pin.net:
+                pin.power["feeds"] = {"rail": rail, "through": through}
+    _exposure(ctx, connector, override)
+    connector.shield = _shield_state(ctx, connector)
+    return connector
+
+
 def run_interface_check(
     netlist: dict,
     plan=None,
@@ -1426,35 +1462,8 @@ def run_interface_check(
     audited = [ref for ref in audited if ctx.fitted.get(ref, True)]
     built: list[_Connector] = []
     for ref in audited:
-        power_connector = bool(_POWER_CONNECTOR.search(ctx.text.get(ref, "")))
-        pins = _classify_pins(ctx, ref, power_connector)
-        connector = _Connector(ref, pins)
-        walks: dict[str, _Walk] = {}
-        for pin in pins:
-            if pin.cls == "signal":
-                if pin.net not in walks:
-                    walks[pin.net] = _walk(ctx, ref, pin.net)
-                pin.walk = walks[pin.net]
-                first = pin.walk.first()
-                # A line into a CAN, RS-485 or RS-232 transceiver is a field bus whatever
-                # its name (RS-485 A and B); one into a PHY's LED pin drives a LED.
-                if first and bus_transceiver(ctx, first[0]):
-                    pin.tags += [tag for tag in ("field_bus", "differential")
-                                 if tag not in pin.tags]
-                if first and "led" not in pin.tags and _LED_PIN.fullmatch(
-                        first_function(ctx.design.pin_name(first[0], first[1]) or "")):
-                    pin.tags.append("led")
-            elif pin.cls == "power":
-                rail, through = _power_feed(ctx, pin.net)
-                protection = sorted({part for part in ctx.esd.get(pin.net, ())
-                                     if ctx.fitted.get(part, True)}, key=natural_key)
-                if protection:
-                    pin.power["esd"] = protection[:3]
-                if rail and rail != pin.net:
-                    pin.power["feeds"] = {"rail": rail, "through": through}
-        _exposure(ctx, connector, overrides.get(ref))
+        connector = audit_connector(ctx, ref, overrides.get(ref))
         connector.audited = connector.exposure != "internal" or wanted is not None
-        connector.shield = _shield_state(ctx, connector)
         built.append(connector)
     findings: list[dict] = []
     for connector in built:

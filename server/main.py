@@ -57,6 +57,7 @@ try:
     from services.interfaces import (
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
     )
+    from services.power_tree import prepare_power_tree, render_power_tree
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -141,6 +142,7 @@ except ImportError:
     from server.services.interfaces import (
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
     )
+    from server.services.power_tree import prepare_power_tree, render_power_tree
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -481,6 +483,19 @@ DNP reasons, fabrication requirements. Use it.
   the TVS part (standoff, clamping voltage, capacitance), or a transceiver's own ESD
   claim, from the tool: look up the datasheet. shield_rc quotes guidance, not a fault.
 
+## Power Tree
+
+- get_power_tree — "how is this board powered?", "draw the power tree", "which regulator
+  makes 3V3?", "how are EN and PG wired?", "is the sequencing right?", "is the input
+  protected?", or the power part of a schematic review: sources (connector power pins,
+  batteries), input protection (fuse, reverse polarity, TVS), converters (type and
+  basis, EN, PG, feedback divider, capacitors, input filter), rails with what feeds
+  them and their load counts, and findings. It is a draft read from names: say so, look
+  up each converter's datasheet before trusting a state (an EN with an internal
+  pull-up is not floating; held_off depends on the pin's polarity) and check
+  implied_vref against the datasheet's Vref (or pass vref=). format='mermaid' gives a
+  flowchart to show the user; rail= and part= narrow it; pages follow next_offset.
+
 ## Firmware Pin Map
 
 - get_firmware_pin_map — "what is the MCU's pinout?", "give the firmware team a pin
@@ -736,8 +751,8 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync", "schematic_review",
-    "package_for_xfn",
+    "get_power_tree", "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync",
+    "schematic_review", "package_for_xfn",
 )
 
 
@@ -4257,6 +4272,139 @@ def check_interfaces(
     return rendered
 
 
+# Rows per page (converters, findings, rails, sources and power inputs page together),
+# tried in turn until the result fits; for the Mermaid flowchart, (load nodes, lines) the
+# same way. The tree is built once and only rendered per step.
+POWER_TREE_STEPS = (100, 40, 15, 5, 2, 1)
+POWER_TREE_MERMAID_STEPS = ((True, None), (False, None), (False, 600), (False, 300),
+                            (False, 120))
+_VREF_ITEM = re.compile(r"\s*([A-Za-z_][\w.-]*)\s*[=:]\s*([0-9]*\.?[0-9]+)\s*[vV]?\s*")
+_VREF_ALL = re.compile(r"\s*([0-9]*\.?[0-9]+)\s*[vV]?\s*")
+
+
+def _parse_vref(text: str | None) -> tuple[dict[str, float] | float | None, dict | None]:
+    """'U5=0.8,U7=0.6' -> {'U5': 0.8, 'U7': 0.6}; '0.8' or '0.8V' -> 0.8; None when
+    empty. The error when it reads as neither or a value is not 0 < V < 10."""
+    error = {"error": "invalid_vref",
+             "message": "vref takes a feedback reference in volts per converter, e.g. "
+                        "'U5=0.8,U7=0.6', or one number for all, e.g. '0.6'."}
+    if text is None or not text.strip():
+        return None, None
+    if match := _VREF_ALL.fullmatch(text):
+        value = float(match.group(1))
+        return (value, None) if 0 < value < 10 else (None, error)
+    values: dict[str, float] = {}
+    for item in text.split(","):
+        match = _VREF_ITEM.fullmatch(item)
+        if not match or not 0 < float(match.group(2)) < 10:
+            return None, error
+        values[match.group(1)] = float(match.group(2))
+    return values, None
+
+
+@mcp.tool(
+    title="Get Power Tree",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_power_tree(
+    rail: str | None = None,
+    part: str | None = None,
+    checks: list[str] | None = None,
+    vref: str | None = None,
+    format: Literal["json", "mermaid"] = "json",
+    offset: int = 0,
+) -> str:
+    """Power tree and power-path checks, offline: sources, protection, converters, rails
+    and loads. Call it when the user asks how the board is powered, for the power tree or
+    a power diagram, which regulator makes a rail, regulator enable or power-good wiring,
+    power sequencing, feedback dividers and output voltages, input protection (fuse,
+    reverse polarity, TVS), input filters on switchers, or for the power part of a
+    schematic review.
+
+    Converters fitted in the active variant are recognised by their words and part
+    number and their pin names (VIN, VOUT, SW, FB, EN, PG ...): LDOs and linear
+    regulators, buck, boost, buck-boost, SEPIC, flyback and inverting switchers and
+    controllers (output traced through the inductor on SW, past the diode of a boost,
+    through external MOSFETs), charge pumps, PMICs (an edge per output), DC/DC and power
+    modules (also on a connector's designator), load switches, eFuses, hot-swap and
+    ideal-diode controllers and chargers; references and supervisors are listed, not
+    taken for converters, and MOSFET drivers are left out. Rails are the nets
+    check_decoupling reads as rails, the converters' inputs and outputs, connector and
+    battery power pins and unnamed nets that only carry power between them; edges are
+    converters and fitted series parts between rails (0 ohm links and shunts, resistors
+    up to 100 ohm or into VREF inputs, ferrites and inductors, fuses, diodes, MOSFETs or
+    transistors, switches, jumpers), oriented from the sources (connector power pins,
+    batteries, converter and reference outputs, ICs' own regulator pins). Loads are parts
+    with a supply pin on a rail, counted per rail. Per converter: EN (tied to its input
+    or another rail, pulled up or down, an undervoltage divider with its ratio, driven by
+    a GPIO, another converter's PG or a supervisor, or floating; held_off when held at
+    the level that keeps the part off), PG (pulled up to which rail, read by which EN,
+    reset or GPIO, or unused), input and output capacitors, the feedback divider (Rtop,
+    Rbot, Vout/Vref, and the Vref the rail name implies, or with vref the output it sets;
+    a leg a jumper switches in is given too) and soft-start, current-limit and mode pins.
+    Per power input (a connector power pin not fed from the board, or a battery; one row
+    per net): fuse, reverse-polarity element (forward diode, P-FET with its drain or N-FET
+    with its source toward the input, ideal diode, crowbar), TVS or clamp, bulk
+    capacitance and inrush parts on its way in; the input findings cover external
+    connectors and power-only ones of unknown exposure. Findings: rail_without_source
+    (warning; info when the rail reaches a connector, one part only, or one part only
+    through a resistor above 100 ohm), enable_floating (warning), enable_held_off
+    (warning; info for one channel of a multi-output part), fb_divider_mismatch (warning
+    when a given vref sets an output more than 5% from the rail name's voltage, else info
+    with the implied Vref), no_input_fuse, no_reverse_protection, no_input_tvs,
+    smps_input_unfiltered (no LC or pi filter on a switcher's input),
+    no_output_capacitor, no_input_capacitor, converter_unknown_rail, pgood_unused and
+    sequencing (EN/PG chains), all info; enable_tied_note (EN tied to its own input, no
+    UVLO divider) only when named in checks.
+
+    It is a heuristic draft read from names, not a simulation: internal pull-ups,
+    fixed-output versions, Vref and thresholds are datasheet facts, so check each
+    converter against its datasheet and say so. vref takes volts per converter
+    ('U5=0.8,U7=0.6') or one number for all; rail and part (comma-separated) narrow the
+    tree and findings to those rails or parts and their neighbours; checks narrows to
+    the names in summary. format='mermaid' returns a flowchart (sources -> protection ->
+    converters -> rails -> load counts) to render or redraw. Converters, findings
+    (warnings first), rails (those with loads and no source first), sources and power
+    inputs page together (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    if format not in ("json", "mermaid"):
+        return json.dumps({"error": "invalid_format",
+                           "message": "format must be 'json' or 'mermaid'."})
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_power_tree(netlist, plan, project.get("parameters") or {},
+                                  checks=checks, rails=_split_names(rail),
+                                  parts=_split_names(part), vref=vrefs)
+    if "error" in prepared:
+        return json.dumps(prepared)
+    steps = POWER_TREE_MERMAID_STEPS if format == "mermaid" else POWER_TREE_STEPS
+    for step in steps:
+        if format == "mermaid":
+            loads, lines = step
+            result = render_power_tree(prepared, format, mermaid_loads=loads,
+                                       mermaid_lines=lines)
+        else:
+            result = render_power_tree(prepared, format, offset=offset, limit=step)
+        result = {"netlist_updated_utc": _netlist_last_updated, **result}
+        if step is not steps[0]:
+            result["page_limited_to" if format == "json" else "mermaid_shrunk"] = (
+                step if format == "json" else
+                "load nodes left out" + (f", cut to {step[1]} lines" if step[1] else ""))
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 # Rows (and findings) per page, tried in turn until the result fits: text formats carry
 # short lines, JSON rows long ones.
 FIRMWARE_PAGE_LIMITS = {"table": (100, 50, 25, 10, 5), "text": (400, 200, 100, 50, 25)}
@@ -5644,6 +5792,11 @@ At minimum, check:
    near_miss_wire_ends) from the circuit, and say whether it is a real fault or
    intended (an intended one wants a No ERC or a level change, not a redesign).
    Off-grid and off-sheet warnings are housekeeping: count them, do not list them.
+7. Power — get_power_tree (rail= or part= for the sheet's rails and regulators): how each
+   rail is fed, each regulator's EN, PG and sequencing, its feedback divider against the
+   datasheet's Vref (vref=), input and output capacitors, input protection and SMPS input
+   filters. Its states are read from names: confirm each against the datasheet before
+   calling it a fault.
 
 For circuit types that require it, apply first principles beyond this
 list. The topology determines what matters.
