@@ -51,8 +51,8 @@ _GENERIC = {
 _PASSIVE = re.compile(r"^(R|C|L|FB)\d", re.IGNORECASE)
 _SIZE = re.compile(r"(?<!\d)(01005|0201|0402|0603|0805|1206|1210|1812|2010|2512)(?!\d)")
 # IPC-7351 names give the metric size code (RESC1005X40N is an imperial 0402).
-_IPC_SIZE = re.compile(r"(?:RES|CAP|IND)[A-Z]{1,2}(\d{4})X", re.IGNORECASE)
-_METRIC_SIZE = {
+IPC_SIZE = re.compile(r"(?:RES|CAP|IND)[A-Z]{1,2}(\d{4})X", re.IGNORECASE)
+METRIC_SIZE = {
     "0402": "01005", "0603": "0201", "1005": "0402", "1608": "0603", "2012": "0805",
     "3216": "1206", "3225": "1210", "4532": "1812", "5025": "2010", "6332": "2512",
 }
@@ -87,9 +87,9 @@ def normalize_value(text: str | None):
 def _size(part: BomPart) -> str | None:
     """The imperial size code from the footprint (IPC-7351 names are metric), else from
     the footprint or description text."""
-    ipc = _IPC_SIZE.search(part.footprint or "")
-    if ipc and ipc[1] in _METRIC_SIZE:
-        return _METRIC_SIZE[ipc[1]]
+    ipc = IPC_SIZE.search(part.footprint or "")
+    if ipc and ipc[1] in METRIC_SIZE:
+        return METRIC_SIZE[ipc[1]]
     # An IPC body size outside the table (RESC2013) is no imperial code: the text decides.
     footprint = "" if ipc else part.footprint
     match = _SIZE.search(" ".join(filter(None, (footprint, part.description))))

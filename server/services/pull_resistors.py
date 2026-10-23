@@ -133,10 +133,14 @@ _REGULATOR_SWITCH = re.compile(r"SW\d*|LX\d*|PH\d*|VSW\d*")
 _BOOTSTRAP = re.compile(r"BOOT|BST|CBOOT|BS|CB")
 DIFF_HALF = re.compile(r"(_|-)(P|N|\+|-)$|^(D[PM]|D[+-])$|[+-]$")
 _VOLTAGE = (
-    re.compile(r"(?<![\d.])(\d{1,2})V(\d{1,3})?(?!\d)"),  # 3V3, 1V8, 5V, 12V, 3V3A
-    re.compile(r"(?<![\d.])(\d{1,2})[.,P](\d{1,3})V?(?!\d)"),  # 3.3V, 3P3, 1,8V
+    # 3V3, 1V8, 5V, 12V, 3V3A; not the 8V of 1.8V, 1,8V or 1P8V (the next pattern's).
+    re.compile(r"(?<![\d.,])(?<!\dP)(\d{1,2})V(\d{1,3})?(?!\d)"),
+    re.compile(r"(?<![\d.])(\d{1,2})[.,P](\d{1,3})V?(?!\d)"),  # 3.3V, 3P3, 1,8V, 1P8V
     re.compile(r"^(?:VDD|VCC|VIO|VCCIO|VDDIO|DVDD|AVDD)(\d)(\d)(?!\d)"),  # VDD33, VCC18
 )
+# The two digits after VDD or VCC read as volts and tenths only for the usual rails
+# (VDD33, VCC18, VDD09): a VCC36 or VCC48 is not 3.6 V or 4.8 V.
+_TENTHS_RAILS = frozenset({"08", "09", "10", "11", "12", "15", "18", "25", "28", "33"})
 
 
 def _forms(token: str) -> list[str]:
@@ -199,8 +203,8 @@ def i2c_line(name: str | None) -> tuple[str, str] | None:
 
 
 def rail_voltage(net: str) -> float | None:
-    """Volts from a rail's name: 3V3, +3.3V, 1V8, 5V, VDD_3V3, P3V3, VCC_1.8V, VDD33; None
-    when the name holds no voltage (VCC, VBUS, VBAT) or a negative one."""
+    """Volts from a rail's name: 3V3, +3.3V, 1V8, 5V, VDD_3V3, P3V3, VCC_1.8V, 1P8V, VDD33;
+    None when the name holds no voltage (VCC, VBUS, VBAT, VCC36) or a negative one."""
     text = net.upper().replace("\\", "")
     if text.strip().startswith("-"):
         return None
@@ -211,8 +215,8 @@ def rail_voltage(net: str) -> float | None:
             if match:
                 whole, fraction = match.group(1), match.group(2) or ""
                 value = float(f"{whole}.{fraction}" if fraction else whole)
-                if index == 2 and value > 5:
-                    continue  # VDD60: not a two-digit voltage
+                if index == 2 and whole + fraction not in _TENTHS_RAILS:
+                    continue  # VDD60, VCC36: not a two-digit voltage
                 if 0 < value <= 60:
                     return value
     return None
@@ -234,11 +238,17 @@ _OHM_TEXT = re.compile(
     re.IGNORECASE,
 )
 _OHM_SCALE = {"": 1.0, "r": 1.0, "k": 1e3, "m": 1e6, "meg": 1e6}
+# A value that is arithmetic on numbers ('(12-2.7)/1m', '2/10m'), as simulation parts carry.
+_EXPRESSION = re.compile(r"[\s\d.,()+\-*/^kKmMuUnNpPrRgG]+")
+_OPERATOR = re.compile(r"[\d)]\s*[-+*/^]\s*[\d(.]")
 
 
 def resistance(*texts: str | None) -> float | None:
     """Ohms from the first text holding a resistance: '10k', '4K7', '100R', '10 kOhm',
-    'RES 10K 1% 0402'. normalize_value reads a value field; descriptions are searched."""
+    'RES 10K 1% 0402'. normalize_value reads a value field; descriptions are searched. A
+    simulation expression ('(12-2.7)/1m') is no resistance."""
+    texts = tuple(text for text in texts if not (text and _EXPRESSION.fullmatch(text)
+                                                 and _OPERATOR.search(text)))
     for text in texts:
         value = normalize_value(text)
         if isinstance(value, float):

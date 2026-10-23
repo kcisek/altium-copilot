@@ -86,7 +86,7 @@ try:
     )
     from services import dfm_geometry as geometry
     from services.bom import BOM_KINDS
-    from services.bom_checks import _IPC_SIZE, _METRIC_SIZE, _PASSIVE, _SIZE
+    from services.bom_checks import IPC_SIZE, METRIC_SIZE, _PASSIVE, _SIZE
     from services.fab_profiles import MM
     from services.pcb_compliance import CLEARANCE_TOLERANCE_MIL
     from services.pcb_geometry import (
@@ -102,7 +102,7 @@ except ImportError:
     )
     from server.services import dfm_geometry as geometry
     from server.services.bom import BOM_KINDS
-    from server.services.bom_checks import _IPC_SIZE, _METRIC_SIZE, _PASSIVE, _SIZE
+    from server.services.bom_checks import IPC_SIZE, METRIC_SIZE, _PASSIVE, _SIZE
     from server.services.fab_profiles import MM
     from server.services.pcb_compliance import CLEARANCE_TOLERANCE_MIL
     from server.services.pcb_geometry import (
@@ -412,9 +412,9 @@ def footprint_size(footprint: str | None) -> str | None:
     """The imperial chip size code a footprint name gives (IPC-7351 names are metric:
     RESC1005X40N is an 0402), as bom_checks reads it; None when it names none."""
     text = footprint or ""
-    ipc = _IPC_SIZE.search(text)
+    ipc = IPC_SIZE.search(text)
     if ipc:
-        return _METRIC_SIZE.get(ipc[1])
+        return METRIC_SIZE.get(ipc[1])
     match = _SIZE.search(text)
     return match[1] if match else None
 

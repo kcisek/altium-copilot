@@ -1,0 +1,41 @@
+{
+  "comment": [
+    "check_derating policy template: the built-in defaults, to edit for your own rules.",
+    "Save it in the project folder (next to the .PrjPcb) as derating_policy.json; check_derating reads it on every call and says so (policy.chosen_by project_file).",
+    "Leave out any key to keep its default. A policy argument on the tool call overrides this file for one call.",
+    "Ratios are the highest applied/rated voltage allowed (0.75 = 25% derating). Tables map imperial case codes (0201, 0402, 0603, ...) to numbers; a table here adds to or replaces the default entries it names.",
+    "Keys starting with _ are ignored."
+  ],
+  "name": "Default derating policy",
+  "source": "Altium's ceramic capacitor derating article and its schematic review checklist",
+  "policy": {
+    "ceramic_max_ratio": 0.75,
+    "ceramic_ripple_max_ratio": 0.5,
+    "tantalum_max_ratio": 0.8,
+    "tantalum_polymer_max_ratio": 0.8,
+    "electrolytic_max_ratio": 0.8,
+    "dc_bias_min_ratio": 0.3,
+    "dc_bias_max_case": "0603",
+    "dc_bias_min_uf": {"01005": 0.01, "0201": 0.1, "0402": 1.0, "0603": 4.7},
+    "resistor_max_voltage": {"01005": 15, "0201": 25, "0402": 50, "0603": 75, "0805": 150,
+                             "1206": 200, "1210": 200, "2010": 200, "2512": 200},
+    "resistor_power_w": {"01005": 0.03125, "0201": 0.05, "0402": 0.0625, "0603": 0.1,
+                         "0805": 0.125, "1206": 0.25, "1210": 0.5, "2010": 0.75, "2512": 1.0},
+    "resistor_power_derating": 0.5,
+    "signal_max_v": 5.0,
+    "_notes": {
+      "ceramic_max_ratio": "ceramics: at least 25% derating as standard (Altium's ceramic derating article)",
+      "ceramic_ripple_max_ratio": "ceramics on a switching converter's input, output or switch node: at least 50% derating (same article)",
+      "tantalum_max_ratio": "MnO2 tantalums: at least 20% headroom (Altium's schematic review checklist); 0.5 is common practice on low-impedance rails",
+      "tantalum_polymer_max_ratio": "polymer tantalums: 0.8 (some makers allow 0.9 above 10 V rated)",
+      "electrolytic_max_ratio": "aluminium electrolytic and polymer capacitors, and polarized ones of no stated kind",
+      "dc_bias_min_ratio": "a Class II ceramic at this share of its rating or more gets a DC-bias loss band",
+      "dc_bias_max_case": "the largest case the DC-bias check looks at",
+      "dc_bias_min_uf": "per case, the capacitance in uF from which a part counts as high-value for its size",
+      "resistor_max_voltage": "typical maximum working voltage per size, used when a part states none",
+      "resistor_power_w": "typical power rating per size, used when a part states none",
+      "resistor_power_derating": "info when a resistor dissipates more than this share of its rating",
+      "signal_max_v": "the highest level assumed for a logic output driving an LED resistor"
+    }
+  }
+}

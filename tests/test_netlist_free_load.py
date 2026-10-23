@@ -47,6 +47,7 @@ NETLIST_TOOL_CALLS = {
     "check_pull_resistors": lambda: main.check_pull_resistors(),
     "check_interfaces": lambda: main.check_interfaces(),
     "get_power_tree": lambda: main.get_power_tree(),
+    "check_derating": lambda: main.check_derating(),
     "get_firmware_pin_map": lambda: main.get_firmware_pin_map(),
     "run_erc": lambda: main.run_erc(),
     "check_sch_pcb_sync": lambda: main.check_sch_pcb_sync(),

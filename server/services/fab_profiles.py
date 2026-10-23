@@ -726,7 +726,7 @@ def _short_int(text: str) -> int:
     return int(text)
 
 
-def _read_json(path: Path, root_dir) -> dict:
+def read_project_json(path: Path, root_dir) -> dict:
     """The file's JSON object, read only when it sits directly in the project folder
     (no link out of it); utf-8 with or without a BOM."""
     file = path.name
@@ -770,7 +770,7 @@ def _text(data: dict, key: str, file: str, limit: int) -> str | None:
 
 def _file_profile(path: Path, root_dir, chosen_by: str) -> Profile:
     file = path.name
-    data = _read_json(path, root_dir)
+    data = read_project_json(path, root_dir)
     for key in data:
         if not key.startswith("_") and key not in _FILE_KEYS:
             raise _profile_error(file, f"unknown key '{_clip(key, 60)}'.",

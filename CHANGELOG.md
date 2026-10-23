@@ -6,6 +6,109 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_derating`: component derating check (roadmap #17, `services/derating.py`),
+  read-only and offline from the compiled netlist. Net voltages carry their source and
+  confidence: `rails` given by the user ('VIN=24,VBUS=5', or 'VIN,VIN_F=24' for names
+  sharing one value; they win over everything), grounds (0 V), a voltage in the net name
+  when a name token is a voltage as a whole (3V3, +5V, VDD_1V8, P3V3, 1P8V, 3P3, 72V,
+  HV_400V; -12V, N5V and VNEG_5V negative; VDD33-style names only for the usual rails
+  and at medium confidence, VDD12 and VCC15 (1.2 V or 12 V?) left unknown; never an EN,
+  PG or SENSE net, an AC net such as 24VAC, a frequency such as 32.768K, a pin bank such
+  as A10VCC..., nor a net on a converter's bootstrap, soft-start, compensation,
+  feedback, current-limit, gate or mode pin such as BST_5V or SS_3V3), then the power
+  tree: an output a given `vref` sets through its feedback divider, rails joined to a
+  known one through 0 ohm links, shunts, ferrites, fuses, inductors or common-mode
+  chokes, and a buck's switch node at its input (a boost's at its output, low
+  confidence); last the unloaded midpoint of a two-resistor divider between two known
+  voltages with nothing else on it but capacitors, connectors and IC inputs (medium
+  confidence). Switching converters' inputs, outputs and switch nodes are ripple nets,
+  each naming every converter role it has (output first). The voltage across a capacitor
+  is the difference of its nets' voltages (arrays and feed-throughs per element); a
+  bootstrap capacitor (a switch node to a net of unknown voltage) stays unknown. Each
+  fitted part's rating, dielectric, technology, capacitance, case size and a resistor's
+  power rating come from its parameters (Voltage, Rated Voltage, Voltage Rating,
+  Dielectric, Temperature Coefficient, Type, Power, Power Rating, Case/Package, Size,
+  Case Code (Metric), a package description's body size), then its value, comment and
+  description (a text voltage only when it is a standard rating, so a rail named in a
+  description is not read; of several, those beside the capacitance, dielectric, case or
+  power; AC ratings kept apart), then its part number decoded by the published schemes
+  of Murata GRM/GCM/GRT, TDK C and CGA/CGB/CGJ, Samsung CL, KEMET C...C, Yageo CC/AC,
+  AVX/Kyocera, Taiyo Yuden and Walsin ceramics, KEMET T49x/T5xx, AVX TAJ/TPS/TCJ and
+  Panasonic POSCAP (TP and TQ series) tantalums and Yageo RC, Vishay CRCW (and CRCW-HP),
+  Panasonic ERJ and Stackpole RMCF/RMCP resistors (their size, and whether the series is
+  a high-power one), then the footprint for the size (imperial codes, metric codes
+  marked metric, metric-only or in IPC-7351 names, mapped to imperial). Each field names
+  its source; when sources disagree the value most kinds of source agree on wins (on a
+  tie a parameter, then the decoded part number, then free text, then the footprint),
+  every candidate is listed, a generic technology is narrowed by a precise one (a
+  polymer series after 'Tantalum'), and a lower rating that ties is judged too, its
+  warnings kept as warnings that say the sources disagree. A capacitor of no stated
+  technology with a ceramic dielectric or a chip footprint is taken for a ceramic. A
+  resistor array of numbered pins pairs pins 1 and N, 2 and N-1 (also with one element
+  on ground, unless it says bussed or its one ground pin is an end pin), and an array
+  whose power sources disagree takes the lowest, per element. Findings: over_rated
+  (warning), ceramic_voltage (above 75% of rated, or 50% on a ripple net, C0G too, with
+  the next standard rating that meets it; the reason quotes the policy's limit:
+  warning), tantalum_voltage (above 80% for MnO2 and polymer, mentioning 50% as common
+  practice for MnO2: warning), electrolytic_voltage (above 80%, also polarized parts of
+  no stated kind: warning), capacitor_voltage (a capacitor whose technology was not
+  read: warning above the most lenient limit of any technology, info above the
+  strictest), dc_bias (a Class II ceramic in 0603 or smaller with a high value for its
+  size at 30% of its rating or more: info with an approximate loss band, Class III
+  wider, the datasheet's DC-bias curve as the authority), resistor_voltage (above the
+  stated or typical working voltage of its size: warning; info when only one end's
+  voltage is known), resistor_power (dV^2/R against the stated or typical rating of its
+  size: warning above it, info above the derated half; a 0 ohm link between two voltages
+  is a warning), needs_current (LED series resistors whose bound with Vf = 0 exceeds the
+  derated rating, naming the rail behind the LED when it drives the resistor through it,
+  shunts, series supply resistors and resistors from a rail to a net of unknown voltage:
+  info saying what to get from the datasheet) and unknown_rating (one info row per board
+  listing the capacitors with a known voltage and no rating). Identical findings group
+  into one row with a count. Thresholds come from a policy table: the defaults (after
+  Altium's ceramic capacitor derating article and its schematic review checklist),
+  `derating_policy.json` in the project folder (read and validated like a fab profile;
+  `examples/derating_policy.json` holds the defaults) and the `policy` argument;
+  `policy` in the result says which applied and which keys each layer set, a note says
+  when a ripple limit looser than the standard one has no effect, and invalid keys or
+  values answer `invalid_policy` with a hint. The summary comes first (parts checked by
+  type, net voltages by source, ratings, dielectrics, cases and technologies by source,
+  conflicts, findings by check and severity), then rails_without_voltage (rails whose
+  voltage is not known, most capacitors first, to ask the user about; not switch nodes
+  or converter control nets). `part` and `net` narrow the findings and list those parts
+  with every parsed field, its source and the voltage across, and the named nets'
+  voltages; findings and listed parts page together, and the parts are read once and
+  only rendered per step of the shrink loop. `schematic_review` gains a Ratings
+  checklist item. `power_tree.tree_data` (the built tree as plain data),
+  `bom_checks.IPC_SIZE` and `METRIC_SIZE` and `fab_profiles.read_project_json` are
+  public now and their callers use them; the other tools' output on Altium's examples is
+  unchanged. Calibrated on Altium's 11 public AD25 example projects (743 capacitors and
+  530 resistors; ratings read for 93% of capacitors, 82% from parameters; 388 capacitors
+  with a known voltage; 7 ceramic_voltage warnings, all 100 uF 6.3 V parts on a 3.3 V
+  net that is a buck's output and two bucks' input, 8 dc_bias parts, 48 parts listed for
+  currents, 4 divider legs above their derated power, 256 capacitors whose two voltage
+  parameters disagree, settled by their text and part number; a hand review of about 100
+  distinct parts found no parse errors left after a generic 'Tantalum' learnt to defer
+  to a polymer series and POSCAP values were read in uF) and on 53 private boards read
+  in aggregate (1113 capacitors and 935 resistors; ratings read for 93% of capacitors:
+  27% from parameters, 53% from text, 13% from part numbers; a decoded part number
+  agreed with 459 of 462 ratings read from parameters or text (on the 3 others the
+  comment and description give four times the part number's rating, and the part number
+  now settles the tie), all 597 sizes and all 592 dielectrics read elsewhere; 209
+  capacitors with a known voltage, 128 ripple nets; 38 capacitors with a ceramic_voltage
+  warning, 37 of them on converter outputs (23 between 50% and 60% of their rating) and
+  1 at 75-100% of the rating its part number gives; 3 dc_bias parts; 50 parts in
+  needs_current; output at most 11k characters, runtime under 0.1 s). Calibration and
+  review removed name voltages read from a crystal frequency, a pin-bank name, a
+  bootstrap or soft-start net named after its rail, a P-form name with a trailing V
+  (P1P8V read as 8 V) and a VCC with two digits that are no usual rail (VCC36 read as
+  3.6 V); a 0 ohm link on an LED's rail taken for its resistor; voltage-parameter
+  conflicts judged against the outvoted value; an isolated resistor array with one
+  element on ground read as every pin to ground; and a divider's top leg taken for a
+  series supply resistor. Not covered: transients, tolerance and ripple amplitude
+  (voltages are nominal), ripple current and ESR heating, temperature derating curves,
+  resistor pulse and surge ratings, the actual DC-bias value, inductor, diode, MOSFET
+  and connector ratings, and boards whose rail names carry no voltage until the user
+  gives them in `rails`.
 - `get_power_tree`: power tree extraction and power-path checks (roadmap #15,
   `services/power_tree.py`), read-only and offline from the compiled netlist, as JSON or
   a Mermaid flowchart (sources -> protection -> converters -> rails -> load counts).
@@ -1436,6 +1539,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   89 boards
 
 ### Fixed
+- The rail voltage read from a net name (`pull_resistors.rail_voltage`, shared by
+  `check_pull_resistors`, `get_power_tree`, `run_erc`'s rail advisories,
+  `get_firmware_pin_map` and `check_derating`) read the digit before the V of a P-form
+  name with a trailing V: 1P8V and P1P8V gave 8 V, VDD_1P35V 35 V and 3P3V 3 V (and
+  1,8V 8 V). They now give 1.8 V, 1.35 V and 3.3 V. A VDD or VCC with two digits reads
+  as volts and tenths only for the usual rails (08, 09, 10, 11, 12, 15, 18, 25, 28, 33):
+  VCC36 or VCC20 no longer reads as 3.6 V or 2.0 V. Altium's examples hold no such
+  names; their outputs are unchanged
+- `pull_resistors.resistance` read a simulation expression as a resistance ('(12-2.7)/1m'
+  as 1 Mohm, '2/10m' as 2 ohm); an arithmetic value is no resistance now. On Altium's
+  'Quick start' example (simulation values) this changes no tool's output
 - `get_design_hierarchy` read an off-sheet connector (a RECORD=17 with
   IsCrossSheetConnector=T) as a power port; it is no longer listed among the power ports
   or joined by name with them
