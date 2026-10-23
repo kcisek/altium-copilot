@@ -98,7 +98,16 @@ try:
     from services.project_options import build_project_options, page_project_options
     from services.erc import build_erc, page_erc
     from services.project_integrity import build_project_integrity, page_project_integrity
-    from services.output_jobs import build_output_jobs, draftsman_outputs, page_output_jobs
+    from services.output_jobs import (
+        build_output_jobs, draftsman_outputs, page_output_jobs, variant_outputs,
+    )
+    from services.variants import (
+        GROUPS as VARIANT_DIFF_GROUPS, compare as compare_variant_views,
+        documentation as variant_documentation, draftsman_variants,
+        export_rows as variant_export_rows, group_rows as group_variant_rows,
+        same_variant, shown_values as shown_variant_values,
+        unvalidated as unvalidated_variant_rows, view_of as variant_view,
+    )
     from services.fab_drawing import (
         board_facts as fab_board_facts, build_fab_drawing, page_fab_drawing,
     )
@@ -191,7 +200,14 @@ except ImportError:
         build_project_integrity, page_project_integrity,
     )
     from server.services.output_jobs import (
-        build_output_jobs, draftsman_outputs, page_output_jobs,
+        build_output_jobs, draftsman_outputs, page_output_jobs, variant_outputs,
+    )
+    from server.services.variants import (
+        GROUPS as VARIANT_DIFF_GROUPS, compare as compare_variant_views,
+        documentation as variant_documentation, draftsman_variants,
+        export_rows as variant_export_rows, group_rows as group_variant_rows,
+        same_variant, shown_values as shown_variant_values,
+        unvalidated as unvalidated_variant_rows, view_of as variant_view,
     )
     from server.services.fab_drawing import (
         board_facts as fab_board_facts, build_fab_drawing, page_fab_drawing,
@@ -458,14 +474,29 @@ DNP reasons, fabrication requirements. Use it.
 
 - get_bom gives the BOM of the active variant (or another, or '[No Variations]'): lines
   with quantity, designators, Comment, footprint, manufacturer and MPN, from the compiled
-  parts, without Not Fitted and no-BOM parts. compare_variants shows what each variant
-  changes; format csv gives the lines as CSV.
+  parts, without Not Fitted and no-BOM parts. Its compare_variants=true shows what each
+  variant changes in the BOM; format csv gives the lines as CSV.
 - check_bom before a release or when asked whether the BOM is right. mpn_coverage_percent
   low means the project keeps MPNs elsewhere (e.g. ActiveBOM, not read): say so instead
   of listing every part as missing one.
 - get_component's mpn falls back to Comment; for part numbers in a BOM use get_bom.
   A line's varies lists values its parts disagree on (varies_count when there are
   more): mention them, the line is not one part.
+
+## Variants
+
+- get_component, get_sheet_context and search_components show the active variant's
+  values: a part it varies has variant_changes (or a "variant <name>:" line) with the
+  base design's values and any alternate part; a part it does not fit keeps its base
+  values. Say which variant each value belongs to.
+- compare_variants — "what's different between these two variants?", "what does the
+  Lite variant change?", "is each variant documented?", before releasing a variant: every
+  fitted / not fitted, value (Value, Comment), other parameter and alternate-part
+  difference between a (default: active) and b (default: '[No Variations]'), bound by
+  UniqueId like get_bom; its documentation block says per variant whether a connected
+  BOM, pick-and-place and assembly-drawing output is set to it and which Draftsman
+  drawings are set to it or name it in their notes (info only: get_output_jobs has the
+  details). Quote binding stored_designators and stale_variant_entries when present.
 
 ## Pull-ups and Floating Nets
 
@@ -977,9 +1008,12 @@ def _resolve_dnp_uids(variant_state: VariantState, netlist: dict | None) -> None
     if not names:
         return
     for variant in variant_state.variants:
+        plan = plan_variant(variant, netlist, names)
         if variant.variations:
-            plan = plan_variant(variant, netlist, names)
             variant.dnp_refdes = sorted(plan.not_fitted, key=natural_key)
+        # Varied parameters and alternate parts follow the same binding, for
+        # get_component and get_sheet_context.
+        variant.bind(plan.params, plan.alternates)
 
 
 class PcbSession:
@@ -1784,15 +1818,19 @@ def _get_component_impl(netlist: dict, variant_state: VariantState, refdes: str)
     detail = {"refdes": matched}
     if comp.get("logical_refdes"):
         detail["logical_refdes"] = comp["logical_refdes"]
-    return json.dumps({
+    shown, changes = shown_variant_values(variant_state, matched, comp)
+    result = {
         **detail,
-        "mpn": comp.get("mpn"),
-        "description": comp.get("description"),
-        "value": comp.get("value"),
+        **shown,
         "dnp": variant_state.is_dnp(matched),
         "sheet": comp.get("sheet"),
-        "pins": comp.get("pins", {}),
-    }, indent=2)
+    }
+    if changes:
+        # The active variant's values are shown above; variant_changes says what the
+        # base design has.
+        result["variant_changes"] = changes
+    result["pins"] = comp.get("pins", {})
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(title="Get Component", annotations=ToolAnnotations(readOnlyHint=True))
@@ -1801,7 +1839,13 @@ def get_component(refdes: str) -> str:
     Use this to drill into a specific component and trace its connections.
     refdes is the board designator; logical_refdes, when present, is the different one
     drawn on the sheet (board-level annotation), also accepted as refdes when no board
-    part has that name."""
+    part has that name.
+
+    mpn, description and value are the active variant's: when the variant varies the
+    part, variant_changes lists each changed field with its base value (fields), the
+    varied parameters that differ from the base design's (parameter, value, base) and an
+    alternate part (lib_reference, library, footprint, with base_lib_reference and
+    base_footprint). A part the variant does not fit (dnp) keeps its base values."""
     try:
         _, netlist, variant_state = _require_project()
     except ProjectNotReady as e:
@@ -1811,7 +1855,8 @@ def get_component(refdes: str) -> str:
 
 # ---------- search_components ----------
 
-def _search_components_impl(netlist: dict, pattern: str, search_by: str) -> str:
+def _search_components_impl(netlist: dict, pattern: str, search_by: str,
+                            variant_state: VariantState | None = None) -> str:
     if search_by not in ("refdes", "mpn", "description"):
         return json.dumps({
             "error": "invalid_search_by",
@@ -1830,6 +1875,8 @@ def _search_components_impl(netlist: dict, pattern: str, search_by: str) -> str:
     components = netlist.get("components", {})
     matches: dict = {}
     for refdes, comp in components.items():
+        # The active variant's MPN, description and value, as get_component shows them.
+        comp = {**comp, **shown_variant_values(variant_state, refdes, comp)[0]}
         if search_by == "refdes":
             target = refdes
         elif search_by == "mpn":
@@ -1878,12 +1925,13 @@ def _search_components_impl(netlist: dict, pattern: str, search_by: str) -> str:
 @mcp.tool(title="Search Components", annotations=ToolAnnotations(readOnlyHint=True))
 def search_components(pattern: str, search_by: str = "description") -> str:
     """Search components by regex pattern. search_by: 'refdes', 'mpn', or 'description'.
-    Returns components grouped by MPN with counts. Use get_component for full pin detail."""
+    Returns components grouped by MPN with counts. Use get_component for full pin detail.
+    MPN, description and value are the active variant's, as get_component shows them."""
     try:
-        _, netlist, _ = _require_project()
+        _, netlist, variant_state = _require_project()
     except ProjectNotReady as e:
         return json.dumps(e.payload)
-    return _search_components_impl(netlist, pattern, search_by)
+    return _search_components_impl(netlist, pattern, search_by, variant_state)
 
 
 # ---------- get_sheet_context ----------
@@ -1956,6 +2004,10 @@ def get_sheet_context(sheet_name: str | None = None, offset: int = 0) -> str:
     the active Altium tab. Use this as the FIRST tool for any question about a sheet, and
     again with sheet_name when following cross-sheet signals. Only call query_net or
     get_component afterward for high-fanout nets (>25 pins) or two-hop tracing.
+
+    Components show the active variant's MPN, description and value; a part the variant
+    varies (parameters, alternate part) has a "variant <name>:" line with the base
+    design's values, and a part it does not fit ([DNP]) keeps its base values.
 
     The first page also carries a design_notes block: the designer's notes, text frames,
     labels, pictures, directives and title block on that sheet. "(near R4, U1)" names the
@@ -2423,12 +2475,43 @@ def check_fab_drawing(document: str | None = None, offset: int = 0) -> str:
 def _list_variants_impl(variant_state: VariantState) -> str:
     variants = []
     for v in variant_state._variants:
-        variants.append({
+        entry = {
             "name": v.name,
             "dnp_count": len(v.dnp_refdes),
             "dnp_components": v.dnp_refdes,
             "is_active": v.name == variant_state.active.name,
-        })
+        }
+        # Varied parameters and alternate parts of the parts the variant fits, by the
+        # designator they apply to (bound like the BOM once the netlist is loaded); left
+        # out when there are none.
+        not_fitted = set(v.dnp_refdes)
+        bound = getattr(v, "bound_params", None)
+        params = bound if bound is not None else (getattr(v, "param_variations", None) or {})
+        params = {designator: varied for designator, varied in params.items()
+                  if designator not in not_fitted}
+        if params:
+            entry["varied_parameter_count"] = sum(len(p) for p in params.values())
+            entry["varied_components"] = sorted(params, key=natural_key)
+        bound_alternates = getattr(v, "bound_alternates", None)
+        if bound_alternates is not None:
+            alternates = [{"designator": designator,
+                           **alternate["variation"].alternate_identity()}
+                          for designator, alternate in sorted(
+                              bound_alternates.items(), key=lambda kv: natural_key(kv[0]))]
+        else:
+            alternates = v.alternate_parts() if hasattr(v, "alternate_parts") else []
+        alternates = [row for row in alternates if row["designator"] not in not_fitted]
+        if alternates:
+            entry["alternate_parts"] = [
+                {key: row[key] for key in ("designator", "lib_reference", "library",
+                                           "footprint", "same_footprint", "library_error")
+                 if key in row}
+                for row in alternates]
+        if getattr(v, "allow_fabrication", False):
+            entry["allow_fabrication"] = True
+        if getattr(v, "parameters", None):
+            entry["parameters"] = v.parameters
+        variants.append(entry)
     return json.dumps({
         "active_variant": variant_state.active.name,
         "variants": variants,
@@ -2438,7 +2521,13 @@ def _list_variants_impl(variant_state: VariantState) -> str:
 @mcp.tool(title="List Variants", annotations=ToolAnnotations(readOnlyHint=True))
 def list_variants() -> str:
     """List all project variants and their DNP component lists.
-    Call this at session start so the user can choose which variant to work in."""
+    Call this at session start so the user can choose which variant to work in.
+    A variant that varies more than fitting also lists varied_components (the parts it
+    fits that have varied parameters, varied_parameter_count in all), alternate_parts
+    (designator, lib_reference, library, footprint; same_footprint keeps the base
+    part's; library_error when the .PrjPcbVariants file could not be read),
+    allow_fabrication (it varies fabrication outputs too) and its parameters.
+    compare_variants(a, b) lists every difference between two variants."""
     try:
         _, _, variant_state = _require_project(netlist=False)
     except ProjectNotReady as e:
@@ -2463,13 +2552,188 @@ def _set_active_variant_impl(variant_state: VariantState, variant_name: str) -> 
 
 @mcp.tool(title="Set Active Variant", annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 def set_active_variant(variant_name: str) -> str:
-    """Switch the active variant. DNP annotations on get_component and get_sheet_context
-    will reflect the new variant immediately."""
+    """Switch the active variant. DNP annotations, varied values and alternate parts on
+    get_component and get_sheet_context will reflect the new variant immediately."""
     try:
         _, _, variant_state = _require_project(netlist=False)
     except ProjectNotReady as e:
         return json.dumps(e.payload)
     return _set_active_variant_impl(variant_state, variant_name)
+
+
+# ---------- compare_variants ----------
+
+VARIANT_DIFF_LIMITS = (100, 40, 15, 5, 1)
+VARIANT_STALE_SHOWN = 20
+COMPARE_VARIANTS_NOTES = [
+    "Altium's variation types: Fitted, Fitted with varied parameters, Not Fitted and "
+    "Alternate Part; a part Not Fitted in both variants is left out, and one fitted in "
+    "only one is listed under fitted with that side's variations.",
+    "A value or parameter a variant does not vary is the base part's (an alternate "
+    "part's: its copy in the project's .PrjPcbVariants file).",
+    "Read from the saved .PrjPcb, sheets and OutJobs; Altium's Variant Management "
+    "dialog is the final word.",
+]
+COMPARE_VARIANTS_UNBOUND_NOTE = (
+    "No netlist is loaded: designators are the ones stored in the .PrjPcb (a renamed part "
+    "keeps its old one; '?' designators show their UniqueId) and base values are not "
+    "known. Load the netlist (refresh_netlist) to bind variations by UniqueId."
+)
+COMPARE_VARIANTS_UNVALIDATED_NOTE = (
+    "Alternate parts with another library part or footprint, and Value variations, have "
+    "no validated sample: check them in Altium's Variant Management dialog."
+)
+
+
+def _variant_or_base(variant_state: VariantState, name: str):
+    """(variant or None for the base design, error or None)."""
+    chosen = variant_state.get(name.strip())
+    if chosen is not None:
+        return chosen, None
+    if name.strip().lower() in BOM_BASE_NAMES:
+        return None, None
+    return None, _variant_not_found(name, variant_state)
+
+
+def _variant_documentation(project: dict, variant_state: VariantState,
+                           notes_cache: DesignNotesCache) -> dict:
+    """compare_variants' per-variant documentation check (info only)."""
+    names = [variant.name for variant in variant_state.variants]
+    drawings = []
+    for path in project.get("pcb_dwf_paths") or []:
+        try:
+            doc = notes_cache.draftsman(path) if Path(path).is_file() else None
+        except Exception as error:  # an unreadable drawing is reported as such
+            logging.warning("Draftsman document not read for compare_variants: %s", error)
+            doc = None
+        drawings.append((PureWindowsPath(path).name, doc))
+    drawing_info = draftsman_variants(drawings, names)
+    try:
+        model = variant_outputs(project, notes_cache.draftsman)
+    except Exception as error:  # a broken OutJob must not fail the comparison
+        model = {"error": "outjobs_unreadable", "message": f"{type(error).__name__}: {error}"}
+    outputs = model.get("outputs") or []
+    result: dict = {
+        "per_variant": variant_documentation(names, outputs, drawing_info),
+        "outjobs": model.get("outjobs", 0),
+    }
+    base = [o for o in outputs if o["connected"] and same_variant(o["variant"], BASE_VARIANT)]
+    if base:
+        result["outputs_on_base_design"] = len(base)
+    if model.get("error"):
+        result["outjob_error"] = model.get("message") or model["error"]
+    if drawing_info:
+        result["draftsman"] = drawing_info
+    result["note"] = (
+        "Info only: a connected OutJob output (BOM, pick and place, assembly drawing: a "
+        "Draftsman drawing's own variant counts) set to each variant, and the Draftsman "
+        "drawings set to it or whose notes name it. get_output_jobs has the details.")
+    return result
+
+
+def _compare_variants_impl(project: dict, netlist: dict | None, variant_state: VariantState,
+                           a: str | None, b: str | None, offset: int,
+                           notes_cache: DesignNotesCache | None) -> str:
+    if not defined_variant_count(variant_state.variants):
+        return json.dumps({
+            "error": "no_variants",
+            "message": "The project defines no variant (Project > Variants in Altium); "
+                       "there is nothing to compare.",
+        })
+    if a is None or not a.strip():
+        chosen_a = variant_state.active
+    else:
+        chosen_a, error = _variant_or_base(variant_state, a)
+        if error:
+            return json.dumps(error)
+    chosen_b, error = (None, None) if b is None or not b.strip() else \
+        _variant_or_base(variant_state, b)
+    if error:
+        return json.dumps(error)
+    if netlist is not None:
+        no_components = _no_components_error(netlist)
+        if no_components:
+            return json.dumps(no_components)
+    view_a, view_b = variant_view(chosen_a, netlist), variant_view(chosen_b, netlist)
+    rows = compare_variant_views(view_a, view_b, netlist)
+    summary = {group: sum(1 for row in rows if row["group"] == group)
+               for group in VARIANT_DIFF_GROUPS}
+    header: dict = {
+        "a": view_a.name,
+        "b": view_b.name,
+        "binding": "unique_id" if netlist is not None else "stored_designators",
+        "summary": {group: count for group, count in summary.items() if count},
+        "differences_total": len(rows),
+    }
+    offset = max(0, int(offset or 0))
+    extras: dict = {}
+    if offset == 0:
+        stale = {side: view.stale for side, view in (("a", view_a), ("b", view_b))
+                 if view.stale}
+        if stale:
+            extras["stale_variant_entries"] = {
+                side: entries[:VARIANT_STALE_SHOWN] for side, entries in stale.items()}
+            extras["stale_variant_entries_note"] = (
+                "Variation lines that no longer fit their part (check_bom's "
+                "stale_variant_entries); they were bound as described or not applied.")
+        if notes_cache is not None:
+            extras["documentation"] = _variant_documentation(project, variant_state,
+                                                             notes_cache)
+        notes = list(COMPARE_VARIANTS_NOTES)
+        if netlist is None:
+            notes.insert(0, COMPARE_VARIANTS_UNBOUND_NOTE)
+        if unvalidated_variant_rows(rows):
+            notes.append(COMPARE_VARIANTS_UNVALIDATED_NOTE)
+        errors = sorted({getattr(alternate.get("variation"), "library_error", "")
+                         for view in (view_a, view_b)
+                         for alternate in view.alternates.values()} - {""})
+        if errors:
+            notes.append(
+                f"The project's .PrjPcbVariants file could not be read ({errors[0]}): "
+                "alternate parts show only what the variant itself stores.")
+        extras["notes"] = notes
+    rendered = ""
+    for limit in VARIANT_DIFF_LIMITS:
+        page = rows[offset:offset + limit]
+        result = {**header, "offset": offset, "has_more": offset + limit < len(rows)}
+        if result["has_more"]:
+            result["next_offset"] = offset + limit
+        result["differences"] = group_variant_rows(page)
+        result.update(extras)
+        if limit < VARIANT_DIFF_LIMITS[0]:
+            result["differences_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
+@mcp.tool(
+    title="Compare Variants",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def compare_variants(a: str | None = None, b: str | None = None, offset: int = 0) -> str:
+    """Every difference between two variants: a (default: the active one) and b
+    (default: the base design, '[No Variations]'). Grouped by kind, designators in
+    natural order: fitted (fitted in one only, with that side's varied parameters or
+    alternate part), values (Value and Comment), parameters (any other varied parameter;
+    Description and Footprint against the part's own), alternate_parts (the part each
+    places: library reference, library, footprint; an alternate's library copy brings
+    its own values and parameters) and variant_parameters. Each row gives a's and b's
+    value and the base design's.
+
+    The first page adds documentation: per variant, the connected OutJob outputs set to
+    it (BOM, pick and place, assembly drawing) and outputs_missing, and the Draftsman
+    drawings set to it or whose notes name it (info only); and stale_variant_entries.
+    Variations bind to parts by UniqueId like get_bom (binding stored_designators
+    without a netlist). Differences are paginated (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    return _compare_variants_impl(project, netlist, variant_state, a, b, offset,
+                                  _design_notes)
 
 
 def _convert_units(obj, to_mm: bool, inside_mil: bool = False):
@@ -5529,12 +5793,24 @@ def _bom_header(netlist: dict, plan, parts: list, excluded: dict) -> dict:
     }
     if plan.stale:
         header["stale_variant_entries"] = len(plan.stale)
-    if any(part.alternate_part for part in fitted):
+    alternates = [part for part in fitted if part.alternate_part]
+    if alternates and all(part.alternate_library for part in alternates):
         header["alternate_parts_note"] = (
-            "Alternate parts take their footprint from the variant; their library data "
-            "(Comment, description, MPN) is not read, only the variant's parameter "
-            "variations."
+            "Alternate parts take their parameters (Comment, MPN) and description from "
+            "their copy in the project's .PrjPcbVariants file, with the variant's "
+            "parameter variations on top, and their footprint from the variant."
         )
+    elif alternates:
+        header["alternate_parts_note"] = (
+            "Alternate parts take their footprint from the variant; the library data "
+            "(Comment, description, MPN) of those not found in the project's "
+            ".PrjPcbVariants file is not read, only the variant's parameter variations."
+        )
+        errors = sorted({getattr(alternate.get("variation"), "library_error", "")
+                         for alternate in plan.alternates.values()} - {""})
+        if errors:
+            header["alternate_parts_note"] += (
+                f" The .PrjPcbVariants file could not be read ({errors[0]}).")
     return header
 
 
@@ -5555,14 +5831,16 @@ def get_bom(
     the base design): lines with quantity, designators, Comment, description, value,
     footprint, manufacturer and manufacturer part number. Built from the compiled parts
     (compile-masked parts are not in it); Graphical, Net Tie and Standard (No BOM) parts
-    and the variant's Not Fitted parts are left out, its parameter variations applied.
+    and the variant's Not Fitted parts are left out, its parameter variations applied
+    (an alternate part takes its copy's data from the project's .PrjPcbVariants file).
     The MPN comes from part parameters, never from Comment ('N/A' and the like are
     shown as mpn_placeholder). group_by mpn groups by MPN, else Comment and footprint;
     comment always by Comment and footprint. A field the line's parts disagree on is in
     varies with its values; logical_designators maps a part to its sheet designator.
 
     include_not_fitted lists the Not Fitted parts as lines; compare_variants adds what
-    each variant changes (Not Fitted parts, varied values, alternate parts); format csv
+    each variant changes in the BOM (Not Fitted parts, varied values, alternate parts;
+    the compare_variants tool lists every difference between two variants); format csv
     returns the page as CSV text. Lines are paginated (offset from next_offset)."""
     try:
         project, netlist, variant_state = _require_project()
@@ -6361,7 +6639,13 @@ def _package_for_xfn_impl(
     notes, notes_errors = note_rows(notes_cache, project) if notes_cache is not None else ([], [])
     firmware, firmware_error = _firmware_rows(project, netlist, variant_state)
     try:
-        db_path = export_project(project, netlist, variant_state, version, notes, firmware)
+        variations = variant_export_rows(getattr(variant_state, "variants", []), netlist)
+    except Exception as error:  # never block the snapshot
+        logging.warning("Variant variations not exported: %s", error)
+        variations = []
+    try:
+        db_path = export_project(project, netlist, variant_state, version, notes, firmware,
+                                 variations)
     except Exception as e:
         return json.dumps({"error": "export_failed", "message": str(e)})
     prj_pcb_name = Path(project["prj_pcb_path"]).name
@@ -6419,7 +6703,8 @@ def package_for_xfn() -> str:
     """Export the current schematic project to a portable .db snapshot file for the
     cross-functional team. Only call this tool when the user explicitly asks to package
     or export the project for sharing with firmware, mechanical, test, or reliability
-    engineers. Do not call speculatively. The snapshot holds sheets, variants, components,
+    engineers. Do not call speculatively. The snapshot holds sheets, variants (and their
+    varied parameters and alternate parts: variant_variations), components,
     nets, pins, design notes and the firmware pin map (firmware_pins: pin, name, port, bit,
     net, function, role, pull, the parts each pin reaches; a heuristic) of each fitted MCU,
     radio or module candidate of get_firmware_pin_map in the active variant (at most four,

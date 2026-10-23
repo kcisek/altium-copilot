@@ -29,7 +29,7 @@ Part of the [ee-in-a-box](https://github.com/ee-in-a-box) suite.
 |---|---|---|
 | *"What's on the power sheet?"* | Every component on the sheet with its pins and nets, one-hop cross-sheet neighbours, and the sheet's notes | `get_sheet_context` |
 | *"What's connected to the 3.3V net?"* | Traces the net across all sheets | `query_net` |
-| *"What's different in the Prototype variant?"* | Compares DNP lists between variants; the BOM adds varied values and alternate parts | `list_variants`, `get_bom` |
+| *"What's different in the Prototype variant? Is each variant documented?"* | Every difference between two variants (or a variant and the base design): parts fitted in one only, varied Value and Comment, other varied parameters, alternate parts (library reference, library and footprint, with their copy in the project's `.PrjPcbVariants` file) and variant parameters, bound to the parts by UniqueId like the BOM; and per variant, whether a connected BOM, pick-and-place and assembly-drawing output is set to it and which Draftsman drawings are set to it or name it. `get_component`, `get_sheet_context` and `search_components` show the active variant's values, `get_component` with the base design's | `compare_variants`, `list_variants` |
 | *"Review this power supply circuit"* | Structured multi-phase schematic review | `schematic_review` |
 | *"I'm new to this board, walk me through it"* | A guided tour from the sheet hierarchy to the PCB, outputs, variants and notes, ending in a project primer you keep | `project_tour` |
 | *"What does U12 do?"* | Pulls component, MPN, value, DNP status, all pins, connected nets | `get_component` |

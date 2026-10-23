@@ -345,6 +345,41 @@ def draftsman_outputs(project: dict) -> list[dict]:
     ]
 
 
+def variant_outputs(project: dict, read_drawing) -> dict:
+    """The BOM, pick-and-place and assembly-drawing outputs of the OutJobs the project
+    lists, with the variant each one uses, for compare_variants' documentation check:
+    {"outputs": [{role, outjob, output, type, variant, variant_from, connected}],
+    "outjobs": n}, or {"error": ...}. An assembly drawing's variant is a Draftsman
+    drawing's own when it has one (what a release prints), else the OutJob's."""
+    prj_path = project["prj_pcb_path"]
+    try:
+        documents = parse_prj_documents(prj_path)
+        prj = parse_prj_pcb(prj_path)
+        options = parse_prj_options(prj_path)
+    except (OSError, UnicodeDecodeError) as error:
+        return {"error": "project_file_unreadable",
+                "message": f"{Path(prj_path).name}: {type(error).__name__}: {error}"}
+    context = _Context(project, prj, options, documents, read_drawing)
+    rows = []
+    for out in context.outputs:
+        role = next((name for name in ("bom", "pick_and_place", "assembly_drawing")
+                     if out.output.type in ROLES[name]), None)
+        if role is None:
+            continue
+        variant, source = out.variant, out.variant_from
+        if role == "assembly_drawing":
+            if _is_assembly_drawing(context, out) is False:
+                continue
+            drawn = _drawing_variant(context, out)
+            if drawn != variant:
+                variant, source = drawn, "drawing"
+        rows.append({"role": role, "outjob": out.job.file,
+                     "output": out.output.name or out.output.type, "type": out.output.type,
+                     "variant": variant, "variant_from": source,
+                     "connected": out.connected})
+    return {"outputs": rows, "outjobs": len(context.listed_jobs())}
+
+
 # ---------- shared state ----------
 
 @dataclass

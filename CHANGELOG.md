@@ -6,6 +6,78 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- Full variant support (roadmap #9, `services/variants.py`): varied parameters, alternate
+  parts and the new `compare_variants` tool, read-only and offline.
+  - Parser (`parsers/prj_pcb.py`): each `[ProjectVariantN]` keeps its UniqueId,
+    AllowFabrication and its variant parameters (the `[ParameterN_M]` sections after it);
+    `VariantDefinition` gains `not_fitted()`, `varied_parameters()` (designator, the
+    UniqueId of its variation line, parameter, value) and `alternate_parts()` (library
+    reference, design item, library, footprint unless IsSameFootprint, database table,
+    the other AltLibLink_* fields). Alternate parts are looked up in the project's
+    `<project>.PrjPcbVariants` file, an OLE schematic library with one storage per
+    alternate part (Altium: "The Alternate Parts are stored in the
+    <ProjectName>.PrjPcbVariants file"): its description, parameters and footprints.
+    `VariationN`, `ParamDesignatorN` and `ParamVariationN` lines are read with spaces
+    around '=' too (`VariationN = ...`), like every other key: some saved projects write
+    every key line that way (3 corpus projects), and one corpus variant has 3 Not Fitted
+    lines written so, which were skipped before. The alternate's library reference is
+    AlternatePart, then AltLibLink_DesignItemID, then SymbolReference, in the identity,
+    the BOM and the library lookup alike. The old `[VariationN]`/`[CompVarN]` format
+    stays DNP-only (no sample, no documentation).
+  - `get_component`, `get_sheet_context` and `search_components` show the active
+    variant's MPN, description and value; a part the variant varies gets
+    `variant_changes` (each changed field with the base design's, the varied parameters
+    that differ from the base design's with their base values, the alternate part with
+    the base part's library reference and footprint), or a `variant <name>:` line on the
+    sheet. Description and Footprint variations compare against the part's fields. A
+    part the variant does not fit keeps its base values (variations stored on it are
+    `stale_variant_entries`, as in get_bom). Variations bind to parts by UniqueId like
+    the BOM (renamed parts keep their variations). Outputs are unchanged for parts a
+    variant does not vary.
+  - `get_bom` and `check_bom`: an alternate part found in the `.PrjPcbVariants` file
+    takes its copy's parameters (Comment, MPN) and description, with the variant's
+    parameter variations on top, and its library reference; without the file, as before,
+    and when the file cannot be read the alternate-parts note says why (so do
+    `list_variants`' `library_error` and compare_variants' notes).
+  - `compare_variants(a, b)` (default: the active variant against `[No Variations]`):
+    parts fitted in one only (with that side's variations), Value and Comment
+    differences (an alternate's library copy brings its own, compared like the variant's
+    variations), other parameters (Description and Footprint against the part's fields),
+    alternate parts (base part or alternate, with `same_as_base_part` when an alternate
+    re-selects the base part) and variant parameters, each with a's, b's and the base
+    design's value, designators in natural order, paginated with the size shrink loop.
+    The first page adds a per-variant documentation check (info only): the connected
+    OutJob BOM, pick-and-place and assembly-drawing outputs set to each variant (a
+    Draftsman drawing's own variant counts) and the roles with none, and the Draftsman
+    drawings set to it or whose notes name it (the name next to the word "variant", as
+    in "variant Lite" or "Lite variant", outside the title block, or a drawing parameter
+    about the variant), whether a drawing prints the VariantName field; and stale
+    variation lines. The unvalidated-format note shows only for a varied Value or an
+    alternate other than the base part. Without a netlist it compares the
+    designators stored in the .PrjPcb (`binding: stored_designators`).
+  - `list_variants` adds, when a variant has them, `varied_components` and
+    `varied_parameter_count` (of the parts it fits), `alternate_parts`,
+    `allow_fabrication` and `parameters`.
+    `project_tour`'s variants step calls `compare_variants` per variant (it called
+    `get_bom(compare_variants=True)`).
+  - `package_for_xfn`: a new `variant_variations` table (variant, refdes, kind
+    parameter or alternate_part, parameter, value, base value, data) for the parts each
+    variant fits; existing tables unchanged, no schema bump. `output_jobs.variant_outputs` lists the BOM,
+    pick-and-place and assembly-drawing outputs with their variant.
+  - Calibration: the 11 public AD25 examples have no variants and no `.PrjPcbVariants`
+    file; every existing tool's output is identical to before on them. On 63 private
+    projects (53 with variants, 63 variants): 315 Not Fitted, 8 fitted and 6
+    alternate-part lines, 175 parameter variations (10 Value or Comment), 6 alternates
+    all found in the `.PrjPcbVariants` file (52 such files; every corpus alternate
+    re-selects the base part); 0 parse failures. compare_variants against the base
+    design matches an independent count of the raw INI in all 63 variants (fitted 314,
+    values 3, parameters 40, alternate parts 6, variant parameters 6): median 2,014
+    characters (max 11,286), median 0.01 s (max 0.33 s). Per variant, 38 of 63 have a
+    connected BOM, pick-and-place and assembly drawing set to them, 9 have none; 44 have
+    a Draftsman drawing set to them. DNP sets and BOM fields are identical to before
+    except in the one variant whose 3 spaced Not Fitted lines are now read.
+  - Unvalidated (no sample): an alternate part with another library part or footprint,
+    a varied Value parameter, variants on multi-channel designs.
 - `check_logic_levels`: driver/receiver logic-level compatibility candidates (roadmap
   #18, `services/logic_levels.py`), read-only and offline from the compiled netlist. For
   every signal that links ICs powered from different rails, each IC pin's I/O supply
