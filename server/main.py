@@ -58,6 +58,10 @@ try:
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
     )
     from services.power_tree import prepare_power_tree, render_power_tree
+    from services.derating import (
+        load_policy as load_derating_policy, parse_rail_map, prepare_derating,
+        render_derating,
+    )
     from services.via_checks import page_result as page_via_result, review_vias
     from services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -143,6 +147,10 @@ except ImportError:
         DEFAULT_MAX_DISTANCE_MIL as DEFAULT_TVS_MAX_DISTANCE_MIL, run_interface_check,
     )
     from server.services.power_tree import prepare_power_tree, render_power_tree
+    from server.services.derating import (
+        load_policy as load_derating_policy, parse_rail_map, prepare_derating,
+        render_derating,
+    )
     from server.services.via_checks import page_result as page_via_result, review_vias
     from server.services.testpoints import (
         build_profile as build_testpoint_profile, marked_testpoint_nets,
@@ -496,6 +504,21 @@ DNP reasons, fabrication requirements. Use it.
   implied_vref against the datasheet's Vref (or pass vref=). format='mermaid' gives a
   flowchart to show the user; rail= and part= narrow it; pages follow next_offset.
 
+## Component Derating
+
+- check_derating — "are my capacitors rated high enough?", "check derating", "will this
+  cap see too much voltage?", "DC bias on my MLCCs?", "is this resistor dissipating too
+  much?", LED or shunt resistors, or the stress part of a schematic review: each
+  capacitor's applied voltage against its rating (ceramics 75%, 50% on a switcher's
+  input or output; tantalums and electrolytics 80%), DC-bias loss bands for small
+  high-value ceramics, resistor working voltage and power. Voltages come from rails=,
+  net names, the power tree and resistor dividers (each with source and confidence);
+  ratings from parameters, text, part numbers and footprints (each with source). Quote
+  sources and say it is a heuristic: confirm findings in the datasheet. Ask the user
+  for the voltages of rails_without_voltage and pass rails='VIN=24'; ask for the
+  currents needs_current asks for. policy says which thresholds applied
+  (derating_policy.json).
+
 ## Firmware Pin Map
 
 - get_firmware_pin_map — "what is the MCU's pinout?", "give the firmware team a pin
@@ -751,8 +774,8 @@ _design_notes = DesignNotesCache()
 NETLIST_TOOLS = (
     "query_net", "get_component", "search_components", "get_sheet_context", "get_bom",
     "check_bom", "check_decoupling", "check_pull_resistors", "check_interfaces",
-    "get_power_tree", "get_firmware_pin_map", "run_erc", "check_sch_pcb_sync",
-    "schematic_review", "package_for_xfn",
+    "get_power_tree", "check_derating", "get_firmware_pin_map", "run_erc",
+    "check_sch_pcb_sync", "schematic_review", "package_for_xfn",
 )
 
 
@@ -4405,6 +4428,123 @@ def get_power_tree(
     return rendered
 
 
+# Findings (and named parts) per page, tried in turn until the result fits; the parts are
+# read once and only rendered per step.
+DERATING_STEPS = (100, 40, 15, 5, 2, 1)
+# check_derating's policy as a client sees it: an object of policy keys, each a number, a
+# case code or an object of case codes to numbers. Typed Any so that the service checks
+# every value and answers invalid_policy with the valid keys.
+DERATING_POLICY_SCHEMA = {
+    "anyOf": [
+        {"type": "object", "additionalProperties": {"anyOf": [
+            {"type": "number"}, {"type": "string"},
+            {"type": "object", "additionalProperties": {"type": "number"}},
+        ]}},
+        {"type": "null"},
+    ],
+}
+
+
+@mcp.tool(
+    title="Check Derating",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_derating(
+    part: str | None = None,
+    net: str | None = None,
+    checks: list[str] | None = None,
+    rails: str | None = None,
+    vref: str | None = None,
+    policy: Annotated[Any, WithJsonSchema(DERATING_POLICY_SCHEMA)] = None,
+    offset: int = 0,
+) -> str:
+    """Component derating check, offline: each capacitor's voltage rating against the
+    voltage across it, small ceramics' DC-bias loss, and resistors' working voltage and
+    power. Call it when the user asks about voltage ratings, derating, whether capacitors
+    are rated high enough, DC bias, resistor power or voltage, LED or shunt resistors, or
+    for the component-stress part of a schematic review.
+
+    Net voltages carry their source and confidence: rails (the user's, e.g.
+    'VIN=24,VBUS=5', or 'VIN,VIN_F=24' for names sharing one value; they win), grounds
+    (0 V), a voltage in the net name (3V3, +5V, VDD_1V8, 1P8V, -12V, VNEG_5V, HV_400V;
+    VDD33-style names at medium confidence, VDD12/VCC15 left unknown; not EN, PG,
+    SENSE or AC nets, nor a converter's bootstrap, soft-start, compensation, feedback or
+    gate net such as BST_5V), then the power tree (an output a given vref sets through its feedback
+    divider; rails joined to a known one through 0 ohm links, shunts, ferrites, fuses or
+    inductors; a buck's switch node peaks at its input, low confidence), then the
+    unloaded midpoint of a two-resistor divider between known voltages. Switching
+    converters' inputs, outputs and switch nodes are ripple nets (every converter role
+    named). Each fitted part's rating, dielectric, technology, capacitance, case size
+    and power rating come from its parameters, then its value, comment and description,
+    then its part number (Murata, TDK, Samsung, KEMET, Yageo, AVX, Taiyo Yuden, Walsin
+    ceramics; KEMET, AVX and POSCAP tantalums; Yageo, Vishay, Panasonic and Stackpole
+    resistors), then its footprint for the size; each field names its source, and
+    sources that disagree are listed (the value most kinds of source agree on is used; on
+    a tie a parameter, then the part number, then text; a lower rating that ties is
+    judged too and its warnings stay warnings). A resistor array's elements pair pins 1
+    and N, 2 and N-1, at the lowest stated power (per element).
+
+    Findings: over_rated (warning), ceramic_voltage (above 75% of rated, or 50% on a
+    ripple net: warning; C0G too), tantalum_voltage (above 80%, MnO2 and polymer:
+    warning), electrolytic_voltage (above 80%: warning), capacitor_voltage (technology
+    not read: warning above the most lenient limit, info above the strictest), dc_bias
+    (a Class II ceramic in 0603 or smaller with a high value for its size at 30% of its
+    rating or more: info with an approximate loss band; the datasheet's DC-bias curve
+    decides),
+    resistor_voltage (above the typical working voltage of its size, 50 V for 0402:
+    warning; info when only one end's voltage is known), resistor_power (dV^2/R against
+    the stated or typical rating: warning above it, info above half of it; a 0 ohm link
+    between two voltages: warning), needs_current (LED series resistors, shunts, series
+    supply resistors and resistors from a rail to a net of unknown voltage whose power
+    cannot be bounded: info saying what to get from the datasheet; ask the user for the
+    current) and unknown_rating (one info row listing the capacitors with a known voltage
+    but no rating read). Thresholds come from a policy: the defaults, then
+    derating_policy.json in the project folder, then policy (e.g.
+    {"ceramic_max_ratio": 0.6}); policy in the result says which applied.
+
+    It is a heuristic, not a simulation: voltages are nominal (no tolerance, transients
+    or ripple peaks), ratings are read from text and can be wrong, and resistor limits are
+    typical for the size: confirm each finding in the datasheet and say so.
+    rails_without_voltage lists rails whose voltage is not known, most capacitors first:
+    ask the user and pass rails. part and net (comma-separated) narrow the findings and
+    list those parts with every parsed field, its source and the voltage across; checks
+    narrows to the names in summary; vref ('U5=0.8') goes to the power tree. Findings
+    (warnings first) and the listed parts page together (offset from next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project()
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    no_components = _no_components_error(netlist)
+    if no_components:
+        return json.dumps(no_components)
+    vrefs, error = _parse_vref(vref)
+    if error:
+        return json.dumps(error)
+    user_rails, error = parse_rail_map(rails)
+    if error:
+        return json.dumps(error)
+    policy_info, error = load_derating_policy(project.get("root_dir"), policy)
+    if error:
+        return json.dumps(error)
+    plan, _, _ = _bom_plan(netlist, variant_state, None)
+    prepared = prepare_derating(netlist, plan, project.get("parameters") or {},
+                                checks=checks, parts=_split_names(part),
+                                nets=_split_names(net), rails=user_rails, vref=vrefs,
+                                policy=policy_info)
+    if "error" in prepared:
+        return json.dumps(prepared)
+    for step in DERATING_STEPS:
+        result = {"netlist_updated_utc": _netlist_last_updated,
+                  **render_derating(prepared, offset=offset, limit=step)}
+        if step != DERATING_STEPS[0]:
+            result["page_limited_to"] = step
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            break
+    return rendered
+
+
 # Rows (and findings) per page, tried in turn until the result fits: text formats carry
 # short lines, JSON rows long ones.
 FIRMWARE_PAGE_LIMITS = {"table": (100, 50, 25, 10, 5), "text": (400, 200, 100, 50, 25)}
@@ -5797,6 +5937,10 @@ At minimum, check:
    datasheet's Vref (vref=), input and output capacitors, input protection and SMPS input
    filters. Its states are read from names: confirm each against the datasheet before
    calling it a fault.
+8. Ratings — check_derating (net= for the sheet's rails, rails='VIN=24' for inputs whose
+   names carry no voltage): capacitor voltage ratings against the rail (ripple nets
+   need 2x), DC bias on small ceramics, resistor power and working voltage, and the
+   LED and shunt currents to look up. Confirm each rating in the datasheet.
 
 For circuit types that require it, apply first principles beyond this
 list. The topology determines what matters.

@@ -162,6 +162,10 @@ def test_i2c_names(name, line):
     ("3V3", 3.3), ("+3V3", 3.3), ("+3.3V", 3.3), ("1V8", 1.8), ("VDD_3V3", 3.3),
     ("P3V3", 3.3), ("5V", 5.0), ("VCC_1.8V", 1.8), ("VDD33", 3.3), ("VCC", None),
     ("VBUS", None), ("-5V", None),
+    # The P and comma forms with a trailing V are volts and fraction, not the last digit.
+    ("1P8V", 1.8), ("P1P8V", 1.8), ("VDD_1P35V", 1.35), ("3P3V", 3.3), ("VCC_1,8V", 1.8),
+    # VDD/VCC and two digits: volts and tenths only for the usual rails.
+    ("VDD12", 1.2), ("VCC18", 1.8), ("VCC36", None), ("VDD60", None),
 ])
 def test_rail_voltage_from_the_name(net, volts):
     assert pr.rail_voltage(net) == volts
@@ -170,6 +174,8 @@ def test_rail_voltage_from_the_name(net, volts):
 @pytest.mark.parametrize("texts, ohms", [
     (("10k",), 10e3), (("4K7",), 4.7e3), (("100R",), 100.0), ((None, "RES 10K 1% 0402"), 10e3),
     (("see note", "Chip Resistor, 49.9 Ohm, 1%"), 49.9), (("DNP",), None),
+    # A simulation expression is no resistance; a value next to a power fraction still is.
+    (("(12-2.7)/1m",), None), (("2/10m",), None), (("RES 10k 1/16W",), 10e3),
 ])
 def test_resistance(texts, ohms):
     assert pr.resistance(*texts) == (pytest.approx(ohms) if ohms else None)

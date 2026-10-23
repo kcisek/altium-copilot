@@ -2012,7 +2012,7 @@ def build_power_tree(netlist: dict, plan=None, project_params: dict | None = Non
     input filter), edges, sources, power inputs with their protection, references,
     supervisors and sequencing chains. vref is a Vref in volts per converter designator,
     or one for all. Heuristic: see the module notes."""
-    return _data(build_tree(netlist, plan, project_params), vref)
+    return tree_data(build_tree(netlist, plan, project_params), vref)
 
 
 def _vref_for(vref, ref: str) -> float | None:
@@ -2025,7 +2025,9 @@ def _vref_for(vref, ref: str) -> float | None:
     return None
 
 
-def _data(tree: _Tree, vref=None) -> dict:
+def tree_data(tree: _Tree, vref=None) -> dict:
+    """A built tree as plain data (what build_power_tree returns), for callers that also
+    read the tree itself (check_derating reads its switch nodes and edges)."""
     converters = []
     enables: dict[str, list[dict]] = {}
     for ref in sorted(tree.converters, key=natural_key):
@@ -2773,7 +2775,7 @@ def prepare_power_tree(
                 ref not in tree.supervisors:
             notes.append(f"{ref} is not recognised as a converter, reference or "
                          "supervisor; the rails it is on are shown.")
-    data = _data(tree, vref)
+    data = tree_data(tree, vref)
     if isinstance(vref, dict):
         dividers = {conv["designator"].casefold() for conv in data["converters"]
                     if any(row.get("state") == "divider" for row in conv.get("feedback", ()))}
