@@ -380,6 +380,45 @@ def variant_outputs(project: dict, read_drawing) -> dict:
     return {"outputs": rows, "outjobs": len(context.listed_jobs())}
 
 
+def output_locations(project: dict) -> dict:
+    """Where the OutJobs the project lists generate their files, for verify_outputs:
+    {"outputs": [{outjob, output, type, variant, document, sources, settings, folder,
+    exact}], "output_path": the resolved Output Path folder, "bomdocs": the project's
+    .BomDoc paths, "outjobs": n}, or {"error": ...}. One row per output and
+    folder-structure container it is connected to; sources are the design documents it is
+    generated from (as the staleness check of get_output_jobs reads them); folder is the
+    container folder (its output sub-folder is not added: Altium names it after the
+    output type's display name, so the caller looks below it). exact False: the
+    container folder is an expression only Altium resolves (CurrentDate, ...), and
+    folder is its base, where each generation gets a folder of its own."""
+    prj_path = project["prj_pcb_path"]
+    try:
+        documents = parse_prj_documents(prj_path)
+        prj = parse_prj_pcb(prj_path)
+        options = parse_prj_options(prj_path)
+    except (OSError, UnicodeDecodeError) as error:
+        return {"error": "project_file_unreadable",
+                "message": f"{Path(prj_path).name}: {type(error).__name__}: {error}"}
+    context = _Context(project, prj, options, documents, lambda path: None)
+    rows = []
+    for out in context.outputs:
+        for index in sorted(out.output.containers):
+            container = out.job.job.container(index) if out.job.job else None
+            if container is None or container.type != "GeneratedFiles":
+                continue
+            path = _container_path(context, container)
+            if path is None:
+                continue
+            settings, _ = _settings(out.output)
+            rows.append({"outjob": out.job.file, "output": out.output.name or out.output.type,
+                         "type": out.output.type, "variant": out.variant,
+                         "document": out.output.document, "sources": context.sources(out),
+                         "settings": settings, "folder": path["resolved"],
+                         "exact": not path.get("container_folder_unresolved")})
+    return {"outputs": rows, "output_path": str(context.resolve(context.output_path)),
+            "bomdocs": list(context.bomdocs), "outjobs": len(context.listed_jobs())}
+
+
 # ---------- shared state ----------
 
 @dataclass
@@ -672,7 +711,7 @@ def _summary(findings: list[dict]) -> dict:
     }
 
 
-def _utc(timestamp: float) -> str:
+def utc_iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -1599,12 +1638,12 @@ def _mtimes(paths: list[str]) -> dict[str, float]:
 
 def _age(newest: float, sources: dict[str, float]) -> dict:
     newer = sorted((t, p) for p, t in sources.items() if t > newest + STALE_TOLERANCE_S)
-    row: dict = {"newest_output_utc": _utc(newest)}
+    row: dict = {"newest_output_utc": utc_iso(newest)}
     if sources:
-        row["design_newest_utc"] = _utc(max(sources.values()))
+        row["design_newest_utc"] = utc_iso(max(sources.values()))
     row["stale"] = bool(newer)
     if newer:
-        row["documents_newer"] = [{"document": Path(p).name, "modified_utc": _utc(t)}
+        row["documents_newer"] = [{"document": Path(p).name, "modified_utc": utc_iso(t)}
                                   for t, p in reversed(newer[-5:])]
     return row
 

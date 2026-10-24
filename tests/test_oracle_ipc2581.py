@@ -6,10 +6,10 @@ environment variables. Never commit oracle files or values derived from them.
 
 import os
 from collections import Counter
-from xml.etree.ElementTree import iterparse
 
 import pytest
 
+from server.parsers.fab_outputs import parse_ipc2581
 from server.parsers.pcb_doc import parse_pcb_doc
 
 PCBDOC = os.environ.get("ALTIUM_COPILOT_ORACLE_PCBDOC")
@@ -20,8 +20,6 @@ pytestmark = pytest.mark.skipif(
     reason="oracle env vars not set",
 )
 
-NS = "{http://webstds.ipc.org/2581}"
-
 
 @pytest.fixture(scope="module")
 def parsed():
@@ -30,38 +28,16 @@ def parsed():
 
 @pytest.fixture(scope="module")
 def ipc():
-    nets: set[str] = set()
-    refdes: set[str] = set()
-    stackup: list[tuple[str, float]] = []
-    span_count = 0
-    via_hole_count = 0
-    for _event, element in iterparse(CVG, events=("start",)):
-        tag = element.tag.removeprefix(NS)
-        if tag == "Component" and element.get("refDes"):
-            refdes.add(element.get("refDes"))
-        elif tag == "StackupLayer":
-            stackup.append(
-                (
-                    element.get("layerOrGroupRef"),
-                    float(element.get("thickness", "0")),
-                )
-            )
-        elif tag == "Span":
-            span_count += 1
-        elif (
-            tag == "LayerHole"
-            and element.get("platingStatus") == "VIA"
-        ):
-            via_hole_count += 1
-        net = element.get("net")
-        if net:
-            nets.add(net)
+    export = parse_ipc2581(CVG)
     return {
-        "nets": nets,
-        "refdes": refdes,
-        "stackup": stackup,
-        "span_count": span_count,
-        "via_hole_count": via_hole_count,
+        "nets": export.net_names,
+        "refdes": {component.refdes for component in export.components},
+        # thickness in mil (the parser converts from the file's units)
+        "stackup": [(layer.name, layer.thickness_mil or 0.0) for layer in export.stackup],
+        "span_count": export.span_count,
+        "via_hole_count": sum(
+            hole.kind == "LayerHole" and hole.plating == "VIA" for hole in export.holes
+        ),
     }
 
 
@@ -120,7 +96,7 @@ def test_copper_thicknesses_match(parsed, ipc):
     for layer in parsed.board.layers:
         if layer.kind == "copper" and layer.copper_thick_mil:
             assert ipc_thickness[layer.name] == pytest.approx(
-                layer.copper_thick_mil * 0.0254,
+                layer.copper_thick_mil,
                 rel=0.01,
             )
 

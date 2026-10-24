@@ -127,6 +127,10 @@ try:
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
     from services.project_tour import build_project_tour, defined_variant_count
+    from services.verify_outputs import (
+        SHRINK_STEPS as VERIFY_SHRINK_STEPS, Tolerances as VerifyTolerances,
+        page_verify_outputs, run_verify_outputs,
+    )
     from services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
         page_release_readiness,
@@ -240,6 +244,10 @@ except ImportError:
         DiffError, diff_folders, diff_revisions, page_design_diff,
     )
     from server.services.project_tour import build_project_tour, defined_variant_count
+    from server.services.verify_outputs import (
+        SHRINK_STEPS as VERIFY_SHRINK_STEPS, Tolerances as VerifyTolerances,
+        page_verify_outputs, run_verify_outputs,
+    )
     from server.services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
         page_release_readiness,
@@ -448,6 +456,19 @@ DNP reasons, fabrication requirements. Use it.
   Draftsman variants, outputs older than the design). Quote each finding's severity, fix
   and source, and not_checked; only a connected output is generated. Generating in
   Altium is the final word.
+
+## Generated Outputs
+
+- verify_outputs — "are my outputs right?", "does the pick-and-place / BOM / drill file
+  match the board?", "check my release package or zip", before sending files to a
+  fabricator or assembler: the files Altium generated (the OutJob folders, or path= a
+  folder or .zip) against the saved design: pick-and-place parts, side, rotation and
+  Center-X/Y; BOM designators, quantities and columns per variant; IPC-D-356A and
+  IPC-2581 nets pin by pin; the IPC-2581 stackup and layer pairs; NC drill tools, hole
+  counts and positions per layer pair; files older than the design. A mismatch says the
+  file and the saved design differ, not which is right: quote the file and the examples,
+  and ask the user to save in Altium and generate again. Quote not_checked (Gerber and
+  ODB++ contents are not read).
 
 ## Fabrication Drawings
 
@@ -6659,6 +6680,158 @@ def get_drc_report(
     return rendered
 
 
+# ---------- verify_outputs ----------
+
+def _verify_board(project: dict, netlist: dict | None):
+    """(index, error message): the PCB session's index; both None without a PcbDoc."""
+    if not project.get("pcb_doc_paths"):
+        return None, None
+    index, error = _pcb_session.get(project, netlist)
+    return index, (error or {}).get("message")
+
+
+def _verify_outputs_model(project: dict, netlist: dict | None, variant_state: VariantState,
+                          **arguments) -> tuple[dict, dict]:
+    """(model, context) of verify_outputs over the loaded project; the model may be an
+    error. Shared with check_release_readiness."""
+    index, board_error = _verify_board(project, netlist)
+    model = run_verify_outputs(project, index, netlist, variant_state, **arguments)
+    paths = project.get("pcb_doc_paths") or []
+    context: dict = {"project": project.get("name")}
+    if paths:
+        context["pcb_doc"] = Path(paths[0]).name
+        if len(paths) > 1:
+            context["note"] = (f"Project lists {len(paths)} PcbDocs; checked against "
+                               f"'{Path(paths[0]).name}'.")
+    if board_error:
+        context["pcb_error"] = board_error
+    if variant_state.variants:
+        context["active_variant"] = variant_state.active.name
+    return model, context
+
+
+@mcp.tool(
+    title="Verify Outputs",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def verify_outputs(
+    path: str | None = None,
+    variant: str | None = None,
+    checks: list[str] | None = None,
+    position_tolerance: float | None = None,
+    rotation_tolerance: float | None = None,
+    drill_tolerance: float | None = None,
+    thickness_tolerance: float | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Cross-check the files Altium generated against the saved design, offline: "are my
+    outputs right?", "does the pick-and-place match the board?", "check my release
+    package", "is this BOM / drill file / IPC netlist up to date?", before sending files
+    to a fabricator or assembler. Not: what the OutJob is set to generate (get_output_jobs),
+    the design's own checks (check_dfm, check_bom).
+
+    Files: path= a folder, a release .zip (read in memory, one nested zip level) or one
+    file (relative to the project folder or absolute); without it, the folders the
+    project's OutJobs generate into (a container folder named by a date/time expression
+    is searched from its base: the newest generation per kind by the folder names' date,
+    else file time; older ones are counted) and the Output Path. Each file is classified
+    by content (a workbook is a BOM once a BOM header row is found) and matched to the
+    OutJob output whose folder holds it; identical files are checked once.
+
+    checks (default all): pick_place (every fitted part of the file's variant present
+    once, Not Fitted parts absent, side, rotation mod 360 as the component's own on both
+    sides, Center-X/Y against the midpoint of the part's pad centres relative to the
+    board origin, Ref-X/Y and Pad-X/Y when present, footprint; Comment and Description
+    as info), bom (designators equal the variant's BOM parts as get_bom builds them, Not
+    Fitted lines, quantity = designator count per line, Comment, Description, Value,
+    Footprint, Manufacturer and MPN columns, a column named after a parameter with its
+    special strings resolved; MPN differences are info when the BOM comes from an
+    ActiveBOM document, whose part choices are not read; the variant from the file's
+    title, its OutJob output (info when the file's parts are exactly another variant's),
+    its name, else the best fit; .xlsx and .csv are read, .xls is not), netlist
+    (IPC-D-356A and IPC-2581 pins against the PcbDoc's pad nets: pins missing, extra or
+    unconnected on one side, nets split, merged or renamed, each with designator, pin and
+    XY; IPC-2581 components and populate flags), stackup (IPC-2581's stackup: copper
+    count, names, order and thickness, the dielectrics between the outer copper layers:
+    thickness, Dk and material; the layers .LDP and .DRR layer pairs name), drill (per
+    drill set: a .DRR report's layer pair with the drill files it names, else an .LDP
+    pair's, else a folder's other drill files as the through holes; Excellon tools vs the
+    board's pad, via and bare holes: size within the tool's written precision plus
+    drill_tolerance, plating, hole and slot counts, hole positions; the .DRR report vs
+    its drill files; a report naming another PcbDoc is called out, not compared) and
+    staleness (a design file the output comes from saved after it, the .PrjPcb's
+    variants included: file times, info).
+
+    variant checks every file against that variant instead of the file's own (default:
+    each file's variant). Tolerances in units (default the board's display unit):
+    position_tolerance (default 0.01 mm), drill_tolerance (default 0.01 mil on top of
+    the written precision); rotation_tolerance in degrees (default 0.01; a file writing
+    whole degrees matches within 0.5), thickness_tolerance in percent (default 10).
+    verdict is consistent, mismatches or no_outputs; findings (warnings first: each a
+    mismatch with its file and examples; info: a stale file, an OutJob output with no
+    file, Comment or Description differences) are paginated (offset from next_offset).
+    A mismatch says the file and the saved design differ, not which is right: quote the
+    file and ask the user to save in Altium and generate again. Quote not_checked
+    (Gerber and ODB++ contents, Board Stack Reports, .xls). Positions (at_mil) are
+    relative to the board origin."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    if units not in (None, "mm", "mil"):
+        return json.dumps({"error": "invalid_units", "message": "units must be 'mil' or 'mm'."})
+    index, _ = _verify_board(project, netlist)
+    resolved = (units or (index.pcb.board.display_unit if index is not None else "mm")).lower()
+    if resolved not in ("mm", "mil"):
+        resolved = "mm"
+    to_mm = resolved == "mm"
+    tolerances = VerifyTolerances()
+    for name, value, most in (("position_tolerance", position_tolerance, None),
+                              ("rotation_tolerance", rotation_tolerance, 180.0),
+                              ("drill_tolerance", drill_tolerance, None),
+                              ("thickness_tolerance", thickness_tolerance, 100.0)):
+        if value is None:
+            continue
+        if not (isinstance(value, (int, float)) and _finite_nonnegative(float(value))
+                and (most is None or value <= most)):
+            return json.dumps({"error": "invalid_tolerance",
+                               "message": f"{name} must be a number of at least 0"
+                                          + (f" and at most {most:g}." if most else ".")})
+    if position_tolerance is not None:
+        tolerances.position_mil = _input_to_mil(float(position_tolerance), resolved)
+    if rotation_tolerance is not None:
+        tolerances.rotation_deg = float(rotation_tolerance)
+    if drill_tolerance is not None:
+        tolerances.drill_mil = _input_to_mil(float(drill_tolerance), resolved)
+    if thickness_tolerance is not None:
+        tolerances.thickness_percent = float(thickness_tolerance)
+    model, context = _verify_outputs_model(
+        project, netlist, variant_state, path=path, variant=variant, checks=checks,
+        tolerances=tolerances)
+    if "error" in model:
+        return json.dumps(model)
+    context["units"] = resolved
+    first = VERIFY_SHRINK_STEPS[0]
+    for limit, examples in VERIFY_SHRINK_STEPS:
+        result = _convert_units({**context, **page_verify_outputs(model, offset, limit,
+                                                                   examples)}, to_mm)
+        if (limit, examples) != first:
+            result["findings_limited_to"] = limit
+            result["examples_per_finding"] = examples
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    brief = {**context, **{key: model[key] for key in (
+        "source", "found", "checks_run", "verdict", "severity_counts") if key in model},
+        "results": model["results"], "findings_total": len(model["findings"]),
+        "files_total": len(model["files"]),
+        "findings_omitted": "The result is too large even at 5 findings per page: call "
+                            "again with checks narrowed to one check."}
+    return json.dumps(_convert_units(brief, to_mm), indent=2)
+
+
 # ---------- check_release_readiness ----------
 
 @mcp.tool(
@@ -6680,8 +6853,9 @@ def check_release_readiness(offset: int = 0) -> str:
     per assembled side (check_dfm), mounting holes, Not Fitted parts left out of the BOM
     and pick-and-place outputs (Altium places them on the PCB by design), the OutJob
     complete for every variant and its generated outputs newer than the design
-    (get_output_jobs), Draftsman fab notes against the stackup (check_fab_drawing),
-    title-block revision and date across sheets and drawings (get_design_notes), project
+    (get_output_jobs) and matching it where verify_outputs reads them (both advisory),
+    Draftsman fab notes against the stackup (check_fab_drawing), title-block revision
+    and date across sheets and drawings (get_design_notes), project
     integrity (check_project_integrity), the Altium 365 copy committed and level
     (get_clone_status), silkscreen DRC, test access on ICT guidance (check_testpoints,
     advisory); and not_verified with the reason: footprints vs libraries, lifecycle and
@@ -6710,6 +6884,7 @@ def check_release_readiness(offset: int = 0) -> str:
         fab_bom=_fab_bom(project, netlist, variant_state),
         clone_status=clone_status,
         offline_erc=lambda: _offline_erc_summary(project),
+        verify_outputs=lambda: _verify_outputs_model(project, netlist, variant_state)[0],
     )
     model = build_release_readiness(inputs)
     for limit in (len(model["gates"]) or 1, 12, 6, 3, 1):

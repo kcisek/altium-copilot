@@ -34,11 +34,11 @@ _HOPS = 4
 _VARIES_SHOWN = 5  # distinct values listed per varying line field
 
 _MANUFACTURER = r"(?:manufacturer|manufact|manuf|mfr|mfg)"
-_MPN_NAME = re.compile(
+MPN_NAME = re.compile(
     rf"^{_MANUFACTURER}\.? ?(?:part ?(?:number|num|no\.?|#)?|pn|p/n|#) ?(\d*)$"
 )
-_MFR_NAME = re.compile(rf"^{_MANUFACTURER}\.?(?: ?name)? ?(\d*)$")
-_PART_NUMBER = re.compile(r"^part ?(?:number|no\.?|#)(?: ?\d+)?$")
+MFR_NAME = re.compile(rf"^{_MANUFACTURER}\.?(?: ?name)? ?(\d*)$")
+PART_NUMBER = re.compile(r"^part ?(?:number|no\.?|#)(?: ?\d+)?$")
 _NATURAL = re.compile(r"(\d+)")
 # Part number texts that say there is none: on purpose ('N/A' on a test point or a
 # fiducial), or not chosen yet ('TBD'), which still needs one.
@@ -51,7 +51,7 @@ _UNDECIDED_MPN = {"tbd", "tba", "?"}
 _FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
 
 
-def _norm_name(name: str) -> str:
+def norm_name(name: str) -> str:
     return re.sub(r"\s+", " ", name.replace("_", " ")).strip().lower()
 
 
@@ -91,16 +91,16 @@ def part_numbers(params: dict[str, str]) -> tuple[str | None, str | None, str | 
     for name, text in params.items():
         if _unset(text):
             continue
-        normal = _norm_name(name)
-        match = _MPN_NAME.match(normal)
+        normal = norm_name(name)
+        match = MPN_NAME.match(normal)
         if match:
             mpns.setdefault(int(match[1] or 0), text.strip())
             continue
-        match = _MFR_NAME.match(normal)
+        match = MFR_NAME.match(normal)
         if match:
             makers.setdefault(int(match[1] or 0), text.strip())
             continue
-        if _PART_NUMBER.match(normal) and generic is None:
+        if PART_NUMBER.match(normal) and generic is None:
             generic = text.strip()
     if mpns:
         index = min(mpns)
@@ -137,6 +137,9 @@ class BomPart:
     alternate_part: str | None = None  # the variant's alternate part (Kind=2)
     # The alternate's data came from its copy in the .PrjPcbVariants file.
     alternate_library: bool = False
+    # Its parameters as the BOM sees them (the variant's variations applied, special
+    # strings as written): what a BOM column of a parameter's name shows.
+    parameters: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def needs_mpn(part: BomPart) -> bool:
@@ -408,6 +411,7 @@ def build_parts(
             mpn_placeholder=placeholder,
             alternate_part=alternate.get("part"),
             alternate_library=library is not None,
+            parameters=params,
         )
         parts.append(part)
     parts.sort(key=lambda part: natural_key(part.designator))
