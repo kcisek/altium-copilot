@@ -1146,6 +1146,7 @@ RELEASE_REVIEW_TOOLS = (
     "check_vias",
     "check_testpoints",
     "diff_design",
+    "run_review_checklist",
 )
 
 RELEASE_REVIEW_PROMPT = """\
@@ -1177,6 +1178,10 @@ Call check_release_readiness (page with next_offset while has_more). Present one
 blocking gates first: | Gate | Blocking | Status | Evidence |
 State the verdict and verdict_summary as given.
 
+Then call run_review_checklist(checklist="release") once and show its coverage table:
+the release checklist adds the items no gate covers (the offline ERC, the generated files
+against the design, footprints against the libraries, release notes, suppliers).
+
 ### Phase 2 — Causes
 
 For each blocking gate that failed, then each warn, call its source_tool once:
@@ -1207,6 +1212,12 @@ Verdict: NO-GO when a blocking gate failed; NOT VERIFIED when none failed but a 
 gate is not_verified (list what the user must confirm in Altium); GO only when the
 verdict is pass, still listing the warnings and the not-verified advisory items as open.
 Never list a not_verified gate as passed, in a table or in the summary.
+
+Finish with the release record: run_review_checklist(checklist="release",
+format="markdown") with decisions= giving your Yes, No or N/A and a one-line reason for
+each needs-judgment item you settled. Show its 'Checklist coverage' table and the record:
+sign-off belongs to the design state it names. Save it only where the user agrees; a
+later review passes it as previous= to see what changed.
 
 Ask: "Shall I dig into a gate, or draft the release notes with diff_design?"
 """

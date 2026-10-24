@@ -266,6 +266,7 @@ MANUFACTURING_REVIEW_TOOLS = (
     "list_variants",
     "set_project_dir",
     "set_active_variant",
+    "run_review_checklist",
 )
 
 PCB_MANUFACTURING_REVIEW_PROMPT = """\
@@ -339,6 +340,9 @@ Do not proceed until the user answers.
    checks=["layer_count", "board_size", "copper_weight"]) and show the echoed profile
    (each limit with its origin) and its scope. Ask the user to confirm the numbers against
    the fab's table.
+4. Checklist: run_review_checklist(checklist="pcb", sections=["manufacturing",
+   "testability"]) and, when assembly is in scope, run_review_checklist(checklist="bom"):
+   show their coverage tables. Their needs-judgment items are what Phases 2-3 decide.
 
 Present a table: | Item | Board | Fab offers (source) |
 
@@ -419,6 +423,12 @@ Verdict, naming the profile: GO (no fail, nothing blocking), GO WITH CONDITIONS 
 results, warnings or open questions the fab or assembler must confirm: list them), or
 NO-GO (a fail of severity error, unrouted connections, shelved or modified pours, a PCB
 out of sync with the schematic). Never a GO on checks that did not run.
+
+Finish with the checklist records: call run_review_checklist again for each checklist
+you ran in Phase 1 (same sections), with format="markdown" and decisions= giving your
+Yes, No or N/A and a one-line reason for each needs-judgment item you settled. Show each
+'Checklist coverage' table and record (tied to the design state it names); save them only
+where the user agrees.
 
 Ask: "Shall I draft the questions for the fabricator and assembler, or dig into a
 finding?"

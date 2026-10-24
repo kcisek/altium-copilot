@@ -10,6 +10,7 @@ if (-not $SkipBuild) {
         --distpath "$root\server\dist" `
         --workpath "$root\build" `
         --add-data "$root\server\scripts;scripts" `
+        --add-data "$root\server\checklists;checklists" `
         --add-data "$root\manifest.json;." `
         --paths "$root\server" `
         "$root\server\main.py"
