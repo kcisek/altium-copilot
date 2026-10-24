@@ -6,6 +6,105 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `check_libraries` and `get_library_part`: the libraries behind the project's parts, read
+  offline (roadmap #52, `services/libraries.py`, on new readers `parsers/sch_lib.py`,
+  `parsers/pcb_lib.py` and `parsers/int_lib.py`). Both work on a netlist-free load (the PCB's
+  parts are then checked) and without a PcbDoc (the schematic's).
+  - Readers: SchLib (FileHeader component list with aliases; per component its pins from the
+    binary pin records and the older text ones, with designator, name, electrical type, part,
+    display mode, hidden, location and length; parameters, description, default designator,
+    Component Type and model links with ModelDataFile0 and UseComponentLibrary), PcbLib
+    (Library/Data names and mechanical layer kinds, per footprint its primitives split by type
+    and read by the PcbDoc decoders: pads, bare holes, tracks, arcs, vias, fills, regions, 3D
+    bodies with model name, id, embedding and V7 layer, texts; Parameters HEIGHT and
+    DESCRIPTION; courtyard, assembly, 3D-body and component-centre outlines by layer kind,
+    mechanical layers above 16 named by the V7 layer id tracks, arcs and fills carry at 41,
+    52 and 42 and by a region's V7_LAYER, where the v6 byte says Mechanical 16) and IntLib (each embedded library is one byte, 2, then a zlib stream holding the library's own
+    OLE file; read in memory). A storage is found by Altium's storage name ('/' as '_', cut
+    to 31 characters), else by reading every storage. `sch_doc.read_records` takes a hook for
+    binary records; `read_records`, `coord_mil`, `pin_end` and `prj_pcb.split_sections` are
+    public now. Schematic parts keep their library, LibraryPath, Workspace and DbLib table
+    and their current footprint's library; PCB components their footprint and component
+    library, SOURCELIBREFERENCE, Workspace flag and HEIGHT; 3D bodies their model name;
+    tracks, arcs, fills and regions their mechanical layer number (`mechanical`). An older
+    3D body record without MODEL.EXTRUDED.MAXZ whose STANDOFFHEIGHT exceeds its
+    OVERALLHEIGHT is read with the two swapped, as Altium places it (the SpiritLevel
+    example's library bodies against their placed copies; no board body read has it).
+  - Resolution, as Altium does it, in the order of the Available File-based Libraries tabs:
+    the project's [DocumentN] libraries, the installed libraries (Altium's AD*\Library and
+    extension library folders plus the existing files of IntLib_Installed.ini), then its
+    [SearchPathN] folders (pattern and subfolders). A
+    symbol is looked up only in the library the part names, by Design Item ID then library
+    reference (a same-name symbol elsewhere is a hint); a footprint in its named library
+    (ModelDataFile0, SOURCEFOOTPRINTLIBRARY, the part's IntLib) first, then in any, as a
+    footprint link set to Any. Exact names first, then differing only in case. A Workspace
+    footprint is read from its cached PcbLib when the PcbDoc names one that exists. Library
+    name indexes are cached by path, size and time.
+  - `check_libraries` checks (default all but where_used): `resolution` (parts placed from a
+    library the project no longer has, with the libraries holding a same-name symbol; names
+    not found; footprints found outside their named library; names differing in case;
+    Workspace and DbLib parts, not readable offline: one finding per side, with the
+    libraries they name counted inside); `footprint_drift` (each placed
+    footprint against its library footprint, as Altium's Footprint Comparison Report: pad
+    and bare-hole counts, pads missing or extra by designator, every pad at one offset from
+    the reference point, the footprint turned or mirrored, pads moved with their delta, pad
+    size, angle, shape, corner radius, hole, slot, plating and layer; Height, 3D bodies and
+    the other primitives' counts per layer as info; parts with the same difference, its
+    numbers within the tolerance, grouped; a footprint compared with a same-name one from
+    another library is labelled; mask and paste expansions, hole offsets, slot angles,
+    texts and the shapes of other primitives are not compared). Placed pads
+    are taken back to the footprint's own frame: Altium mirrors a bottom-side footprint
+    about its X axis, then turns it by the component's rotation (pad rotation on the bottom
+    is the component's minus the pad's); confirmed on every bottom-side part of the examples
+    and the private set. `pads_cover_pins` (every pin on a net has a copper pad in the placed
+    and in the library footprint: errors, as Update PCB's Unknown Pin; a bare hole, a pad
+    without copper, does not count and is named in `on_bare_holes`; board pads carrying a
+    net without a pin; `footprint=` with `part=` checks a proposed swap: `swap` says per
+    part whether every used pin keeps a copper pad, the pins lost and the new pads without
+    pins; parts whose netlist pins are not their symbol's are skipped). `symbol_rules`
+    (Altium's SchLib Component Rule Check: duplicate pins (same name: info), pins without a
+    designator (info on a Graphical symbol) or a name, gaps in the pin numbering, no
+    description, default designator or footprint (pinless and simulation-only symbols:
+    info), IC pins all Passive; each symbol against its footprint: pins
+    without pads, pads without pins, a pad four times the median without a pin flagged as an
+    exposed or thermal pad with no net). `footprint_rules` (Altium's PcbLib Component Rule
+    Check: pads without a designator or sharing one, duplicate primitives, mirrored,
+    reference point outside the pads, shorted copper (pads of different designators touching
+    or joined by tracks, arcs, fills or regions: a warning on the library item, skipped for
+    net ties, naming the parts net_ties reports) and unconnected copper, no description, no
+    courtyard on a library declaring courtyard layers). `net_ties` (net-tie parts: copper
+    joins the pads, the schematic, PCB and library types agree, the tie joins different nets
+    on the board; a part that is not a net tie whose library footprint joins pads the board
+    has on different nets, one finding per footprint: an error when the placed copy joins
+    them too, as DRC's short, a warning when only the library's does, as Update From PCB
+    Libraries would).
+    `height_3d` (per part: a 3D model, an extruded body, only the fallback Height, neither).
+    `where_used` (`where_used=` a symbol or footprint name: the registered projects and the
+    projects under `folders=` that place it, from their SchDocs and the PcbDocs' Components6,
+    cached by file time; with `library=`, only parts placed from that library). `part=`
+    narrows every check; `library=` runs the rule checks, net ties and 3D on every item of
+    one library. Findings (errors first; items many share grouped per library, warnings
+    such as a library of symbols without footprints too) are paged with a size shrink loop;
+    lengths in mm or mil, finding messages without numbers.
+  - `get_library_part`: a placed part (`designator=`) or a library item (`lib_reference=`,
+    `footprint=`, `library=`: only that file is searched, a same-name item elsewhere is a
+    hint, and a library that cannot hold the item is an error): where the symbol and
+    footprint were found or why not, the symbol's pins with electrical types, parts,
+    footprint links, other models and parameters, the footprint's pads, bare holes,
+    outlines, courtyard, Height and 3D bodies (with a summary), and the part's rule checks,
+    pins against pads, used pins without a library copper pad, footprint drift and 3D
+    category. Pins, pads and bodies page together; a part too large even at the smallest
+    page comes back without them.
+  - Not available offline (stated in the results): Workspace (Altium 365) parts (a
+    footprint is read only from a cached PcbLib the PcbDoc names), DbLib and SVNDbLib parts'
+    database links (roadmap #53), LibPkg packages, LibCrossRef.Txt.
+  - Calibrated on Altium's examples and a private set of 63 projects (aggregates only): every
+    placed footprint of the examples compared (120) matches its library footprint, and 97%
+    of the private set's (3,475 of 3,566); the rest are real edits (single-pad parts whose
+    pad is offset from the reference point, footprints compared with a same-name footprint
+    from another library, pads renamed or removed, Heights changed). The checks take about
+    3.2 s over the whole private set (its netlist compiles and PcbDoc reads aside) and
+    about 40 ms per library in library mode.
 - `verify_outputs`: the files Altium generated cross-checked against the saved design,
   offline and read-only (roadmap #39, `services/verify_outputs.py`, on stage A's readers in
   `parsers/fab_outputs.py`). Works on a netlist-free load (the BOM is then compared with the

@@ -5,9 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from parsers.sch_doc import _read_records
+    from parsers.sch_doc import read_records
 except ImportError:
-    from server.parsers.sch_doc import _read_records
+    from server.parsers.sch_doc import read_records
 
 # Kind of a [ProjectVariantN] VariationN line, as the Variant Management dialog names it.
 KIND_FITTED, KIND_NOT_FITTED, KIND_ALTERNATE = 0, 1, 2
@@ -227,7 +227,7 @@ class PrjOptions:
 
 def parse_prj_options(path: str) -> PrjOptions:
     """The project option sections of a .PrjPcb (Project Options dialog), as written."""
-    sections = _split_sections(Path(path).read_text(encoding="utf-8-sig"))
+    sections = split_sections(Path(path).read_text(encoding="utf-8-sig"))
     options = PrjOptions(
         design=_section(sections, "Design"),
         erc_levels=_section(sections, "Electrical Rules Check"),
@@ -267,7 +267,7 @@ def parse_prj_documents(path: str) -> list[ProjectDocument]:
     keeps only the types the tools read)."""
     project_dir = Path(path).parent
     documents = []
-    for header, lines in _split_sections(Path(path).read_text(encoding="utf-8-sig")):
+    for header, lines in split_sections(Path(path).read_text(encoding="utf-8-sig")):
         if re.match(r"^(?:Document|DeviceSheet)\d+$", header, re.IGNORECASE):
             raw = _get_field(lines, "DocumentPath") or ""
             if raw:
@@ -302,7 +302,7 @@ NET_NAMING_KEYS = (
 def parse_prj_pcb(path: str) -> PrjPcbData:
     text = Path(path).read_text(encoding="utf-8-sig")
     project_dir = Path(path).parent
-    sections = _split_sections(text)
+    sections = split_sections(text)
     sheet_paths = _extract_sheets(sections, project_dir)
     variants = _extract_variants(sections)
     library_path, library_error = _attach_library_parts(variants, Path(path))
@@ -333,7 +333,7 @@ def _design_field(sections: list[tuple[str, list[str]]], key: str) -> str:
     return ""
 
 
-def _split_sections(text: str) -> list[tuple[str, list[str]]]:
+def split_sections(text: str) -> list[tuple[str, list[str]]]:
     sections: list[tuple[str, list[str]]] = []
     current_header: str | None = None
     current_lines: list[str] = []
@@ -520,7 +520,7 @@ def parse_variant_library(path: str) -> list[LibraryPart]:
             if len(stream) != 2 or stream[1] != "Data" or \
                     re.fullmatch(r"Component_\d+", stream[0]):
                 continue
-            records = _read_records(ole.openstream("/".join(stream)).read())
+            records = read_records(ole.openstream("/".join(stream)).read())
             if not records or records[0].get("record") != "1":
                 continue
             head = records[0]
