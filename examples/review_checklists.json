@@ -1,0 +1,64 @@
+{
+  "_comment": [
+    "run_review_checklist team overrides: copy this file next to the .PrjPcb (or into the root of the Git repository above it) as review_checklists.json, or into a review_checklists folder there under any name ending in .json.",
+    "disable: item ids of the bundled checklists to leave out (run_review_checklist with no checklist lists the checklists; README 'Review checklists' explains the item format).",
+    "add_sections / add: sections and items for an existing checklist, named by 'checklist'. Item ids are unique across all checklists.",
+    "checklists: whole checklists; one with a bundled id (schematic, pcb, release, bom) replaces it, a new id adds one.",
+    "Keys starting with _ are ignored. Every value is checked: a problem is reported with this file and the place in it."
+  ],
+  "name": "Example team review rules",
+  "disable": ["SCH-STY-05"],
+  "add_sections": [
+    {"checklist": "schematic", "id": "team", "title": "Team rules"}
+  ],
+  "add": [
+    {
+      "checklist": "schematic", "id": "TEAM-SCH-01", "section": "team", "kind": "auto",
+      "text": "The offline ERC reports no warnings either.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "no": [{"path": "summary.by_level.Warning", "op": ">", "value": 0, "label": "ERC warnings"}],
+        "anchors": [{"list": "violations", "where": {"level": "Warning"}}]
+      },
+      "source": "Team rule: warnings are fixed or waived with a No ERC marker before review."
+    },
+    {
+      "checklist": "schematic", "id": "TEAM-SCH-02", "section": "team", "kind": "judgment",
+      "text": "Every connector's mating part is named in the design notes."
+    },
+    {
+      "checklist": "bom", "id": "TEAM-BOM-01", "section": "part_data", "kind": "auto",
+      "text": "At least nine parts in ten carry a manufacturer part number in the design.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"path": "mpn_coverage_percent", "op": "<", "value": 90, "label": "share of parts with a part number (%)"}]
+      }
+    }
+  ],
+  "checklists": [
+    {
+      "id": "prototype",
+      "title": "Prototype bring-up readiness",
+      "scope": "release",
+      "version": "1",
+      "sections": [
+        {"id": "board", "title": "Board"},
+        {"id": "bringup", "title": "Bring-up"}
+      ],
+      "items": [
+        {
+          "id": "PROTO-01", "section": "board", "kind": "auto",
+          "text": "Every net is routed.",
+          "evidence": {
+            "tool": "check_connectivity", "args": {},
+            "no": [{"path": "summary.connections.missing", "op": ">", "value": 0, "label": "missing connections"}]
+          }
+        },
+        {
+          "id": "PROTO-02", "section": "bringup", "kind": "judgment",
+          "text": "Each supply rail can be powered up on its own (jumpers or 0 ohm links) for bring-up."
+        }
+      ]
+    }
+  ]
+}

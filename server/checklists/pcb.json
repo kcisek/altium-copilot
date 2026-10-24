@@ -1,0 +1,345 @@
+{
+  "_about": "Bundled PCB review checklist of altium-copilot (run_review_checklist). Item texts are this project's own words; the topics follow Altium's PCB design review checklists (resources.altium.com/p/pcb-design-and-review-checklist, resources.altium.com/p/pcb-design-review-checklist-gets-you-manufacturing-quickly). Teams change it with review_checklists.json (see README).",
+  "id": "pcb",
+  "title": "PCB layout review",
+  "scope": "pcb",
+  "version": "1",
+  "description": "Placement, power and thermal, high speed and constraints, manufacturing, testability.",
+  "source": "Topics after Altium's PCB design review checklists (resources.altium.com/p/pcb-design-and-review-checklist and /p/pcb-design-review-checklist-gets-you-manufacturing-quickly); items written for this project.",
+  "sections": [
+    {"id": "placement", "title": "Placement"},
+    {"id": "power_thermal", "title": "Power and thermal"},
+    {"id": "high_speed", "title": "High speed and constraints"},
+    {"id": "manufacturing", "title": "Manufacturing"},
+    {"id": "testability", "title": "Testability"}
+  ],
+  "items": [
+    {
+      "id": "PCB-PLC-01", "section": "placement", "kind": "auto",
+      "text": "The board matches the schematic: no missing or extra parts, and no footprint, comment or pad-net differences.",
+      "evidence": {
+        "tool": "check_sch_pcb_sync", "args": {},
+        "no": [
+          {"path": "severity_counts.error", "op": ">", "value": 0, "label": "sync errors"},
+          {"path": "severity_counts.warning", "op": ">", "value": 0, "label": "sync warnings"}
+        ],
+        "judge": [{"path": "netlist_stale", "op": "truthy", "label": "compared with a netlist older than some sheets"}],
+        "anchors": [{"list": "findings", "where": {"severity": ["error", "warning"]}}]
+      },
+      "hint": "Altium's Show Differences is the final word; with netlist_stale, refresh the netlist first."
+    },
+    {
+      "id": "PCB-PLC-02", "section": "placement", "kind": "assisted",
+      "text": "Placed footprints match their library footprints (no unintended edits on the board).",
+      "evidence": {
+        "tool": "check_libraries", "args": {},
+        "na": [{"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"}],
+        "no": [{"list": "findings", "where": {"check": "footprint_drift", "severity": ["error", "warning"]}, "label": "footprints that differ from the library"}],
+        "judge": [
+          {"list": "findings", "where": {"check": "footprint_drift"}, "label": "footprint differences shown as info"},
+          {"path": "summary.footprint_drift.compared", "op": "==", "value": 0, "label": "no footprint could be compared with its library"}
+        ]
+      },
+      "hint": "A difference does not say which side is right: ask before suggesting Update From PCB Libraries."
+    },
+    {
+      "id": "PCB-PLC-03", "section": "placement", "kind": "assisted",
+      "text": "Decoupling capacitors sit close to the supply pins they serve, with a short path to them.",
+      "evidence": {
+        "tool": "check_decoupling", "args": {},
+        "na": [
+          {"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"},
+          {"path": "overview.ic_rail_pairs", "op": "==", "value": 0, "label": "no IC supply pin found"}
+        ],
+        "no": [{"list": "findings", "where": {"check": ["far_capacitor", "opposite_side_no_via"], "severity": "warning"}, "label": "capacitors far from their IC or on the other side without a via"}],
+        "judge": [{"list": "findings", "where": {"check": ["far_capacitor", "pads_far", "opposite_side_no_via", "capacitor_elsewhere"]}, "label": "placement notes"}]
+      }
+    },
+    {
+      "id": "PCB-PLC-04", "section": "placement", "kind": "assisted",
+      "text": "ESD and TVS parts sit at the connector they protect, before the trace reaches the IC.",
+      "evidence": {
+        "tool": "check_interfaces", "args": {},
+        "na": [
+          {"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"},
+          {"path": "connectors_total", "op": "==", "value": 0, "label": "no connector found"}
+        ],
+        "no": [{"list": "findings", "where": {"check": "tvs_far_from_connector", "severity": "warning"}, "label": "protection parts far from their connector"}],
+        "judge": [{"list": "findings", "where": {"check": "tvs_far_from_connector"}, "label": "protection placement notes"}]
+      }
+    },
+    {
+      "id": "PCB-PLC-05", "section": "placement", "kind": "assisted",
+      "text": "Parts keep enough spacing from each other and from the board edge for assembly and rework.",
+      "evidence": {
+        "tool": "check_dfm", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["part_spacing", "part_to_edge"], "severity": ["error", "warning"]}, "label": "parts too close"}],
+        "judge": [{"list": "findings", "where": {"check": ["part_spacing", "part_to_edge"]}, "label": "spacing measured without an assembler limit"}]
+      },
+      "hint": "Ask the assembler for its spacing and edge limits (check_dfm limits=)."
+    },
+    {
+      "id": "PCB-PLC-06", "section": "placement", "kind": "auto",
+      "text": "The board has a closed outline and the mounting holes the mechanics need.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes"], "status": {"op": "!=", "value": "not_applicable"}}, "op": "==", "value": 0, "label": "outline and mounting hole gates not applicable"}],
+        "no": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes"], "status": "fail"}, "label": "outline or mounting hole gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes"], "status": ["warn", "not_verified"]}, "label": "outline or mounting hole gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes"], "status": "pass"}, "label": "outline and mounting hole gates passed"}]
+      }
+    },
+    {
+      "id": "PCB-PLC-07", "section": "placement", "kind": "judgment",
+      "text": "Connectors, switches, LEDs and mounting holes line up with the enclosure, and tall parts clear it."
+    },
+    {
+      "id": "PCB-PLC-08", "section": "placement", "kind": "judgment",
+      "text": "Polarity, pin-1 marks and designators stay readable on the silkscreen once the board is assembled."
+    },
+    {
+      "id": "PCB-PWR-01", "section": "power_thermal", "kind": "assisted",
+      "text": "Exposed pads and tabs of hot parts have thermal vias into a plane or pour.",
+      "evidence": {
+        "tool": "check_thermal", "args": {},
+        "na": [
+          {"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"},
+          {"path": "summary.thermal_pads.pads", "op": "==", "value": 0, "label": "no exposed pad or tab"}
+        ],
+        "no": [{"list": "findings", "where": {"check": ["thermal_pad_no_vias", "thermal_pad_unconnected", "thermal_vias_wrong_net"], "severity": "warning"}, "label": "thermal pads without vias or on the wrong net"}],
+        "judge": [{"list": "findings", "where": {"check": ["thermal_pad_no_vias", "thermal_pad_unconnected", "thermal_vias_wrong_net", "thermal_pad_few_vias"]}, "label": "thermal pad notes"}]
+      }
+    },
+    {
+      "id": "PCB-PWR-02", "section": "power_thermal", "kind": "assisted",
+      "text": "Hot parts are spaced apart and kept away from electrolytics, crystals, references and sensors.",
+      "evidence": {
+        "tool": "check_thermal", "args": {},
+        "na": [{"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"}],
+        "no": [{"list": "findings", "where": {"check": ["hot_neighbours", "sensitive_near_hot"], "severity": "warning"}, "label": "hot parts too close"}],
+        "judge": [{"list": "findings", "where": {"check": ["hot_neighbours", "sensitive_near_hot"]}, "label": "hot part neighbourhood notes"}]
+      }
+    },
+    {
+      "id": "PCB-PWR-03", "section": "power_thermal", "kind": "assisted",
+      "text": "Copper of high-voltage nets keeps the spacing its working voltage needs (IPC-2221B or the product's standard).",
+      "evidence": {
+        "tool": "check_hv_clearance", "args": {},
+        "na": [{"all": [
+          {"path": "summary.pairs.above_threshold", "op": "==", "value": 0},
+          {"list": "findings", "where": {"check": "unknown_voltage_pairs"}, "op": "==", "value": 0}
+        ], "label": "no net pair differs by more than the voltage threshold"}],
+        "no": [{"list": "findings", "where": {"check": ["spacing_below_standard", "spacing_below_rule"], "severity": "warning"}, "label": "spacings below the standard or rule"}],
+        "judge": [{"list": "findings", "where": {"check": ["spacing_below_standard", "spacing_below_rule", "unknown_voltage_pairs", "creepage_not_computed"]}, "label": "spacing notes and nets of unknown voltage"}]
+      },
+      "hint": "Ask the working voltages (check_hv_clearance hv=); creepage around slots is not computed."
+    },
+    {
+      "id": "PCB-PWR-04", "section": "power_thermal", "kind": "judgment",
+      "text": "Traces, pours and vias that carry high current are sized for it, and its return path is short and unbroken."
+    },
+    {
+      "id": "PCB-PWR-05", "section": "power_thermal", "kind": "auto",
+      "text": "Every net is fully routed: no connection is missing.",
+      "evidence": {
+        "tool": "check_connectivity", "args": {},
+        "no": [
+          {"path": "summary.connections.missing", "op": ">", "value": 0, "label": "missing connections"},
+          {"path": "summary.unrouted", "op": ">", "value": 0, "label": "unrouted nets"}
+        ],
+        "judge": [{"path": "summary.nets_connected_through_assumed_copper", "op": ">", "value": 0, "label": "nets joined only through assumed plane or pour copper"}],
+        "anchors": [{"list": "findings", "where": {"check": "unrouted"}}]
+      }
+    },
+    {
+      "id": "PCB-PWR-06", "section": "power_thermal", "kind": "auto",
+      "text": "Polygons are poured and saved: none is shelved or changed since its last repour.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "polygons", "status": "not_applicable"}, "label": "polygon gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "polygons", "status": "fail"}, "label": "polygon gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "polygons", "status": ["warn", "not_verified"]}, "label": "polygon gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "polygons", "status": "pass"}, "label": "polygon gate passed"}]
+      }
+    },
+    {
+      "id": "PCB-PWR-07", "section": "power_thermal", "kind": "assisted",
+      "text": "No isolated copper islands or long dead-end stubs (antennae) are left on the board.",
+      "evidence": {
+        "tool": "check_connectivity", "args": {},
+        "judge": [
+          {"path": "summary.isolated_copper_islands", "op": ">", "value": 0, "label": "isolated copper islands"},
+          {"path": "summary.antennae_over_tolerance", "op": ">", "value": 0, "label": "antennae over their tolerance"}
+        ],
+        "anchors": [{"list": "findings", "where": {"check": ["isolated_copper", "antenna"]}}]
+      }
+    },
+    {
+      "id": "PCB-HS-01", "section": "high_speed", "kind": "auto",
+      "text": "Tracks and vias meet their width, via, hole, annular-ring and routing-layer rules.",
+      "evidence": {
+        "tool": "check_rule_compliance", "args": {},
+        "no": [{"list": "kinds", "where": {"kind": ["Width", "DiffPairsRouting", "RoutingVias", "HoleSize", "MinimumAnnularRing", "RoutingLayers"], "violation_count": {"op": ">", "value": 0}}, "label": "rule kinds with violations"}]
+      }
+    },
+    {
+      "id": "PCB-HS-02", "section": "high_speed", "kind": "auto",
+      "text": "Length and matched-length rules are met.",
+      "evidence": {
+        "tool": "check_lengths", "args": {},
+        "na": [{"path": "rule_count", "op": "==", "value": 0, "label": "no Length or MatchedLengths rule"}],
+        "no": [{"list": "rules", "where": {"summary.violations": {"op": ">", "field": "summary.marginal_violations"}}, "label": "length rules with violations beyond the measuring tolerance"}],
+        "judge": [
+          {"list": "rules", "where": {"summary.marginal_violations": {"op": ">", "value": 0}}, "label": "length rules with marginal violations only"},
+          {"list": "rules", "where": {"summary.incomplete": {"op": ">", "value": 0}}, "label": "length rules with members not fully routed"}
+        ]
+      },
+      "hint": "Marginal violations are within measuring tolerance of the limit: confirm them with Altium's DRC."
+    },
+    {
+      "id": "PCB-HS-03", "section": "high_speed", "kind": "assisted",
+      "text": "Differential pairs are declared, not swapped at their pins, and within their skew tolerance.",
+      "evidence": {
+        "tool": "check_diff_pairs", "args": {},
+        "na": [{"all": [
+          {"path": "pairs_total", "op": "==", "value": 0},
+          {"path": "summary.naming.candidates", "op": "==", "value": 0}
+        ], "label": "no differential pair"}],
+        "no": [{"list": "findings", "where": {"severity": ["error", "warning"], "issue": {"op": "not_in", "value": ["in_pair_rule_stale", "in_pair_rule_matches_no_pair"]}}, "label": "pair problems"}],
+        "judge": [{"list": "findings", "label": "pair notes (stale or conditional rules, marginal skew)"}]
+      }
+    },
+    {
+      "id": "PCB-HS-04", "section": "high_speed", "kind": "auto",
+      "text": "Altium's last Batch DRC report is clean and newer than the board.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "drc", "status": "not_applicable"}, "label": "DRC gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "drc", "status": "fail"}, "label": "DRC gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "drc", "status": ["warn", "not_verified"]}, "label": "DRC gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "drc", "status": "pass"}, "label": "DRC gate passed"}]
+      }
+    },
+    {
+      "id": "PCB-HS-05", "section": "high_speed", "kind": "judgment",
+      "text": "Impedance-controlled nets have a stack-up impedance profile and rules that use it.",
+      "hint": "constraints_review audits each interface's rules against its layout guide."
+    },
+    {
+      "id": "PCB-HS-06", "section": "high_speed", "kind": "judgment",
+      "text": "Fast signals keep a continuous reference plane, avoid plane splits and change layers next to a return via."
+    },
+    {
+      "id": "PCB-HS-07", "section": "high_speed", "kind": "judgment",
+      "text": "Clocks, switch nodes and other noisy nets are kept away from sensitive analog and high-speed nets.",
+      "hint": "get_net_neighbors shows what runs near a net."
+    },
+    {
+      "id": "PCB-MFG-01", "section": "manufacturing", "kind": "auto",
+      "text": "Copper, holes and the board outline meet the chosen fabricator's limits.",
+      "evidence": {
+        "tool": "check_dfm", "args": {},
+        "no": [{"all": [
+          {"list": "findings", "where": {"check": ["trace_width", "spacing", "hole_size", "annular_ring", "aspect_ratio", "hole_to_hole", "copper_to_edge", "layer_count", "copper_weight", "board_size", "drill_count"], "severity": "error"}},
+          {"path": "profile.chosen_by", "op": "!=", "value": "default"}
+        ], "label": "misses of the chosen fabricator's limits"}],
+        "judge": [
+          {"list": "findings", "where": {"check": ["trace_width", "spacing", "hole_size", "annular_ring", "aspect_ratio", "hole_to_hole", "copper_to_edge", "layer_count", "copper_weight", "board_size", "drill_count", "rules_vs_profile"], "severity": ["error", "warning"]}, "label": "fabrication misses and warnings"},
+          {"path": "profile.chosen_by", "op": "==", "value": "default", "label": "checked against Altimade's limits by default, not the user's fabricator"}
+        ]
+      },
+      "hint": "Ask which fabricator builds the board and use its limits (fab_profile.json or check_dfm limits=)."
+    },
+    {
+      "id": "PCB-MFG-02", "section": "manufacturing", "kind": "assisted",
+      "text": "Via aspect ratios, annular rings, tenting and vias in pads are what the fabricator expects.",
+      "evidence": {
+        "tool": "check_vias", "args": {},
+        "no": [{"list": "findings", "where": {"severity": ["error", "warning"]}, "label": "via problems"}],
+        "judge": [{"list": "findings", "where": {"check": ["aspect_ratio", "annular_ring", "via_in_pad", "tenting", "back_drill"]}, "label": "via notes (via in pad, tenting, stubs)"}]
+      }
+    },
+    {
+      "id": "PCB-MFG-03", "section": "manufacturing", "kind": "auto",
+      "text": "The PCB health check is clean: no shelved polygons, duplicate designators, zero-area or self-intersecting shapes.",
+      "evidence": {
+        "tool": "check_pcb_health", "args": {},
+        "no": [{"path": "severity_counts.error", "op": ">", "value": 0, "label": "health errors"}],
+        "judge": [{"path": "severity_counts.warning", "op": ">", "value": 0, "label": "health warnings"}],
+        "anchors": [{"list": "findings", "where": {"severity": ["error", "warning"]}}]
+      }
+    },
+    {
+      "id": "PCB-MFG-04", "section": "manufacturing", "kind": "auto",
+      "text": "Each assembled side has global fiducials.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "fiducials", "status": "not_applicable"}, "label": "fiducial gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "fiducials", "status": "fail"}, "label": "fiducial gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "fiducials", "status": ["warn", "not_verified"]}, "label": "fiducial gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "fiducials", "status": "pass"}, "label": "fiducial gate passed"}]
+      }
+    },
+    {
+      "id": "PCB-MFG-05", "section": "manufacturing", "kind": "assisted",
+      "text": "Small passives are not prone to tombstoning, and fine-pitch parts are within the assembler's capability.",
+      "evidence": {
+        "tool": "check_dfm", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["tombstoning", "fine_pitch"], "severity": ["error", "warning"]}, "label": "tombstoning or fine-pitch risks"}],
+        "judge": [{"list": "findings", "where": {"check": ["tombstoning", "fine_pitch"]}, "label": "tombstoning and pitch notes"}]
+      }
+    },
+    {
+      "id": "PCB-MFG-06", "section": "manufacturing", "kind": "auto",
+      "text": "Silkscreen keeps clear of pads and solder-mask openings.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "silkscreen", "status": "not_applicable"}, "label": "silkscreen gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "silkscreen", "status": "fail"}, "label": "silkscreen gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "silkscreen", "status": ["warn", "not_verified"]}, "label": "silkscreen gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "silkscreen", "status": "pass"}, "label": "silkscreen gate passed"}]
+      }
+    },
+    {
+      "id": "PCB-MFG-07", "section": "manufacturing", "kind": "assisted",
+      "text": "The pick-and-place origin and part centroids are what the assembler expects.",
+      "evidence": {
+        "tool": "check_dfm", "args": {},
+        "no": [{"list": "findings", "where": {"check": "pick_and_place", "severity": ["error", "warning"]}, "label": "pick-and-place problems"}],
+        "judge": [{"list": "findings", "where": {"check": "pick_and_place"}, "label": "pick-and-place notes"}]
+      }
+    },
+    {
+      "id": "PCB-TST-01", "section": "testability", "kind": "assisted",
+      "text": "Nets the test plan needs have probe access.",
+      "evidence": {
+        "tool": "check_testpoints", "args": {},
+        "no": [{"list": "findings", "where": {"check": "required_nets", "severity": "warning"}, "label": "required nets without access"}],
+        "judge": [{"list": "findings", "where": {"check": ["required_nets", "coverage", "probe_side"]}, "label": "coverage notes"}]
+      },
+      "hint": "The numbers are guidance: ask the test house for its own (check_testpoints limits=)."
+    },
+    {
+      "id": "PCB-TST-02", "section": "testability", "kind": "assisted",
+      "text": "Test points meet the probe size, spacing, edge clearance and component clearance of the fixture.",
+      "evidence": {
+        "tool": "check_testpoints", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["pad_size", "spacing", "edge_clearance", "under_component", "tall_parts", "solder_mask"], "severity": "warning"}, "label": "test points that break a fixture rule"}],
+        "judge": [{"list": "findings", "where": {"check": ["pad_size", "spacing", "edge_clearance", "under_component", "tall_parts", "solder_mask", "style_rule"]}, "label": "test point notes"}]
+      }
+    },
+    {
+      "id": "PCB-TST-03", "section": "testability", "kind": "assisted",
+      "text": "Rails and ground have enough probe sites, and the board has tooling holes for a fixture.",
+      "evidence": {
+        "tool": "check_testpoints", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["rails", "ground", "tooling_holes"], "severity": "warning"}, "label": "rails, ground or tooling holes short of the guidance"}],
+        "judge": [{"list": "findings", "where": {"check": ["rails", "ground", "tooling_holes"]}, "label": "rail, ground and tooling notes"}]
+      }
+    },
+    {
+      "id": "PCB-TST-04", "section": "testability", "kind": "judgment",
+      "text": "The test strategy (in-circuit, flying probe, boundary scan, functional) is agreed with the test engineer."
+    }
+  ]
+}

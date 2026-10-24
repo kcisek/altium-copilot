@@ -97,7 +97,7 @@ try:
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
     )
-    from services.clone_status import clone_status
+    from services.clone_status import clone_status, head_state
     from parsers.pcb_doc import CLASS_KINDS
     from services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -139,6 +139,13 @@ try:
     from services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
         page_release_readiness,
+    )
+    from services.review_checklist import (
+        EVIDENCE_TOOLS as REVIEW_EVIDENCE_TOOLS, ChecklistError, apply_decisions,
+        catalog as checklist_catalog, compare as compare_review_records, design_state,
+        folder_signature, load_bundled as load_bundled_checklists, load_checklists,
+        page_review, parse_decisions, read_previous as read_previous_record, render_record,
+        run_review_checklist as build_review_checklist, select as select_checklist_items,
     )
     from export import export_project, HIGH_FANOUT_THRESHOLD
 except ImportError:
@@ -217,7 +224,7 @@ except ImportError:
         check_connectivity as review_connectivity, drc_comparison,
         page_result as page_connectivity_result,
     )
-    from server.services.clone_status import clone_status
+    from server.services.clone_status import clone_status, head_state
     from server.parsers.pcb_doc import CLASS_KINDS
     from server.services.design_notes import (
         DesignNotesCache, NOTES_MAX_RESULT_SIZE_CHARS, build_design_notes,
@@ -261,6 +268,13 @@ except ImportError:
     from server.services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
         page_release_readiness,
+    )
+    from server.services.review_checklist import (
+        EVIDENCE_TOOLS as REVIEW_EVIDENCE_TOOLS, ChecklistError, apply_decisions,
+        catalog as checklist_catalog, compare as compare_review_records, design_state,
+        folder_signature, load_bundled as load_bundled_checklists, load_checklists,
+        page_review, parse_decisions, read_previous as read_previous_record, render_record,
+        run_review_checklist as build_review_checklist, select as select_checklist_items,
     )
     from server.export import export_project, HIGH_FANOUT_THRESHOLD
 
@@ -523,6 +537,22 @@ DNP reasons, fabrication requirements. Use it.
   evidence cites run_erc's offline counts, which never make it pass).
 - release_review — a guided go / no-go: the gates, the causes from each source_tool, then
   the blocking items, what was not verified and the warnings.
+
+## Review Checklists
+
+- run_review_checklist — "run the review checklist", "what is left before sign-off?",
+  "write the review record", "what changed since the last review?", and first in
+  schematic_review, constraints_review, pcb_manufacturing_review and release_review: a
+  checklist (schematic, pcb, release, bom, or a team's own; no checklist lists them) whose
+  items each get Yes, No, N/A or needs judgment from the deterministic tools (auto: the
+  tool decides; assisted: the evidence leans yes or no and the datasheet or the reviewer
+  decides; judgment: a person), with evidence, finding ids and anchors (designators,
+  nets, sheets), a coverage table and the design state (Git commit, else file SHA1s).
+  Quote the coverage table and the No items first. Settle needs-judgment items from the
+  evidence, the datasheets or the user, never by guessing; then call again with
+  decisions={"ID": "no: reason"} and format='markdown' for the review record (sign-off
+  belongs to the design state it names; save it only where the user agrees).
+  previous=<a saved record> says what newly fails, what was fixed and what is still open.
 
 ## Project Tour
 
@@ -7190,6 +7220,191 @@ def check_release_readiness(offset: int = 0) -> str:
     return rendered
 
 
+# ---------- run_review_checklist (roadmap #46) ----------
+
+REVIEW_ITEM_STEPS = (80, 40, 20, 10, 5, 2)
+# (evidence characters, anchors per kind, design files listed, item text characters, open
+# items with their text) of the Markdown record.
+REVIEW_RECORD_STEPS = ((220, 6, 60, 300, True), (160, 4, 30, 200, True),
+                       (110, 3, 10, 120, False), (70, 2, 0, 80, False), (40, 1, 0, 60, False))
+REVIEW_CACHE_SECONDS = 300
+REVIEW_CACHE_SIZE = 4
+REVIEW_RECORD_HINT = (
+    "Call again with format='markdown' (and decisions= for the needs-judgment items you "
+    "settled) for the review record: the coverage table, every item with its evidence, "
+    "the design state and a sign-off table. Nothing is saved: offer to save it where the "
+    "user agrees, and pass it as previous= in a later review.")
+_bundled_checklists: dict | None = None
+_review_cache: dict = {}  # key -> (time, model)
+
+
+def _checklists_bundled() -> dict:
+    """The bundled checklists, read once per server run."""
+    global _bundled_checklists
+    if _bundled_checklists is None:
+        _bundled_checklists = load_bundled_checklists()
+    return _bundled_checklists
+
+
+def _review_tools() -> dict:
+    """The evidence tools, as the MCP tool functions themselves: a checklist item gets
+    exactly what a direct call with its arguments returns."""
+    return {name: globals()[name] for name in REVIEW_EVIDENCE_TOOLS}
+
+
+def _review_model(project: dict, netlist: dict | None, variant: str | None, checklist: dict,
+                  sections: list[str] | None, items: list[str] | None, state: dict) -> dict:
+    """The checklist run, reused for REVIEW_CACHE_SECONDS while the design state, every
+    file under the project folder (OutJobs, DRC reports, outputs, fab profile), the
+    netlist, the variant and the checklist are the same (format='markdown' right after
+    the JSON call does not run the tools again). A folder of more than
+    FOLDER_SIGNATURE_FILES files is not cached."""
+    folder = folder_signature(project.get("root_dir") or ".")
+    key = (project.get("prj_pcb_path"), json.dumps(checklist, sort_keys=True),
+           tuple(sections or ()), tuple(items or ()), state.get("id"),
+           state.get("fingerprint"), folder, variant, id(netlist), _netlist_last_updated)
+    now = datetime.now(timezone.utc).timestamp()
+    for old in [k for k, (stamp, _) in _review_cache.items()
+                if now - stamp > REVIEW_CACHE_SECONDS]:
+        del _review_cache[old]
+    if folder is not None and key in _review_cache:
+        return _review_cache[key][1]
+    model = build_review_checklist(project, netlist, checklist, tools=_review_tools(),
+                                   sections=sections, items=items, variant=variant,
+                                   state=state)
+    if folder is None:
+        return model
+    while len(_review_cache) >= REVIEW_CACHE_SIZE:
+        del _review_cache[next(iter(_review_cache))]
+    _review_cache[key] = (now, model)
+    return model
+
+
+@mcp.tool(
+    title="Run Review Checklist",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def run_review_checklist(
+    checklist: str | None = None,
+    sections: list[str] | None = None,
+    items: list[str] | None = None,
+    previous: str | None = None,
+    decisions: dict[str, str] | None = None,
+    overrides: bool = True,
+    format: Literal["json", "markdown"] = "json",
+    offset: int = 0,
+) -> str:
+    """Run a design-review checklist against the saved project, offline: "run the
+    schematic checklist", "what is left before sign-off?", "write the review record",
+    "what changed since the last review?", and first in schematic_review,
+    constraints_review, pcb_manufacturing_review and release_review.
+
+    checklist: schematic (power, signals and interfaces, components and ratings,
+    connectors and protection, testability and production, style), pcb (placement, power
+    and thermal, high speed and constraints, manufacturing, testability), release
+    (validation, generated outputs, documentation, configuration) or bom (part data,
+    sourcing, variants), or a team's own; none lists the checklists with their sections
+    and item counts. sections= and items= (ids, in any case) narrow it. Each item is auto
+    (a deterministic tool decides), assisted (a tool gives evidence: status needs
+    judgment with lean yes or no, the datasheet or the reviewer decides) or judgment (a
+    person). The tools run in-process with the arguments the item names, as a direct call
+    would (active variant, every page an item needs read), once per call; each item row
+    gives status (yes, no, n/a, needs_judgment), evidence (counts and the first finding's
+    text; for a Yes, what was checked), tool and args, findings (finding ids with
+    counts), anchors (designators, nets, sheets), could_not_run when its tool failed or
+    needs what the load lacks (a netlist), and unresolved when a field the item reads is
+    not in the tool's result (then needs judgment, never Yes). coverage counts items by
+    status per section; design_state is the Git commit (and whether any of the PrjPcb,
+    sheets, PcbDocs and drawings differs from it, wherever it is) or the SHA1s of those
+    files, so a sign-off names the state it belongs to.
+
+    decisions={"SCH-PWR-02": "no: U3 EN floats (datasheet p. 12)"} records the review's
+    own Yes, No or N/A for items (the tool's status is kept as tool_status). format
+    'markdown' returns the review record: header, design state, the 'Checklist coverage'
+    table, every item with status and evidence, the open items, a sign-off table and a
+    machine-readable block; nothing is written. A record that does not fit one result
+    even shortened is a record_too_large error: call per section. previous= (a record
+    saved earlier, path absolute or relative to the project folder) adds what changed:
+    design state, newly failing, fixed (No to Yes), still open, other changes. A run is
+    reused for 5 minutes while the design files and every file in the project folder are
+    unchanged. Team overrides: review_checklists.json or review_checklists/*.json next to
+    the .PrjPcb or in the Git repository root above it (replace a checklist, add sections
+    and items, disable items by id; arguments are checked against the tool's
+    parameters); overrides=false ignores them. Items are paginated (offset from
+    next_offset)."""
+    try:
+        project, netlist, variant_state = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    if format not in ("json", "markdown"):
+        return json.dumps({"error": "invalid_format",
+                           "message": "format is 'json' or 'markdown'."})
+    try:
+        checklists, override_info = load_checklists(
+            project.get("root_dir"), overrides=overrides, bundled=_checklists_bundled(),
+            tools=_review_tools())
+    except ChecklistError as error:
+        return json.dumps(error.error)
+    name = (checklist or "").strip().lower()
+    if not name:
+        if sections or items or previous or decisions or format == "markdown":
+            return json.dumps({"error": "checklist_required",
+                               "message": "Name the checklist (checklist=) to run.",
+                               "checklists": sorted(checklists)})
+        return json.dumps(checklist_catalog(checklists, override_info), indent=2)
+    chosen = checklists.get(name)
+    if chosen is None:
+        return json.dumps({"error": "unknown_checklist",
+                           "message": f"No checklist '{checklist.strip()[:60]}'.",
+                           "checklists": sorted(checklists)})
+    try:
+        selected = select_checklist_items(chosen, sections, items)
+        decided = parse_decisions(decisions, selected)
+        prior = read_previous_record(previous, project.get("root_dir")) if previous else None
+    except ChecklistError as error:
+        return json.dumps(error.error)
+    if not selected:
+        return json.dumps({"error": "no_items",
+                           "message": f"The selection leaves no item of the '{name}' "
+                                      "checklist to run (disabled by an override?)."})
+    state = design_state(project, head_state)
+    variant = variant_state.active.name if variant_state.variants else None
+    model = _review_model(project, netlist, variant, chosen, sections, items, state)
+    model = {**model, "overrides_applied": override_info.get("applied") or []}
+    model = apply_decisions(model, decided)
+    comparison = compare_review_records(model, prior) if prior else None
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if format == "markdown":
+        for evidence_chars, anchors, files, text_chars, open_detail in REVIEW_RECORD_STEPS:
+            record = render_record(model, generated_utc=generated, generator=_read_version(),
+                                   comparison=comparison, evidence_chars=evidence_chars,
+                                   anchors_shown=anchors, files_shown=files,
+                                   text_chars=text_chars, open_detail=open_detail)
+            if len(record) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+                return record
+        # A cut record would lose its machine-readable block (previous= reads it).
+        return json.dumps({
+            "error": "record_too_large",
+            "message": f"The review record of {len(model['items'])} items is larger than one "
+                       "result even shortened: call again with sections= (or items=) for "
+                       "one record per part (each names the same design state).",
+            "sections": [section["id"] for section in model["sections"]]})
+    for limit in REVIEW_ITEM_STEPS:
+        page = page_review(model, offset, limit, comparison=comparison)
+        page["record"] = REVIEW_RECORD_HINT
+        if limit != REVIEW_ITEM_STEPS[0]:
+            page["items_limited_to"] = limit
+        rendered = json.dumps(page, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    brief = page_review(model, offset, 1, files_listed=0, comparison=comparison, full=False)
+    brief["items_limited_to"] = 1
+    brief["omitted"] = ("The result is too large even at 1 item per page: call again with "
+                        "sections= or items= to narrow it.")
+    return json.dumps(brief, indent=2)
+
+
 SCHEMATIC_REVIEW_PROMPT = """\
 Project: {name}
 Sheets: {sheets}
@@ -7202,6 +7417,10 @@ its own ERC result; say so). Show its summary (counts by level and violation typ
 its Errors and Fatal Errors in one short table (Violation | Sheet | Object | Message);
 mention the warning count and the advisories (near-miss wire ends, rail aliases) without
 listing every warning. These are the review's first evidence, not its conclusions.
+
+Then call run_review_checklist(checklist="schematic") once and show its coverage table
+and its No items. Auto items are answered by the tools; the needs-judgment items (with
+their evidence and lean) are what Phases 1-2 decide.
 
 Then ask the user to choose a scope:
   - A specific sheet (e.g. "{first_sheet}")
@@ -7315,6 +7534,11 @@ Present findings as three Markdown tables:
   Table 3 — Verified Critical Nets
   | Net | Source → Destination | Result |
 
+Finish with the checklist record: run_review_checklist(checklist="schematic",
+format="markdown") with decisions= giving your Yes, No or N/A and a one-line reason for
+each needs-judgment item you settled. Show its 'Checklist coverage' table and the record
+(tied to the design state it names); save it only where the user agrees.
+
 Ask: "Any sub-circuits to dive deeper into, or alternative
 architectures to brainstorm?"
 """
@@ -7326,7 +7550,8 @@ def constraints_review() -> str:
     interfaces from parts and pins (USB, PCIe, Ethernet, DDR, HDMI/DP, MIPI, LVDS, SATA,
     CAN, RS-485, SerDes), checks pairs, classes, impedance-driven rules, matched-length
     groups, clearances, reference layers and stale rules against each chip's layout
-    guide, then spot-checks the saved copper. Call when the user asks to review or verify
+    guide, then spot-checks the saved copper, with the pcb checklist's high-speed items
+    (run_review_checklist) and their review record. Call when the user asks to review or verify
     the layout's constraints, design rules or high-speed routing ('check my high-speed
     rules', 'are my DDR length rules right?', 'review the diff pairs before fab'). Not for
     one net's rule (get_rules_for_net) or a schematic review (schematic_review)."""
@@ -7353,7 +7578,8 @@ def pcb_manufacturing_review() -> str:
     fabrication against the user's fabricator (check_dfm with its profile, check_vias,
     check_pcb_health, check_connectivity, get_drc_report), then assembly (check_dfm's
     assembly checks, get_bom and check_bom), ending in a go / no-go that lists what was
-    not checked. It asks which fabricator first and never presents Altimade's limits as
+    not checked and the review records of the pcb manufacturing and testability and the
+    bom checklists (run_review_checklist). It asks which fabricator first and never presents Altimade's limits as
     another fab's. Call when the user asks for a manufacturing, DFM/DFA or production
     readiness review ('is this board ready to order?', 'review it for manufacturing',
     'go/no-go before fab', 'can it be built and assembled?'). Not for one check against a
@@ -7380,7 +7606,8 @@ def release_review() -> str:
     """Start a release go / no-go review of the loaded project, modelled on Altium's
     Project Releaser: run check_release_readiness, drill into each failing gate with its
     source tool, then give a go / no-go with the blocking items, what was not verified
-    (never reported as passed) and the warnings. Call when the user asks whether the
+    (never reported as passed) and the warnings, with the release checklist
+    (run_review_checklist) and its review record. Call when the user asks whether the
     design is ready to release, for review or for fabrication ('is this ready to
     release?', 'release check', 'go/no-go before release', 'can I send this to fab?').
     Not for one fabricator's capabilities (pcb_manufacturing_review, check_dfm) or the
@@ -7416,9 +7643,10 @@ interface ICs, and say in the report that pins were not checked against the sche
 @mcp.tool(title="Schematic Review", annotations=ToolAnnotations(readOnlyHint=True))
 def schematic_review() -> str:
     """Start a structured schematic review: run_erc first (the offline approximation of
-    Altium's ERC, its errors shown before anything else), then a scope question,
-    understanding, an evidenced audit per sheet (ERC findings judged from the circuit)
-    and three tables. Call when the user explicitly asks to review or verify the
+    Altium's ERC, its errors shown before anything else) and the schematic checklist
+    (run_review_checklist), then a scope question, understanding, an evidenced audit per
+    sheet (ERC findings judged from the circuit), three tables and the checklist's review
+    record. Call when the user explicitly asks to review or verify the
     schematic (e.g. 'review this', 'check my schematic', 'do a design review', 'is this
     correct?', 'does this look right?'). Do not call for general questions."""
     try:

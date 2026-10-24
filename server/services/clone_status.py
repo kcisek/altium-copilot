@@ -215,10 +215,13 @@ def _last_fetch(git: str, cwd: Path, fetch_head: Path,
     return None, None
 
 
-def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
+def _uncommitted(git: str, top: Path, filters: set[str], paths: list[str] | None = None,
+                 ignored: bool = False) -> dict:
     """Uncommitted changes: counts per kind, how many are design files the tools read,
     and a sample of paths, design files first. Files in new folders are listed one by
-    one, so a new folder of sheets counts as design files.
+    one, so a new folder of sheets counts as design files. paths (relative to top, taken
+    literally and ignoring case) limits it to those files and folders; with ignored,
+    git-ignored files among them count too (kind 'ignored': in no commit).
 
     Filter drivers are blanked, so a filtered file (git-lfs and the like) whose stat data
     changed is compared raw with its stored, cleaned content and would look modified:
@@ -226,9 +229,12 @@ def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
     blank = [(f"filter.{name}.{key}", value) for name in sorted(filters)
              for key, value in (("clean", ""), ("smudge", ""), ("process", ""),
                                 ("required", "false"))]
-    out = _git(git, top, "status", "--porcelain", "-z", "--untracked-files=all",
-               "--ignore-submodules=all", config=blank)
-    entries = out.split("\0")
+    entries: list[str] = []
+    for chunk in _pathspec_chunks(paths):
+        out = _git(git, top, "status", "--porcelain", "-z", "--untracked-files=all",
+                   "--ignore-submodules=all", *(("--ignored=matching",) if ignored else ()),
+                   *(("--", *chunk) if chunk else ()), config=blank)
+        entries += out.split("\0")
     changes: list[tuple[str, str]] = []
     worktree_only: list[str] = []
     i = 0
@@ -240,6 +246,8 @@ def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
         code, path = entry[:2], entry[3:]
         if code == "??":
             kind = "untracked"
+        elif code == "!!":
+            kind = "ignored"
         elif code in _CONFLICTS:
             kind = "conflicted"
         else:
@@ -261,6 +269,26 @@ def _uncommitted(git: str, top: Path, filters: set[str]) -> dict:
     others = [path for path in paths if path not in design]
     return {"count": len(paths), "by_kind": counts, "design_files": len(design),
             "unverified": len(filtered), "sample": (design + others)[:UNCOMMITTED_SAMPLE]}
+
+
+PATHSPEC_CHARS = 6000  # per git call: a Windows command line stops at 32767 characters
+
+
+def _pathspec_chunks(paths: list[str] | None) -> list[list[str]]:
+    """paths as literal, case-insensitive pathspecs (a folder named 'Board [A]' is not a
+    glob), in chunks short enough for one command line; [[]] (everything) without paths."""
+    if paths is None:
+        return [[]]
+    chunks: list[list[str]] = []
+    size = PATHSPEC_CHARS
+    for path in paths:
+        spec = f":(literal,icase){path}"
+        if size + len(spec) > PATHSPEC_CHARS:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(spec)
+        size += len(spec) + 1
+    return chunks
 
 
 def _filtered(git: str, top: Path, paths: list[str], filters: set[str]) -> set[str]:
@@ -285,6 +313,21 @@ def _commit(git: str, cwd: Path, rev: str) -> dict | None:
     return {"commit": short, "date_utc": _utc(float(timestamp)), "message": subject}
 
 
+def _origin_and_filters(git: str, cwd: Path) -> tuple[str, set[str]]:
+    """remote.origin.url ("" without one) and the names of the configured filter
+    drivers, in one git config call."""
+    url, filters = "", set()
+    config = _git(git, cwd, "config", "--get-regexp",
+                  r"^(remote\.origin\.url|filter\..*)$", check=False)
+    for line in (config or "").splitlines():
+        key, _, value = line.partition(" ")
+        if key == "remote.origin.url":
+            url = value
+        elif key.startswith("filter.") and key.count(".") >= 2:
+            filters.add(key[len("filter."):key.rindex(".")])
+    return url, filters
+
+
 def clone_status(project_dir: str | Path, now: datetime | None = None,
                  stale_after_days: int = STALE_FETCH_DAYS, git: str | None = None) -> dict:
     """Where the Git clone holding project_dir stands against its Altium 365 project.
@@ -303,15 +346,7 @@ def clone_status(project_dir: str | Path, now: datetime | None = None,
                                "--git-path", "FETCH_HEAD").splitlines()[:2]
     except GitError as error:
         return _without_git(cwd, "git_failed", str(error))
-    url, filters = "", set()
-    config = _git(git, cwd, "config", "--get-regexp",
-                  r"^(remote\.origin\.url|filter\..*)$", check=False)
-    for line in (config or "").splitlines():
-        key, _, value = line.partition(" ")
-        if key == "remote.origin.url":
-            url = value
-        elif key.startswith("filter.") and key.count(".") >= 2:
-            filters.add(key[len("filter."):key.rindex(".")])
+    url, filters = _origin_and_filters(git, cwd)
     remote = parse_a365_remote(url)
     if remote is None:
         return {"altium365": False, "reason": "origin_is_not_altium365"}
@@ -323,6 +358,56 @@ def clone_status(project_dir: str | Path, now: datetime | None = None,
     except GitError as error:
         return {"altium365": True, "workspace": workspace, "project_guid": guid,
                 "error": "git_failed", "message": str(error)}
+
+
+def head_state(project_dir: str | Path, paths: list[str] | None = None,
+               git: str | None = None) -> dict | None:
+    """The commit the Git work tree holding project_dir is on and whether design files
+    differ from it, with the same local, hardened git calls as clone_status (any origin,
+    nothing fetched): {"commit" (full id, None before the first commit), "date_utc",
+    "branch", "design_files_changed", "changed_files", "outside_work_tree", "altium365"}.
+    With paths (the project's design files) exactly those are compared, wherever they are
+    in the work tree: a changed, untracked or git-ignored one counts as changed, and so
+    does one outside the work tree (no commit holds it). Without paths, the design files
+    in the project folder are. None when the folder is in no Git work tree; {"error"}
+    when git is missing or fails. For run_review_checklist's design state."""
+    cwd = Path(project_dir)
+    if not _has_git_dir(cwd):
+        return None
+    git = git or shutil.which("git")
+    if git is None:
+        return {"error": "git_not_found"}
+    try:
+        top = Path(_git(git, cwd, "rev-parse", "--show-toplevel").strip())
+        head = (_git(git, cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
+                     check=False) or "").strip() or None
+        url, filters = _origin_and_filters(git, cwd)
+        inside, outside = _relative_to_top([cwd] if paths is None else paths, top)
+        if paths is None:
+            outside, inside = 0, (None if inside in ([], ["."]) else inside)
+        changes = (_uncommitted(git, top, filters, inside, ignored=paths is not None)
+                   if inside != [] else {"count": 0, "design_files": 0})
+        branch = (_git(git, cwd, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+                  or "").strip() or None
+        commit = _commit(git, cwd, "HEAD") if head else None
+    except GitError as error:
+        return {"error": "git_failed", "message": str(error)}
+    return {"commit": head, "date_utc": commit["date_utc"] if commit else None,
+            "branch": branch, "design_files_changed": changes["design_files"] + outside,
+            "changed_files": changes["count"], "outside_work_tree": outside,
+            "altium365": parse_a365_remote(url) is not None}
+
+
+def _relative_to_top(paths: list, top: Path) -> tuple[list[str], int]:
+    """paths relative to the work tree's top (posix), and how many are outside it."""
+    inside, outside = [], 0
+    root = top.resolve()
+    for path in paths:
+        try:
+            inside.append(Path(path).resolve().relative_to(root).as_posix())
+        except (ValueError, OSError):
+            outside += 1
+    return inside, outside
 
 
 def _without_git(cwd: Path, error: str, message: str) -> dict:

@@ -1,0 +1,405 @@
+{
+  "_about": "Bundled schematic review checklist of altium-copilot (run_review_checklist). Item texts are this project's own words; the topics follow Altium's schematic review checklist (resources.altium.com/p/schematic-review-checklist). Teams change it with review_checklists.json (see README).",
+  "id": "schematic",
+  "title": "Schematic review",
+  "scope": "schematic",
+  "version": "1",
+  "description": "Power, signals and interfaces, components and ratings, connectors and protection, testability and production, style and documentation.",
+  "source": "Topics after Altium's schematic review checklist (resources.altium.com/p/schematic-review-checklist); items written for this project.",
+  "sections": [
+    {"id": "power", "title": "Power"},
+    {"id": "signals", "title": "Signals and interfaces"},
+    {"id": "components", "title": "Components and ratings"},
+    {"id": "connectors", "title": "Connectors and protection"},
+    {"id": "testability", "title": "Testability and production"},
+    {"id": "style", "title": "Style and documentation"}
+  ],
+  "items": [
+    {
+      "id": "SCH-PWR-01", "section": "power", "kind": "assisted",
+      "text": "Every power rail is fed by something: a regulator, a power input, a battery or another rail.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.rails", "op": "==", "value": 0, "label": "no power rail found"}],
+        "no": [{"list": "findings", "where": {"check": "rail_without_source", "severity": "warning"}, "label": "rails with loads and no source"}],
+        "judge": [{"list": "findings", "where": {"check": "rail_without_source"}, "label": "rails with no source found (a pin the part regulates itself, or fed from off the board)"}]
+      },
+      "hint": "The power tree is read from names: a rail fed through a part it does not recognise looks unfed."
+    },
+    {
+      "id": "SCH-PWR-02", "section": "power", "kind": "assisted",
+      "text": "Regulator enable pins are tied, pulled or driven, and none is held off by mistake.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.converters", "op": "==", "value": 0, "label": "no converter found"}],
+        "no": [{"list": "findings", "where": {"check": ["enable_floating", "enable_held_off"], "severity": "warning"}, "label": "enables floating or held off"}],
+        "judge": [{"list": "findings", "where": {"check": ["enable_floating", "enable_held_off"]}, "label": "enable notes"}]
+      },
+      "hint": "Check each EN pin's polarity and internal pull in the converter's datasheet."
+    },
+    {
+      "id": "SCH-PWR-03", "section": "power", "kind": "assisted",
+      "text": "Each adjustable regulator's feedback divider sets the output voltage the rail is meant to have.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.converters", "op": "==", "value": 0, "label": "no converter found"}],
+        "no": [{"list": "findings", "where": {"check": "fb_divider_mismatch", "severity": "warning"}, "label": "feedback dividers that set another voltage than the rail's"}],
+        "judge": [
+          {"list": "findings", "where": {"check": "fb_divider_mismatch", "near_common_vref": {"op": "falsy"}}, "label": "dividers implying an uncommon reference voltage"},
+          {"list": "findings", "where": {"check": "converter_unknown_rail"}, "label": "converters whose output rail is unknown"}
+        ]
+      },
+      "hint": "Recalculate with the datasheet's reference voltage (get_power_tree vref=)."
+    },
+    {
+      "id": "SCH-PWR-04", "section": "power", "kind": "assisted",
+      "text": "Power entering the board is protected against over-current, reverse polarity and transients as the product needs.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.power_inputs", "op": "==", "value": 0, "label": "no power input found"}],
+        "no": [
+          {"list": "inputs", "where": {"kind": "connector", "exposure": "external", "fuse": {"op": "falsy"}, "usb": {"op": "falsy"}}, "label": "external power inputs with no fuse"},
+          {"list": "inputs", "where": {"kind": "connector", "exposure": "external", "reverse_polarity": {"op": "falsy"}, "usb": {"op": "falsy"}}, "label": "external power inputs with no reverse-polarity protection"},
+          {"list": "inputs", "where": {"kind": "connector", "exposure": "external", "tvs": {"op": "falsy"}, "clamp_diodes_to_ground": {"op": "falsy"}}, "label": "external power inputs with no TVS or clamp"}
+        ],
+        "judge": [{"list": "findings", "where": {"check": ["no_input_fuse", "no_reverse_protection", "no_input_tvs"]}, "label": "input protection notes (inputs of unknown exposure)"}]
+      },
+      "hint": "Whether a fuse or TVS is needed depends on the source (a bench supply, a vehicle, a cable)."
+    },
+    {
+      "id": "SCH-PWR-05", "section": "power", "kind": "assisted",
+      "text": "Switching regulators have their input and output capacitors, and an input filter where their noise matters.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.converters", "op": "==", "value": 0, "label": "no converter found"}],
+        "judge": [
+          {"list": "findings", "where": {"check": ["no_output_capacitor", "no_input_capacitor"]}, "label": "converters with no input or output capacitor found"},
+          {"list": "findings", "where": {"check": "smps_input_unfiltered"}, "label": "switching regulators with no input filter"}
+        ]
+      },
+      "hint": "The power tree reports these as notes: a capacitor behind a ferrite or on a differently named net is not seen, so check each converter on its sheet."
+    },
+    {
+      "id": "SCH-PWR-06", "section": "power", "kind": "assisted",
+      "text": "Power-good signals and the start-up order of the rails are used as the parts' datasheets ask.",
+      "evidence": {
+        "tool": "get_power_tree", "args": {},
+        "na": [{"path": "overview.converters", "op": "==", "value": 0, "label": "no converter found"}],
+        "judge": [{"list": "findings", "where": {"check": ["pgood_unused", "sequencing"]}, "label": "power-good and sequencing notes"}]
+      },
+      "hint": "FPGAs, processors and DDR memory often need a rail order: compare with their datasheets."
+    },
+    {
+      "id": "SCH-PWR-07", "section": "power", "kind": "assisted",
+      "text": "Every IC supply pin has a fitted decoupling capacitor on its own rail.",
+      "evidence": {
+        "tool": "check_decoupling", "args": {},
+        "na": [{"path": "overview.ic_rail_pairs", "op": "==", "value": 0, "label": "no IC supply pin found"}],
+        "no": [{"list": "findings", "where": {"check": ["no_capacitor", "not_fitted_only", "filtered_rail"], "severity": "warning"}, "label": "IC rails without a fitted capacitor"}],
+        "judge": [{"list": "findings", "where": {"check": ["no_capacitor", "not_fitted_only", "filtered_rail", "no_small_capacitor", "capacitor_elsewhere", "unknown_value"]}, "label": "decoupling notes"}]
+      },
+      "hint": "The datasheet decides how many capacitors each supply pin needs and of what value."
+    },
+    {
+      "id": "SCH-PWR-08", "section": "power", "kind": "assisted",
+      "text": "Capacitors keep a safe margin between their voltage rating and the voltage across them, and small ceramics keep enough capacitance under DC bias.",
+      "evidence": {
+        "tool": "check_derating", "args": {},
+        "na": [{"path": "summary.parts_checked.capacitors", "op": "==", "value": 0, "label": "no capacitor checked"}],
+        "no": [{"list": "findings", "where": {"check": ["over_rated", "ceramic_voltage", "tantalum_voltage", "electrolytic_voltage", "capacitor_voltage"], "severity": "warning"}, "label": "capacitors above their derated voltage"}],
+        "judge": [
+          {"list": "findings", "where": {"check": ["over_rated", "ceramic_voltage", "tantalum_voltage", "electrolytic_voltage", "capacitor_voltage", "dc_bias", "unknown_rating"]}, "label": "capacitor rating notes"},
+          {"path": "rails_without_voltage_total", "op": ">", "value": 0, "label": "rails without a known voltage (pass rails=)"}
+        ]
+      },
+      "hint": "Confirm ratings in the datasheets; give the voltages of rails whose names carry none (check_derating rails=)."
+    },
+    {
+      "id": "SCH-PWR-09", "section": "power", "kind": "assisted",
+      "text": "Resistors stay within their power and working-voltage ratings, and the currents of LEDs and shunts are known.",
+      "evidence": {
+        "tool": "check_derating", "args": {},
+        "na": [{"path": "summary.parts_checked.resistors", "op": "==", "value": 0, "label": "no resistor checked"}],
+        "no": [{"list": "findings", "where": {"check": ["resistor_power", "resistor_voltage"], "severity": "warning"}, "label": "resistors above their rating"}],
+        "judge": [{"list": "findings", "where": {"check": ["resistor_power", "resistor_voltage", "needs_current"]}, "label": "resistor notes and currents to look up"}]
+      }
+    },
+    {
+      "id": "SCH-PWR-10", "section": "power", "kind": "assisted",
+      "text": "Parts that dissipate power stay below their maximum junction temperature with margin.",
+      "evidence": {
+        "tool": "check_thermal", "args": {},
+        "na": [{"path": "summary.hot_parts", "op": "==", "value": 0, "label": "no part that dissipates much"}],
+        "no": [{"list": "findings", "where": {"check": "tj_over_max"}, "label": "parts above their maximum junction temperature"}],
+        "judge": [
+          {"list": "findings", "where": {"check": "tj_near_max"}, "label": "parts near their maximum junction temperature"},
+          {"path": "summary.dissipation.needs_inputs", "op": ">", "value": 0, "label": "hot parts whose dissipation needs loads or efficiencies"}
+        ]
+      },
+      "hint": "Loads, efficiencies and thermal resistances come from the datasheets and the user (check_thermal load=, theta=)."
+    },
+    {
+      "id": "SCH-SIG-01", "section": "signals", "kind": "auto",
+      "text": "The offline ERC finds no errors or fatal errors.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "no": [
+          {"path": "summary.by_level.Fatal Error", "op": ">", "value": 0, "label": "ERC fatal errors"},
+          {"path": "summary.by_level.Error", "op": ">", "value": 0, "label": "ERC errors"}
+        ],
+        "anchors": [{"list": "violations", "where": {"level": ["Error", "Fatal Error"]}}]
+      },
+      "hint": "run_erc approximates Altium's ERC: confirm with Project > Validate PCB Project in Altium."
+    },
+    {
+      "id": "SCH-SIG-02", "section": "signals", "kind": "assisted",
+      "text": "Connectivity warnings (floating labels or power ports, loose wires, single-pin nets, ports or sheet entries without a match) are fixed or intended.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "no": [{"list": "violations", "where": {"violation": ["Floating net labels", "Floating power objects", "Unconnected wires", "Nets with only one pin", "Port not linked to parent sheet symbol", "Sheet Entry not linked to child sheet", "Port with no matching ports", "Unconnected objects in net", "Nets with possible connection problems", "Nets containing floating input pins", "Nets with no driving source"]}, "label": "connectivity violations"}],
+        "judge": [{"list": "advisories", "where": {"advisory": "near_miss_wire_ends"}, "label": "wire ends that almost touch"}]
+      },
+      "hint": "An intended one wants a No ERC marker or a level change, not a redesign."
+    },
+    {
+      "id": "SCH-SIG-03", "section": "signals", "kind": "assisted",
+      "text": "Reset, enable, boot, strap and open-drain lines have a defined level: a pull resistor or a driver.",
+      "evidence": {
+        "tool": "check_pull_resistors", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["control_no_pull", "open_drain_no_pull", "gate_no_pull", "comparator_no_pull", "not_fitted_pull"], "severity": "warning"}, "label": "lines without a defined level"}],
+        "judge": [{"list": "findings", "where": {"check": ["control_no_pull", "open_drain_no_pull", "gate_no_pull", "comparator_no_pull", "not_fitted_pull", "pull_up_and_down", "parallel_pull_ups"]}, "label": "pull resistor notes"}]
+      },
+      "hint": "Pulls inside ICs are invisible here: check the datasheet before calling one missing."
+    },
+    {
+      "id": "SCH-SIG-04", "section": "signals", "kind": "assisted",
+      "text": "I2C pull-up values suit the bus speed and its capacitance.",
+      "evidence": {
+        "tool": "check_pull_resistors", "args": {},
+        "na": [{"path": "i2c.buses_total", "op": "==", "value": 0, "label": "no I2C bus found"}],
+        "no": [{"list": "findings", "where": {"check": "i2c_pull_value", "severity": "warning"}, "label": "I2C buses with an unsuitable pull-up"}],
+        "judge": [
+          {"list": "findings", "where": {"check": "i2c_pull_value"}, "label": "I2C pull-up notes"},
+          {"list": "i2c.buses", "where": {"verdict": {"op": "!=", "value": "ok"}}, "label": "I2C buses not judged ok"}
+        ]
+      },
+      "hint": "Ask the bus speed and pass check_pull_resistors i2c_mode= and bus_capacitance_pf=."
+    },
+    {
+      "id": "SCH-SIG-05", "section": "signals", "kind": "assisted",
+      "text": "Signals between ICs on different supply rails have compatible logic levels, and no input is driven above its supply.",
+      "evidence": {
+        "tool": "check_logic_levels", "args": {},
+        "na": [{"path": "summary.signals.checked", "op": "==", "value": 0, "label": "no signal between ICs checked"}],
+        "no": [{"list": "findings", "where": {"check": ["driver_low_for_receiver", "receiver_overvoltage", "open_drain_pullup_mismatch"], "severity": "warning"}, "label": "level mismatch candidates"}],
+        "judge": [{"list": "findings", "where": {"check": ["driver_low_for_receiver", "receiver_overvoltage", "open_drain_pullup_mismatch", "unknown_rail"]}, "label": "logic level notes and rails of unknown voltage"}]
+      },
+      "hint": "Confirm VOH, VIH, 5 V tolerance and absolute maximum ratings in both datasheets."
+    },
+    {
+      "id": "SCH-SIG-06", "section": "signals", "kind": "assisted",
+      "text": "Dividers, LED and optocoupler currents and ADC input filters compute to the intended values.",
+      "evidence": {
+        "tool": "get_circuit_calculations", "args": {},
+        "na": [{"path": "calculations_total", "op": "==", "value": 0, "label": "no divider, LED, optocoupler or filter found"}],
+        "no": [{"list": "findings", "where": {"severity": "warning"}, "label": "calculations out of range"}],
+        "judge": [
+          {"list": "findings", "label": "calculation notes"},
+          {"path": "voltages_needed_total", "op": "exists", "label": "rails whose voltage is needed (pass rails=)"}
+        ]
+      },
+      "hint": "Vf, Vref and thresholds are datasheet values: recheck each calculation with them."
+    },
+    {
+      "id": "SCH-SIG-07", "section": "signals", "kind": "assisted",
+      "text": "The processor's UART, boot and strap pins are wired as intended: TX meets RX, boot levels are set.",
+      "evidence": {
+        "tool": "get_firmware_pin_map", "args": {},
+        "na": [{"path": "candidates_total", "op": "==", "value": 0, "label": "no processor, FPGA or radio found"}],
+        "no": [{"list": "findings", "where": {"check": ["uart_crossing", "boot_straps", "conflicting_assignment"], "severity": "warning"}, "label": "pin wiring problems"}],
+        "judge": [{"list": "findings", "where": {"check": ["uart_crossing", "boot_straps", "conflicting_assignment", "external_memory"]}, "label": "pin notes"}]
+      },
+      "hint": "Check pin functions and boot modes against the processor's datasheet."
+    },
+    {
+      "id": "SCH-SIG-08", "section": "signals", "kind": "auto",
+      "text": "The sheet hierarchy is consistent: sheet symbols point at existing sheets, and entries and ports match.",
+      "evidence": {
+        "tool": "get_design_hierarchy", "args": {},
+        "no": [{"list": "issues", "where": {"severity": "error"}, "label": "hierarchy errors"}],
+        "judge": [{"list": "issues", "where": {"severity": "warning"}, "label": "hierarchy warnings"}]
+      }
+    },
+    {
+      "id": "SCH-SIG-09", "section": "signals", "kind": "judgment",
+      "text": "Differential pairs and other critical nets are named and marked (diff-pair directives, net classes) as the layout needs.",
+      "hint": "list_diff_pairs and get_classes show what reached the board."
+    },
+    {
+      "id": "SCH-CMP-01", "section": "components", "kind": "auto",
+      "text": "Designators are unique and every part is annotated.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "no": [{"list": "violations", "where": {"violation": ["Duplicate Part Designators", "Un-Designated parts requiring annotation"]}, "label": "duplicate or unannotated designators"}]
+      }
+    },
+    {
+      "id": "SCH-CMP-02", "section": "components", "kind": "auto",
+      "text": "Every placed part's symbol and footprint are found in a library the project uses.",
+      "evidence": {
+        "tool": "check_libraries", "args": {},
+        "no": [{"list": "findings", "where": {"check": "resolution", "severity": ["error", "warning"]}, "label": "parts whose library item is not found"}],
+        "judge": [{"list": "findings", "where": {"check": "resolution"}, "label": "library notes (Workspace or database parts are not readable offline)"}]
+      }
+    },
+    {
+      "id": "SCH-CMP-03", "section": "components", "kind": "auto",
+      "text": "The symbols used pass the library rule check: pins named and numbered once, description, designator prefix and footprint set.",
+      "evidence": {
+        "tool": "check_libraries", "args": {},
+        "no": [{"list": "findings", "where": {"check": "symbol_rules", "severity": ["error", "warning"]}, "label": "symbol rule violations"}],
+        "judge": [{"list": "findings", "where": {"check": "symbol_rules", "kind": ["missing_description", "missing_footprint"]}, "label": "symbols without a description or footprint"}]
+      }
+    },
+    {
+      "id": "SCH-CMP-04", "section": "components", "kind": "auto",
+      "text": "Every BOM part has a footprint and a real description, not a placeholder.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["no_footprint", "placeholder_description", "unresolved_special_string"], "severity": "warning"}, "label": "parts without a footprint or with a placeholder text"}],
+        "judge": [{"list": "findings", "where": {"check": "placeholder_description"}, "label": "description notes"}]
+      }
+    },
+    {
+      "id": "SCH-CMP-05", "section": "components", "kind": "judgment",
+      "text": "Each IC follows its datasheet's application circuit: pin functions, required external parts, unused pins handled.",
+      "hint": "Read each IC with get_sheet_context and its datasheet; name any part without a datasheet."
+    },
+    {
+      "id": "SCH-CMP-06", "section": "components", "kind": "judgment",
+      "text": "Polarised parts (diodes, LEDs, electrolytic and tantalum capacitors) and transistors are connected the right way round."
+    },
+    {
+      "id": "SCH-CMP-07", "section": "components", "kind": "judgment",
+      "text": "Parts are rated for the product's temperature range and environment, and safety-relevant parts carry the approvals they need."
+    },
+    {
+      "id": "SCH-CON-01", "section": "connectors", "kind": "assisted",
+      "text": "Pins of connectors the outside world can touch have ESD or TVS protection near the connector.",
+      "evidence": {
+        "tool": "check_interfaces", "args": {},
+        "na": [{"path": "connectors_total", "op": "==", "value": 0, "label": "no connector found"}],
+        "no": [{"list": "findings", "where": {"check": "no_esd", "severity": "warning"}, "label": "exposed pins without ESD protection"}],
+        "judge": [{"list": "findings", "where": {"check": ["no_esd", "esd_behind_series"]}, "label": "ESD notes (connector exposure unknown or internal)"}]
+      },
+      "hint": "Confirm which connectors are user-facing (check_interfaces external= / internal=) and the TVS part's ratings."
+    },
+    {
+      "id": "SCH-CON-02", "section": "connectors", "kind": "assisted",
+      "text": "Cable shields and connector grounds are tied as intended: no floating shield, no ground only through a part by accident.",
+      "evidence": {
+        "tool": "check_interfaces", "args": {},
+        "na": [{"path": "connectors_total", "op": "==", "value": 0, "label": "no connector found"}],
+        "no": [{"list": "findings", "where": {"check": ["shield_floating", "ground_indirect"], "severity": "warning"}, "label": "shields or grounds tied wrongly"}],
+        "judge": [{"list": "findings", "where": {"check": ["shield_floating", "ground_indirect", "shield_rc", "sparse_ground"]}, "label": "shield and ground notes"}]
+      }
+    },
+    {
+      "id": "SCH-CON-03", "section": "connectors", "kind": "assisted",
+      "text": "Low-speed lines leaving the board have a place for a series resistor or ferrite, for EMC tuning.",
+      "evidence": {
+        "tool": "check_interfaces", "args": {},
+        "na": [{"path": "connectors_total", "op": "==", "value": 0, "label": "no connector found"}],
+        "judge": [{"list": "findings", "where": {"check": "no_series_element"}, "label": "off-board lines with no series element"}]
+      }
+    },
+    {
+      "id": "SCH-CON-04", "section": "connectors", "kind": "judgment",
+      "text": "Connector pinouts match the mating connector, cable or board, and pin 1 and keying are documented."
+    },
+    {
+      "id": "SCH-CON-05", "section": "connectors", "kind": "judgment",
+      "text": "Inputs from the outside world survive miswiring, overvoltage and hot-plugging as far as the product requires."
+    },
+    {
+      "id": "SCH-TST-01", "section": "testability", "kind": "assisted",
+      "text": "The processor can be programmed and debugged: its debug and boot pins reach a header or test pads.",
+      "evidence": {
+        "tool": "get_firmware_pin_map", "args": {},
+        "na": [{"path": "candidates_total", "op": "==", "value": 0, "label": "no processor, FPGA or radio found"}],
+        "no": [{"list": "findings", "where": {"check": "debug_access", "severity": "warning"}, "label": "debug or programming pins without access"}],
+        "judge": [{"list": "findings", "where": {"check": "debug_access"}, "label": "debug access notes"}]
+      }
+    },
+    {
+      "id": "SCH-TST-02", "section": "testability", "kind": "auto",
+      "text": "The project files are sound: no missing documents, legacy file types, stale variant entries or hidden characters in names.",
+      "evidence": {
+        "tool": "check_project_integrity", "args": {},
+        "no": [{"path": "summary.severity_counts.error", "op": ">", "value": 0, "label": "integrity errors"}],
+        "judge": [{"path": "summary.severity_counts.warning", "op": ">", "value": 0, "label": "integrity warnings"}],
+        "anchors": [{"list": "findings", "where": {"severity": ["error", "warning"]}}]
+      }
+    },
+    {
+      "id": "SCH-TST-03", "section": "testability", "kind": "assisted",
+      "text": "ERC settings keep Altium's important checks on, and each No ERC marker hides only an intended violation.",
+      "evidence": {
+        "tool": "get_project_options", "args": {},
+        "judge": [
+          {"path": "audit.no_erc.flagged", "op": ">", "value": 0, "label": "No ERC markers on power or multi-pin nets"},
+          {"list": "audit.erc_checks_off_or_downgraded", "where": {"hides": {"op": "exists"}}, "label": "ERC checks switched off that can hide faults"},
+          {"list": "audit.connection_matrix_relaxed", "label": "relaxed Connection Matrix cells"}
+        ]
+      }
+    },
+    {
+      "id": "SCH-TST-04", "section": "testability", "kind": "judgment",
+      "text": "Rails and signals the test plan measures have test points or reachable pads.",
+      "hint": "check_testpoints shows probe access on the board."
+    },
+    {
+      "id": "SCH-TST-05", "section": "testability", "kind": "judgment",
+      "text": "Not Fitted parts and variant choices are explained (why a part is left out, which variant ships)."
+    },
+    {
+      "id": "SCH-STY-01", "section": "style", "kind": "auto",
+      "text": "Title blocks give the same revision and date on every sheet and drawing.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "title_block", "status": "not_applicable"}, "label": "title block gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "title_block", "status": "fail"}, "label": "title block gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "title_block", "status": ["warn", "not_verified"]}, "label": "title block gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "title_block", "status": "pass"}, "label": "title block gate passed"}]
+      }
+    },
+    {
+      "id": "SCH-STY-02", "section": "style", "kind": "assisted",
+      "text": "Objects sit on the grid and inside the sheet border.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "judge": [{"list": "violations", "where": {"violation": ["Off-grid object", "Object not completely within sheet boundaries"]}, "label": "off-grid or off-sheet objects"}]
+      }
+    },
+    {
+      "id": "SCH-STY-03", "section": "style", "kind": "assisted",
+      "text": "Each rail has one name and power ports are used consistently.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "judge": [
+          {"list": "violations", "where": {"violation": "Nets with multiple names"}, "label": "nets with several names"},
+          {"list": "advisories", "where": {"advisory": ["near_duplicate_power_aliases", "label_casing"]}, "label": "rail aliases and name casing"}
+        ]
+      }
+    },
+    {
+      "id": "SCH-STY-04", "section": "style", "kind": "judgment",
+      "text": "Sheets read clearly: signals flow from inputs to outputs, related circuits are grouped, net names say what the net carries."
+    },
+    {
+      "id": "SCH-STY-05", "section": "style", "kind": "judgment",
+      "text": "Design notes explain the non-obvious: chosen values, Not Fitted parts, open questions.",
+      "hint": "get_design_notes lists the notes of every sheet and drawing."
+    }
+  ]
+}

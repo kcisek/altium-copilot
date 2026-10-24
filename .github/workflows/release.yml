@@ -91,6 +91,7 @@ jobs:
             --distpath server/dist `
             --workpath build `
             --add-data "server/scripts;scripts" `
+            --add-data "server/checklists;checklists" `
             --add-data "manifest.json;." `
             --paths server `
             server/main.py

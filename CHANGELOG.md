@@ -6,6 +6,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `run_review_checklist`: design-review checklists run against the saved project, offline
+  (roadmap #46 phase 1, `services/review_checklist.py`). Works on a netlist-free load (the
+  schematic tools' items then say they could not run) and without a PcbDoc (board items
+  are N/A).
+  - Four bundled checklists in `server/checklists/*.json`, written in this project's own
+    words on the topics of Altium's schematic review checklist and its PCB design review
+    checklists (cited in each file): `schematic` (power; signals and interfaces;
+    components and ratings; connectors and protection; testability and production; style
+    and documentation, 41 items), `pcb` (placement; power and thermal; high speed and
+    constraints; manufacturing; testability, 33), `release` (validation, generated outputs,
+    documentation, configuration, 21) and `bom` (part data, sourcing, variants, 12). Each
+    item has an id, its text, a kind (auto: a deterministic tool decides; assisted: a tool
+    gives evidence and the datasheet or the reviewer decides; judgment: a person), a scope,
+    an optional hint and source, and for tool items its evidence: the tool and arguments
+    and condition lists (`na`, `no`, `judge`, `yes`) over the tool's findings and summary
+    fields. No checklist named lists them with sections and item counts.
+  - The tools run in-process through the MCP tool functions themselves, with the item's
+    arguments and the active variant, once per tool and arguments per call; pages are read
+    while they bring new rows of a list an item looks at (at most 25). Each item row gives
+    its status (yes, no, n/a, needs_judgment; an assisted item's lean yes or no), an
+    evidence line (counts, finding ids and the first finding's own words), the tool and
+    arguments, finding ids with counts, anchors (designators, nets, sheets, rule and
+    variant names) and could_not_run (the tool's error code, such as netlist_required).
+    A field an item reads that is not in its tool's result makes it needs judgment
+    (`unresolved`), never Yes; a Yes quotes what was checked. A coverage table counts
+    items by status per section.
+  - Design state: SHA1 and save time of the .PrjPcb, sheets, PcbDocs and Draftsman
+    drawings with a fingerprint over them, and when the project is in a Git work tree the
+    commit and whether any of those files differs from it, wherever it is (a sheet outside
+    the project folder too; an untracked or git-ignored file, or one outside the work
+    tree, counts as changed). New `clone_status.head_state`, with the same local, hardened
+    git calls as `get_clone_status`; `_uncommitted` takes literal, case-insensitive paths.
+  - `decisions={"ID": "no: reason"}` records the review's own verdicts (the tool's status
+    is kept as tool_status). `format='markdown'` returns the review record: header and
+    design state, the design files with their SHA1s, the 'Checklist coverage' table,
+    every item with status, evidence and anchors, the open items, a sign-off table and a
+    machine-readable block (an HTML comment). `previous=` reads such a record back and
+    reports the design-state change, newly failing, fixed and still-open items, other
+    status changes (No to N/A is a change, not a fix) and the earlier review decisions on
+    items that are open again. A record too large for one result even shortened is a
+    `record_too_large` error asking for one record per section, never a record cut
+    through its block. Nothing is written; a run is reused for 5 minutes while the design
+    files and every file in the project folder (OutJobs, reports, outputs) are unchanged.
+  - Team overrides: `review_checklists.json` or `review_checklists/*.json` next to the
+    .PrjPcb or in the root of the Git repository above it replace a checklist, add
+    checklists, sections and items, and disable items by id. Every file is validated
+    (keys, ids, kinds, scopes, tools and the arguments they take, operators, values,
+    duplicate ids across checklists ignoring case, JSON with line and column, size, links
+    out of the folder); a problem is an `invalid_checklist` error naming the file and the
+    place. A `where` field can be compared with another field of the row (`field`).
+    `overrides=false` ignores them. Template: `examples/review_checklists.json`.
+  - `schematic_review`, `constraints_review`, `pcb_manufacturing_review` and
+    `release_review` call `run_review_checklist` with their checklist first and finish
+    with its coverage table and record. The bundled checklists are packaged with
+    `--add-data "server/checklists;checklists"` (release workflow and `pack.ps1`).
 - `check_libraries` and `get_library_part`: the libraries behind the project's parts, read
   offline (roadmap #52, `services/libraries.py`, on new readers `parsers/sch_lib.py`,
   `parsers/pcb_lib.py` and `parsers/int_lib.py`). Both work on a netlist-free load (the PCB's

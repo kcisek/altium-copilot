@@ -1,0 +1,111 @@
+{
+  "_about": "Bundled supply-chain and BOM checklist of altium-copilot (run_review_checklist). Item texts are this project's own words; the topics follow the BOM and supply-chain items of Altium's PCB design review articles (resources.altium.com/p/pcb-design-review-checklist-gets-you-manufacturing-quickly). Teams change it with review_checklists.json (see README).",
+  "id": "bom",
+  "title": "Supply chain and BOM",
+  "scope": "bom",
+  "version": "1",
+  "description": "Part data, sourcing and variants of the bill of materials.",
+  "source": "Topics after the BOM and supply-chain items of Altium's PCB review articles (resources.altium.com/p/pcb-design-review-checklist-gets-you-manufacturing-quickly); items written for this project.",
+  "sections": [
+    {"id": "part_data", "title": "Part data"},
+    {"id": "sourcing", "title": "Sourcing"},
+    {"id": "variants", "title": "Variants and assembly"}
+  ],
+  "items": [
+    {
+      "id": "BOM-DAT-01", "section": "part_data", "kind": "auto",
+      "text": "Every fitted BOM line names a manufacturer and a manufacturer part number.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["missing_mpn", "mpn_without_manufacturer"], "severity": "warning"}, "label": "lines without a manufacturer or part number"}],
+        "judge": [{"list": "findings", "where": {"check": "missing_mpn"}, "label": "part numbers kept elsewhere (few parts carry one here)"}]
+      },
+      "hint": "Part numbers kept in ActiveBOM or a database library are not read: say so instead of listing every part."
+    },
+    {
+      "id": "BOM-DAT-02", "section": "part_data", "kind": "auto",
+      "text": "Parts on one BOM line agree on part number and value.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"list": "findings", "where": {"check": "mpn_inconsistent", "severity": "warning"}, "label": "lines whose parts disagree"}],
+        "judge": [{"list": "findings", "where": {"check": ["mpn_inconsistent", "consolidation"]}, "label": "line notes (footprints differ, lines that could merge)"}]
+      }
+    },
+    {
+      "id": "BOM-DAT-03", "section": "part_data", "kind": "auto",
+      "text": "No BOM text is left unresolved, and no fitted part is marked as not fitted in its text.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"list": "findings", "where": {"check": ["unresolved_special_string", "dnp_marker_on_fitted"]}, "label": "unresolved texts or Not Fitted markers on fitted parts"}]
+      }
+    },
+    {
+      "id": "BOM-DAT-04", "section": "part_data", "kind": "auto",
+      "text": "Designators are unique and every schematic part reaches the compiled BOM.",
+      "evidence": {
+        "tool": "check_bom", "args": {},
+        "no": [{"list": "findings", "where": {"check": "duplicate_designator"}, "label": "duplicate designators"}],
+        "judge": [{"list": "findings", "where": {"check": "not_compiled"}, "label": "parts outside the compiled part list"}]
+      }
+    },
+    {
+      "id": "BOM-SRC-01", "section": "sourcing", "kind": "judgment",
+      "text": "Every part is active (not end-of-life or not recommended for new designs)."
+    },
+    {
+      "id": "BOM-SRC-02", "section": "sourcing", "kind": "judgment",
+      "text": "Single-source parts have an approved alternate or a recorded risk."
+    },
+    {
+      "id": "BOM-SRC-03", "section": "sourcing", "kind": "judgment",
+      "text": "Long-lead and low-stock parts are known and ordered in time."
+    },
+    {
+      "id": "BOM-SRC-04", "section": "sourcing", "kind": "judgment",
+      "text": "Compliance data (RoHS, REACH, conflict minerals) is available for every part the product needs it for."
+    },
+    {
+      "id": "BOM-VAR-01", "section": "variants", "kind": "assisted",
+      "text": "Every variant that ships has a BOM, a pick-and-place and an assembly drawing output set to it.",
+      "evidence": {
+        "tool": "compare_variants", "args": {},
+        "na_errors": ["no_variants"],
+        "no": [{"list": "documentation.per_variant", "where": {"outputs_missing": {"op": "nonempty"}}, "label": "variants missing an output"}]
+      },
+      "hint": "Only variants that are built need outputs: ask which ones ship."
+    },
+    {
+      "id": "BOM-VAR-02", "section": "variants", "kind": "auto",
+      "text": "Variant entries still point at their parts (no stale Not Fitted or varied-parameter lines).",
+      "evidence": {
+        "tool": "check_project_integrity", "args": {},
+        "na": [{"path": "not_applicable.variant_entry", "op": "exists", "label": "no variant entries"}],
+        "no": [{"list": "findings", "where": {"check": "variant_entry", "severity": ["error", "warning"]}, "label": "stale variant entries (any variant)"}],
+        "judge": [{"list": "findings", "where": {"check": "variant_entry"}, "label": "variant entry notes"}]
+      }
+    },
+    {
+      "id": "BOM-VAR-03", "section": "variants", "kind": "auto",
+      "text": "The BOM and the pick-and-place outputs use the same variant.",
+      "evidence": {
+        "tool": "get_output_jobs", "args": {},
+        "na": [{"any": [
+          {"path": "coverage.bom.status", "op": "!=", "value": "connected"},
+          {"path": "coverage.pick_and_place.status", "op": "!=", "value": "connected"}
+        ], "label": "no connected BOM and pick-and-place outputs to compare"}],
+        "no": [{"list": "findings", "where": {"check": "bom_pnp_variant"}, "label": "BOM and pick-and-place on different variants"}],
+        "judge": [{"list": "findings", "where": {"check": ["assembly_drawing_variant", "draftsman_variant"]}, "label": "assembly drawing variant notes"}]
+      }
+    },
+    {
+      "id": "BOM-VAR-04", "section": "variants", "kind": "assisted",
+      "text": "The number of unique parts and placements suits the assembler.",
+      "evidence": {
+        "tool": "check_dfm", "args": {},
+        "no": [{"list": "findings", "where": {"check": "part_counts", "severity": ["error", "warning"]}, "label": "part counts above the assembler's limits"}],
+        "judge": [{"list": "findings", "where": {"check": "part_counts"}, "label": "part count notes"}]
+      },
+      "hint": "The limits are an assembler's: ask for its numbers (check_dfm limits=)."
+    }
+  ]
+}

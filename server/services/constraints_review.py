@@ -421,6 +421,7 @@ CONSTRAINTS_REVIEW_TOOLS = (
     "set_project_dir",
     "set_active_variant",
     "schematic_review",
+    "run_review_checklist",
 )
 
 CONSTRAINTS_REVIEW_PROMPT = """\
@@ -505,6 +506,10 @@ Do not proceed until the user answers.
 Present a table: | Interface | Endpoints | Nets / Pairs | Targets (source) |
 Ask about anything you could not determine.
 
+5. Checklist — run_review_checklist(checklist="pcb", sections=["high_speed"]) once: show
+   its coverage table. Its auto items (rule compliance, lengths, pairs, the DRC report)
+   are answered from the tools; its needs-judgment items are what Phases 2-3 decide.
+
 Done when: the user has confirmed or corrected the interface list and the targets.
 Do not proceed to Phase 2 until then.
 
@@ -584,6 +589,12 @@ Present the findings as three Markdown tables:
   | Item | Observation | What would confirm it |
 
 Result is one of: met, violated, not encoded (no rule), conditional, unverifiable.
+
+Finish with the checklist: run_review_checklist(checklist="pcb", sections=["high_speed"],
+format="markdown") with decisions= giving your Yes, No or N/A and a one-line reason for
+each needs-judgment item you settled. Show its 'Checklist coverage' table and the review
+record (it names the design state it belongs to); save the record only where the user
+agrees.
 
 Ask: "Any interface to dig deeper into, or should I review its circuit with
 schematic_review?"

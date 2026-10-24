@@ -1,0 +1,225 @@
+{
+  "_about": "Bundled manufacturing and release checklist of altium-copilot (run_review_checklist). Item texts are this project's own words; the topics follow Altium's Project Releaser validations and its PCB design review checklists (resources.altium.com/p/pcb-design-and-review-checklist). Teams change it with review_checklists.json (see README).",
+  "id": "release",
+  "title": "Manufacturing and release",
+  "scope": "release",
+  "version": "1",
+  "description": "Validation, generated outputs, documentation and configuration before a design goes to fabrication and assembly.",
+  "source": "Topics after Altium's Project Releaser validations and its PCB design review checklists (resources.altium.com/p/pcb-design-and-review-checklist); items written for this project.",
+  "sections": [
+    {"id": "validation", "title": "Validation"},
+    {"id": "outputs", "title": "Generated outputs"},
+    {"id": "documentation", "title": "Documentation"},
+    {"id": "configuration", "title": "Configuration and mechanics"}
+  ],
+  "items": [
+    {
+      "id": "REL-VAL-01", "section": "validation", "kind": "auto",
+      "text": "Altium's last Batch DRC report is clean and newer than the board.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "drc", "status": "not_applicable"}, "label": "DRC gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "drc", "status": "fail"}, "label": "DRC gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "drc", "status": ["warn", "not_verified"]}, "label": "DRC gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "drc", "status": "pass"}, "label": "DRC gate passed"}]
+      }
+    },
+    {
+      "id": "REL-VAL-02", "section": "validation", "kind": "assisted",
+      "text": "ERC has been run in Altium and its errors are resolved or waived.",
+      "evidence": {
+        "tool": "run_erc", "args": {},
+        "no": [
+          {"path": "summary.by_level.Fatal Error", "op": ">", "value": 0, "label": "offline ERC fatal errors"},
+          {"path": "summary.by_level.Error", "op": ">", "value": 0, "label": "offline ERC errors"}
+        ],
+        "anchors": [{"list": "violations", "where": {"level": ["Error", "Fatal Error"]}}]
+      },
+      "hint": "Altium never saves its ERC result: confirm a clean Messages panel after Project > Validate PCB Project."
+    },
+    {
+      "id": "REL-VAL-03", "section": "validation", "kind": "auto",
+      "text": "The netlist the tools read is newer than every sheet.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "netlist_fresh", "status": "not_applicable"}, "label": "netlist gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "netlist_fresh", "status": "fail"}, "label": "netlist gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "netlist_fresh", "status": ["warn", "not_verified"]}, "label": "netlist gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "netlist_fresh", "status": "pass"}, "label": "netlist gate passed"}]
+      }
+    },
+    {
+      "id": "REL-VAL-04", "section": "validation", "kind": "auto",
+      "text": "Schematic and PCB are in sync.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "sch_pcb_sync", "status": "not_applicable"}, "label": "sync gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "sch_pcb_sync", "status": "fail"}, "label": "sync gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "sch_pcb_sync", "status": ["warn", "not_verified"]}, "label": "sync gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "sch_pcb_sync", "status": "pass"}, "label": "sync gate passed"}]
+      }
+    },
+    {
+      "id": "REL-VAL-05", "section": "validation", "kind": "auto",
+      "text": "No net is left unrouted.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "unrouted_nets", "status": "not_applicable"}, "label": "unrouted-net gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "unrouted_nets", "status": "fail"}, "label": "unrouted-net gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "unrouted_nets", "status": ["warn", "not_verified"]}, "label": "unrouted-net gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "unrouted_nets", "status": "pass"}, "label": "unrouted-net gate passed"}]
+      }
+    },
+    {
+      "id": "REL-VAL-06", "section": "validation", "kind": "auto",
+      "text": "Polygons are repoured and saved.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "polygons", "status": "not_applicable"}, "label": "polygon gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "polygons", "status": "fail"}, "label": "polygon gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "polygons", "status": ["warn", "not_verified"]}, "label": "polygon gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "polygons", "status": "pass"}, "label": "polygon gate passed"}]
+      }
+    },
+    {
+      "id": "REL-VAL-07", "section": "validation", "kind": "auto",
+      "text": "The project files have no integrity errors.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "project_integrity", "status": "not_applicable"}, "label": "integrity gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "project_integrity", "status": "fail"}, "label": "integrity gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "project_integrity", "status": ["warn", "not_verified"]}, "label": "integrity gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "project_integrity", "status": "pass"}, "label": "integrity gate passed"}]
+      }
+    },
+    {
+      "id": "REL-OUT-01", "section": "outputs", "kind": "auto",
+      "text": "The Output Jobs are complete and sound: fabrication data, drill, pick-and-place, assembly drawing and BOM for every variant that ships, readable OutJob files, and validation settings that match the project.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "outjob_coverage", "status": "not_applicable"}, "label": "OutJob gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "outjob_coverage", "status": "fail"}, "label": "OutJob gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "outjob_coverage", "status": ["warn", "not_verified"]}, "label": "OutJob gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "outjob_coverage", "status": "pass"}, "label": "OutJob gate passed"}]
+      }
+    },
+    {
+      "id": "REL-OUT-02", "section": "outputs", "kind": "auto",
+      "text": "Generated outputs are newer than the design files.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "outputs_current", "status": "not_applicable"}, "label": "output age gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "outputs_current", "status": "fail"}, "label": "output age gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "outputs_current", "status": ["warn", "not_verified"]}, "label": "output age gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "outputs_current", "status": "pass"}, "label": "output age gate passed"}]
+      }
+    },
+    {
+      "id": "REL-OUT-03", "section": "outputs", "kind": "auto",
+      "text": "Not Fitted parts are left out of the BOM and pick-and-place outputs.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "dnp_parts", "status": "not_applicable"}, "label": "Not Fitted gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "dnp_parts", "status": "fail"}, "label": "Not Fitted gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "dnp_parts", "status": ["warn", "not_verified"]}, "label": "Not Fitted gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "dnp_parts", "status": "pass"}, "label": "Not Fitted gate passed"}]
+      }
+    },
+    {
+      "id": "REL-OUT-04", "section": "outputs", "kind": "assisted",
+      "text": "The generated files (pick-and-place, BOM, netlists, drill) match the saved design.",
+      "evidence": {
+        "tool": "verify_outputs", "args": {},
+        "no": [{"list": "findings", "where": {"severity": ["error", "warning"]}, "label": "output mismatches"}],
+        "judge": [{"path": "verdict", "op": "==", "value": "no_outputs", "label": "generated outputs not found"}]
+      },
+      "hint": "Generate the outputs in Altium (or point verify_outputs path= at the release folder or zip)."
+    },
+    {
+      "id": "REL-DOC-01", "section": "documentation", "kind": "auto",
+      "text": "The fabrication drawing is complete and agrees with the layer stack.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "fab_drawing", "status": "not_applicable"}, "label": "fab drawing gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "fab_drawing", "status": "fail"}, "label": "fab drawing gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "fab_drawing", "status": ["warn", "not_verified"]}, "label": "fab drawing gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "fab_drawing", "status": "pass"}, "label": "fab drawing gate passed"}]
+      }
+    },
+    {
+      "id": "REL-DOC-02", "section": "documentation", "kind": "auto",
+      "text": "Title blocks give the same revision and date on every sheet and drawing.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "title_block", "status": "not_applicable"}, "label": "title block gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "title_block", "status": "fail"}, "label": "title block gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "title_block", "status": ["warn", "not_verified"]}, "label": "title block gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "title_block", "status": "pass"}, "label": "title block gate passed"}]
+      }
+    },
+    {
+      "id": "REL-DOC-03", "section": "documentation", "kind": "judgment",
+      "text": "Release notes list what changed since the last release.",
+      "hint": "diff_design drafts an ECO-style changelog between two revisions."
+    },
+    {
+      "id": "REL-DOC-04", "section": "documentation", "kind": "judgment",
+      "text": "Assembly drawings show both sides, polarity marks and the Not Fitted parts of each variant."
+    },
+    {
+      "id": "REL-DOC-05", "section": "documentation", "kind": "judgment",
+      "text": "Fabrication and assembly requirements (IPC class, finish, stack-up, electrical test) are agreed with the suppliers."
+    },
+    {
+      "id": "REL-CFG-01", "section": "configuration", "kind": "auto",
+      "text": "The design files are committed, and the Altium 365 copy is up to date.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "clone_status", "status": "not_applicable"}, "label": "Altium 365 gate not applicable (not an Altium 365 clone)"}],
+        "no": [{"list": "gates", "where": {"id": "clone_status", "status": "fail"}, "label": "Altium 365 gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "clone_status", "status": ["warn", "not_verified"]}, "label": "Altium 365 gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": "clone_status", "status": "pass"}, "label": "Altium 365 gate passed"}]
+      }
+    },
+    {
+      "id": "REL-CFG-02", "section": "configuration", "kind": "auto",
+      "text": "The board has an outline, mounting holes and global fiducials on each assembled side.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes", "fiducials"], "status": {"op": "!=", "value": "not_applicable"}}, "op": "==", "value": 0, "label": "outline, mounting hole and fiducial gates not applicable"}],
+        "no": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes", "fiducials"], "status": "fail"}, "label": "outline, mounting hole or fiducial gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes", "fiducials"], "status": ["warn", "not_verified"]}, "label": "outline, mounting hole or fiducial gate warned or not verified"}],
+        "yes": [{"list": "gates", "where": {"id": ["board_outline", "mounting_holes", "fiducials"], "status": "pass"}, "label": "outline, mounting hole and fiducial gates passed"}]
+      }
+    },
+    {
+      "id": "REL-CFG-03", "section": "configuration", "kind": "assisted",
+      "text": "The board can be tested: test access meets the test plan.",
+      "evidence": {
+        "tool": "check_release_readiness", "args": {},
+        "na": [{"list": "gates", "where": {"id": "testpoints", "status": "not_applicable"}, "label": "test access gate not applicable"}],
+        "no": [{"list": "gates", "where": {"id": "testpoints", "status": "fail"}, "label": "test access gate failed"}],
+        "judge": [{"list": "gates", "where": {"id": "testpoints", "status": ["warn", "not_verified"]}, "label": "test access gate warned or not verified"}]
+      },
+      "hint": "Test-access numbers are guidance: ask the test house."
+    },
+    {
+      "id": "REL-CFG-04", "section": "configuration", "kind": "assisted",
+      "text": "Placed footprints match the libraries the release is built from.",
+      "evidence": {
+        "tool": "check_libraries", "args": {},
+        "na": [{"path": "pcb_doc", "op": "missing", "label": "no PcbDoc"}],
+        "no": [{"list": "findings", "where": {"check": ["footprint_drift", "resolution"], "severity": ["error", "warning"]}, "label": "footprints that differ from or are missing in the library"}],
+        "judge": [
+          {"list": "findings", "where": {"check": "footprint_drift"}, "label": "footprint differences shown as info"},
+          {"path": "summary.footprint_drift.compared", "op": "==", "value": 0, "label": "no footprint could be compared with its library"}
+        ]
+      }
+    },
+    {
+      "id": "REL-CFG-05", "section": "configuration", "kind": "judgment",
+      "text": "Every part is active and available in the quantity the build needs (lifecycle and stock are not read offline).",
+      "hint": "Check the BOM with the distributor or the Altium 365 part data."
+    }
+  ]
+}
