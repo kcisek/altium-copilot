@@ -331,6 +331,14 @@ def _make_enriched(meta: "ComponentMeta", comp_pins: dict) -> dict:
         "params": dict(meta.params),
         "lib_reference": meta.lib_reference,
         "design_item_id": meta.design_item_id,
+        # Where the part and its footprint come from, for resolving them in the
+        # project's libraries (services/libraries.py).
+        "library": meta.library,
+        "library_path": meta.library_path,
+        "workspace_part": meta.workspace_part,
+        "database_table": meta.database_table,
+        "footprint_library": meta.footprint_library,
+        "footprint_from_component_library": meta.footprint_from_component_library,
         "compile_masked": meta.compile_masked,
         "masked_unique_ids": list(meta.masked_unique_ids),
         # Every pin's electrical type (Input, IO, Output, OpenCollector, Passive, HiZ,

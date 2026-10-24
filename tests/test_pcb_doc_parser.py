@@ -1791,7 +1791,9 @@ def test_decode_component_bodies():
     assert first.outline == BODY_SQUARE
     assert first.overall_height_mil == pytest.approx(31.4961)
     assert first.standoff_height_mil == 0.0
-    assert "secret" not in repr(first)  # the model's name is not kept
+    # The 3D model's name and the V7 layer are kept; MODELID and MODEL.EMBED are unset.
+    assert (first.model_name, first.v7_layer, first.model_id, first.model_embedded) == (
+        "secret.step", "MECHANICAL13", None, None)
     # A free body; the closing copy of the first vertex is dropped, holes are read past.
     assert (free.component, free.layer, free.projection, free.model_type) == (
         None, 57, None, None)

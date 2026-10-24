@@ -220,6 +220,27 @@ class Primitive:
     # decoded (no file read so far sets one apart from these). False elsewhere.
     test_fab_top: bool = False
     test_fab_bottom: bool = False
+    # Tracks and arcs on a mechanical layer: its number from the record's V7 layer id
+    # (v7_mechanical), which names the layers above 16 that `layer` folds into
+    # Mechanical 16 (72). None elsewhere and in records without the id.
+    mechanical: int | None = None
+
+
+# Tracks6, Arcs6 and Fills6 records of newer files carry the primitive's V7 layer id
+# (u32; 0x0102nnnn is Mechanical nnnn) at 41, 52 and 42. Their v6 layer byte at 0 is 72
+# (Mechanical 16) for every mechanical layer above 16. Checked on Altium's examples and a
+# private set: the id always agrees with the v6 byte on Mechanical 1-16.
+V7_MECHANICAL = 0x01020000
+_TRACK_V7_AT, _ARC_V7_AT, _FILL_V7_AT = 41, 52, 42
+
+
+def v7_mechanical(payload: bytes, at: int) -> int | None:
+    """The mechanical layer number of the V7 layer id at `at` of a record; None when the
+    record is too short to hold one or it names another layer."""
+    if len(payload) < at + 4:
+        return None
+    (layer_id,) = struct.unpack_from("<I", payload, at)
+    return layer_id & 0xFFFF if layer_id & 0xFFFF0000 == V7_MECHANICAL else None
 
 
 # Pads6 main subrecord and Vias6 record header (KiCad's APAD6 and AVIA6 read the same
@@ -323,6 +344,7 @@ def decode_tracks(data: bytes) -> tuple[list[Primitive], int]:
                 y2=_units_to_mil(y2),
                 width=_units_to_mil(width),
                 poured_by=_poured_by(payload),
+                mechanical=v7_mechanical(payload, _TRACK_V7_AT),
             )
         )
     return primitives, skipped
@@ -516,6 +538,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
         )
         chord_length = radius_mil * math.radians(sweep) / (len(points) - 1)
         poured_by = _poured_by(payload)
+        mechanical = v7_mechanical(payload, _ARC_V7_AT)
         for (x1, y1), (x2, y2) in zip(points, points[1:]):
             primitives.append(
                 Primitive(
@@ -534,6 +557,7 @@ def decode_arcs(data: bytes) -> tuple[list[Primitive], int]:
                     arc_x=center_x_mil,
                     arc_y=center_y_mil,
                     arc_radius=radius_mil,
+                    mechanical=mechanical,
                 )
             )
     return primitives, skipped
@@ -1130,6 +1154,16 @@ class PcbComponent:
     source_unique_id: str | None = None
     # The LAYER token as written (TOP, BOTTOM, MID1, ...); side folds it to two.
     layer_name: str = ""
+    # Where the footprint and part were placed from: SOURCEFOOTPRINTLIBRARY (a PcbLib
+    # or IntLib name, or the path of a Workspace part's cached PcbLib),
+    # SOURCECOMPONENTLIBRARY and SOURCELIBREFERENCE (the schematic library and symbol),
+    # a Workspace item (VAULTGUID or ITEMGUID set) and the footprint's Height (HEIGHT;
+    # None when not written).
+    footprint_library: str = ""
+    component_library: str = ""
+    lib_reference: str = ""
+    workspace_part: bool = False
+    height_mil: float | None = None
 
 
 @dataclass
@@ -1446,6 +1480,11 @@ def decode_components(
                 kind=_component_kind(record),
                 source_unique_id=source_uid or None,
                 layer_name=record.get("LAYER", "").strip().upper(),
+                footprint_library=record.get("SOURCEFOOTPRINTLIBRARY", "").strip(),
+                component_library=record.get("SOURCECOMPONENTLIBRARY", "").strip(),
+                lib_reference=record.get("SOURCELIBREFERENCE", "").strip(),
+                workspace_part=bool(record.get("VAULTGUID") or record.get("ITEMGUID")),
+                height_mil=parse_dim_mil(record.get("HEIGHT")),
             )
         )
     return components
@@ -1729,6 +1768,17 @@ class PcbRegion:
     vertices: list[ShapeVertex]
     holes: list[list[tuple[float, float]]]
     name: str = ""
+    # The mechanical layer number its V7_LAYER names (MECHANICAL17), None when unset.
+    mechanical: int | None = None
+
+
+_V7_LAYER_NAME = re.compile(r"MECHANICAL(\d+)", re.IGNORECASE)
+
+
+def v7_layer_mechanical(layer_name: str | None) -> int | None:
+    """The mechanical layer number of a V7_LAYER name such as MECHANICAL17."""
+    match = _V7_LAYER_NAME.fullmatch((layer_name or "").strip())
+    return int(match.group(1)) if match else None
 
 
 def _read_shape_vertices(payload: bytes, at: int) -> tuple[list[ShapeVertex], int]:
@@ -1795,14 +1845,15 @@ def decode_region_records(data: bytes, shape_based: bool) -> tuple[list[PcbRegio
             vertices=vertices,
             holes=holes,
             name=head.properties.get("NAME", ""),
+            mechanical=v7_layer_mechanical(head.properties.get("V7_LAYER")),
         ))
     return regions, skipped
 
 
 @dataclass
 class ComponentBody:
-    """A ComponentBodies6 record: a 3D body's 2D outline (mil, absolute) and heights.
-    The model's name and other free text are not kept."""
+    """A ComponentBodies6 record (or a footprint's body record in a PcbLib): a 3D body's
+    2D outline (mil, absolute on a board, footprint-relative in a library) and heights."""
 
     component: int | None  # Components6 index; None for a free body
     layer: int  # v6 layer (a mechanical layer)
@@ -1811,6 +1862,14 @@ class ComponentBody:
     standoff_height_mil: float | None  # STANDOFFHEIGHT
     projection: str | None  # BODYPROJECTION 0 "top", 1 "bottom"; None when unset
     model_type: int | None  # MODEL.MODELTYPE: 0 extruded, 1 STEP, 2 cylinder, 3 sphere
+    # The 3D model: MODEL.NAME (the STEP file's name; None for a body without a model),
+    # MODELID (the model's GUID) and MODEL.EMBED (the model is embedded in the file).
+    model_name: str | None = None
+    model_id: str | None = None
+    model_embedded: bool | None = None
+    # V7_LAYER as written (MECHANICAL1 ... MECHANICAL1024; None on older files): the
+    # layer of a body on a mechanical layer above 16, which `layer` cannot name.
+    v7_layer: str | None = None
 
 
 # ComponentBodies6 records are type 12 with the region layout (_RegionHead): layer u8
@@ -1843,14 +1902,29 @@ def decode_component_bodies(data: bytes) -> tuple[list[ComponentBody], int]:
             continue
         if len(outline) > 1 and outline[-1] == outline[0]:
             outline.pop()  # a closing copy of the first vertex
+        overall = parse_dim_mil(properties.get("OVERALLHEIGHT"))
+        standoff = parse_dim_mil(properties.get("STANDOFFHEIGHT"))
+        if ("MODEL.EXTRUDED.MAXZ" not in properties and overall is not None
+                and standoff is not None and standoff > overall):
+            # An older record (no MODEL.EXTRUDED.MAXZ) may hold the two heights the other
+            # way round: Altium places it from the lower to the higher (the SpiritLevel
+            # example's library bodies against their placed copies).
+            overall, standoff = standoff, overall
         bodies.append(ComponentBody(
             component=_optional_index(component, NO_COMPONENT),
             layer=payload[0],
             outline=outline,
-            overall_height_mil=parse_dim_mil(properties.get("OVERALLHEIGHT")),
-            standoff_height_mil=parse_dim_mil(properties.get("STANDOFFHEIGHT")),
+            overall_height_mil=overall,
+            standoff_height_mil=standoff,
             projection=_BODY_PROJECTIONS.get(properties.get("BODYPROJECTION", "").strip()),
             model_type=_optional_int(properties.get("MODEL.MODELTYPE")),
+            model_name=properties.get("MODEL.NAME", "").strip() or None,
+            model_id=properties.get("MODELID", "").strip() or None,
+            model_embedded=(
+                properties["MODEL.EMBED"].strip().upper() == "TRUE"
+                if "MODEL.EMBED" in properties else None
+            ),
+            v7_layer=properties.get("V7_LAYER", "").strip() or None,
         ))
     return bodies, skipped
 
@@ -1868,15 +1942,16 @@ class PcbFill:
     x2: float
     y2: float
     rotation: float
+    mechanical: int | None = None  # as on Primitive (v7_mechanical)
 
 
 def _fill_records(data: bytes):
     """Each Fills6 record (KiCad's AFILL6) as a PcbFill, rotation as stored (it may
     not be finite): layer u8 at 0, flags2 at 2 (_KEEPOUT), net u16 at 3, component
-    u16 at 7, two corners (int32 x, y) at 13 and 21 and a rotation (double, degrees,
-    about the centre) at 29. None for a record that is not a fill (another type, or
-    shorter than one) and for a record running past the stream, which the decoders
-    count as skipped."""
+    u16 at 7, two corners (int32 x, y) at 13 and 21, a rotation (double, degrees,
+    about the centre) at 29 and the V7 layer id at 42. None for a record that is not a
+    fill (another type, or shorter than one) and for a record running past the stream,
+    which the decoders count as skipped."""
     for record_type, payload in _records_with_rest(data):
         if record_type != 6 or len(payload) < 37:
             yield None
@@ -1893,6 +1968,7 @@ def _fill_records(data: bytes):
             keepout=payload[2] == _KEEPOUT,
             x1=x1, y1=y1, x2=x2, y2=y2,
             rotation=rotation,
+            mechanical=v7_mechanical(payload, _FILL_V7_AT),
         )
 
 

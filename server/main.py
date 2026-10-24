@@ -131,6 +131,11 @@ try:
         SHRINK_STEPS as VERIFY_SHRINK_STEPS, Tolerances as VerifyTolerances,
         page_verify_outputs, run_verify_outputs,
     )
+    from services.libraries import (
+        LibraryCheckInputs, installed_libraries, library_part, page_library_checks,
+        page_library_part, project_files, project_libraries, registry_projects,
+        run_library_checks,
+    )
     from services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
         page_release_readiness,
@@ -247,6 +252,11 @@ except ImportError:
     from server.services.verify_outputs import (
         SHRINK_STEPS as VERIFY_SHRINK_STEPS, Tolerances as VerifyTolerances,
         page_verify_outputs, run_verify_outputs,
+    )
+    from server.services.libraries import (
+        LibraryCheckInputs, installed_libraries, library_part, page_library_checks,
+        page_library_part, project_files, project_libraries, registry_projects,
+        run_library_checks,
     )
     from server.services.release_gate import (
         ReleaseInputs, build_release_readiness, build_release_review,
@@ -469,6 +479,24 @@ DNP reasons, fabrication requirements. Use it.
   file and the saved design differ, not which is right: quote the file and the examples,
   and ask the user to save in Altium and generate again. Quote not_checked (Gerber and
   ODB++ contents are not read).
+
+## Libraries
+
+- get_library_part — "what footprint does U5 use and where is it from?", "what are this
+  symbol's pins and pin types?", "how big are this footprint's pads?": a placed part's (or
+  a library reference's or footprint's) symbol and footprint read offline from the
+  project's libraries, installed libraries and search paths, with where each was found
+  or why not, its pins, pads, outlines, Height and 3D bodies.
+- check_libraries — "do my footprints still match the library?", "footprint comparison
+  report", "run the component rule check", "can I swap U3 to footprint X?", "is this net
+  tie built right?", "which parts have no 3D model?", "where else is this part used?":
+  parts placed from libraries the project no longer has, each placed footprint against
+  its library footprint (Altium's Footprint Comparison Report), pins on nets without a
+  pad, Altium's SchLib and PcbLib Component Rule Checks, net ties, 3D bodies against the
+  fallback Height and where-used across the registered projects (library= checks a whole
+  library). A drift finding says the board and the library differ, not which is right:
+  ask the user before suggesting Update From PCB Libraries. Workspace (Altium 365) and
+  DbLib parts are not readable offline: say so instead of calling them missing.
 
 ## Fabrication Drawings
 
@@ -6829,6 +6857,274 @@ def verify_outputs(
         "files_total": len(model["files"]),
         "findings_omitted": "The result is too large even at 5 findings per page: call "
                             "again with checks narrowed to one check."}
+    return json.dumps(_convert_units(brief, to_mm), indent=2)
+
+
+# ---------- library parts and checks (roadmap #52) ----------
+
+_installed_library_paths: list[str] | None = None
+
+
+def _installed_libraries() -> list[str]:
+    """Altium's installed libraries on this PC, found once per server run."""
+    global _installed_library_paths
+    if _installed_library_paths is None:
+        try:
+            _installed_library_paths = installed_libraries()
+        except Exception as error:
+            logging.warning("installed libraries not read: %s", error)
+            _installed_library_paths = []
+    return list(_installed_library_paths)
+
+
+def _library_context(project: dict, netlist: dict | None):
+    """(libraries, PCB index or None, sch_refdes or None, PCB error message or None)."""
+    libraries = project_libraries(project["prj_pcb_path"], installed=_installed_libraries())
+    index, error = None, None
+    if project.get("pcb_doc_paths"):
+        index, error = _pcb_session.get(project, netlist)
+    sch_refdes = None
+    if index is not None and netlist:
+        sch_refdes = {row["id"]: row["sch_refdes"] for row in index.db.execute(
+            "SELECT id, sch_refdes FROM components") if row["sch_refdes"]}
+    return libraries, index, sch_refdes, (error or {}).get("message")
+
+
+def _library_units(index, units: PcbUnits | None) -> tuple[str | None, dict | None]:
+    if units not in (None, "mm", "mil"):
+        return None, {"error": "invalid_units", "message": "units must be 'mil' or 'mm'."}
+    resolved = (units or (index.pcb.board.display_unit if index is not None else "mm")).lower()
+    return (resolved if resolved in ("mm", "mil") else "mm"), None
+
+
+def _library_header(project: dict, netlist: dict | None, index, pcb_error: str | None,
+                    resolved: str) -> dict:
+    header: dict = {"project": project.get("name"), "units": resolved}
+    paths = project.get("pcb_doc_paths") or []
+    if paths:
+        header["pcb_doc"] = Path(paths[0]).name
+    if pcb_error:
+        header["pcb_error"] = pcb_error
+    if not netlist:
+        header["netlist"] = ("Not loaded (netlist-free load): schematic parts, their pins on "
+                             "nets and the symbols they were placed from are not read; the "
+                             "PCB's parts are checked.")
+    return header
+
+
+LIBRARY_PART_STEPS = (400, 200, 100, 50, 20, 5)
+
+
+@mcp.tool(
+    title="Get Library Part",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def get_library_part(
+    designator: str | None = None,
+    lib_reference: str | None = None,
+    footprint: str | None = None,
+    library: str | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """The library symbol and footprint behind a part, read offline from the library
+    files: "what footprint does U5 use and where does it come from?", "what are the
+    pins and pin types of this symbol?", "how big are the pads of this footprint?",
+    "does the placed footprint still match the library?". Not: the placed part's nets
+    and values (get_component), its position and neighbours (get_component_placement).
+
+    designator: a placed part (netlist or PCB designator): its schematic library links,
+    its placement (x, y, rotation, side, Height, Component Type), the symbol it was
+    placed from and the footprint the board uses, each with the library file it was
+    found in and how (origin: project, search path, installed, workspace cache;
+    in_named_library false when found by searching every library, as a footprint link
+    set to Any does; case_differs) or why not (reason: library file missing, name not
+    found, workspace part, database library part); symbol_elsewhere is a same-name
+    symbol in another library when its own is missing. Or lib_reference (a library
+    component's name or Design Item ID) and/or footprint, searched in every library the
+    project can use, or only in library= (a library file name or path: a symbol in a
+    SchLib or IntLib, a footprint in a PcbLib or IntLib; a same-name item elsewhere is
+    given as symbol_elsewhere or footprint_elsewhere).
+
+    symbol: description, default designator, type, parts, footprint links, other model
+    types, parameters and every pin (designator, name, electrical type, part: 0 on
+    every part; hidden; display_mode for alternate graphics). footprint: description,
+    Height (the fallback 3D height), pads with position in the footprint's own frame,
+    layer, shape, size, rotation, hole, slot and plating, bare holes, outlines on the
+    library's courtyard, assembly and 3D-body layers (courtyard says when the library
+    declares no courtyard layer kinds), 3D bodies with model, height and standoff
+    (bodies_summary: count, models, tallest), and 3d (3d_model, extruded_body,
+    height_only, no_height). checks: the symbol's and the footprint's component rule
+    checks, pins_vs_pads, and for a placed part its used pins without a library copper
+    pad (a bare hole has no copper), footprint_drift (the placed footprint against the
+    library's, as check_libraries) and 3d on the board. Pins, pads and bodies page
+    together (offset from next_offset); lengths in units (default the board's display
+    unit). Workspace (Altium 365) and database-library parts are not readable offline:
+    not_available_offline says so."""
+    try:
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    if not (designator or lib_reference or footprint):
+        return json.dumps({"error": "nothing_to_look_up",
+                           "message": "Pass designator=, lib_reference= or footprint=."})
+    if designator and (lib_reference or footprint or library):
+        return json.dumps({"error": "invalid_arguments",
+                           "message": "designator= looks up a placed part; lib_reference=, "
+                                      "footprint= and library= look up library items. Pass one "
+                                      "or the other."})
+    libraries, index, sch_refdes, pcb_error = _library_context(project, netlist)
+    resolved, error = _library_units(index, units)
+    if error:
+        return json.dumps(error)
+    try:
+        model = library_part(libraries, netlist, index.pcb if index is not None else None,
+                             sch_refdes, designator=designator, lib_reference=lib_reference,
+                             footprint=footprint, library=library)
+    except Exception as error:
+        logging.warning("get_library_part failed: %s", error)
+        return json.dumps({"error": "library_read_failed",
+                           "message": f"{type(error).__name__}: {error}"})
+    if "error" in model:
+        return json.dumps(model)
+    header = _library_header(project, netlist, index, pcb_error, resolved)
+    to_mm = resolved == "mm"
+    for limit in LIBRARY_PART_STEPS:
+        result = _convert_units({**header, **page_library_part(model, offset, limit)}, to_mm)
+        if limit != LIBRARY_PART_STEPS[0]:
+            result["page_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    # Too large even at the smallest page: where the items come from, without their pins,
+    # pads, bodies, outlines, parameters and checks.
+    brief = {**header, **{key: model[key] for key in (
+        "designator", "schematic", "placement", "symbol_elsewhere", "footprint_elsewhere",
+        "not_available_offline") if key in model}}
+    for key, dropped in (("symbol", ("pins", "parameters", "footprint_links")),
+                         ("footprint", ("pads", "bodies", "outlines"))):
+        if key in model:
+            brief[key] = {name: value for name, value in model[key].items()
+                          if name not in dropped}
+    brief["omitted"] = ("The result is too large even at 5 pins and pads per page: the pins, "
+                        "pads, 3D bodies, outlines, parameters and checks are left out. Call "
+                        "check_libraries(part=...) for the checks.")
+    return json.dumps(_convert_units(brief, to_mm), indent=2)
+
+
+LIBRARY_CHECK_STEPS = (100, 50, 25, 10, 5, 1)
+
+
+@mcp.tool(
+    title="Check Libraries",
+    annotations=ToolAnnotations(readOnlyHint=True),
+    meta={"anthropic/maxResultSizeChars": QUERY_NET_MAX_RESULT_SIZE_CHARS},
+)
+def check_libraries(
+    checks: list[str] | None = None,
+    part: str | None = None,
+    library: str | None = None,
+    footprint: str | None = None,
+    where_used: str | None = None,
+    folders: list[str] | None = None,
+    units: PcbUnits | None = None,
+    offset: int = 0,
+) -> str:
+    """Check the libraries behind the project's parts, offline: "do my footprints still
+    match the library?", "run the footprint comparison report", "were footprints edited
+    on the board?", "are my libraries clean?", "run the component rule check", "can I
+    swap U3 to footprint X?", "is this net tie built right?", "which parts have no 3D
+    model?", "where else is this part used?", before a library update or a release.
+
+    Each part's symbol and footprint are resolved in the libraries the project can use
+    (its own, the installed ones, then its search paths), as Altium does. checks (default
+    every one but where_used):
+    resolution (parts placed from a library the project no longer has, with a
+    same-name symbol elsewhere; names not found; footprints taken from another library
+    than the named one; Workspace and database parts, which are not readable offline);
+    footprint_drift (each placed footprint against its library footprint, as Altium's
+    Footprint Comparison Report: pad count, pads missing or extra by designator, every
+    pad offset from the reference point (origin moved), the footprint turned or
+    mirrored, pads moved with the delta, pad size, angle, shape, corner radius, hole,
+    slot, plating and layer, then Height, 3D bodies and the other primitives' counts as
+    info; positions in the footprint's own frame, a bottom-side part flipped back; each
+    finding groups the parts with the same difference; not compared: mask and paste
+    expansions, hole offsets, slot angles, texts and the shapes of other primitives);
+    pads_cover_pins (every pin on a net has a copper pad in the placed footprint and in
+    the library footprint: errors, as Update PCB's Unknown Pin; a bare hole, a pad
+    without copper, does not count: on_bare_holes; board pads carrying a net with no
+    pin; footprint= checks a proposed swap of the part= parts: swap lists per part
+    whether the new footprint keeps every used pin, the pins it loses and its pads
+    without pins);
+    symbol_rules (Altium's SchLib Component Rule Check: duplicate pins, pins without a
+    designator or name, gaps in the pin numbering, no description, default designator
+    or footprint, IC pins all Passive; and each symbol against the footprint it is used
+    with: pins without pads, pads without pins, a large pad without a pin flagged as an
+    exposed pad with no net);
+    footprint_rules (Altium's PcbLib Component Rule Check: pads without or sharing a
+    designator, duplicate primitives, mirrored, reference point outside the pads,
+    shorted copper (pads of different designators touching or joined by copper, a
+    warning on the library item; expected in a net tie; on_different_nets names the
+    parts net_ties reports) and unconnected copper, no description, no courtyard on a
+    library with courtyard layers);
+    net_ties (net-tie parts: the footprint's copper joins its pads, the schematic, PCB
+    and library agree on the type, the tie joins different nets on the board; a part
+    that is not a net tie whose library footprint joins pads on different nets: an
+    error when the placed copy joins them too, as DRC's short, a warning when only the
+    library's does, as an update from the library would);
+    height_3d (per placed part: a 3D model, an extruded body, only the footprint's
+    Height, or neither); where_used (where_used='<symbol or footprint name>': the
+    registered projects, and the projects under folders=, that place it, with counts
+    and designators; with library=, only parts placed from that library).
+    part= (comma-separated designators, library references or footprint names) narrows
+    every check; library= (a library file name or path) runs symbol_rules,
+    footprint_rules, net_ties and height_3d on every item of that library instead.
+    Findings (errors first, items many share grouped per library) are paginated (offset
+    from next_offset); lengths in units (default the board's display unit). A drift
+    finding says the board and the library differ, not which is right. Workspace (Altium
+    365) parts and DbLib parts (roadmap #53) are not readable offline:
+    not_available_offline and not_readable_offline_parts say so."""
+    try:
+        project, netlist, _ = _require_project(netlist=False)
+    except ProjectNotReady as error:
+        return json.dumps(error.payload)
+    for folder in folders or []:
+        if not Path(folder).is_dir():
+            return json.dumps({"error": "folder_not_found", "message": f"Folder not found: {folder}"})
+    libraries, index, sch_refdes, pcb_error = _library_context(project, netlist)
+    resolved, error = _library_units(index, units)
+    if error:
+        return json.dumps(error)
+    projects: list[str] = []
+    if where_used or (checks and "where_used" in checks):
+        projects = list(dict.fromkeys([*registry_projects(read_registry()),
+                                       *project_files(folders or [])]))
+    try:
+        model = run_library_checks(LibraryCheckInputs(
+            libraries, netlist, index.pcb if index is not None else None, sch_refdes,
+            checks=checks, parts=_split_names(part), library=library, footprint=footprint,
+            where_used=where_used, projects=projects))
+    except Exception as error:
+        logging.warning("check_libraries failed: %s", error)
+        return json.dumps({"error": "library_check_failed",
+                           "message": f"{type(error).__name__}: {error}"})
+    if "error" in model:
+        return json.dumps(model)
+    header = _library_header(project, netlist, index, pcb_error, resolved)
+    to_mm = resolved == "mm"
+    for limit in LIBRARY_CHECK_STEPS:
+        result = _convert_units({**header, **page_library_checks(model, offset, limit)}, to_mm)
+        if limit != LIBRARY_CHECK_STEPS[0]:
+            result["findings_limited_to"] = limit
+        rendered = json.dumps(result, indent=2)
+        if len(rendered) <= QUERY_NET_MAX_RESULT_SIZE_CHARS:
+            return rendered
+    brief = {**header, **{key: model[key] for key in (
+        "checks_run", "summary", "severity_counts") if key in model},
+        "findings_total": len(model["findings"]),
+        "findings_omitted": "The result is too large even at 1 finding per page: call again "
+                            "with checks= narrowed to one check or part= to a few parts."}
     return json.dumps(_convert_units(brief, to_mm), indent=2)
 
 

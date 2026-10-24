@@ -2,6 +2,7 @@ import logging
 import re
 import struct
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import olefile
@@ -43,6 +44,19 @@ class ComponentMeta:
     # Every pin's electrical type (pin designator -> PIN_TYPES name), unnamed pins
     # included; each pin of a multi-part component keeps its own record's type.
     pin_types: dict[str, str] = field(default_factory=dict)
+    # Where the part was placed from (RECORD=1): SourceLibraryName (a library file name
+    # such as X.SchLib or X.IntLib, or a Workspace name), LibraryPath ("*" or empty
+    # unless a path was kept), a Workspace item (VaultGUID or ItemGUID set) and the
+    # DbLib table of a database part (DatabaseTableName).
+    library: str = ""
+    library_path: str = ""
+    workspace_part: bool = False
+    database_table: str = ""
+    # The current footprint model's library as its PCB model link names it
+    # (ModelDataFile0: a library file name or path; empty for "Any"), and whether the
+    # link takes it from the component's own library (UseComponentLibrary=T).
+    footprint_library: str = ""
+    footprint_from_component_library: bool = False
 
 
 # A pin record's Electrical property, as Altium's pin dialog lists it; a pin without the
@@ -94,14 +108,14 @@ def components_from_stream(
     source names the sheet in logged warnings. Designators that name two or more
     different components are appended to clashes, see _merge_parts.
     """
-    return _components_from_records(_read_records(data), source, clashes)
+    return _components_from_records(read_records(data), source, clashes)
 
 
 def _components_from_records(
     records: list[dict[str, str]], source: str = "",
     clashes: list[DesignatorClash] | None = None,
 ) -> dict[str, ComponentMeta]:
-    """components_from_stream for the records _read_records gives (stripped values)."""
+    """components_from_stream for the records read_records gives (stripped values)."""
     # Parsing state
     # Key: owner_key = record_num - 1 for the RECORD=1 entry
     components_by_owner: dict[int, ComponentMeta] = {}
@@ -123,7 +137,7 @@ def _components_from_records(
                 props, record_num, components_by_owner, canonical_owner, uid_seen, parts
             )
             origins.setdefault(canonical_owner[record_num - 1], []).append(
-                (_coord(props, "location.x"), _coord(props, "location.y"))
+                (coord_mil(props, "location.x"), coord_mil(props, "location.y"))
             )
         elif record_type == "211" and props.get("collapsed", "").upper() != "T":
             masks.append(_rect(props))  # a collapsed compile mask is disabled
@@ -196,12 +210,17 @@ def _merge_part_lists(target: ComponentMeta, other: ComponentMeta) -> None:
     for name in ("unique_ids", "footprints", "pin_designators"):
         held = getattr(target, name)
         held.extend(item for item in getattr(other, name) if item not in held)
-    target.footprint = target.footprint or other.footprint
+    if not target.footprint and other.footprint:
+        target.footprint = other.footprint
+        target.footprint_library = other.footprint_library
+        target.footprint_from_component_library = other.footprint_from_component_library
     target.kind = target.kind or other.kind
     for name, text in other.params.items():
         target.params.setdefault(name, text)
-    target.lib_reference = target.lib_reference or other.lib_reference
-    target.design_item_id = target.design_item_id or other.design_item_id
+    for name in ("lib_reference", "design_item_id", "library", "library_path",
+                 "database_table"):
+        setattr(target, name, getattr(target, name) or getattr(other, name))
+    target.workspace_part = target.workspace_part or other.workspace_part
 
 
 def _merge_parts(
@@ -315,13 +334,18 @@ def _parse_props(text: str, strip: bool = True) -> dict[str, str]:
     return props
 
 
-def _read_records(data: bytes, strip: bool = True) -> list[dict[str, str]]:
+def read_records(
+    data: bytes, strip: bool = True,
+    binary: Callable[[bytes], dict[str, str] | None] | None = None,
+) -> list[dict[str, str]]:
     """Split a schematic stream into property dicts with lower-case keys.
 
     Each record is a 4-byte header (24-bit length, then a type byte, 0 = text) and a
     `|KEY=VALUE|...` body. Binary records become empty dicts so that list positions,
-    which OwnerIndex refers to, stay aligned. Position 0 is the stream header, and a
-    child's OwnerIndex is its owner's position minus one. strip: see _parse_props.
+    which OwnerIndex refers to, stay aligned; binary, when given, reads a binary
+    record's body into properties instead (None keeps the empty dict). Position 0 is
+    the stream header, and a child's OwnerIndex is its owner's position minus one.
+    strip: see _parse_props.
     """
     records: list[dict[str, str]] = []
     offset = 0
@@ -331,7 +355,7 @@ def _read_records(data: bytes, strip: bool = True) -> list[dict[str, str]]:
         body = data[offset + 4 : offset + 4 + length]
         offset += 4 + length
         if header >> 24:
-            records.append({})
+            records.append((binary(body) if binary else None) or {})
             continue
         text = body.decode("latin-1").rstrip("\x00")
         records.append(_parse_props(text, strip))
@@ -371,6 +395,10 @@ def _handle_component(
             kind=_component_kind(props),
             lib_reference=props.get("libreference", ""),
             design_item_id=props.get("designitemid", ""),
+            library=props.get("sourcelibraryname", ""),
+            library_path=props.get("librarypath", ""),
+            workspace_part=bool(props.get("vaultguid") or props.get("itemguid")),
+            database_table=props.get("databasetablename", ""),
         )
         components_by_owner[owner_key] = comp
         canonical_owner[owner_key] = owner_key
@@ -453,6 +481,9 @@ def _handle_model(
         component.footprints.append(name)
     if props.get("iscurrent", "").upper() == "T" and not component.footprint:
         component.footprint = name
+        component.footprint_library = props.get("modeldatafile0", "")
+        component.footprint_from_component_library = (
+            props.get("usecomponentlibrary", "").upper() == "T")
 
 
 def _handle_parameter(
@@ -553,7 +584,7 @@ class SheetAnnotations:
     sheet_parameters: dict[str, str] = field(default_factory=dict)
 
 
-def _coord(props: dict[str, str], key: str) -> float:
+def coord_mil(props: dict[str, str], key: str) -> float:
     try:
         whole = int(props.get(key, "0"))
         frac = int(props.get(key + "_frac", "0"))
@@ -564,8 +595,8 @@ def _coord(props: dict[str, str], key: str) -> float:
 
 def _rect(props: dict[str, str]) -> list[float]:
     """[x0, y0, x1, y1] in mil from Location and Corner."""
-    x0, y0 = _coord(props, "location.x"), _coord(props, "location.y")
-    x1, y1 = _coord(props, "corner.x"), _coord(props, "corner.y")
+    x0, y0 = coord_mil(props, "location.x"), coord_mil(props, "location.y")
+    x1, y1 = coord_mil(props, "corner.x"), coord_mil(props, "corner.y")
     return [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)]
 
 
@@ -576,7 +607,7 @@ def _label_rect(props: dict[str, str], text: str, font_sizes: dict[str, int]) ->
     center/top x left/center/right) in the text's own frame, then turned about the
     anchor by Orientation x 90 degrees counter-clockwise.
     """
-    x, y = _coord(props, "location.x"), _coord(props, "location.y")
+    x, y = coord_mil(props, "location.x"), coord_mil(props, "location.y")
     em = font_sizes.get(props.get("fontid", "1"), 10) * _FONT_SIZE_MIL
     lines = text.split("\n")
     width, height = max(len(line) for line in lines) * em * _CHAR_WIDTH_EM, em * len(lines)
@@ -626,7 +657,7 @@ def parse_sch_doc_annotations(path: str) -> SheetAnnotations:
 
 def annotations_from_stream(data: bytes) -> SheetAnnotations:
     """parse_sch_doc_annotations for the bytes of a FileHeader stream."""
-    records = _read_records(data)
+    records = read_records(data)
     result = SheetAnnotations()
     rects: dict[int, list[float]] = {}           # id(annotation) -> rectangle
     part_boxes: dict[int, list[float]] = {}      # component part position -> pin bounding box
@@ -645,7 +676,7 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
                     font_sizes[key[4:]] = int(val)
             continue
         if record == "1":
-            x, y = _coord(props, "location.x"), _coord(props, "location.y")
+            x, y = coord_mil(props, "location.x"), coord_mil(props, "location.y")
             part_boxes[pos] = [x, y, x, y]
             part_modes[pos] = (props.get("currentpartid", "1"), props.get("displaymode", "0"))
             continue
@@ -655,7 +686,7 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
                 part, mode = part_modes[owner]
                 if (props.get("ownerpartid", part) in (part, "-1", "0")
                         and props.get("ownerpartdisplaymode", "0") == mode):
-                    x, y = _coord(props, "location.x"), _coord(props, "location.y")
+                    x, y = coord_mil(props, "location.x"), coord_mil(props, "location.y")
                     box = part_boxes[owner]
                     box[:] = [min(box[0], x), min(box[1], y), max(box[2], x), max(box[3], y)]
             elif record == "34" and props.get("name") == "Designator" and owner in part_boxes:
@@ -689,8 +720,8 @@ def annotations_from_stream(data: bytes) -> SheetAnnotations:
         elif record == "43":
             directives[pos] = SheetDirective(
                 name=props.get("name", ""),
-                x_mil=_coord(props, "location.x"),
-                y_mil=_coord(props, "location.y"),
+                x_mil=coord_mil(props, "location.x"),
+                y_mil=coord_mil(props, "location.y"),
             )
             result.directives.append(directives[pos])
             continue
@@ -906,7 +937,7 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
     pins: list[tuple[int, str, tuple[float, float]]] = []  # (owner, pin, electrical end)
     wiring = _Wiring()
 
-    for pos, props in enumerate(_read_records(data)):
+    for pos, props in enumerate(read_records(data)):
         record = props.get("record")
         owner = _owner_position(props)
         if record == "1":
@@ -917,7 +948,7 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
             if (props.get("ownerpartid", part) in (part, "-1", "0")
                     and props.get("ownerpartdisplaymode", "0") == mode
                     and not conglomerate & 0x04 and props.get("designator")):  # 4: hidden
-                pins.append((owner, props["designator"], _pin_end(props, conglomerate)))
+                pins.append((owner, props["designator"], pin_end(props, conglomerate)))
         elif record == "34" and owner in parts and props.get("name", "").lower() == "designator":
             designators[owner] = props.get("text", "")
         elif record == "15" and owner is None:
@@ -925,10 +956,10 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
                 unique_id=props.get("uniqueid", ""),
                 symbol_type=props.get("symboltype", ""),
                 design_item_id=props.get("designitemid", ""),
-                x_mil=_coord(props, "location.x"),
-                y_mil=_coord(props, "location.y"),
-                width_mil=_coord(props, "xsize"),
-                height_mil=_coord(props, "ysize"),
+                x_mil=coord_mil(props, "location.x"),
+                y_mil=coord_mil(props, "location.y"),
+                width_mil=coord_mil(props, "xsize"),
+                height_mil=coord_mil(props, "ysize"),
             )
             result.symbols.append(symbols[pos])
         elif record in ("32", "33") and owner in symbols:
@@ -960,8 +991,8 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
             wiring.add_object("junction", None, [_location(props)])
         elif record == "22":
             no_erc = NoErc(
-                x_mil=_coord(props, "location.x"),
-                y_mil=_coord(props, "location.y"),
+                x_mil=coord_mil(props, "location.x"),
+                y_mil=coord_mil(props, "location.y"),
                 active=_flag(props, "isactive"),
                 suppress_all=_flag(props, "suppressall"),
                 symbol=props.get("symbol", ""),
@@ -981,7 +1012,7 @@ def hierarchy_from_stream(data: bytes, additional: bytes = b"") -> SheetHierarch
             if props["text"] not in names:
                 names.append(props["text"])
 
-    for props in _read_records(additional) if additional else ():
+    for props in read_records(additional) if additional else ():
         if props.get("record") == "218":
             wiring.add_line(_vertices(props))
     for owner, pin, point in pins:
@@ -1012,20 +1043,20 @@ def _flag(props: dict[str, str], key: str) -> bool:
 
 
 def _location(props: dict[str, str]) -> tuple[float, float]:
-    return _coord(props, "location.x"), _coord(props, "location.y")
+    return coord_mil(props, "location.x"), coord_mil(props, "location.y")
 
 
 def _vertices(props: dict[str, str]) -> list[tuple[float, float]]:
     count = _int(props.get("locationcount", "0"))
-    return [(_coord(props, f"x{i}"), _coord(props, f"y{i}")) for i in range(1, count + 1)]
+    return [(coord_mil(props, f"x{i}"), coord_mil(props, f"y{i}")) for i in range(1, count + 1)]
 
 
-def _pin_end(props: dict[str, str], conglomerate: int) -> tuple[float, float]:
+def pin_end(props: dict[str, str], conglomerate: int) -> tuple[float, float]:
     """A pin's electrical end: Location is where it meets the body, and the pin points
     PinLength away in the direction PinConglomerate bits 0-1 give (0 right, 1 up, 2 left,
     3 down)."""
     x, y = _location(props)
-    length = _coord(props, "pinlength")
+    length = coord_mil(props, "pinlength")
     dx, dy = ((1, 0), (0, 1), (-1, 0), (0, -1))[conglomerate & 0x03]
     return x + dx * length, y + dy * length
 
@@ -1050,7 +1081,7 @@ def _port_ends(props: dict[str, str]) -> list[tuple[float, float]]:
     """A port's two connection points: Width to the right of Location for the horizontal
     styles (0-3), above it for the vertical ones (4-7)."""
     x, y = _location(props)
-    width = _coord(props, "width")
+    width = coord_mil(props, "width")
     if _int(props.get("style", "0")) >= 4:
         return [(x, y), (x, y + width)]
     return [(x, y), (x + width, y)]
@@ -1365,7 +1396,7 @@ def parse_sch_connectivity(path: str) -> SheetConnectivity:
 def connectivity_from_stream(data: bytes, additional: bytes = b"",
                              source: str = "") -> SheetConnectivity:
     """parse_sch_connectivity for the bytes of a FileHeader and an Additional stream."""
-    records = _read_records(data)
+    records = read_records(data)
     result = SheetConnectivity()
     (result.sheet_style, result.width_mil, result.height_mil,
      result.portrait) = _sheet_size({})
@@ -1391,7 +1422,7 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
                     and props.get("ownerpartdisplaymode", "0") == mode
                     and props.get("designator")):
                 result.pins.append(SchPin(
-                    parts[owner], props["designator"], _pin_end(props, conglomerate),
+                    parts[owner], props["designator"], pin_end(props, conglomerate),
                     hidden=bool(conglomerate & 0x04), name=props.get("name", ""),
                     hidden_net=props.get("hiddennetname", "")))
         elif record == "34" and owner in parts:
@@ -1402,10 +1433,10 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
                 unique_id=props.get("uniqueid", ""),
                 symbol_type=props.get("symboltype", ""),
                 design_item_id=props.get("designitemid", ""),
-                x_mil=_coord(props, "location.x"),
-                y_mil=_coord(props, "location.y"),
-                width_mil=_coord(props, "xsize"),
-                height_mil=_coord(props, "ysize"),
+                x_mil=coord_mil(props, "location.x"),
+                y_mil=coord_mil(props, "location.y"),
+                width_mil=coord_mil(props, "xsize"),
+                height_mil=coord_mil(props, "ysize"),
             )
             symbols[pos] = (symbol, [])
             result.symbols.append(symbols[pos])
@@ -1448,7 +1479,7 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
             result.masks.append(_rect(props))  # a collapsed compile mask is disabled
         elif record == "22":
             result.no_ercs.append(NoErc(
-                x_mil=_coord(props, "location.x"), y_mil=_coord(props, "location.y"),
+                x_mil=coord_mil(props, "location.x"), y_mil=coord_mil(props, "location.y"),
                 active=_flag(props, "isactive"), suppress_all=_flag(props, "suppressall"),
                 symbol=props.get("symbol", ""),
                 error_kinds=props.get("errorkindsettosuppress", ""),
@@ -1462,13 +1493,13 @@ def connectivity_from_stream(data: bytes, additional: bytes = b"",
             (result.sheet_style, result.width_mil, result.height_mil,
              result.portrait) = _sheet_size(props)
             if "snapgridsize" in props:
-                result.snap_grid_mil = _coord(props, "snapgridsize")
+                result.snap_grid_mil = coord_mil(props, "snapgridsize")
             # Not _flag: a sheet header leaves out a false flag, so absent is off.
             result.snap_grid_on = props.get("snapgridon", "").strip().upper() in ("T", "TRUE")
         elif record == "41" and props.get("name", "").lower() == "sheetnumber":
             result.sheet_number = props.get("text", "")
     connector: HarnessConnector | None = None
-    for props in _read_records(additional) if additional else ():
+    for props in read_records(additional) if additional else ():
         record = props.get("record")
         if record == "218":
             result.harnesses.append(_vertices(props))
@@ -1489,9 +1520,9 @@ def _harness_connector(props: dict[str, str]) -> HarnessConnector:
     harness attaches on HarnessConnectorSide (0 left, 1 right, 2 top, 3 bottom) at
     PrimaryConnectionPosition along it; the entries sit on the opposite side."""
     x, y = _location(props)
-    width, height = _coord(props, "xsize"), _coord(props, "ysize")
+    width, height = coord_mil(props, "xsize"), coord_mil(props, "ysize")
     side = props.get("harnessconnectorside", "0")
-    along = _coord(props, "primaryconnectionposition")
+    along = coord_mil(props, "primaryconnectionposition")
     point = {"1": (x + width, y - along), "2": (x + along, y),
              "3": (x + along, y - height)}.get(side, (x, y - along))
     return HarnessConnector(point, box=(x, y, width, height, side))
@@ -1573,7 +1604,7 @@ def _sheet_size(props: dict[str, str]) -> tuple[str, float, float, bool]:
         # A custom size is the width and height as given. Whether Altium turns it on a
         # portrait sheet is undocumented (KiCad's importer does); the integrity check
         # accepts both.
-        return "Custom", _coord(props, "customx"), _coord(props, "customy"), portrait
+        return "Custom", coord_mil(props, "customx"), coord_mil(props, "customy"), portrait
     style = _int(props.get("sheetstyle", "0").strip())
     name, width, height = SHEET_STYLES[style if 0 <= style < len(SHEET_STYLES) else 0]
     width, height = width * _UNIT_MIL, height * _UNIT_MIL
@@ -1590,7 +1621,7 @@ def integrity_from_stream(data: bytes, source: str = "") -> SheetIntegrity:
     symbols: dict[int, tuple[str, float, float]] = {}  # designator, top-left corner
     entries: list[tuple[int, str, float, float]] = []
     masks: list[list[float]] = []
-    records = _read_records(data, strip=False)
+    records = read_records(data, strip=False)
     for pos, props in enumerate(records):
         record = props.get("record", "").strip()
         owner = _owner_position(props)
@@ -1609,7 +1640,7 @@ def integrity_from_stream(data: bytes, source: str = "") -> SheetIntegrity:
             if (props.get("ownerpartid", part).strip() in (part, "-1", "0")
                     and props.get("ownerpartdisplaymode", "0").strip() == mode
                     and not conglomerate & 0x04):
-                parts[owner].points.append(_pin_end(props, conglomerate))
+                parts[owner].points.append(pin_end(props, conglomerate))
         elif record == "34" and owner in parts:
             if props.get("name", "").strip().lower() == "designator":
                 designators[owner] = (props.get("text", ""), x, y)

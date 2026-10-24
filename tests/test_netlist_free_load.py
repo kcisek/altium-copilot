@@ -91,6 +91,8 @@ WORKING_TOOL_CALLS = {
     "get_output_jobs": lambda: main.get_output_jobs(),
     "check_fab_drawing": lambda: main.check_fab_drawing(),
     "verify_outputs": lambda: main.verify_outputs(),
+    "get_library_part": lambda: main.get_library_part("R1"),
+    "check_libraries": lambda: main.check_libraries(),
     "check_release_readiness": lambda: main.check_release_readiness(),
     "release_review": lambda: main.release_review(),
     # The project folder against itself: no Git clone is needed in folder mode.
@@ -136,6 +138,7 @@ def _environment(tmp_path, pcb_data, compiles: bool):
          patch.object(main, "_netlist_last_updated", None), \
          patch.object(main, "_pcb_session", session), \
          patch.object(main, "_design_notes", main.DesignNotesCache()), \
+         patch.object(main, "_installed_library_paths", []), \
          patch.object(main, "_altium", AltiumClient()), \
          patch.object(main, "read_registry", return_value={"projects": []}), \
          patch.object(main, "upsert_registry_entry") as upsert, \
