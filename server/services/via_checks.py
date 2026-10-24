@@ -181,18 +181,23 @@ class _Stack:
     def resolve(self, token: str) -> int | None:
         """A stored layer token (TOP, MID4, BOTTOM, PLANE2 or a layer name) as a
         stack position."""
-        text = (token or "").strip().lower()
-        if text == "top":
-            layer = 1
-        elif text == "bottom":
-            layer = 32
-        elif text.startswith("mid") and text[3:].isdigit():
-            layer = int(text[3:]) + 1
-        elif text.startswith("plane") and text[5:].isdigit():
-            layer = int(text[5:]) + 38
-        else:
-            layer = self.index.rule_context.layer_ids.get(text)
-        return self.position.get(layer)
+        return self.position.get(layer_token_v6(self.index, token))
+
+
+def layer_token_v6(index, token: str | None) -> int | None:
+    """The v6 layer of a stored layer token (TOP, MID4, BOTTOM, PLANE2, as Board6 drill
+    pairs and Altium's .LDP layer-pairs file write them) or a layer name; None when it
+    names none."""
+    text = (token or "").strip().lower()
+    if text == "top":
+        return 1
+    if text == "bottom":
+        return 32
+    if text.startswith("mid") and text[3:].isdigit():
+        return int(text[3:]) + 1
+    if text.startswith("plane") and text[5:].isdigit():
+        return int(text[5:]) + 38
+    return index.rule_context.layer_ids.get(text)
 
 
 def via_span(stack: _Stack, prim) -> tuple[int | None, int | None, str]:

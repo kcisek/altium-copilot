@@ -148,7 +148,9 @@ class ReleaseInputs:
     variant; fab_board_reader and fab_bom: check_fab_drawing's board and BOM readers
     (fab_bom None without a netlist); clone_status(project_dir) -> get_clone_status's
     dict; offline_erc() -> run_erc's summary counts (main._offline_erc_summary) or None,
-    cited by the ERC gate as evidence only."""
+    cited by the ERC gate as evidence only; verify_outputs() -> verify_outputs' model of
+    the generated files (services.verify_outputs.run_verify_outputs) or None, cited by
+    the dnp_parts and outputs_current gates."""
 
     project: dict
     netlist: dict | None
@@ -162,6 +164,7 @@ class ReleaseInputs:
     fab_bom: Callable | None = None
     clone_status: Callable[[str], dict] = field(default=read_clone_status)
     offline_erc: Callable[[], dict | None] | None = None
+    verify_outputs: Callable[[], dict | None] | None = None
 
 
 class GateResult(Exception):
@@ -240,6 +243,29 @@ class ReleaseContext:
             return self.inputs.offline_erc()
         except Exception:
             return None
+
+    @cached_property
+    def verified(self) -> dict | None:
+        """verify_outputs' model of the generated files; None when not given, when it
+        failed or when it found no files."""
+        if self.inputs.verify_outputs is None:
+            return None
+        try:
+            model = self.inputs.verify_outputs()
+        except Exception as error:  # evidence only: never stops a gate
+            logging.warning("check_release_readiness: verify_outputs failed: %s", error)
+            return None
+        if not model or "error" in model or model.get("verdict") == "no_outputs":
+            return None
+        return model
+
+    def verified_codes(self, check: str, codes: tuple[str, ...]) -> int:
+        """How many findings of these codes verify_outputs reported for a check."""
+        model = self.verified
+        if model is None:
+            return 0
+        return sum(finding["count"] for finding in model.get("findings") or []
+                   if finding["check"] == check and finding["code"] in codes)
 
     @cached_property
     def outjobs(self) -> dict:
@@ -584,6 +610,14 @@ def gate_dnp_parts(ctx: ReleaseContext) -> tuple[str, str]:
     used = sorted({row["variant"] for row in outputs})
     left_out = [variant for variant in variants if variant.name in used]
     text = f"BOM and pick-and-place outputs use {_names(used)}"
+    placed = (ctx.verified_codes("pick_place", ("dnp_present",))
+              + ctx.verified_codes("bom", ("dnp_listed",)))
+    if placed:
+        # The generated files themselves list Not Fitted parts: they were generated
+        # with another variant, or before the variant changed.
+        return "warn", (f"{text}, but the generated files list Not Fitted parts as placed "
+                        f"({_plural(placed, 'listing')}, verify_outputs): generate them again "
+                        "with the variant.")
     if left_out:
         return "pass", (f"{text}, which leave out their Not Fitted parts ({counted(left_out)}); "
                         "those stay on the PCB by design.")
@@ -651,8 +685,28 @@ def gate_outputs_current(ctx: ReleaseContext) -> tuple[str, str]:
         return "not_verified", ("No generated outputs found at the OutJob containers' "
                                 "folders: generate the OutJob or run the Project Releaser.")
     newest = max(row["newest_output_utc"] for row in dated)
-    return "pass", (f"Outputs at {_plural(len(dated), 'container')} are newer than the design "
-                    f"(newest {newest}).")
+    text = (f"Outputs at {_plural(len(dated), 'container')} are newer than the design "
+            f"(newest {newest})")
+    verified = ctx.verified
+    if verified is not None:
+        # File times do not show what changed since: the files' contents compared with
+        # the design do. Differences make the outputs not current.
+        warnings = verified["severity_counts"].get("warning", 0)
+        results = verified.get("results") or {}
+        labels = {"pick_place": "pick-and-place", "bom": "BOM", "netlist": "netlist",
+                  "stackup": "stackup", "drill": "NC drill"}
+        checks = [labels.get(check, check) for check, entry in results.items()
+                  if entry.get("status") == "mismatch"]
+        if warnings:
+            return "warn", (f"{text}, but their contents differ from the design: "
+                            f"{_plural(warnings, 'mismatch finding')} in {_names(checks)} "
+                            "(verify_outputs): generate them again.")
+        matched = [labels.get(check, check) for check, entry in results.items()
+                   if entry.get("status") == "match"]
+        if matched:
+            return "pass", (f"{text}; the {_names(matched)} files match the design "
+                            "(verify_outputs).")
+    return "pass", text + "."
 
 
 def gate_fab_drawing(ctx: ReleaseContext) -> tuple[str, str]:
@@ -1084,6 +1138,7 @@ RELEASE_REVIEW_TOOLS = (
     "check_dfm",
     "get_assembly_guide",
     "get_output_jobs",
+    "verify_outputs",
     "check_fab_drawing",
     "get_design_notes",
     "check_project_integrity",
@@ -1130,9 +1185,10 @@ errors, never a pass), get_project_options (ERC levels, No ERC directives) and
 get_output_jobs (the ERC validation output); netlist_fresh and
 sch_pcb_sync → check_sch_pcb_sync; unrouted_nets → check_connectivity; polygons →
 check_pcb_health; board_outline → get_board_info; fiducials → check_dfm with checks
-["fiducials"]; mounting_holes → get_assembly_guide; dnp_parts, outjob_coverage and
-outputs_current → get_output_jobs; fab_drawing → check_fab_drawing; title_block →
-get_design_notes; project_integrity → check_project_integrity; clone_status →
+["fiducials"]; mounting_holes → get_assembly_guide; outjob_coverage → get_output_jobs;
+dnp_parts and outputs_current → get_output_jobs, then verify_outputs when the evidence
+cites it (the generated files against the design); fab_drawing → check_fab_drawing;
+title_block → get_design_notes; project_integrity → check_project_integrity; clone_status →
 get_clone_status; testpoints → check_testpoints (guidance values: ask for the test
 house's numbers); via_stitching → check_vias. Give each its cause and the fix in Altium.
 

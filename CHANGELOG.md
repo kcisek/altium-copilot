@@ -6,6 +6,93 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 ## [Unreleased]
 
 ### Added
+- `verify_outputs`: the files Altium generated cross-checked against the saved design,
+  offline and read-only (roadmap #39, `services/verify_outputs.py`, on stage A's readers in
+  `parsers/fab_outputs.py`). Works on a netlist-free load (the BOM is then compared with the
+  PCB's parts: designators, Comment and footprint only).
+  - Files: `path=` a folder, a release `.zip` (read in memory, one nested zip deep, nothing
+    extracted) or one file; without it, the folders the project's OutJobs generate into
+    (`output_jobs.output_locations`: each output's folder-structure container, its data
+    sources and the project's `.BomDoc`s) and the Output Path. Below a container folder named
+    by a date/time expression (and below a container's timestamp folders) each first-level
+    folder is a generation: only the newest generation of each kind is checked, ordered by the
+    date and time in the folder names (a copy or checkout resets file times), else by file
+    time; older ones are counted and the generation checked is named. Files are classified
+    by content (`detect_output_kind`; a workbook counts as a BOM once a BOM header row is
+    found in it, other workbooks are listed as not a BOM), identical files and pick-and-place
+    twins (same rows) are checked once, and each file is matched to the OutJob output whose
+    folder holds it (its variant, data source and settings; Test Points and Test Points For
+    Assembly outputs make the IPC-D-356A netlist). Zips in the OutJob folders are listed, not
+    opened (pass `path=`).
+  - `pick_place`: every fitted part of the file's variant (its preamble's Variant line;
+    `variant=` overrides; with a variant the project lacks, a part some variant does not fit
+    may be absent) present once, Not Fitted parts absent, side, rotation (mod 360, the
+    component's own on both sides; a file writing whole degrees matches within 0.5),
+    Center-X/Y against check_dfm's centroid (the pad-centre box midpoint relative to the board
+    origin; a part without pads at the absolute origin) within `position_tolerance`
+    (default 0.01 mm), Ref-X/Y and Pad-X/Y when present (a bottom-side Y written negated is
+    Altium's Y-flip option), footprint (Altium writes a space in a footprint name as '_');
+    Comment and Description against the variant's BOM part are info. Standard (No BOM),
+    Graphical and Net Tie (No BOM) parts may be listed or not. A file whose rows mostly
+    differ is called out once (`layout_differs`: another revision of the board).
+  - `bom`: the fitted lines' designators against the variant's BOM parts as get_bom builds
+    them, lines a 'Fitted'-style column or a zero quantity marks Not Fitted against the
+    variant's Not Fitted parts, quantity against the designator count, duplicates, and the
+    Comment, Value, Footprint and Manufacturer Part Number columns (warnings) and
+    Description and Manufacturer (info: supplier data spells them its own way) against the
+    part: a column named after a parameter shows that parameter ('Manufacturer Part Number 1',
+    also in the templates' 'Manufacture' spelling), its special strings ('=Value') resolved as
+    get_bom resolves them, else get_bom's value. A BOM generated from an ActiveBOM document
+    (its OutJob output's data source, or every BOM output of the project's for a file given by
+    path) takes part numbers from the BomDoc's part choices, which are not read: its part
+    number differences are info (`part_choices_not_read`). The variant: the file's title
+    block, its OutJob output (unless the fitted lines are exactly another variant's parts:
+    then that variant, with `variant_differs_from_outjob` as info), a variant named in its
+    path, else the variant whose parts fit it best (`variant_from`). `.xlsx` workbooks are
+    read by a stdlib reader (`fab_outputs.xlsx_sheets`, `parse_bom_xlsx`); `.xls` is reported
+    as not read.
+  - `netlist`: IPC-D-356A (317/327 records; vias and 367 tooling holes left out, N/C as
+    unconnected) and IPC-2581 LogicalNets against the PcbDoc's pad nets pin by pin, with the
+    format's 6/4/14-character cut of designators, pins and net names: pins missing, extra or
+    connected on one side only, nets split or merged (warnings, listing the pins on the
+    smaller side), renamed (info, with the net's first pins), each pin with designator, pin
+    and XY; a file mostly for another board is called out once. IPC-2581 components against
+    the placement (side, rotation) and its BOM populate flags against the variant (the
+    argument's, the OutJob output's, else the variant whose Not Fitted parts fit the
+    unpopulated ones best).
+  - `stackup`: IPC-2581's stackup against the PcbDoc's layer stack (copper count, names,
+    order and thickness, and the dielectrics between the outer copper layers, so solder mask
+    is left out however the file labels it: thickness, Dk and material, within
+    `thickness_tolerance`, default 10 %; layers pair up in order when the counts agree, else
+    by name only), and the layers the `.LDP` (Gerber extensions: gtl, gN, gpN, gbl, listed in
+    layer-ID order, so their order is not judged) and `.DRR` layer pairs name.
+  - `drill`: per drill set: a `.DRR` report's layer pair with the drill files it names (in
+    its own folder, else elsewhere in its generation), an `.LDP` pair's files no report
+    names, else a folder's other drill files taken as the through holes; identical sets are
+    compared once. A set's Excellon tools against the board's pad, via and bare holes of the
+    pair (its span the outermost layers named; stacked coincident holes drilled once): size
+    within half the tool size's written precision plus `drill_tolerance` (default 0.01 mil),
+    plating from the ;TYPE sections, hole and slot counts per tool, sizes no tool drills,
+    tools no hole needs, and hole positions (at the origin the OutJob sets, else whichever
+    fits; a file whose hits mostly miss is called out once); the `.DRR` report against the
+    drill files it names by tool number, or against the board when they are not there. A
+    report or layer-pairs file naming another PcbDoc is called out (`other_board`: a warning
+    for a board the project does not list, info for its other PcbDocs) and its files are
+    not compared.
+  - `staleness`: an output file older than the design documents it comes from (its OutJob
+    output's data sources as get_output_jobs reads them, else the PcbDoc, and for a BOM the
+    sheets and `.BomDoc`s; for pick and place and BOMs also the `.PrjPcb` when the project
+    has variants), by file times, info. An OutJob output with no file found, and no output
+    found at all, are info.
+  - Paging with offset, a shrink loop to the result size, `units`, the model kept per
+    arguments, files and OutJob outputs for paging; verdict `consistent`, `mismatches` or
+    `no_outputs`. Calibrated on 63 real projects and 11 public examples: 147
+    pick-and-place, 73 BOM and 250 NC drill files found in the OutJob folders (1,083
+    older-generation files counted, not checked). There, every drill set whose holes sit on
+    the board's (46) matches it with no finding, and the mismatches left trace to outputs
+    generated from other board revisions and to BOM part-number columns filled from part
+    choices, not to the readers. Runtime median 0.3 s per project (1.0 s reading a whole
+    project tree with its release zips).
 - `check_hv_clearance`: voltage-aware clearance and creepage screen (roadmap #32,
   `services/hv_clearance.py`), read-only and offline from the compiled netlist, the active
   variant and the PcbDoc (a PcbDoc is required: `no_pcb_document` without one). A
@@ -1981,6 +2068,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
   uncommitted `.PcbDoc`, in about 0.3 s per clone
 
 ### Changed
+- `check_release_readiness`: the dnp_parts and outputs_current gates cite verify_outputs'
+  result of the generated files (`ReleaseInputs.verify_outputs`). dnp_parts warns when the
+  files themselves list Not Fitted parts as placed; outputs_current warns when their
+  contents differ from the design, and names the kinds of files that match it (nothing is
+  claimed about files it cannot compare, such as Gerbers). Both stay non-blocking and keep
+  their titles: the verdict is unchanged. The release_review prompt sends those gates to
+  verify_outputs.
+- Shared helpers made public for verify_outputs: `via_checks.layer_token_v6` (the Board6
+  layer tokens, used by its own drill-pair resolution), `bom.BomPart.parameters` (the part's
+  parameters as the BOM sees them), `bom.norm_name` and the part-number name patterns,
+  `output_jobs.output_locations` and `output_jobs.utc_iso`. Stage A readers:
+  `split_designators` keeps a designator with a space ('U1 A') whole between commas,
+  Excellon tool definitions carry their written precision (`DrillTool.diameter_step_mil`),
+  and `PickPlace.source` is documented as what Altium writes there: the output file's own
+  path, not the PcbDoc's.
 - Compiled components carry `pin_names` (every named pin, connected or not, united across
   the sheets a part is placed on), so unconnected pins have names. Helpers reused by
   `get_firmware_pin_map` are public: `pull_resistors.link_group` and
